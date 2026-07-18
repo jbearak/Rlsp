@@ -30,8 +30,10 @@ use crate::content_provider::ContentProvider;
 use crate::handlers;
 use crate::indentation;
 use crate::state::{
-    DiagnosticsTrigger, IndentationSettings, SymbolConfig, WorkspaceGraphDerivationContext,
-    WorkspaceGraphOverlay, WorldState, derive_workspace_dependency_graph,
+    AnalysisRevalidationTicket, DiagnosticsTrigger, IndentationSettings, PreparedAnalysisCommit,
+    PreparedOpenCommitPlan, PreparedOpenEditAnalysis, PreparedOpenGraphProjection, SymbolConfig,
+    WorkspaceGraphDerivationContext, WorkspaceGraphOverlay, WorldState,
+    derive_workspace_dependency_graph,
 };
 use crate::utf16::utf16_column_to_byte_offset;
 tokio::task_local! {
@@ -4918,15 +4920,27 @@ fn extract_enriched_live_metadata(
     uri: &Url,
     analysis_text: &str,
 ) -> crate::cross_file::CrossFileMetadata {
+    extract_enriched_live_metadata_with_contexts(state, uri, analysis_text).0
+}
+
+fn extract_enriched_live_metadata_with_contexts(
+    state: &WorldState,
+    uri: &Url,
+    analysis_text: &str,
+) -> (crate::cross_file::CrossFileMetadata, Vec<Url>) {
     let mut meta = crate::cross_file::extract_metadata(analysis_text);
     let workspace_root = state.workspace_folders.first().cloned();
     let max_chain_depth = state.cross_file_config.max_chain_depth;
+    let attempted = std::cell::RefCell::new(Vec::new());
 
     crate::cross_file::enrich_metadata_with_inherited_wd(
         &mut meta,
         uri,
         workspace_root.as_ref(),
-        |parent_uri| state.get_enriched_metadata(parent_uri),
+        |parent_uri| {
+            attempted.borrow_mut().push(parent_uri.clone());
+            state.get_enriched_metadata(parent_uri)
+        },
         max_chain_depth,
     );
 
@@ -4936,7 +4950,7 @@ fn extract_enriched_live_metadata(
     let lib_paths = state.package_library.lib_paths();
     crate::cross_file::resolve_system_file_sources(&mut meta, ws_name, ws_root, lib_paths);
 
-    meta
+    (meta, attempted.into_inner())
 }
 
 fn source_targets_to_index_for_live_diagnostics(
@@ -5006,8 +5020,20 @@ fn metadata_for_graph_root<'a>(
     meta: &'a crate::cross_file::CrossFileMetadata,
     workspace_root: Option<&Url>,
 ) -> std::borrow::Cow<'a, crate::cross_file::CrossFileMetadata> {
+    let root_meta = semantic_metadata_for_graph_root(state, root, input_root, meta, workspace_root);
+    let graph_meta = state.metadata_for_dependency_graph(root, root_meta.as_ref(), workspace_root);
+    std::borrow::Cow::Owned(graph_meta.into_owned())
+}
+
+fn semantic_metadata_for_graph_root<'a>(
+    state: &WorldState,
+    root: &Url,
+    input_root: &Url,
+    meta: &'a crate::cross_file::CrossFileMetadata,
+    workspace_root: Option<&Url>,
+) -> std::borrow::Cow<'a, crate::cross_file::CrossFileMetadata> {
     if root == input_root {
-        return state.metadata_for_dependency_graph(input_root, meta, workspace_root);
+        return std::borrow::Cow::Borrowed(meta);
     }
 
     let mut root_meta = meta.clone();
@@ -5019,8 +5045,7 @@ fn metadata_for_graph_root<'a>(
         |parent_uri| state.get_enriched_metadata(parent_uri),
         state.cross_file_config.max_chain_depth,
     );
-    let graph_meta = state.metadata_for_dependency_graph(root, &root_meta, workspace_root);
-    std::borrow::Cow::Owned(graph_meta.into_owned())
+    std::borrow::Cow::Owned(root_meta)
 }
 
 fn update_cross_file_graph_for_roots(
@@ -5066,6 +5091,395 @@ fn update_cross_file_graph_for_roots(
     }
 
     result
+}
+
+/// Prepare every alias-root graph and WD projection without mutating state.
+///
+/// The returned attempted-parent list is attached to the open transaction's
+/// exact closed/raw context authorities before commit.
+fn prepare_open_graph_plan(
+    state: &WorldState,
+    uri: &Url,
+    old_meta: Option<&crate::cross_file::CrossFileMetadata>,
+    new_meta: &crate::cross_file::CrossFileMetadata,
+    workspace_root: Option<&Url>,
+    make_non_lending: bool,
+) -> (Vec<PreparedOpenGraphProjection>, Vec<Url>, Vec<Url>) {
+    let graph_roots = state.authoritative_revalidation_roots_for_uri(uri);
+    let input_root = graph_roots.first().unwrap_or(uri);
+    let mut projections = Vec::with_capacity(graph_roots.len());
+    let mut attempted = Vec::new();
+    for graph_uri in &graph_roots {
+        let old_root_meta = old_meta.map(|old_meta| {
+            semantic_metadata_for_graph_root(state, graph_uri, input_root, old_meta, workspace_root)
+                .into_owned()
+        });
+        let new_root_meta = semantic_metadata_for_graph_root(
+            state,
+            graph_uri,
+            input_root,
+            new_meta,
+            workspace_root,
+        )
+        .into_owned();
+        let graph_meta =
+            state.metadata_for_dependency_graph(graph_uri, &new_root_meta, workspace_root);
+        let (parent_content, parent_attempts) = collect_backward_parent_content_with(
+            graph_uri,
+            workspace_root,
+            graph_meta.as_ref(),
+            |parent_uri| state.content_provider().get_content(parent_uri),
+        );
+        attempted.extend(parent_attempts);
+        projections.push(PreparedOpenGraphProjection {
+            uri: graph_uri.clone(),
+            graph_metadata: Arc::new(graph_meta.into_owned()),
+            old_metadata: old_root_meta.map(Arc::new),
+            new_metadata: Arc::new(new_root_meta),
+            parent_content,
+            make_non_lending: make_non_lending || state.is_project_excluded_uri(graph_uri),
+        });
+    }
+    (projections, graph_roots, attempted)
+}
+
+struct CapturedOpenEditFallback {
+    analysis_text: String,
+    old_metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
+    workspace_root: Option<Url>,
+    workspace_name: Option<String>,
+    package_root: Option<std::path::PathBuf>,
+    library_paths: Vec<std::path::PathBuf>,
+    exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    subject_excluded: bool,
+    graph_roots: Vec<Url>,
+    packages_enabled: bool,
+    data_packages: Vec<String>,
+    plan: PreparedOpenCommitPlan,
+}
+
+fn capture_open_edit_fallback(
+    state: &WorldState,
+    uri: &Url,
+    prepared: &crate::state::PreparedOpenEdit,
+    old_metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
+) -> CapturedOpenEditFallback {
+    let subject_excluded = state.is_project_excluded_uri(uri);
+    let (workspace_name, package_root, library_paths) = state.snapshot_system_file_inputs();
+    let package_event_uri = (!subject_excluded)
+        .then(|| {
+            state
+                .package_inputs
+                .workspace_root
+                .as_ref()
+                .and_then(|root| {
+                    authoritative_package_input_uri_for_open_document(state, uri, root)
+                        .map(|package_input| package_input.uri().clone())
+                })
+        })
+        .flatten();
+    let package_text = package_event_uri
+        .as_ref()
+        .map(|_| Arc::<str>::from(prepared.document().text()));
+    let (package_fanout_uris, package_source_interface_fanout) =
+        if !subject_excluded && let Some(package) = state.package_workspace() {
+            (
+                state
+                    .documents
+                    .keys()
+                    .filter(|open_uri| {
+                        is_authoritative_package_source_open_uri(state, open_uri, &package.root)
+                    })
+                    .cloned()
+                    .collect(),
+                authoritative_package_r_file_kind_for_open_document(state, uri, &package.root)
+                    == Some(crate::package_state::RFileKind::Source),
+            )
+        } else {
+            (Vec::new(), false)
+        };
+    let mut plan = PreparedOpenCommitPlan {
+        package_event: package_event_uri.zip(package_text),
+        package_fanout_uris,
+        package_source_interface_fanout,
+        ..PreparedOpenCommitPlan::default()
+    };
+    plan.seed_revalidation_uris
+        .extend(state.documents.keys().cloned());
+    CapturedOpenEditFallback {
+        analysis_text: prepared.document().analysis_text(),
+        old_metadata,
+        workspace_root: state.workspace_folders.first().cloned(),
+        workspace_name,
+        package_root,
+        library_paths,
+        exclusions: state.workspace_exclusions.clone(),
+        subject_excluded,
+        graph_roots: state.authoritative_revalidation_roots_for_uri(uri),
+        packages_enabled: state.cross_file_config.packages_enabled,
+        data_packages: prepared.document().data_packages.clone(),
+        plan,
+    }
+}
+
+/// Derive an over-ceiling open edit's local-only projection off-lock.
+///
+/// Own metadata, package calls, and forward sources survive. Inherited WD and
+/// backward-parent graph edges fail closed because their full foreign context
+/// set could not be authorized.
+fn derive_open_edit_fallback(
+    captured: CapturedOpenEditFallback,
+) -> (crate::cross_file::CrossFileMetadata, PreparedOpenCommitPlan) {
+    let mut local_metadata = crate::cross_file::extract_metadata(&captured.analysis_text);
+    crate::cross_file::resolve_system_file_sources(
+        &mut local_metadata,
+        captured.workspace_name.as_deref(),
+        captured.package_root.as_deref(),
+        &captured.library_paths,
+    );
+    let graph = captured
+        .graph_roots
+        .iter()
+        .map(|graph_uri| {
+            let mut semantic_metadata = local_metadata.clone();
+            semantic_metadata.inherited_working_directory = None;
+            let mut graph_metadata = WorldState::metadata_for_dependency_graph_with_exclusions(
+                &captured.exclusions,
+                graph_uri,
+                &semantic_metadata,
+                captured.workspace_root.as_ref(),
+            )
+            .into_owned();
+            // Backward declarations require foreign parent content. Retain the
+            // directive in the document metadata for diagnostics/navigation,
+            // but remove its graph edge in the fail-closed projection.
+            graph_metadata.sourced_by.clear();
+            PreparedOpenGraphProjection {
+                uri: graph_uri.clone(),
+                graph_metadata: Arc::new(graph_metadata),
+                old_metadata: captured.old_metadata.clone(),
+                new_metadata: Arc::new(semantic_metadata),
+                parent_content: HashMap::new(),
+                make_non_lending: captured.subject_excluded
+                    || captured.exclusions.is_excluded_uri(graph_uri),
+            }
+        })
+        .collect();
+    let mut plan = captured.plan;
+    if captured.packages_enabled {
+        plan.packages_to_prefetch =
+            extract_loaded_packages_from_library_calls(&local_metadata.library_calls);
+        plan.packages_to_prefetch
+            .extend(namespace_warm_packages(&local_metadata));
+        plan.packages_to_prefetch.extend(
+            captured
+                .data_packages
+                .into_iter()
+                .filter(|package| is_valid_package_name(package)),
+        );
+        plan.packages_to_prefetch.sort_unstable();
+        plan.packages_to_prefetch.dedup();
+    }
+    plan.graph = graph;
+    plan.reset_closed_roots = captured.graph_roots;
+    plan.refresh_pins = true;
+    (local_metadata, plan)
+}
+
+/// Commit one over-ceiling edit with at most one fresh detached retry.
+///
+/// The prepared document is never replayed: its exact full/range edit result
+/// is retained across an unrelated authority race. A changed target token
+/// means a newer edit/metadata/lifecycle owns the URI and this work exits
+/// without effects. A second unrelated invalidation also exits without panic.
+async fn commit_detached_open_edit_fallback(
+    state_arc: &Arc<RwLock<WorldState>>,
+    uri: &Url,
+    mut prepared: crate::state::PreparedOpenEdit,
+) -> Option<crate::state::AnalysisCommitEffects> {
+    for attempt in 0..=1 {
+        let captured = {
+            let state = state_arc.read().await;
+            if attempt == 0 {
+                if !state.open_edit_subject_is_current(&prepared) {
+                    return None;
+                }
+            } else {
+                prepared = state.rebase_open_edit_if_subject_current(prepared)?;
+            }
+            capture_open_edit_fallback(&state, uri, &prepared, state.get_enriched_metadata(uri))
+        };
+        let (metadata, plan) = derive_open_edit_fallback(captured);
+
+        #[cfg(test)]
+        {
+            let pause = {
+                let state = state_arc.read().await;
+                state.open_edit_fallback_test_pause.take_armed(uri)
+            };
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
+
+        let mut state = state_arc.write().await;
+        if !state.open_edit_basis_is_current(&prepared) {
+            continue;
+        }
+        let result = state.try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+            PreparedOpenEditAnalysis::new(prepared, Arc::new(metadata), plan),
+        )));
+        let Ok(effects) = result else {
+            // The basis was checked under this same write lock. Treat an
+            // unexpected rejection conservatively instead of panicking.
+            return None;
+        };
+        state.cross_file_activity.record_recent(uri.clone());
+        return Some(effects);
+    }
+    None
+}
+
+struct DerivedOpenMetadataReenrichment {
+    metadata: crate::cross_file::CrossFileMetadata,
+    graph: Vec<PreparedOpenGraphProjection>,
+    context_uris: Vec<Url>,
+}
+
+/// Derive didOpen metadata and graph projections from one immutable snapshot.
+///
+/// Every metadata/content lookup is against the captured maps. The lookup
+/// closures record absent as well as present URIs; the captured global
+/// closed-index, raw-cache, and open-context generations make those
+/// observations stale if any authority changes before commit.
+fn derive_open_metadata_reenrichment(
+    captured: &crate::state::CapturedOpenMetadataAnalysis,
+) -> DerivedOpenMetadataReenrichment {
+    let attempted = std::cell::RefCell::new(Vec::new());
+    let metadata_lookup = |parent_uri: &Url| {
+        attempted.borrow_mut().push(parent_uri.clone());
+        captured.metadata_map.get(parent_uri).cloned().or_else(|| {
+            captured.raw_content.get(parent_uri).map(|(content, kind)| {
+                Arc::new(crate::cross_file::extract_metadata_for_kind(*kind, content))
+            })
+        })
+    };
+
+    let mut metadata = crate::cross_file::extract_metadata(&captured.analysis_text);
+    crate::cross_file::enrich_metadata_with_inherited_wd(
+        &mut metadata,
+        &captured.uri,
+        captured.workspace_root.as_ref(),
+        metadata_lookup,
+        captured.max_chain_depth,
+    );
+    crate::cross_file::resolve_system_file_sources(
+        &mut metadata,
+        captured.workspace_name.as_deref(),
+        captured.package_workspace_root.as_deref(),
+        &captured.library_paths,
+    );
+
+    let input_root = captured.graph_roots.first().unwrap_or(&captured.uri);
+    let mut graph = Vec::with_capacity(captured.graph_roots.len());
+    for graph_uri in &captured.graph_roots {
+        let semantic_for_root =
+            |input: &crate::cross_file::CrossFileMetadata| -> crate::cross_file::CrossFileMetadata {
+                let mut root_metadata = input.clone();
+                if graph_uri != input_root {
+                    root_metadata.inherited_working_directory = None;
+                    crate::cross_file::enrich_metadata_with_inherited_wd(
+                        &mut root_metadata,
+                        graph_uri,
+                        captured.workspace_root.as_ref(),
+                        metadata_lookup,
+                        captured.max_chain_depth,
+                    );
+                }
+                root_metadata
+            };
+        let old_metadata = semantic_for_root(captured.old_metadata.as_ref());
+        let new_metadata = semantic_for_root(&metadata);
+        let graph_metadata = WorldState::metadata_for_dependency_graph_with_exclusions(
+            &captured.exclusions,
+            graph_uri,
+            &new_metadata,
+            captured.workspace_root.as_ref(),
+        )
+        .into_owned();
+        let (parent_content, parent_attempts) = collect_backward_parent_content_with(
+            graph_uri,
+            captured.workspace_root.as_ref(),
+            &graph_metadata,
+            |parent_uri| captured.content_map.get(parent_uri).cloned(),
+        );
+        attempted.borrow_mut().extend(parent_attempts);
+        graph.push(PreparedOpenGraphProjection {
+            uri: graph_uri.clone(),
+            graph_metadata: Arc::new(graph_metadata),
+            old_metadata: Some(Arc::new(old_metadata)),
+            new_metadata: Arc::new(new_metadata),
+            parent_content,
+            make_non_lending: captured.exclusions.is_excluded_uri(graph_uri),
+        });
+    }
+    let mut context_uris = attempted.into_inner();
+    context_uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    context_uris.dedup();
+
+    DerivedOpenMetadataReenrichment {
+        metadata,
+        graph,
+        context_uris,
+    }
+}
+
+fn commit_open_metadata_reenrichment(
+    state: &mut WorldState,
+    captured: crate::state::CapturedOpenMetadataAnalysis,
+    derived: DerivedOpenMetadataReenrichment,
+    seed_revalidations: &[AnalysisRevalidationTicket],
+) -> std::result::Result<Vec<AnalysisRevalidationTicket>, crate::state::AnalysisCommitRejected> {
+    let uri = captured.uri.clone();
+    let (package_fanout_uris, package_source_interface_fanout) = if let Some(pkg) =
+        state.package_workspace()
+    {
+        let fanout = state
+            .documents
+            .keys()
+            .filter(|open_uri| is_authoritative_package_source_open_uri(state, open_uri, &pkg.root))
+            .cloned()
+            .collect();
+        let source_edit =
+            authoritative_package_r_file_kind_for_open_document(state, &uri, &pkg.root)
+                == Some(crate::package_state::RFileKind::Source);
+        (fanout, source_edit)
+    } else {
+        (Vec::new(), false)
+    };
+    let plan = PreparedOpenCommitPlan {
+        graph: derived.graph,
+        package_fanout_uris,
+        package_source_interface_fanout,
+        refresh_pins: false,
+        seed_revalidation_uris: seed_revalidations
+            .iter()
+            .map(|ticket| ticket.uri.clone())
+            .collect(),
+        subject_debounce_ms: Some(state.cross_file_config.revalidation_debounce_ms),
+        ..PreparedOpenCommitPlan::default()
+    };
+    let prepared = state
+        .prepare_captured_open_metadata_analysis(
+            captured,
+            Arc::new(derived.metadata),
+            plan,
+            derived.context_uris,
+        )
+        .ok_or(crate::state::AnalysisCommitRejected::StaleBasis)?;
+    let effects =
+        state.try_commit_analysis(PreparedAnalysisCommit::OpenMetadata(Box::new(prepared)))?;
+    Ok(effects.revalidations)
 }
 
 /// What a single-file disk resync did. Immediate commits return their atomic
@@ -6619,6 +7033,7 @@ fn cap_watched_file_revalidations(
 /// initial scheduling pass already truncates to the cap, the loop body
 /// never executed when the cap was full, silently dropping newly reachable
 /// neighbors regardless of priority.
+#[cfg(test)]
 fn merge_and_cap_reenrichment_revalidations(
     pinned_uri: &Url,
     prev_uris: std::collections::HashSet<Url>,
@@ -6642,42 +7057,6 @@ fn merge_and_cap_reenrichment_revalidations(
     });
     union.truncate(max_revalidations);
     union
-}
-
-/// Rebuild `work_items` for the `did_open` re-enrichment paths after the
-/// dependency graph has changed: derive `prev_uris` from the current
-/// `work_items`, merge in the new neighbors via
-/// [`merge_and_cap_reenrichment_revalidations`], and snapshot each surviving
-/// URI's current `(version, revision)` from `state.documents` for the
-/// freshness guard in `run_debounced_diagnostics`.
-///
-/// Both `did_open` re-enrichment branches (on-demand-indexing and
-/// non-on-demand) share this exact shape. Force-republish marking is NOT
-/// done here — it is deferred to a single end-of-flow site so URIs evicted
-/// by the cap don't carry orphaned force counters.
-fn rebuild_work_items_after_reenrichment(
-    pinned_uri: &Url,
-    prev_work_items: &[(Url, DiagnosticsTrigger)],
-    new_neighbors: Vec<Url>,
-    state: &WorldState,
-) -> Vec<(Url, DiagnosticsTrigger)> {
-    let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
-    let prev_uris: std::collections::HashSet<Url> =
-        prev_work_items.iter().map(|(u, _)| u.clone()).collect();
-    let final_uris = merge_and_cap_reenrichment_revalidations(
-        pinned_uri,
-        prev_uris,
-        new_neighbors,
-        max_revalidations,
-        &state.cross_file_activity,
-    );
-    final_uris
-        .into_iter()
-        .map(|u| {
-            let trigger = DiagnosticsTrigger::capture(state, &u);
-            (u, trigger)
-        })
-        .collect()
 }
 
 async fn check_and_warn_traversal_truncation(
@@ -7363,7 +7742,7 @@ impl LanguageServer for Backend {
         {
             let mut state = self.state.write().await;
             state.raw_client_settings = raw_client;
-            state.editor_diagnostic_uris = editor_diagnostic_uris;
+            state.replace_editor_diagnostic_uris(editor_diagnostic_uris);
             apply_project_config_layer(&mut state, project_layer);
             // `recompute_parsed_configs` now also recompiles
             // `state.lint_overrides` — callers no longer need a
@@ -8181,7 +8560,6 @@ impl LanguageServer for Backend {
         // Compute affected files while holding write lock
         let (
             mut work_items,
-            debounce_ms,
             files_to_index,
             on_demand_enabled,
             packages_to_prefetch,
@@ -8600,7 +8978,11 @@ impl LanguageServer for Backend {
                 .into_iter()
                 .map(|affected_uri| {
                     let trigger = DiagnosticsTrigger::capture(&state, &affected_uri);
-                    (affected_uri, trigger)
+                    AnalysisRevalidationTicket {
+                        uri: affected_uri,
+                        trigger,
+                        debounce_ms: state.cross_file_config.revalidation_debounce_ms,
+                    }
                 })
                 .collect();
 
@@ -8608,10 +8990,8 @@ impl LanguageServer for Backend {
             // the dependency graph may have new edges from the new file.
             state.recompute_open_neighborhood_pins();
 
-            let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
             (
                 work_items,
-                debounce_ms,
                 files_to_index,
                 on_demand_enabled,
                 packages_to_prefetch,
@@ -8712,13 +9092,16 @@ impl LanguageServer for Backend {
                 let _ = self.ensure_package_library_initialized().await;
             }
             {
-                let mut state = self.state.write().await;
-                let workspace_root = state.workspace_folders.first().cloned();
-
-                // Derive from the exact immutable record installed before the
-                // awaits above. Its generation guards the commit below.
-                let analysis_text = opened_record.document().analysis_text();
-                let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
+                let Some(captured) = ({
+                    let state = self.state.read().await;
+                    state.capture_open_metadata_derivation(&uri, opened_record.generation())
+                }) else {
+                    log::trace!("discarding stale didOpen re-enrichment basis for {uri}");
+                    return;
+                };
+                let workspace_root = captured.workspace_root.clone();
+                let derived = derive_open_metadata_reenrichment(&captured);
+                let meta = derived.metadata.clone();
                 log::trace!(
                     "did_open re-enrich: uri={}, sources={}, sourced_by={}",
                     uri,
@@ -8732,13 +9115,16 @@ impl LanguageServer for Backend {
                     meta.inherited_working_directory
                 );
 
-                if let Err(error) = state.replace_open_document_metadata_if_current(
-                    &uri,
-                    opened_record.generation(),
-                    Arc::new(meta.clone()),
-                ) {
-                    log::trace!("discarding stale didOpen re-enrichment for {uri}: {error:?}");
-                    return;
+                let commit = {
+                    let mut state = self.state.write().await;
+                    commit_open_metadata_reenrichment(&mut state, captured, derived, &work_items)
+                };
+                match commit {
+                    Ok(tickets) => work_items = tickets,
+                    Err(error) => {
+                        log::trace!("discarding stale didOpen re-enrichment for {uri}: {error:?}");
+                        return;
+                    }
                 }
 
                 if let Some(forward_ctx) =
@@ -8769,31 +9155,6 @@ impl LanguageServer for Backend {
                     }
                 }
 
-                let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
-                let second_result = update_cross_file_graph_for_roots(
-                    &mut state,
-                    &graph_roots,
-                    &meta,
-                    workspace_root.as_ref(),
-                );
-
-                // If re-enrichment changed dependency edges (e.g., inherited WD
-                // altered path resolution), schedule newly affected open
-                // neighbors — both backward dependents and forward children
-                // (their inherited scope is taken from this file's symbols at
-                // the source() call site).
-                if second_result.edges_changed {
-                    let neighbors = state.affected_open_dependents_after_edit(&uri, false, true);
-                    // Re-enrichment changed work_items; force-republish marking
-                    // is deferred until after both re-enrichment paths complete
-                    // so evicted URIs don't carry orphaned force counters.
-                    work_items =
-                        rebuild_work_items_after_reenrichment(&uri, &work_items, neighbors, &state);
-                    // Re-enrichment moved edges; refresh pins so the open-doc
-                    // neighborhood matches the post-update graph.
-                    state.recompute_open_neighborhood_pins();
-                }
-
                 // Ensure direct sources for this document are indexed using the re-enriched metadata.
                 let forward_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
                     &uri,
@@ -8813,14 +9174,13 @@ impl LanguageServer for Backend {
                     });
                     if let Some(child_uri) = child_uri_opt {
                         let needs_indexing = {
+                            let state = self.state.read().await;
                             !state.is_document_open_or_alias(&child_uri)
                                 && !state.workspace_index.is_complete(&child_uri)
                         };
                         if needs_indexing {
                             log::trace!("did_open re-enrich: indexing direct source {}", child_uri);
-                            drop(state);
                             let _ = self.index_file_on_demand(&child_uri).await;
-                            state = self.state.write().await;
                         }
                     }
                 }
@@ -8834,41 +9194,24 @@ impl LanguageServer for Backend {
             if packages_enabled {
                 let _ = self.ensure_package_library_initialized().await;
             }
-            let mut state = self.state.write().await;
-            let workspace_root = state.workspace_folders.first().cloned();
-
-            // Derive from the exact immutable record installed before the
-            // awaits above. Its generation guards the commit below.
-            let analysis_text = opened_record.document().analysis_text();
-            let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
-
-            if let Err(error) = state.replace_open_document_metadata_if_current(
-                &uri,
-                opened_record.generation(),
-                Arc::new(meta.clone()),
-            ) {
-                log::trace!("discarding stale didOpen re-enrichment for {uri}: {error:?}");
+            let Some(captured) = ({
+                let state = self.state.read().await;
+                state.capture_open_metadata_derivation(&uri, opened_record.generation())
+            }) else {
+                log::trace!("discarding stale didOpen re-enrichment basis for {uri}");
                 return;
-            }
-
-            let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
-            let second_result = update_cross_file_graph_for_roots(
-                &mut state,
-                &graph_roots,
-                &meta,
-                workspace_root.as_ref(),
-            );
-
-            if second_result.edges_changed {
-                let neighbors = state.affected_open_dependents_after_edit(&uri, false, true);
-                // Re-enrichment changed work_items; force-republish marking
-                // is deferred until after both re-enrichment paths complete
-                // so evicted URIs don't carry orphaned force counters.
-                work_items =
-                    rebuild_work_items_after_reenrichment(&uri, &work_items, neighbors, &state);
-                // Re-enrichment moved edges; refresh pins so the open-doc
-                // neighborhood matches the post-update graph.
-                state.recompute_open_neighborhood_pins();
+            };
+            let derived = derive_open_metadata_reenrichment(&captured);
+            let commit = {
+                let mut state = self.state.write().await;
+                commit_open_metadata_reenrichment(&mut state, captured, derived, &work_items)
+            };
+            match commit {
+                Ok(tickets) => work_items = tickets,
+                Err(error) => {
+                    log::trace!("discarding stale didOpen re-enrichment for {uri}: {error:?}");
+                    return;
+                }
             }
         }
 
@@ -8969,24 +9312,36 @@ impl LanguageServer for Backend {
         // preamble now so its sibling fanout can exclude exactly those jobs
         // that will be marked and scheduled below.
         if let Some((root, paths)) = preamble_live_edit {
-            let scheduled_uris = work_items.iter().map(|(uri, _)| uri.clone()).collect();
+            let scheduled_uris = work_items.iter().map(|ticket| ticket.uri.clone()).collect();
             self.refresh_testthat_preambles_for_paths(root, paths, &scheduled_uris)
                 .await;
         }
 
-        // Mark force-republish on the final work_items set, excluding the
-        // edited URI itself (its publish is driven by its own version bump,
-        // not by a cross-file marker). Marking after re-enrichment ensures
-        // that evicted URIs don't carry orphaned force counters.
+        #[cfg(test)]
         {
-            let state = self.state.read().await;
-            state.diagnostics_gate.mark_force_republish_many(
-                work_items.iter().map(|(u, _)| u).filter(|u| **u != uri),
-            );
+            let pause = {
+                let mut state = self.state.write().await;
+                state.did_open_reservation_snapshot_for_test = work_items
+                    .iter()
+                    .map(|ticket| {
+                        (
+                            ticket.uri.clone(),
+                            state
+                                .diagnostics_gate
+                                .force_republish_count_for_test(&ticket.uri),
+                        )
+                    })
+                    .collect();
+                state.did_open_reservation_test_pause.take_armed(&uri)
+            };
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
         }
 
-        // Schedule debounced diagnostics for all affected files via revalidation system
-        for (affected_uri, trigger) in work_items {
+        // Re-enrichment committed and reserved the final capped union. Spawn
+        // those immutable tickets without rebuilding freshness after unlock.
+        for ticket in work_items {
             let state_arc = self.state.clone();
             let client = self.client.clone();
             let traversal_truncation = self.traversal_truncation.clone();
@@ -8994,9 +9349,9 @@ impl LanguageServer for Backend {
             tokio::spawn(run_debounced_diagnostics(
                 state_arc,
                 client,
-                affected_uri,
-                debounce_ms,
-                trigger,
+                ticket.uri,
+                ticket.debounce_ms,
+                ticket.trigger,
                 Some(traversal_truncation),
             ));
         }
@@ -9063,18 +9418,12 @@ impl LanguageServer for Backend {
         let mut preamble_live_edit: Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> = None;
 
         // Compute affected files and debounce config while holding write lock
-        let (
-            work_items,
-            edited_file_debounce_ms,
-            dependent_debounce_ms,
-            packages_to_prefetch,
-            packages_enabled,
-            package_library,
-        ) = {
+        let (work_items, packages_to_prefetch, packages_enabled, package_library) = {
             let mut state = self.state.write().await;
 
             if state.is_project_excluded_uri(&uri) {
                 let workspace_root = state.workspace_folders.first().cloned();
+                let old_meta = state.get_enriched_metadata(&uri);
                 let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
                 let max_forward_depth = state.cross_file_config.max_forward_depth;
                 let packages_enabled = state.cross_file_config.packages_enabled;
@@ -9084,8 +9433,9 @@ impl LanguageServer for Backend {
                     return;
                 };
                 let analysis_text = prepared.document().analysis_text();
-                let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
-                let files_to_index = if on_demand_enabled {
+                let (meta, mut attempted_contexts) =
+                    extract_enriched_live_metadata_with_contexts(&state, &uri, &analysis_text);
+                let mut files_to_index = if on_demand_enabled {
                     source_targets_to_index_for_live_diagnostics(
                         &state,
                         &uri,
@@ -9103,20 +9453,65 @@ impl LanguageServer for Backend {
                 } else {
                     Vec::new()
                 };
-                state
-                    .commit_document_changes(&uri, prepared, Arc::new(meta.clone()))
-                    .expect("didChange basis cannot change under the WorldState write lock");
-                state.cross_file_activity.record_recent(uri.clone());
-                for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
-                    remove_file_from_cross_file_state(&mut state, &graph_root);
-                }
-                update_project_excluded_live_graph(
-                    &mut state,
+                let (graph, graph_roots, graph_contexts) = prepare_open_graph_plan(
+                    &state,
                     &uri,
+                    old_meta.as_deref(),
                     &meta,
                     workspace_root.as_ref(),
+                    true,
                 );
-                drop(state);
+                attempted_contexts.extend(graph_contexts);
+                let plan = PreparedOpenCommitPlan {
+                    graph,
+                    reset_closed_roots: graph_roots,
+                    packages_to_prefetch: packages_to_prefetch.clone(),
+                    refresh_pins: true,
+                    ..PreparedOpenCommitPlan::default()
+                };
+                let effects = match state
+                    .attach_open_edit_context_authorities(prepared, attempted_contexts)
+                {
+                    Ok(prepared) => {
+                        let effects = state
+                            .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+                                PreparedOpenEditAnalysis::new(
+                                    prepared,
+                                    Arc::new(meta.clone()),
+                                    plan,
+                                ),
+                            )))
+                            .expect(
+                                "didChange basis cannot change under the WorldState write lock",
+                            );
+                        state.cross_file_activity.record_recent(uri.clone());
+                        drop(state);
+                        effects
+                    }
+                    Err(prepared) => {
+                        let prepared = *prepared;
+                        log::warn!(
+                            "didChange for {uri} exceeded the open-analysis authority ceiling; \
+                                 committing the local buffer with cross-file facts disabled"
+                        );
+                        files_to_index.clear();
+                        drop(state);
+                        let Some(effects) =
+                            commit_detached_open_edit_fallback(&self.state, &uri, prepared).await
+                        else {
+                            log::trace!(
+                                "discarding superseded didChange overflow fallback for {uri}"
+                            );
+                            return;
+                        };
+                        effects
+                    }
+                };
+                let mut revalidations = effects.revalidations;
+                let packages_to_prefetch = effects
+                    .open
+                    .expect("open edit returns its immutable outcome")
+                    .packages_to_prefetch;
                 if packages_enabled && !packages_to_prefetch.is_empty() {
                     let _ = self.ensure_package_library_initialized().await;
                     let package_library = self.state.read().await.package_library.clone();
@@ -9133,6 +9528,23 @@ impl LanguageServer for Backend {
                             .await;
                     }
                 }
+                // The excluded path publishes the edited subject immediately,
+                // but every dependent ticket reserved by the commit seam must
+                // still get a consumer so its force-republish marker drains.
+                revalidations.retain(|ticket| ticket.uri != uri);
+                for ticket in revalidations {
+                    let state_arc = self.state.clone();
+                    let client = self.client.clone();
+                    let traversal_truncation = self.traversal_truncation.clone();
+                    tokio::spawn(run_debounced_diagnostics(
+                        state_arc,
+                        client,
+                        ticket.uri,
+                        ticket.debounce_ms,
+                        ticket.trigger,
+                        Some(traversal_truncation),
+                    ));
+                }
                 self.publish_diagnostics(&uri).await;
                 return;
             }
@@ -9140,21 +9552,11 @@ impl LanguageServer for Backend {
             // Capture old metadata before recomputing (for WD change detection)
             let old_meta = state.get_enriched_metadata(&uri);
 
-            // Capture old interface_hash before applying changes (for selective invalidation).
-            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            let old_interface_hash = state
-                .documents
-                .get_record(&uri)
-                .map(|record| record.artifacts().interface_hash);
-
             let Some(prepared) = state.prepare_document_changes(&uri, changes.clone(), version)
             else {
                 log::warn!("Ignoring didChange for unopened document {uri}");
                 return;
             };
-            // Record as recently changed for activity prioritization
-            state.cross_file_activity.record_recent(uri.clone());
-
             // Snapshot the post-change buffer text if this is the workspace-root
             // `.Rprofile`, for the off-lock prelude refresh after this block.
             if let Some(root) = authoritative_rprofile_root_for_open_document(&state, &uri) {
@@ -9167,29 +9569,13 @@ impl LanguageServer for Backend {
             // Capture package settings for background prefetch
             let packages_enabled = state.cross_file_config.packages_enabled;
             let package_library = state.package_library.clone();
-            let max_chain_depth = state.cross_file_config.max_chain_depth;
 
             // Extract and enrich metadata from the prepared document's exact
             // analysis view, then atomically install one coherent record.
             let text = prepared.document().analysis_text();
-            let mut meta = crate::cross_file::extract_metadata(&text);
+            let (meta, mut attempted_contexts) =
+                extract_enriched_live_metadata_with_contexts(&state, &uri, &text);
             let workspace_root = state.workspace_folders.first().cloned();
-            crate::cross_file::enrich_metadata_with_inherited_wd(
-                &mut meta,
-                &uri,
-                workspace_root.as_ref(),
-                |parent_uri| state.get_enriched_metadata(parent_uri),
-                max_chain_depth,
-            );
-            {
-                let ws = state.package_state.workspace();
-                let ws_name = ws.map(|w| w.name.as_str());
-                let ws_root = ws.map(|w| w.root.as_path());
-                let lib_paths = state.package_library.lib_paths();
-                crate::cross_file::resolve_system_file_sources(
-                    &mut meta, ws_name, ws_root, lib_paths,
-                );
-            }
             let packages_to_prefetch: Vec<String> = if packages_enabled {
                 let mut packages =
                     edited_document_warm_packages(&meta.library_calls, prepared.document());
@@ -9198,62 +9584,15 @@ impl LanguageServer for Backend {
             } else {
                 Vec::new()
             };
-            state
-                .commit_document_changes(&uri, prepared, Arc::new(meta.clone()))
-                .expect("didChange basis cannot change under the WorldState write lock");
-
-            let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
-            let graph_result = update_cross_file_graph_for_roots(
-                &mut state,
-                &graph_roots,
+            let (graph, _graph_roots, graph_contexts) = prepare_open_graph_plan(
+                &state,
+                &uri,
+                old_meta.as_deref(),
                 &meta,
                 workspace_root.as_ref(),
+                false,
             );
-            let mut wd_affected = Vec::new();
-            let input_root = graph_roots.first().unwrap_or(&uri);
-            for graph_uri in &graph_roots {
-                let old_root_meta = old_meta.as_deref().map(|old_meta| {
-                    metadata_for_graph_root(
-                        &state,
-                        graph_uri,
-                        input_root,
-                        old_meta,
-                        workspace_root.as_ref(),
-                    )
-                    .into_owned()
-                });
-                let new_root_meta = metadata_for_graph_root(
-                    &state,
-                    graph_uri,
-                    input_root,
-                    &meta,
-                    workspace_root.as_ref(),
-                );
-                wd_affected.extend(
-                    crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-                        graph_uri,
-                        old_root_meta.as_ref(),
-                        new_root_meta.as_ref(),
-                        &state.cross_file_graph,
-                        &state.cross_file_meta,
-                    ),
-                );
-            }
-            let edges_changed = graph_result.edges_changed;
-
-            // Update package state via event-driven path when an R/*.R file
-            // changes in a package workspace.
-            //
-            // Guard the potentially expensive full-document `Rope -> String ->
-            // Arc<str>` materialization behind a cheap path check. Without
-            // the guard, every keystroke on every open R file in every
-            // workspace (including non-package and scratch-file workflows)
-            // paid two full-document heap allocations just to have
-            // `translate()` short-circuit on `is_r_source_path == None`.
-            // The `DidChange` variant uses only this in-memory buffer text;
-            // watched-file events are the only package events that may read
-            // from disk and are handled on their own code paths.
-            let mut package_visibility_changed = false;
+            attempted_contexts.extend(graph_contexts);
             let package_event_uri = state
                 .package_inputs
                 .workspace_root
@@ -9262,185 +9601,70 @@ impl LanguageServer for Backend {
                     authoritative_package_input_uri_for_open_document(&state, &uri, root)
                         .map(|package_input| package_input.uri().clone())
                 });
-            if let Some(package_event_uri) = package_event_uri {
-                let text: std::sync::Arc<str> = state
-                    .documents
-                    .get(&uri)
-                    .map(|d| d.text())
-                    .unwrap_or_default()
-                    .into();
-                let old_ns_model = state.package_state.namespace_model().cloned();
-                let old_contribution = state.package_state.scope_contribution().clone();
-                let event = crate::package_state::event::HandlerEvent::DidChange {
-                    uri: package_event_uri,
-                    text,
-                };
-                if let Some(delta) = translate_package_event(&mut state, event) {
-                    state.apply_package_event(&delta);
-                    package_visibility_changed = state.package_state.namespace_model()
-                        != old_ns_model.as_ref()
-                        || state.package_state.scope_contribution() != &old_contribution;
-                }
-            }
-
-            // Compute new interface_hash after applying changes.
-            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            let new_interface_hash = state
-                .documents
-                .get_record(&uri)
-                .map(|record| record.artifacts().interface_hash);
-
-            // Determine if interface changed (selective invalidation optimization)
-            // Only invalidate dependents if the exported interface actually changed
-            let interface_changed = match (old_interface_hash, new_interface_hash) {
-                (Some(old), Some(new)) => old != new,
-                (None, Some(_)) => true, // New file with interface
-                (Some(_), None) => true, // File lost its interface (parse error?)
-                (None, None) => false,   // No interface before or after
-            };
-
-            if interface_changed {
-                log::trace!(
-                    "Interface changed for {}: {:?} -> {:?}",
-                    uri,
-                    old_interface_hash,
-                    new_interface_hash
-                );
-                // Package-internal symbols are now updated by apply_package_event
-                // above (via scope_contribution → internal_symbols_cache). No
-                // separate rebuild is needed here.
-            }
-
-            // Compute affected files from dependency graph using HashSet for O(1) deduplication
-            let mut affected: std::collections::HashSet<Url> =
-                std::collections::HashSet::from([uri.clone()]);
-
-            // Invalidate cross-file scope neighbors if interface changed OR
-            // dependency edges changed. Walks both directions:
-            //   - backward (parents who source `uri`): they consume `uri`'s
-            //     exported interface, so their cycle/symbol diagnostics may
-            //     change.
-            //   - forward (files `uri` sources): their inherited scope is
-            //     taken from `uri` at the source() call site, so changing
-            //     `uri`'s top-level symbols or source() topology can flip
-            //     undefined-variable diagnostics in descendants. Without
-            //     this, an edit to `parent.R` that drops `y <- 1` never
-            //     triggers a republish of `child.R` (which uses `y`) until
-            //     the user manually edits `child.R`.
-            // Bulk-mark all dependents/children under a single write-lock to
-            // skip per-URI lock churn on large fan-outs (Requirement 0.8).
-            if interface_changed || edges_changed {
-                let neighbors = state.affected_open_dependents_after_edit(
-                    &uri,
-                    interface_changed,
-                    edges_changed,
-                );
-                for dep in neighbors {
-                    affected.insert(dep);
-                }
-            }
-            // Include children affected by WD change (Requirement 8)
-            for child in wd_affected {
-                if let Some(open_child) = state.open_document_uri_for_authoritative_uri(&child) {
-                    affected.insert(open_child);
-                }
-            }
-            // When package-mode visibility changed, all open package files
-            // need revalidation so imports and internal symbols propagate.
-            // Both `R/` (two-way) and `tests/testthat/` (one-way) receive the
-            // contribution via `append_package_contribution`, so both need
-            // the affected-set.
-            if package_visibility_changed && let Some(pkg) = state.package_workspace() {
-                for open_uri in state.documents.keys() {
-                    if is_authoritative_package_source_open_uri(&state, open_uri, &pkg.root) {
-                        affected.insert(open_uri.clone());
-                    }
-                }
-            }
-            // In package mode, when the exported interface of an R/*.R file
-            // changes, other open package files depend on it via mutual
-            // visibility (not the source() graph). Revalidate them so
-            // added/removed symbols propagate to undefined-variable
-            // diagnostics. `tests/testthat/` sees R/ symbols (one-way), so
-            // include test files in the affected set too.
-            if interface_changed
-                && !package_visibility_changed
-                && let Some(pkg) = state.package_workspace()
-            {
-                let edited_kind =
-                    authoritative_package_r_file_kind_for_open_document(&state, &uri, &pkg.root);
-                if edited_kind == Some(crate::package_state::RFileKind::Source) {
-                    for open_uri in state.documents.keys() {
-                        if is_authoritative_package_source_open_uri(&state, open_uri, &pkg.root) {
-                            affected.insert(open_uri.clone());
-                        }
-                    }
-                }
-            }
-            // Convert to Vec for sorting
-            let mut affected: Vec<Url> = affected.into_iter().collect();
-
-            // Prioritize by activity (trigger first, then active, then visible, then recent)
-            // Use saturating_add to prevent integer overflow at usize::MAX.
-            // sort_by_cached_key memoizes priority_score per URI so the
-            // O(N) recent_uris position scan runs once per element rather
-            // than once per sort comparison.
-            let activity = &state.cross_file_activity;
-            affected.sort_by_cached_key(|u| {
-                if *u == uri {
-                    0
+            let package_text = package_event_uri
+                .as_ref()
+                .map(|_| Arc::<str>::from(prepared.document().text()));
+            let (package_fanout_uris, package_source_interface_fanout) =
+                if let Some(pkg) = state.package_workspace() {
+                    let fanout = state
+                        .documents
+                        .keys()
+                        .filter(|open_uri| {
+                            is_authoritative_package_source_open_uri(&state, open_uri, &pkg.root)
+                        })
+                        .cloned()
+                        .collect();
+                    let source_edit = authoritative_package_r_file_kind_for_open_document(
+                        &state, &uri, &pkg.root,
+                    ) == Some(crate::package_state::RFileKind::Source);
+                    (fanout, source_edit)
                 } else {
-                    activity.priority_score(u).saturating_add(1)
+                    (Vec::new(), false)
+                };
+            let plan = PreparedOpenCommitPlan {
+                graph,
+                package_event: package_event_uri.zip(package_text),
+                package_fanout_uris,
+                package_source_interface_fanout,
+                packages_to_prefetch: packages_to_prefetch.clone(),
+                ..PreparedOpenCommitPlan::default()
+            };
+            let effects = match state
+                .attach_open_edit_context_authorities(prepared, attempted_contexts)
+            {
+                Ok(prepared) => {
+                    let effects = state
+                        .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+                            PreparedOpenEditAnalysis::new(prepared, Arc::new(meta.clone()), plan),
+                        )))
+                        .expect("didChange basis cannot change under the WorldState write lock");
+                    state.cross_file_activity.record_recent(uri.clone());
+                    effects
                 }
-            });
-
-            // Apply revalidation cap (Requirement 0.9, 0.10)
-            let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
-            if affected.len() > max_revalidations {
-                log::trace!(
-                    "Cross-file revalidation cap exceeded: {} affected, scheduling {}",
-                    affected.len(),
-                    max_revalidations
-                );
-                affected.truncate(max_revalidations);
-            }
-
-            // Bulk-mark dependents under a single write-lock, AFTER the cap
-            // is applied. Iterating the deduped, truncated set prevents two
-            // bugs: (1) a URI present in both the dependency-graph walk and
-            // `wd_affected` would otherwise get its force-republish counter
-            // incremented twice (the counter decrements only on a consumed
-            // publish, so duplicate marks leak as phantom markers); (2) URIs
-            // dropped by the cap would otherwise carry orphaned force
-            // counters that leak into a future unrelated same-version
-            // publish. The edited URI itself is excluded — its publish is
-            // driven by its own version bump.
-            state
-                .diagnostics_gate
-                .mark_force_republish_many(affected.iter().filter(|u| **u != uri));
-
-            // Build work items with trigger snapshot for the freshness guard
-            let work_items: Vec<_> = affected
-                .into_iter()
-                .map(|affected_uri| {
-                    let trigger = DiagnosticsTrigger::capture(&state, &affected_uri);
-                    (affected_uri, trigger)
-                })
-                .collect();
-
-            // Refresh pins when graph edges shift: a removed `source()` may
-            // pull a closed file out of the open neighborhood (let it become
-            // LRU-evictable), and a newly added one may pull one in.
-            if edges_changed {
-                state.recompute_open_neighborhood_pins();
-            }
-
-            let edited_file_debounce_ms = state.cross_file_config.edited_file_debounce_ms;
-            let dependent_debounce_ms = state.cross_file_config.revalidation_debounce_ms;
+                Err(prepared) => {
+                    let prepared = *prepared;
+                    log::warn!(
+                        "didChange for {uri} exceeded the open-analysis authority ceiling; \
+                             committing the local buffer with cross-file facts disabled"
+                    );
+                    drop(state);
+                    let Some(effects) =
+                        commit_detached_open_edit_fallback(&self.state, &uri, prepared).await
+                    else {
+                        log::trace!("discarding superseded didChange overflow fallback for {uri}");
+                        return;
+                    };
+                    effects
+                }
+            };
+            let packages_to_prefetch = effects
+                .open
+                .as_ref()
+                .expect("open edit returns its immutable outcome")
+                .packages_to_prefetch
+                .clone();
             (
-                work_items,
-                edited_file_debounce_ms,
-                dependent_debounce_ms,
+                effects.revalidations,
                 packages_to_prefetch,
                 packages_enabled,
                 package_library,
@@ -9453,7 +9677,7 @@ impl LanguageServer for Backend {
             self.refresh_rprofile_prelude_from_buffer(root, text).await;
         }
         if let Some((root, paths)) = preamble_live_edit {
-            let scheduled_uris = work_items.iter().map(|(uri, _)| uri.clone()).collect();
+            let scheduled_uris = work_items.iter().map(|ticket| ticket.uri.clone()).collect();
             self.refresh_testthat_preambles_for_paths(root, paths, &scheduled_uris)
                 .await;
         }
@@ -9474,7 +9698,7 @@ impl LanguageServer for Backend {
             // leak a phantom marker (a later same-URI job cancels an earlier
             // one before it consumes its mark).
             let scheduled_uris: std::collections::HashSet<Url> =
-                work_items.iter().map(|(u, _)| u.clone()).collect();
+                work_items.iter().map(|ticket| ticket.uri.clone()).collect();
             tokio::spawn(async move {
                 // Extend direct library_calls with inherited packages from
                 // parent source() chains. Snapshot under the lock, release it,
@@ -9609,25 +9833,19 @@ impl LanguageServer for Backend {
             });
         }
 
-        // Schedule debounced diagnostics for all affected files (Requirement 0.5)
-        // The edited file uses a shorter debounce for near-instant feedback;
-        // dependent files use the longer revalidation debounce.
-        for (affected_uri, trigger) in work_items {
+        // Spawn the immutable tickets reserved atomically with the analysis
+        // commit. Callers do not recompute debounce or freshness after unlock.
+        for ticket in work_items {
             let state_arc = self.state.clone();
             let client = self.client.clone();
             let traversal_truncation = self.traversal_truncation.clone();
-            let debounce = if affected_uri == uri {
-                edited_file_debounce_ms
-            } else {
-                dependent_debounce_ms
-            };
 
             tokio::spawn(run_debounced_diagnostics(
                 state_arc,
                 client,
-                affected_uri,
-                debounce,
-                trigger,
+                ticket.uri,
+                ticket.debounce_ms,
+                ticket.trigger,
                 Some(traversal_truncation),
             ));
         }
@@ -13059,7 +13277,7 @@ impl Backend {
                 .cloned()
                 .collect();
 
-            state.editor_diagnostic_uris = Some(new_uris);
+            state.replace_editor_diagnostic_uris(Some(new_uris));
             for uri in &removed {
                 // In-flight work also re-checks eligibility at commit.
                 // Retiring the lifecycle (cancel + gate clear, including the
@@ -24992,7 +25210,7 @@ mod project_config_initialize_tests {
             establish_package_event_translation_state(&mut state, root.clone());
             // Exercise the Rope-instance fallback: this URI is deliberately not
             // diagnostics-eligible, so both lifecycles have epoch=None.
-            state.editor_diagnostic_uris = Some(std::collections::HashSet::new());
+            state.replace_editor_diagnostic_uris(Some(std::collections::HashSet::new()));
             let initial = crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
                 &root,
                 &exclusions,
@@ -31212,6 +31430,682 @@ infixContinuationStyle = "aligned"
                 }],
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn did_change_applies_full_sync_then_utf16_ranges_to_rmd_through_open_edit_seam() {
+        use tower_lsp::lsp_types::{
+            DidChangeTextDocumentParams, Position, Range, TextDocumentContentChangeEvent,
+            VersionedTextDocumentIdentifier,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (svc, uri) = open_in_workspace(
+            &tmp,
+            "report.Rmd",
+            "rmd",
+            "old prose\n```{r}\nold <- 0\n```\n",
+        )
+        .await;
+        let backend = svc.inner();
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![
+                    TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: "intro 🎉\n```{r}\nx <- 1\n```\n".into(),
+                    },
+                    TextDocumentContentChangeEvent {
+                        range: Some(Range {
+                            start: Position {
+                                line: 0,
+                                character: 8,
+                            },
+                            end: Position {
+                                line: 0,
+                                character: 8,
+                            },
+                        }),
+                        range_length: None,
+                        text: "!".into(),
+                    },
+                    TextDocumentContentChangeEvent {
+                        range: Some(Range {
+                            start: Position {
+                                line: 2,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: 2,
+                                character: 1,
+                            },
+                        }),
+                        range_length: None,
+                        text: "中".into(),
+                    },
+                ],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        let document = state.documents.get(&uri).unwrap();
+        assert_eq!(document.text(), "intro 🎉!\n```{r}\n中 <- 1\n```\n");
+        assert!(document.analysis_text().contains("中 <- 1"));
+        assert!(!document.analysis_text().contains("intro"));
+    }
+
+    #[test]
+    fn open_edit_overflow_commits_local_facts_and_drops_foreign_edges() {
+        let root = Url::parse("file:///workspace/").unwrap();
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let text =
+            "# raven: sourced-by parent.R\nsource(\"child.R\")\nlibrary(stats)\nlocal_value <- 1\n";
+        let mut state = WorldState::new();
+        state.workspace_folders.push(root);
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        state.open_document(parent.clone(), "parent_value <- 1\n", Some(1));
+        state.open_document(child.clone(), "child_value <- 1\n", Some(1));
+
+        let prepared = state
+            .prepare_document_changes(
+                &uri,
+                [tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.into(),
+                }],
+                2,
+            )
+            .unwrap();
+        let prepared =
+            state.force_open_edit_context_overflow_for_test(prepared, vec![parent.clone()]);
+        let captured =
+            capture_open_edit_fallback(&state, &uri, &prepared, state.get_enriched_metadata(&uri));
+        let (metadata, plan) = derive_open_edit_fallback(captured);
+        state
+            .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+                PreparedOpenEditAnalysis::new(prepared, Arc::new(metadata), plan),
+            )))
+            .unwrap();
+
+        let record = state.documents.get_record(&uri).unwrap();
+        assert_eq!(record.document().text(), text);
+        assert_eq!(record.document().version, Some(2));
+        assert_eq!(record.document().revision, 1);
+        assert!(
+            record
+                .artifacts()
+                .exported_interface
+                .contains_key("local_value")
+        );
+        assert_eq!(record.metadata().sources.len(), 1);
+        assert_eq!(record.metadata().sourced_by.len(), 1);
+        assert!(
+            record
+                .metadata()
+                .library_calls
+                .iter()
+                .any(|call| call.package == "stats")
+        );
+        assert!(
+            record
+                .document()
+                .loaded_packages
+                .iter()
+                .any(|pkg| pkg == "stats")
+        );
+        let dependencies = state.cross_file_graph.get_dependencies(&uri);
+        assert!(dependencies.iter().any(|edge| edge.to == child));
+        assert!(dependencies.iter().all(|edge| !edge.non_lending));
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependents(&uri)
+                .iter()
+                .all(|edge| edge.from != parent),
+            "the foreign backward-parent edge must fail closed"
+        );
+    }
+
+    #[test]
+    fn detached_metadata_records_subject_and_alias_wd_attempts_even_when_absent() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let alias = Url::parse("file:///alias/open.R").unwrap();
+        let subject_parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let alias_parent = Url::parse("file:///alias/parent.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(
+            uri.clone(),
+            "# raven: sourced-by parent.R\nvalue <- 1\n",
+            Some(1),
+        );
+        let generation = state.documents.get_record(&uri).unwrap().generation();
+        let mut captured = state
+            .capture_open_metadata_derivation(&uri, generation)
+            .unwrap();
+        captured.graph_roots = vec![uri, alias];
+
+        let derived = derive_open_metadata_reenrichment(&captured);
+
+        assert!(derived.context_uris.contains(&subject_parent));
+        assert!(derived.context_uris.contains(&alias_parent));
+    }
+
+    #[tokio::test]
+    async fn did_change_accepts_zero_and_one_transitive_visit_budgets() {
+        for (index, budget) in [0, 1].into_iter().enumerate() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (svc, uri) =
+                open_in_workspace(&tmp, &format!("budget-{index}.R"), "r", "before <- 1\n").await;
+            let backend = svc.inner();
+            backend
+                .state
+                .write()
+                .await
+                .cross_file_config
+                .max_transitive_dependents_visited = budget;
+
+            change_doc(backend, &uri, 2, "after <- 2\n").await;
+
+            let state = backend.state.read().await;
+            let document = state.documents.get(&uri).unwrap();
+            assert_eq!(document.text(), "after <- 2\n");
+            assert_eq!(document.version, Some(2));
+            assert_eq!(document.revision, 1);
+        }
+    }
+
+    fn fallback_race_snapshot(id: u64) -> crate::cross_file::file_cache::FileSnapshot {
+        crate::cross_file::file_cache::FileSnapshot {
+            mtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
+            size: id,
+            content_hash: Some(id),
+        }
+    }
+
+    async fn wait_for_revalidation_drain(backend: &Backend, uris: &[&Url]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = backend.state.read().await;
+            let drained = uris.iter().all(|uri| {
+                state.diagnostics_gate.force_republish_count_for_test(uri) == 0
+                    && !state.cross_file_revalidation.has_pending_for_test(uri)
+            });
+            if drained {
+                return;
+            }
+            drop(state);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "diagnostic reservations must drain for {uris:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_did_change_overflow_schedules_exact_dependent_and_drains_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "excluded-overflow.R", "r", "before <- 1\n").await;
+        let backend = svc.inner();
+        let dependent = Url::from_file_path(tmp.path().join("dependent.R")).unwrap();
+        open_doc(backend, &dependent, "r", 1, "dependent <- 1\n").await;
+        wait_for_revalidation_drain(backend, &[&uri, &dependent]).await;
+
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["excluded-overflow.R"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+        let dependent_pause = {
+            let mut state = backend.state.write().await;
+            state.workspace_exclusions = exclusions;
+            assert!(state.is_project_excluded_uri(&uri));
+            state.cross_file_config.packages_enabled = false;
+            state.cross_file_config.on_demand_indexing_enabled = false;
+            state.cross_file_config.max_revalidations_per_trigger = 2;
+            state.cross_file_config.revalidation_debounce_ms = 0;
+            state.force_open_edit_overflow_for_test = true;
+            state.diagnostics_test_pause.arm(dependent.clone())
+        };
+
+        change_doc(backend, &uri, 2, "after <- 2\n").await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dependent_pause.wait_arrived(),
+        )
+        .await
+        .expect("the excluded overflow dependent ticket must get a diagnostics consumer");
+
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&dependent),
+                1,
+                "the seam must select and mark the sole dependent exactly once"
+            );
+            assert_eq!(
+                state.diagnostics_gate.force_republish_count_for_test(&uri),
+                0,
+                "the directly-published subject must not receive a force marker"
+            );
+            assert_eq!(state.documents.get(&uri).unwrap().text(), "after <- 2\n");
+        }
+
+        dependent_pause.release();
+        wait_for_revalidation_drain(backend, &[&uri, &dependent]).await;
+    }
+
+    #[tokio::test]
+    async fn did_change_overflow_retries_once_after_unrelated_authority_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "retry-overflow.R", "r", "before <- 1\n").await;
+        let backend = svc.inner();
+        let first_pause = {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.packages_enabled = false;
+            state.cross_file_config.on_demand_indexing_enabled = false;
+            state.force_open_edit_overflow_for_test = true;
+            state.open_edit_fallback_test_pause.arm(uri.clone())
+        };
+        let handler = change_doc(backend, &uri, 2, "after <- 2\n");
+        tokio::pin!(handler);
+        tokio::select! {
+            _ = first_pause.wait_arrived() => {}
+            _ = &mut handler => panic!("overflow handler returned before its first CAS barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("overflow handler did not reach its first CAS barrier")
+            }
+        }
+        let raw_uri = Url::parse("file:///workspace/unrelated.R").unwrap();
+        let second_pause = {
+            let state = backend.state.write().await;
+            state.cross_file_file_cache.insert(
+                raw_uri.clone(),
+                fallback_race_snapshot(1),
+                "unrelated <- 1\n".to_owned(),
+            );
+            state.open_edit_fallback_test_pause.arm(uri.clone())
+        };
+        first_pause.release();
+        tokio::select! {
+            _ = second_pause.wait_arrived() => {}
+            _ = &mut handler => panic!("overflow handler did not perform its one fresh retry"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("overflow retry did not reach its CAS barrier")
+            }
+        }
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .documents
+                .get(&uri)
+                .unwrap()
+                .text(),
+            "before <- 1\n",
+            "detached work must remain invisible before the retry CAS"
+        );
+        second_pause.release();
+        handler.await;
+
+        let state = backend.state.read().await;
+        let document = state.documents.get(&uri).unwrap();
+        assert_eq!(document.text(), "after <- 2\n");
+        assert_eq!(document.version, Some(2));
+        assert_eq!(document.revision, 1);
+        assert_eq!(
+            state.cross_file_file_cache.get(&raw_uri).as_deref(),
+            Some("unrelated <- 1\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn did_change_overflow_retry_refreshes_flipped_exclusion_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "flip-exclusion.R", "r", "before <- 1\n").await;
+        let backend = svc.inner();
+        let child = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        open_doc(backend, &child, "r", 1, "child_value <- 1\n").await;
+        wait_for_revalidation_drain(backend, &[&uri, &child]).await;
+
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["flip-exclusion.R"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+        let first_pause = {
+            let mut state = backend.state.write().await;
+            state.workspace_exclusions = exclusions;
+            assert!(state.is_project_excluded_uri(&uri));
+            state.cross_file_config.packages_enabled = false;
+            state.cross_file_config.on_demand_indexing_enabled = false;
+            state.cross_file_config.max_revalidations_per_trigger = 2;
+            state.cross_file_config.revalidation_debounce_ms = 0;
+            state.force_open_edit_overflow_for_test = true;
+            state.open_edit_fallback_test_pause.arm(uri.clone())
+        };
+        let handler = change_doc(
+            backend,
+            &uri,
+            2,
+            "source(\"child.R\")\nafter <- child_value\n",
+        );
+        tokio::pin!(handler);
+        tokio::select! {
+            _ = first_pause.wait_arrived() => {}
+            _ = &mut handler => panic!("overflow handler returned before its first CAS barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("overflow handler did not reach its first CAS barrier")
+            }
+        }
+
+        let (second_pause, dependent_pause) = {
+            let mut state = backend.state.write().await;
+            state.workspace_exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            assert!(!state.is_project_excluded_uri(&uri));
+            (
+                state.open_edit_fallback_test_pause.arm(uri.clone()),
+                state.diagnostics_test_pause.arm(child.clone()),
+            )
+        };
+        first_pause.release();
+        tokio::select! {
+            _ = second_pause.wait_arrived() => {}
+            _ = &mut handler => panic!("exclusion flip must force one fresh fallback retry"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("fresh exclusion-policy retry did not reach its CAS barrier")
+            }
+        }
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .documents
+                .get(&uri)
+                .unwrap()
+                .text(),
+            "before <- 1\n",
+            "the stale excluded projection must remain invisible"
+        );
+        second_pause.release();
+        handler.await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dependent_pause.wait_arrived(),
+        )
+        .await
+        .expect("the fresh fallback plan must schedule its sole dependent once");
+
+        {
+            let state = backend.state.read().await;
+            let dependencies = state.cross_file_graph.get_dependencies(&uri);
+            assert!(
+                dependencies
+                    .iter()
+                    .any(|edge| edge.to == child && !edge.non_lending),
+                "the retry must use the fresh non-excluded policy for graph lending"
+            );
+            assert!(
+                dependencies
+                    .iter()
+                    .all(|edge| edge.to != child || !edge.non_lending),
+                "the stale excluded projection must not survive the retry"
+            );
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&child),
+                1,
+                "the fresh fallback must reserve the dependent exactly once"
+            );
+        }
+
+        dependent_pause.release();
+        wait_for_revalidation_drain(backend, &[&uri, &child]).await;
+    }
+
+    #[tokio::test]
+    async fn did_change_overflow_second_invalidation_stops_without_partial_effects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (svc, uri) =
+            open_in_workspace(&tmp, "twice-stale-overflow.R", "r", "before <- 1\n").await;
+        let backend = svc.inner();
+        let first_pause = {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.packages_enabled = false;
+            state.cross_file_config.on_demand_indexing_enabled = false;
+            state.force_open_edit_overflow_for_test = true;
+            state.open_edit_fallback_test_pause.arm(uri.clone())
+        };
+        let handler = change_doc(backend, &uri, 2, "stale <- 2\n");
+        tokio::pin!(handler);
+        tokio::select! {
+            _ = first_pause.wait_arrived() => {}
+            _ = &mut handler => panic!("overflow handler returned before its first CAS barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("overflow handler did not reach its first CAS barrier")
+            }
+        }
+        let raw_uri = Url::parse("file:///workspace/twice-unrelated.R").unwrap();
+        let second_pause = {
+            let state = backend.state.write().await;
+            state.cross_file_file_cache.insert(
+                raw_uri.clone(),
+                fallback_race_snapshot(1),
+                "first <- 1\n".to_owned(),
+            );
+            state.open_edit_fallback_test_pause.arm(uri.clone())
+        };
+        first_pause.release();
+        tokio::select! {
+            _ = second_pause.wait_arrived() => {}
+            _ = &mut handler => panic!("overflow handler did not perform its one fresh retry"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("overflow retry did not reach its CAS barrier")
+            }
+        }
+        {
+            let state = backend.state.write().await;
+            state.cross_file_file_cache.insert(
+                raw_uri.clone(),
+                fallback_race_snapshot(2),
+                "second <- 2\n".to_owned(),
+            );
+        }
+        second_pause.release();
+        handler.await;
+
+        let state = backend.state.read().await;
+        let document = state.documents.get(&uri).unwrap();
+        assert_eq!(document.text(), "before <- 1\n");
+        assert_eq!(document.version, Some(1));
+        assert_eq!(document.revision, 0);
+        assert_eq!(
+            state.cross_file_file_cache.get(&raw_uri).as_deref(),
+            Some("second <- 2\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn did_change_overflow_target_generation_change_never_overwrites() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (svc, uri) =
+            open_in_workspace(&tmp, "superseded-overflow.R", "r", "before <- 1\n").await;
+        let backend = svc.inner();
+        let pause = {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.packages_enabled = false;
+            state.cross_file_config.on_demand_indexing_enabled = false;
+            state.force_open_edit_overflow_for_test = true;
+            state.open_edit_fallback_test_pause.arm(uri.clone())
+        };
+        let handler = change_doc(backend, &uri, 2, "stale <- 2\n");
+        tokio::pin!(handler);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut handler => panic!("overflow handler returned before its CAS barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("overflow handler did not reach its CAS barrier")
+            }
+        }
+        let mut replacement = crate::cross_file::CrossFileMetadata::default();
+        replacement.working_directory = Some("/new-owner".to_owned());
+        {
+            let mut state = backend.state.write().await;
+            let generation = state.documents.get_record(&uri).unwrap().generation();
+            state
+                .replace_open_document_metadata_if_current(&uri, generation, Arc::new(replacement))
+                .unwrap();
+        }
+        pause.release();
+        handler.await;
+
+        let state = backend.state.read().await;
+        let record = state.documents.get_record(&uri).unwrap();
+        assert_eq!(record.document().text(), "before <- 1\n");
+        assert_eq!(record.document().version, Some(1));
+        assert_eq!(
+            record.metadata().working_directory.as_deref(),
+            Some("/new-owner")
+        );
+    }
+
+    #[tokio::test]
+    async fn did_open_coalesces_seed_and_new_neighbors_before_cap_and_marks_once() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let first = Url::parse("file:///workspace/first.R").unwrap();
+        let second = Url::parse("file:///workspace/second.R").unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams::default())
+            .await
+            .unwrap();
+        let pause = {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
+            state.cross_file_config.packages_enabled = false;
+            state.cross_file_config.on_demand_indexing_enabled = false;
+            state.cross_file_config.max_revalidations_per_trigger = 2;
+            state.cross_file_config.revalidation_debounce_ms = 10;
+            state.replace_editor_diagnostic_uris(Some(std::collections::HashSet::from([
+                uri.clone(),
+                first.clone(),
+                second.clone(),
+            ])));
+            let first_epoch = state.begin_diagnostic_lifecycle(&first);
+            let second_epoch = state.begin_diagnostic_lifecycle(&second);
+            state.open_document_with_language_id_and_metadata(
+                first.clone(),
+                "first_value <- 1\n",
+                Some(1),
+                Some("r"),
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                first_epoch,
+            );
+            state.open_document_with_language_id_and_metadata(
+                second.clone(),
+                "second_value <- 1\n",
+                Some(1),
+                Some("r"),
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                second_epoch,
+            );
+            state.did_open_reservation_test_pause.arm(uri.clone())
+        };
+
+        let handler = open_doc(
+            backend,
+            &uri,
+            "r",
+            1,
+            "source(\"first.R\")\nsource(\"second.R\")\n",
+        );
+        tokio::pin!(handler);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut handler => {
+                let snapshot = backend
+                    .state
+                    .read()
+                    .await
+                    .did_open_reservation_snapshot_for_test
+                    .clone();
+                panic!(
+                    "didOpen returned without reaching the armed reservation barrier; snapshot={snapshot:?}"
+                )
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("didOpen did not reach the armed reservation barrier")
+            }
+        }
+        let state = backend.state.read().await;
+        let snapshot = &state.did_open_reservation_snapshot_for_test;
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.iter().any(|(selected, _)| selected == &uri));
+        let selected_neighbors: Vec<_> = snapshot
+            .iter()
+            .filter(|(selected, _)| selected != &uri)
+            .collect();
+        assert_eq!(selected_neighbors.len(), 1);
+        assert_eq!(
+            snapshot
+                .iter()
+                .find(|(selected, _)| selected == &uri)
+                .unwrap()
+                .1,
+            0,
+            "the subject uses ordinary monotonic publication, not a force marker"
+        );
+        assert_eq!(selected_neighbors[0].1, 1);
+        let evicted = if selected_neighbors[0].0 == first {
+            &second
+        } else {
+            &first
+        };
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(evicted),
+            0
+        );
+        drop(state);
+        pause.release();
+        handler.await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = backend.state.read().await;
+            let drained = [&first, &second].into_iter().all(|candidate| {
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(candidate)
+                    == 0
+                    && !state
+                        .cross_file_revalidation
+                        .has_pending_for_test(candidate)
+            });
+            if drained {
+                break;
+            }
+            drop(state);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "released didOpen reservations must drain normally"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Close `uri` through the real `did_close` path.

@@ -178,7 +178,7 @@ use crate::cross_file::{
 };
 use crate::file_type::{FileType, file_type_from_language_id_or_uri, file_type_from_uri};
 use crate::open_document_store::{
-    AnalysisGeneration, OpenDocumentCommitError, OpenDocumentRecord, OpenDocumentStore,
+    AnalysisGeneration, OpenDocumentRecord, OpenDocumentStore, OpenRecordToken,
     PreparedOpenDocument,
 };
 use crate::package_library::PackageLibrary;
@@ -480,7 +480,7 @@ pub(crate) fn document_from_workspace_entry(
 /// parameter/signature package scope, package sibling fanout, and workspace-root
 /// `.Rprofile` prelude ownership resolve through the authoritative canonical
 /// URI.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OpenDocumentAliases {
     canonical_to_open: HashMap<Url, Vec<Url>>,
     open_to_canonical: HashMap<Url, Vec<Url>>,
@@ -761,6 +761,18 @@ pub struct WorldState {
     /// `DiagnosticsPublishPause`. Compiled out of production builds.
     #[cfg(any(test, feature = "test-support"))]
     pub diagnostics_test_pause: crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic didOpen reservation barrier used only by handler tests.
+    #[cfg(test)]
+    pub(crate) did_open_reservation_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) did_open_reservation_snapshot_for_test: Vec<(Url, u32)>,
+    /// Deterministic barrier between detached overflow derivation and CAS.
+    #[cfg(test)]
+    pub(crate) open_edit_fallback_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) force_open_edit_overflow_for_test: bool,
 
     // Cross-file state
     pub cross_file_config: CrossFileConfig,
@@ -851,6 +863,12 @@ pub struct WorldState {
     /// receive diagnostics. `Some` keeps hidden client-created text models as
     /// analysis inputs while preventing them from acquiring Problems entries.
     pub editor_diagnostic_uris: Option<HashSet<Url>>,
+    /// Freshness identity for the editor eligibility policy.
+    ///
+    /// Production writers replace the policy through
+    /// [`Self::replace_editor_diagnostic_uris`] so detached open transitions
+    /// can validate the policy without cloning its potentially unbounded set.
+    editor_eligibility_generation: EditorEligibilityGeneration,
     /// Last-known editor-derived chunk classification for file-backed
     /// documents whose editor language made the file behave differently from
     /// path classification.
@@ -907,7 +925,7 @@ pub struct WorldState {
     /// Detached closed preparation enumerates open parents and consumes their
     /// metadata, so open/install/close/metadata-only replacements all advance
     /// this stamp even when the graph's edge set is unchanged.
-    open_context_authority_generation: u64,
+    open_context_authority_generation: OpenContextAuthorityGeneration,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) open_pin_recompute_count: usize,
     #[cfg(any(test, feature = "test-support"))]
@@ -1015,9 +1033,10 @@ pub(crate) struct AnalysisBasis {
     watched_file_generation: Option<u64>,
     graph_revision: u64,
     graph_authority_generation: u64,
-    open_context_authority_generation: u64,
+    open_context_authority_generation: OpenContextAuthorityGeneration,
     context_authorities: Vec<AnalysisContextAuthority>,
     batch_overlay_contexts: Vec<Url>,
+    open_transition: Option<OpenTransitionStamp>,
     package_input_generation: u64,
     package_config_generation: u64,
     system_file_routing: SystemFileRoutingStamp,
@@ -1029,7 +1048,33 @@ enum AnalysisSubjectBasis {
     Pending(EnrichmentClaim),
     Complete(CompleteRefreshToken),
     Observed(ClosedRecordToken),
+    Open(OpenRecordToken),
 }
+
+#[derive(Clone)]
+struct OpenTransitionStamp {
+    diagnostic_epoch: Option<DiagnosticsEpoch>,
+    editor_eligibility_generation: EditorEligibilityGeneration,
+    closed_index_version: u64,
+    raw_cache_generation: u64,
+    /// Current authoritative owners actually consulted for the target's raw,
+    /// registered-canonical, and prospective-canonical URI spellings.
+    ///
+    /// Each open record has at most [`WorldState::MAX_OPEN_ALIASES_PER_RECORD`]
+    /// canonical aliases, and the prospective calculation has the same bound.
+    /// After URI de-duplication this list is therefore fixed-size (at most five
+    /// tokens including the target spelling), in deterministic URI order.
+    alias_owner_tokens: Vec<OpenRecordToken>,
+    raw_authorities: Vec<(Url, Option<crate::cross_file::file_cache::FileSnapshot>)>,
+}
+
+/// Typed freshness identity for the open-record/alias/lifecycle authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenContextAuthorityGeneration(u64);
+
+/// Typed freshness identity for the editor diagnostics-eligibility policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditorEligibilityGeneration(u64);
 
 #[derive(Clone)]
 enum AnalysisContextAuthority {
@@ -1145,10 +1190,140 @@ impl PreparedClosedAnalysis {
     }
 }
 
+impl PreparedOpenEditAnalysis {
+    pub(crate) fn new(
+        edit: PreparedOpenEdit,
+        metadata: Arc<crate::cross_file::CrossFileMetadata>,
+        plan: PreparedOpenCommitPlan,
+    ) -> Self {
+        Self {
+            basis: edit.basis,
+            uri: edit.uri,
+            prepared: edit.prepared,
+            metadata,
+            plan,
+        }
+    }
+}
+
+impl PreparedOpenMetadataAnalysis {
+    pub(crate) fn new(
+        basis: AnalysisBasis,
+        uri: Url,
+        expected: AnalysisGeneration,
+        metadata: Arc<crate::cross_file::CrossFileMetadata>,
+        plan: PreparedOpenCommitPlan,
+    ) -> Self {
+        Self {
+            basis,
+            uri,
+            expected,
+            metadata,
+            plan,
+        }
+    }
+}
+
 pub(crate) enum PreparedAnalysisCommit {
     Upsert(Box<PreparedClosedAnalysis>),
     Remove { basis: Box<AnalysisBasis>, uri: Url },
     Batch(Vec<PreparedClosedMutation>),
+    OpenEdit(Box<PreparedOpenEditAnalysis>),
+    OpenMetadata(Box<PreparedOpenMetadataAnalysis>),
+}
+
+pub(crate) struct PreparedOpenEditAnalysis {
+    basis: AnalysisBasis,
+    uri: Url,
+    prepared: PreparedOpenDocument,
+    metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    plan: PreparedOpenCommitPlan,
+}
+
+/// One edit prepared from an exact open-analysis basis.
+///
+/// Preparation is read-only. Raw-cache invalidation and every other visible
+/// effect stay behind [`WorldState::try_commit_analysis`].
+pub(crate) struct PreparedOpenEdit {
+    basis: AnalysisBasis,
+    uri: Url,
+    prepared: PreparedOpenDocument,
+}
+
+impl PreparedOpenEdit {
+    pub(crate) fn document(&self) -> &Document {
+        self.prepared.document()
+    }
+}
+
+pub(crate) struct PreparedOpenMetadataAnalysis {
+    basis: AnalysisBasis,
+    uri: Url,
+    expected: AnalysisGeneration,
+    metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    plan: PreparedOpenCommitPlan,
+}
+
+/// Immutable inputs for detached didOpen metadata re-enrichment.
+///
+/// Captured coherently with `basis` under one brief `WorldState` lock. Parsing,
+/// inherited-WD traversal, alias-root projection, and path filtering run only
+/// after the lock is dropped.
+pub(crate) struct CapturedOpenMetadataAnalysis {
+    basis: AnalysisBasis,
+    pub(crate) uri: Url,
+    pub(crate) expected: AnalysisGeneration,
+    pub(crate) analysis_text: String,
+    pub(crate) old_metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    pub(crate) workspace_root: Option<Url>,
+    pub(crate) max_chain_depth: usize,
+    pub(crate) workspace_name: Option<String>,
+    pub(crate) package_workspace_root: Option<PathBuf>,
+    pub(crate) library_paths: Vec<PathBuf>,
+    pub(crate) exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    pub(crate) graph_roots: Vec<Url>,
+    /// Coherent graph snapshot retained for detached fanout/debug analysis.
+    /// The commit basis owns the operational graph-revision identity.
+    pub(crate) _graph: DependencyGraph,
+    pub(crate) metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    pub(crate) content_map: HashMap<Url, String>,
+    pub(crate) raw_content: HashMap<Url, (String, ChunkKind)>,
+}
+
+/// One graph-root projection derived from an exact open-analysis basis.
+pub(crate) struct PreparedOpenGraphProjection {
+    pub(crate) uri: Url,
+    pub(crate) graph_metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    pub(crate) old_metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
+    pub(crate) new_metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    pub(crate) parent_content: HashMap<Url, String>,
+    pub(crate) make_non_lending: bool,
+}
+
+/// All state-derived effects that become valid only if an open record commits.
+#[derive(Default)]
+pub(crate) struct PreparedOpenCommitPlan {
+    pub(crate) graph: Vec<PreparedOpenGraphProjection>,
+    pub(crate) reset_closed_roots: Vec<Url>,
+    pub(crate) package_event: Option<(Url, Arc<str>)>,
+    pub(crate) package_fanout_uris: Vec<Url>,
+    pub(crate) package_source_interface_fanout: bool,
+    pub(crate) packages_to_prefetch: Vec<String>,
+    pub(crate) refresh_pins: bool,
+    /// Candidates already selected by an earlier phase of the same handler.
+    /// The seam unions, reprioritizes, caps, and marks them with newly-derived
+    /// graph/WD/package fanout so no marker can outlive cap eviction.
+    pub(crate) seed_revalidation_uris: Vec<Url>,
+    /// Override for operations such as didOpen re-enrichment, whose subject
+    /// uses the dependent debounce rather than the edited-file debounce.
+    pub(crate) subject_debounce_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenAnalysisCommitOutcome {
+    pub(crate) generation: AnalysisGeneration,
+    pub(crate) provenance: crate::open_document_store::OpenDocumentProvenance,
+    pub(crate) packages_to_prefetch: Vec<String>,
 }
 
 pub(crate) enum PreparedClosedMutation {
@@ -1166,6 +1341,7 @@ pub(crate) struct AnalysisRevalidationTicket {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AnalysisCommitEffects {
     pub(crate) revalidations: Vec<AnalysisRevalidationTicket>,
+    pub(crate) open: Option<OpenAnalysisCommitOutcome>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1174,6 +1350,11 @@ pub(crate) enum AnalysisCommitRejected {
 }
 
 impl WorldState {
+    /// A record can acquire at most one case-corrected and one symlink-target
+    /// alias. Their order is stable: case spelling first, symlink target
+    /// second, with duplicates removed while preserving that order.
+    const MAX_OPEN_ALIASES_PER_RECORD: usize = 2;
+
     /// Passthrough for legacy `state.package_workspace` reads.
     pub fn package_workspace(&self) -> Option<&crate::package_namespace::PackageWorkspace> {
         self.package_state.workspace()
@@ -1255,8 +1436,18 @@ impl WorldState {
     }
 
     fn advance_open_context_authority_generation(&mut self) {
-        self.open_context_authority_generation =
-            self.open_context_authority_generation.wrapping_add(1);
+        self.open_context_authority_generation.0 =
+            self.open_context_authority_generation.0.wrapping_add(1);
+    }
+
+    /// Replace the editor diagnostics policy and advance its compact authority
+    /// stamp when the effective set changes.
+    pub(crate) fn replace_editor_diagnostic_uris(&mut self, uris: Option<HashSet<Url>>) {
+        if self.editor_diagnostic_uris == uris {
+            return;
+        }
+        self.editor_diagnostic_uris = uris;
+        self.editor_eligibility_generation.0 = self.editor_eligibility_generation.0.wrapping_add(1);
     }
 
     /// Retire detached scans captured before a closed-file or scan-input write.
@@ -1478,7 +1669,6 @@ impl WorldState {
     ///
     /// let ws = WorldState::new();
     /// // newly created state has no opened documents or workspace folders by default
-    /// assert!(ws.documents.is_empty());
     /// assert!(ws.workspace_folders.is_empty());
     /// ```
     pub fn new() -> Self {
@@ -1537,6 +1727,16 @@ impl WorldState {
             #[cfg(any(test, feature = "test-support"))]
             diagnostics_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            did_open_reservation_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            did_open_reservation_snapshot_for_test: Vec::new(),
+            #[cfg(test)]
+            open_edit_fallback_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            force_open_edit_overflow_for_test: false,
 
             // Cross-file state
             cross_file_config: config,
@@ -1561,6 +1761,7 @@ impl WorldState {
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
             editor_diagnostic_uris: None,
+            editor_eligibility_generation: EditorEligibilityGeneration(0),
             editor_chunk_kind_overrides: HashMap::new(),
             watched_file_resync_generation_counter: 0,
             watched_file_resync_generations: HashMap::new(),
@@ -1568,7 +1769,7 @@ impl WorldState {
             package_library_ready: false,
             workspace_scan_generation: 0,
             workspace_graph_authority_generation: 0,
-            open_context_authority_generation: 0,
+            open_context_authority_generation: OpenContextAuthorityGeneration(0),
             #[cfg(any(test, feature = "test-support"))]
             open_pin_recompute_count: 0,
             #[cfg(any(test, feature = "test-support"))]
@@ -1637,6 +1838,7 @@ impl WorldState {
             self.documents
                 .replace_lifecycle_epoch_if_current(uri, generation, Some(epoch))
                 .expect("open lifecycle replacement remains current under the state write lock");
+            self.advance_open_context_authority_generation();
         }
         Some(epoch)
     }
@@ -1666,6 +1868,7 @@ impl WorldState {
             self.documents
                 .replace_lifecycle_epoch_if_current(uri, generation, None)
                 .expect("open lifecycle retirement remains current under the state write lock");
+            self.advance_open_context_authority_generation();
         }
     }
 
@@ -1705,6 +1908,8 @@ impl WorldState {
 
         let mut seen = HashSet::new();
         candidates.retain(|candidate| seen.insert(candidate.clone()));
+        debug_assert!(candidates.len() <= Self::MAX_OPEN_ALIASES_PER_RECORD);
+        candidates.truncate(Self::MAX_OPEN_ALIASES_PER_RECORD);
         candidates
     }
 
@@ -2166,7 +2371,8 @@ impl WorldState {
 
     pub fn close_document(&mut self, uri: &Url) -> Vec<Url> {
         let aliases = self.open_document_aliases.close(uri);
-        if self.documents.close(uri).is_some() {
+        let removed_record = self.documents.close(uri).is_some();
+        if removed_record || !aliases.is_empty() {
             self.advance_open_context_authority_generation();
         }
         if let Ok(mut cache) = self.effective_lint_config_cache.lock() {
@@ -2246,21 +2452,22 @@ impl WorldState {
 
     /// Prepare one ordered LSP notification batch against the current record.
     ///
-    /// Cache invalidation happens once for the URI and every registered open
-    /// alias. The returned batch is not visible until
-    /// [`Self::commit_document_changes`] succeeds for its captured generation.
+    /// The returned batch is not visible until [`Self::try_commit_analysis`]
+    /// validates its exact basis. Preparation never invalidates the raw cache:
+    /// rejected changes are strict no-ops.
     pub(crate) fn prepare_document_changes(
-        &mut self,
+        &self,
         uri: &Url,
         changes: impl IntoIterator<Item = TextDocumentContentChangeEvent>,
         version: i32,
-    ) -> Option<PreparedOpenDocument> {
-        let aliases = self.canonical_uris_for_open_document(uri);
-        self.cross_file_file_cache.invalidate(uri);
-        for alias in aliases {
-            self.cross_file_file_cache.invalidate(&alias);
-        }
-        self.documents.prepare_changes(uri, changes, version)
+    ) -> Option<PreparedOpenEdit> {
+        let basis = self.capture_open_analysis_basis(uri)?;
+        let prepared = self.documents.prepare_changes(uri, changes, version)?;
+        Some(PreparedOpenEdit {
+            basis,
+            uri: uri.clone(),
+            prepared,
+        })
     }
 
     fn capture_closed_analysis_basis(
@@ -2277,6 +2484,7 @@ impl WorldState {
             open_context_authority_generation: self.open_context_authority_generation,
             context_authorities: Vec::new(),
             batch_overlay_contexts: Vec::new(),
+            open_transition: None,
             package_input_generation: self.package_input_generation(),
             package_config_generation: self.package_config_generation,
             system_file_routing: SystemFileRoutingStamp {
@@ -2301,11 +2509,9 @@ impl WorldState {
     /// exact snapshot. An over-budget preparation fails closed.
     pub(crate) fn attach_analysis_context_authorities(
         &self,
-        mut basis: AnalysisBasis,
-        mut uris: Vec<Url>,
+        basis: AnalysisBasis,
+        uris: Vec<Url>,
     ) -> Option<AnalysisBasis> {
-        uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-        uris.dedup();
         // Use the same visited budget and absolute ceiling as cross-file
         // neighborhood traversal. Preparation must not carry more authority
         // identities than the traversal it supports could legally visit.
@@ -2313,7 +2519,18 @@ impl WorldState {
             .cross_file_config
             .max_transitive_dependents_visited
             .min(Self::MULTI_SEED_VISITED_CEILING);
-        if uris.len() > context_budget {
+        self.attach_analysis_context_authorities_bounded(basis, uris, context_budget)
+    }
+
+    fn attach_analysis_context_authorities_bounded(
+        &self,
+        mut basis: AnalysisBasis,
+        mut uris: Vec<Url>,
+        limit: usize,
+    ) -> Option<AnalysisBasis> {
+        uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        uris.dedup();
+        if uris.len() > limit {
             return None;
         }
         basis.context_authorities = uris
@@ -2359,6 +2576,214 @@ impl WorldState {
         )
     }
 
+    pub(crate) fn capture_open_analysis_basis(&self, uri: &Url) -> Option<AnalysisBasis> {
+        let mut basis = self.capture_closed_analysis_basis(
+            AnalysisSubjectBasis::Open(self.documents.record_token(uri)),
+            uri,
+        );
+        let mut raw_uris = vec![uri.clone()];
+        raw_uris.extend(self.canonical_uris_for_open_document(uri));
+        raw_uris.extend(self.open_alias_candidates_for_uri(uri));
+        raw_uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        raw_uris.dedup();
+        // One target spelling plus the two registered and two prospective
+        // aliases. Registered/prospective sets can overlap, hence `<=`.
+        debug_assert!(raw_uris.len() <= 1 + 2 * Self::MAX_OPEN_ALIASES_PER_RECORD);
+        let mut alias_owner_uris: Vec<Url> = raw_uris
+            .iter()
+            .filter_map(|candidate| self.open_document_uri_for_authoritative_uri(candidate))
+            .collect();
+        alias_owner_uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        alias_owner_uris.dedup();
+        let alias_owner_tokens = alias_owner_uris
+            .into_iter()
+            .map(|owner| self.documents.record_token(&owner))
+            .collect();
+        let raw_authorities = raw_uris
+            .into_iter()
+            .map(|raw_uri| {
+                let snapshot = self.cross_file_file_cache.get_snapshot(&raw_uri);
+                (raw_uri, snapshot)
+            })
+            .collect();
+        basis.open_transition = Some(OpenTransitionStamp {
+            diagnostic_epoch: self.diagnostics_gate.current_epoch(uri),
+            editor_eligibility_generation: self.editor_eligibility_generation,
+            closed_index_version: self.workspace_index.version(),
+            raw_cache_generation: self.cross_file_file_cache.content_generation(),
+            alias_owner_tokens,
+            raw_authorities,
+        });
+        Some(basis)
+    }
+
+    pub(crate) fn attach_open_edit_context_authorities(
+        &self,
+        edit: PreparedOpenEdit,
+        uris: Vec<Url>,
+    ) -> Result<PreparedOpenEdit, Box<PreparedOpenEdit>> {
+        #[cfg(test)]
+        if self.force_open_edit_overflow_for_test {
+            return Err(Box::new(edit));
+        }
+        self.attach_open_edit_context_authorities_with_limit(
+            edit,
+            uris,
+            Self::MULTI_SEED_VISITED_CEILING,
+        )
+    }
+
+    fn attach_open_edit_context_authorities_with_limit(
+        &self,
+        mut edit: PreparedOpenEdit,
+        mut uris: Vec<Url>,
+        limit: usize,
+    ) -> Result<PreparedOpenEdit, Box<PreparedOpenEdit>> {
+        uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        uris.dedup();
+        if uris.len() > limit {
+            return Err(Box::new(edit));
+        }
+        edit.basis = self
+            .attach_analysis_context_authorities_bounded(edit.basis, uris, limit)
+            .expect("deduplicated open-edit context set was checked against its ceiling");
+        Ok(edit)
+    }
+
+    pub(crate) fn open_edit_subject_is_current(&self, edit: &PreparedOpenEdit) -> bool {
+        matches!(
+            &edit.basis.subject,
+            AnalysisSubjectBasis::Open(token)
+                if token.uri() == &edit.uri && self.documents.record_token_is_current(token)
+        )
+    }
+
+    pub(crate) fn open_edit_basis_is_current(&self, edit: &PreparedOpenEdit) -> bool {
+        self.analysis_basis_is_current(&edit.basis, &edit.uri, &HashSet::new())
+    }
+
+    pub(crate) fn rebase_open_edit_if_subject_current(
+        &self,
+        mut edit: PreparedOpenEdit,
+    ) -> Option<PreparedOpenEdit> {
+        if !self.open_edit_subject_is_current(&edit) {
+            return None;
+        }
+        edit.basis = self.capture_open_analysis_basis(&edit.uri)?;
+        Some(edit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_open_edit_context_overflow_for_test(
+        &self,
+        edit: PreparedOpenEdit,
+        uris: Vec<Url>,
+    ) -> PreparedOpenEdit {
+        match self.attach_open_edit_context_authorities_with_limit(edit, uris, 0) {
+            Ok(_) => panic!("non-empty test context must exceed the zero ceiling"),
+            Err(edit) => *edit,
+        }
+    }
+
+    pub(crate) fn capture_open_metadata_derivation(
+        &self,
+        uri: &Url,
+        expected: AnalysisGeneration,
+    ) -> Option<CapturedOpenMetadataAnalysis> {
+        let record = self.documents.get_record(uri)?;
+        if record.generation() != expected {
+            return None;
+        }
+        let basis = self.capture_open_analysis_basis(uri)?;
+        let graph_roots = self.authoritative_revalidation_roots_for_uri(uri);
+        let mut metadata_map = HashMap::new();
+        let mut content_map = HashMap::new();
+        for open_uri in self.documents.uris() {
+            if let Some(open_record) = self.documents.get_record(&open_uri) {
+                metadata_map.insert(open_uri.clone(), open_record.metadata().clone());
+                content_map.insert(open_uri.clone(), open_record.document().text());
+                for canonical in self.canonical_uris_for_open_document(&open_uri) {
+                    if self
+                        .open_document_uri_for_authoritative_uri(&canonical)
+                        .as_ref()
+                        == Some(&open_uri)
+                    {
+                        metadata_map.insert(canonical.clone(), open_record.metadata().clone());
+                        content_map.insert(canonical, open_record.document().text());
+                    }
+                }
+            }
+        }
+        for closed_uri in self.workspace_index.artifact_uris() {
+            if metadata_map.contains_key(&closed_uri) {
+                continue;
+            }
+            if let Some(metadata) = self.workspace_index.get_metadata(&closed_uri) {
+                metadata_map.insert(closed_uri.clone(), metadata);
+            }
+            if let Some(entry) = self.workspace_index.get(&closed_uri) {
+                content_map.insert(closed_uri, entry.contents.to_string());
+            }
+        }
+        let raw_entries = self.cross_file_file_cache.snapshot_entries();
+        if metadata_map.len().saturating_add(raw_entries.len()) > Self::MULTI_SEED_VISITED_CEILING {
+            return None;
+        }
+        let raw_content = raw_entries
+            .into_iter()
+            .map(|(raw_uri, _snapshot, content)| {
+                let kind = self.chunk_kind_for_closed_file(&raw_uri);
+                content_map
+                    .entry(raw_uri.clone())
+                    .or_insert_with(|| content.clone());
+                (raw_uri, (content, kind))
+            })
+            .collect();
+        let (workspace_name, package_workspace_root, library_paths) =
+            self.snapshot_system_file_inputs();
+        Some(CapturedOpenMetadataAnalysis {
+            basis,
+            uri: uri.clone(),
+            expected,
+            analysis_text: record.document().analysis_text(),
+            old_metadata: record.metadata().clone(),
+            workspace_root: self.workspace_folders.first().cloned(),
+            max_chain_depth: self.cross_file_config.max_chain_depth,
+            workspace_name,
+            package_workspace_root,
+            library_paths,
+            exclusions: self.workspace_exclusions.clone(),
+            graph_roots,
+            _graph: self.cross_file_graph.clone(),
+            metadata_map,
+            content_map,
+            raw_content,
+        })
+    }
+
+    pub(crate) fn prepare_captured_open_metadata_analysis(
+        &self,
+        captured: CapturedOpenMetadataAnalysis,
+        metadata: Arc<crate::cross_file::CrossFileMetadata>,
+        plan: PreparedOpenCommitPlan,
+        context_uris: Vec<Url>,
+    ) -> Option<PreparedOpenMetadataAnalysis> {
+        // Detached derivation may only validate the authority identities
+        // captured with its snapshot. Do not resample per-URI authorities
+        // here: the snapshot basis already owns global closed-index,
+        // raw-cache, and open-context generations that cover every lookup.
+        if context_uris.len() > Self::MULTI_SEED_VISITED_CEILING {
+            return None;
+        }
+        Some(PreparedOpenMetadataAnalysis::new(
+            captured.basis,
+            captured.uri,
+            captured.expected,
+            metadata,
+            plan,
+        ))
+    }
+
     fn analysis_basis_is_current(
         &self,
         basis: &AnalysisBasis,
@@ -2375,9 +2800,13 @@ impl WorldState {
             AnalysisSubjectBasis::Observed(token) => {
                 token.uri() == uri && self.workspace_index.closed_record_token_is_current(token)
             }
+            AnalysisSubjectBasis::Open(token) => {
+                token.uri() == uri && self.documents.record_token_is_current(token)
+            }
         };
+        let closed_subject = !matches!(&basis.subject, AnalysisSubjectBasis::Open(_));
         if !subject_current
-            || self.is_document_open_or_alias(uri)
+            || (closed_subject && self.is_document_open_or_alias(uri))
             || self.watched_file_resync_generations.get(uri).copied()
                 != basis.watched_file_generation
             || self.cross_file_graph.edge_revision() != basis.graph_revision
@@ -2385,6 +2814,21 @@ impl WorldState {
             || self.open_context_authority_generation != basis.open_context_authority_generation
             || self.package_input_generation() != basis.package_input_generation
             || self.package_config_generation != basis.package_config_generation
+        {
+            return false;
+        }
+        if let Some(open) = &basis.open_transition
+            && (self.diagnostics_gate.current_epoch(uri) != open.diagnostic_epoch
+                || self.editor_eligibility_generation != open.editor_eligibility_generation
+                || self.workspace_index.version() != open.closed_index_version
+                || self.cross_file_file_cache.content_generation() != open.raw_cache_generation
+                || open
+                    .alias_owner_tokens
+                    .iter()
+                    .any(|token| !self.documents.record_token_is_current(token))
+                || open.raw_authorities.iter().any(|(raw_uri, snapshot)| {
+                    self.cross_file_file_cache.get_snapshot(raw_uri) != *snapshot
+                }))
         {
             return false;
         }
@@ -2451,6 +2895,7 @@ impl WorldState {
                     uri,
                 })
                 .collect(),
+            open: None,
         }
     }
 
@@ -2467,6 +2912,12 @@ impl WorldState {
         prepared: PreparedAnalysisCommit,
     ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
         let mutations = match prepared {
+            PreparedAnalysisCommit::OpenEdit(prepared) => {
+                return self.try_commit_open_edit(*prepared);
+            }
+            PreparedAnalysisCommit::OpenMetadata(prepared) => {
+                return self.try_commit_open_metadata(*prepared);
+            }
             PreparedAnalysisCommit::Upsert(prepared) => {
                 vec![PreparedClosedMutation::Upsert(prepared)]
             }
@@ -2476,6 +2927,224 @@ impl WorldState {
             PreparedAnalysisCommit::Batch(mutations) => mutations,
         };
         self.try_commit_closed_batch(mutations)
+    }
+
+    fn try_commit_open_edit(
+        &mut self,
+        prepared: PreparedOpenEditAnalysis,
+    ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
+        let targets = HashSet::from([prepared.uri.clone()]);
+        if !self.analysis_basis_is_current(&prepared.basis, &prepared.uri, &targets) {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+        let raw_uris: Vec<Url> = prepared
+            .basis
+            .open_transition
+            .as_ref()
+            .expect("open edit carries its transition authority")
+            .raw_authorities
+            .iter()
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        let old_interface = self
+            .documents
+            .get_record(&prepared.uri)
+            .map(|record| record.artifacts().interface_hash);
+        let committed = self
+            .documents
+            .commit_prepared_if_current(&prepared.uri, prepared.prepared, prepared.metadata)
+            .map_err(|_| AnalysisCommitRejected::StaleBasis)?;
+        for raw_uri in raw_uris {
+            self.cross_file_file_cache.invalidate(&raw_uri);
+        }
+        let packages_to_prefetch = prepared.plan.packages_to_prefetch.clone();
+        let revalidations =
+            self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan);
+        self.advance_workspace_graph_authority_generation();
+        self.advance_open_context_authority_generation();
+        Ok(AnalysisCommitEffects {
+            revalidations,
+            open: Some(OpenAnalysisCommitOutcome {
+                generation: committed.generation(),
+                provenance: committed.provenance(),
+                packages_to_prefetch,
+            }),
+        })
+    }
+
+    fn try_commit_open_metadata(
+        &mut self,
+        prepared: PreparedOpenMetadataAnalysis,
+    ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
+        let targets = HashSet::from([prepared.uri.clone()]);
+        if !self.analysis_basis_is_current(&prepared.basis, &prepared.uri, &targets) {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+        if !self
+            .documents
+            .generation_is_current(&prepared.uri, prepared.expected)
+        {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+        let old_interface = self
+            .documents
+            .get_record(&prepared.uri)
+            .map(|record| record.artifacts().interface_hash);
+        let committed = self
+            .documents
+            .replace_metadata_if_current(&prepared.uri, prepared.expected, prepared.metadata)
+            .map_err(|_| AnalysisCommitRejected::StaleBasis)?;
+        let packages_to_prefetch = prepared.plan.packages_to_prefetch.clone();
+        let revalidations =
+            self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan);
+        self.advance_workspace_graph_authority_generation();
+        self.advance_open_context_authority_generation();
+        Ok(AnalysisCommitEffects {
+            revalidations,
+            open: Some(OpenAnalysisCommitOutcome {
+                generation: committed.generation(),
+                provenance: committed.provenance(),
+                packages_to_prefetch,
+            }),
+        })
+    }
+
+    fn apply_open_commit_plan(
+        &mut self,
+        uri: &Url,
+        old_interface: Option<u64>,
+        plan: PreparedOpenCommitPlan,
+    ) -> Vec<AnalysisRevalidationTicket> {
+        // Preserve the pre-update neighborhood only when the prepared graph
+        // inputs can change routing. This keeps private/body-only edits on the
+        // selective fast path while still retaining a removed edge's endpoint,
+        // which is no longer discoverable from the post-update graph.
+        let capture_pre_graph = !plan.reset_closed_roots.is_empty()
+            || plan.graph.iter().any(|projection| {
+                let Some(old) = projection.old_metadata.as_deref() else {
+                    return true;
+                };
+                let new = projection.new_metadata.as_ref();
+                old.sources != new.sources
+                    || old.sourced_by != new.sourced_by
+                    || old.working_directory != new.working_directory
+                    || old.inherited_working_directory != new.inherited_working_directory
+            });
+        let pre_graph_neighbors = if capture_pre_graph {
+            self.affected_open_dependents_after_edit(uri, true, true)
+        } else {
+            Vec::new()
+        };
+        for root in &plan.reset_closed_roots {
+            self.workspace_index.invalidate(root);
+            self.cross_file_graph.remove_file(root);
+            self.cross_file_file_cache.invalidate(root);
+            self.cross_file_meta.remove(root);
+            self.prune_editor_chunk_kind_override(root);
+            self.watched_file_resync_generations.remove(root);
+        }
+
+        let mut edges_changed = false;
+        let mut wd_affected = Vec::new();
+        let workspace_root = self.workspace_folders.first().cloned();
+        for projection in plan.graph {
+            let result = self.cross_file_graph.update_file(
+                &projection.uri,
+                projection.graph_metadata.as_ref(),
+                workspace_root.as_ref(),
+                |parent_uri| projection.parent_content.get(parent_uri).cloned(),
+            );
+            edges_changed |= result.edges_changed;
+            if projection.make_non_lending {
+                edges_changed |= self
+                    .cross_file_graph
+                    .make_forward_edges_non_lending(&projection.uri);
+            }
+            wd_affected.extend(
+                crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+                    &projection.uri,
+                    projection.old_metadata.as_deref(),
+                    projection.new_metadata.as_ref(),
+                    &self.cross_file_graph,
+                    &self.cross_file_meta,
+                ),
+            );
+        }
+
+        let mut package_visibility_changed = false;
+        if let Some((event_uri, text)) = plan.package_event {
+            let old_namespace = self.package_state.namespace_model().cloned();
+            let old_contribution = self.package_state.scope_contribution().clone();
+            let event = crate::package_state::event::HandlerEvent::DidChange {
+                uri: event_uri,
+                text,
+            };
+            if let Some(delta) =
+                crate::package_state::event::translate(&mut self.package_inputs, event)
+            {
+                self.record_package_input_mutation();
+                self.apply_package_event(&delta);
+                package_visibility_changed = self.package_state.namespace_model()
+                    != old_namespace.as_ref()
+                    || self.package_state.scope_contribution() != &old_contribution;
+            }
+        }
+
+        let new_interface = self
+            .documents
+            .get_record(uri)
+            .map(|record| record.artifacts().interface_hash);
+        let interface_changed = old_interface != new_interface;
+        let mut affected: HashSet<Url> = plan.seed_revalidation_uris.into_iter().collect();
+        affected.insert(uri.clone());
+        if interface_changed || edges_changed {
+            affected.extend(pre_graph_neighbors);
+            affected.extend(self.affected_open_dependents_after_edit(
+                uri,
+                interface_changed,
+                edges_changed,
+            ));
+        }
+        for child in wd_affected {
+            if let Some(open_child) = self.open_document_uri_for_authoritative_uri(&child) {
+                affected.insert(open_child);
+            }
+        }
+        if package_visibility_changed || (interface_changed && plan.package_source_interface_fanout)
+        {
+            affected.extend(plan.package_fanout_uris);
+        }
+
+        if edges_changed || plan.refresh_pins {
+            self.recompute_open_neighborhood_pins();
+        }
+
+        let mut affected: Vec<Url> = affected.into_iter().collect();
+        affected.sort_by_cached_key(|candidate| {
+            if candidate == uri {
+                0
+            } else {
+                self.cross_file_activity
+                    .priority_score(candidate)
+                    .saturating_add(1)
+            }
+        });
+        affected.truncate(self.cross_file_config.max_revalidations_per_trigger);
+        self.diagnostics_gate
+            .mark_force_republish_many(affected.iter().filter(|candidate| *candidate != uri));
+        affected
+            .into_iter()
+            .map(|affected_uri| AnalysisRevalidationTicket {
+                debounce_ms: if affected_uri == *uri {
+                    plan.subject_debounce_ms
+                        .unwrap_or(self.cross_file_config.edited_file_debounce_ms)
+                } else {
+                    self.cross_file_config.revalidation_debounce_ms
+                },
+                trigger: DiagnosticsTrigger::capture(self, &affected_uri),
+                uri: affected_uri,
+            })
+            .collect()
     }
 
     fn try_commit_closed_batch(
@@ -2565,6 +3234,9 @@ impl WorldState {
                             );
                             true
                         }
+                        AnalysisSubjectBasis::Open(_) => {
+                            unreachable!("open subjects never enter the closed commit path")
+                        }
                     };
                     debug_assert!(committed, "prevalidated closed CAS remains current");
 
@@ -2638,18 +3310,23 @@ impl WorldState {
     }
 
     /// Install a prepared document plus its enriched metadata if still current.
+    #[cfg(test)]
     pub(crate) fn commit_document_changes(
         &mut self,
         uri: &Url,
-        prepared: PreparedOpenDocument,
+        prepared: PreparedOpenEdit,
         metadata: Arc<crate::cross_file::CrossFileMetadata>,
-    ) -> Result<Arc<OpenDocumentRecord>, OpenDocumentCommitError> {
-        let committed = self
-            .documents
-            .commit_prepared_if_current(uri, prepared, metadata)?;
-        self.advance_workspace_graph_authority_generation();
-        self.advance_open_context_authority_generation();
-        Ok(committed)
+    ) -> Result<Arc<OpenDocumentRecord>, AnalysisCommitRejected> {
+        if prepared.uri != *uri {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+        self.try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+            PreparedOpenEditAnalysis::new(prepared, metadata, PreparedOpenCommitPlan::default()),
+        )))?;
+        self.documents
+            .get_record(uri)
+            .cloned()
+            .ok_or(AnalysisCommitRejected::StaleBasis)
     }
 
     /// Guarded replacement for metadata/artifacts derived off the current text.
@@ -2658,13 +3335,23 @@ impl WorldState {
         uri: &Url,
         generation: AnalysisGeneration,
         metadata: Arc<crate::cross_file::CrossFileMetadata>,
-    ) -> Result<Arc<OpenDocumentRecord>, OpenDocumentCommitError> {
-        let committed = self
-            .documents
-            .replace_metadata_if_current(uri, generation, metadata)?;
-        self.advance_workspace_graph_authority_generation();
-        self.advance_open_context_authority_generation();
-        Ok(committed)
+    ) -> Result<Arc<OpenDocumentRecord>, AnalysisCommitRejected> {
+        let basis = self
+            .capture_open_analysis_basis(uri)
+            .ok_or(AnalysisCommitRejected::StaleBasis)?;
+        self.try_commit_analysis(PreparedAnalysisCommit::OpenMetadata(Box::new(
+            PreparedOpenMetadataAnalysis::new(
+                basis,
+                uri.clone(),
+                generation,
+                metadata,
+                PreparedOpenCommitPlan::default(),
+            ),
+        )))?;
+        self.documents
+            .get_record(uri)
+            .cloned()
+            .ok_or(AnalysisCommitRejected::StaleBasis)
     }
 
     pub fn get_document(&self, uri: &Url) -> Option<&Document> {
@@ -4298,6 +4985,843 @@ fn is_stat_model_extension(path: &Path) -> bool {
 mod tests {
     use super::*;
     use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+
+    fn full_change(text: &str) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: text.to_owned(),
+        }
+    }
+
+    fn cache_snapshot(size: u64, content_hash: u64) -> crate::cross_file::file_cache::FileSnapshot {
+        crate::cross_file::file_cache::FileSnapshot {
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size,
+            content_hash: Some(content_hash),
+        }
+    }
+
+    fn commit_test_edit(
+        state: &mut WorldState,
+        uri: &Url,
+        text: &str,
+        metadata: crate::cross_file::CrossFileMetadata,
+        plan: PreparedOpenCommitPlan,
+    ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
+        let edit = state
+            .prepare_document_changes(uri, [full_change(text)], 2)
+            .unwrap();
+        state.try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+            PreparedOpenEditAnalysis::new(edit, Arc::new(metadata), plan),
+        )))
+    }
+
+    fn open_projection(
+        uri: Url,
+        graph_metadata: crate::cross_file::CrossFileMetadata,
+        old_metadata: Option<crate::cross_file::CrossFileMetadata>,
+        new_metadata: crate::cross_file::CrossFileMetadata,
+        make_non_lending: bool,
+    ) -> PreparedOpenGraphProjection {
+        PreparedOpenGraphProjection {
+            uri,
+            graph_metadata: Arc::new(graph_metadata),
+            old_metadata: old_metadata.map(Arc::new),
+            new_metadata: Arc::new(new_metadata),
+            parent_content: HashMap::new(),
+            make_non_lending,
+        }
+    }
+
+    #[test]
+    fn open_edit_private_only_change_does_not_fan_out() {
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(parent.clone(), "source(\"child.R\")\n", Some(1));
+        state.open_document(
+            child.clone(),
+            "f <- function() {\n  private <- 1\n}\n",
+            Some(1),
+        );
+        state.cross_file_graph.update_file(
+            &parent,
+            &crate::cross_file::CrossFileMetadata {
+                sources: vec![crate::cross_file::ForwardSource {
+                    resolved_uri: Some(child.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            None,
+            |_| None,
+        );
+
+        let effects = commit_test_edit(
+            &mut state,
+            &child,
+            "f <- function() {\n  private <- 2\n}\n",
+            crate::cross_file::CrossFileMetadata::default(),
+            PreparedOpenCommitPlan::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            effects
+                .revalidations
+                .iter()
+                .map(|ticket| &ticket.uri)
+                .collect::<Vec<_>>(),
+            vec![&child]
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent),
+            0
+        );
+    }
+
+    #[test]
+    fn open_edit_interface_only_change_fans_out_to_parent() {
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(parent.clone(), "source(\"child.R\")\n", Some(1));
+        state.open_document(child.clone(), "exported <- 1\n", Some(1));
+        state.cross_file_graph.update_file(
+            &parent,
+            &crate::cross_file::CrossFileMetadata {
+                sources: vec![crate::cross_file::ForwardSource {
+                    resolved_uri: Some(child.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            None,
+            |_| None,
+        );
+
+        let effects = commit_test_edit(
+            &mut state,
+            &child,
+            "renamed_export <- 1\n",
+            crate::cross_file::CrossFileMetadata::default(),
+            PreparedOpenCommitPlan::default(),
+        )
+        .unwrap();
+        assert!(
+            effects
+                .revalidations
+                .iter()
+                .any(|ticket| ticket.uri == parent)
+        );
+    }
+
+    #[test]
+    fn open_edit_edge_only_removal_fans_out_to_removed_child_and_refreshes_pins() {
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(parent.clone(), "source(\"child.R\")\n", Some(1));
+        state.open_document(child.clone(), "value <- 1\n", Some(1));
+        state.cross_file_graph.update_file(
+            &parent,
+            &crate::cross_file::CrossFileMetadata {
+                sources: vec![crate::cross_file::ForwardSource {
+                    resolved_uri: Some(child.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            None,
+            |_| None,
+        );
+        let pin_count = state.open_pin_recompute_count;
+        let meta = crate::cross_file::CrossFileMetadata::default();
+        let effects = commit_test_edit(
+            &mut state,
+            &parent,
+            "# source removed\n",
+            meta.clone(),
+            PreparedOpenCommitPlan {
+                graph: vec![open_projection(
+                    parent.clone(),
+                    meta.clone(),
+                    None,
+                    meta,
+                    false,
+                )],
+                ..PreparedOpenCommitPlan::default()
+            },
+        )
+        .unwrap();
+        let uris: HashSet<_> = effects
+            .revalidations
+            .iter()
+            .map(|ticket| ticket.uri.clone())
+            .collect();
+        assert_eq!(uris, HashSet::from([parent, child.clone()]));
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&child),
+            1
+        );
+        assert_eq!(state.open_pin_recompute_count, pin_count + 1);
+    }
+
+    #[test]
+    fn open_edit_wd_only_change_fans_out_to_backward_directive_child() {
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let root = Url::parse("file:///workspace").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders.push(root.clone());
+        state.open_document(parent.clone(), "f <- function() 1\n", Some(1));
+        state.open_document(child.clone(), "f()\n", Some(1));
+        state.cross_file_graph.update_file(
+            &child,
+            &crate::cross_file::CrossFileMetadata {
+                sourced_by: vec![crate::cross_file::BackwardDirective {
+                    path: "parent.R".to_owned(),
+                    call_site: crate::cross_file::CallSiteSpec::Default,
+                    directive_line: 0,
+                }],
+                ..Default::default()
+            },
+            Some(&root),
+            |_| None,
+        );
+        let old_meta = crate::cross_file::CrossFileMetadata {
+            working_directory: Some("/old".to_owned()),
+            ..Default::default()
+        };
+        let new_meta = crate::cross_file::CrossFileMetadata {
+            working_directory: Some("/new".to_owned()),
+            ..Default::default()
+        };
+        let effects = commit_test_edit(
+            &mut state,
+            &parent,
+            "f <- function() 2\n",
+            new_meta.clone(),
+            PreparedOpenCommitPlan {
+                graph: vec![open_projection(
+                    parent.clone(),
+                    new_meta.clone(),
+                    Some(old_meta),
+                    new_meta,
+                    false,
+                )],
+                ..PreparedOpenCommitPlan::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            effects
+                .revalidations
+                .iter()
+                .any(|ticket| ticket.uri == child)
+        );
+    }
+
+    #[test]
+    fn open_edit_excluded_projection_is_non_lending() {
+        let excluded = Url::parse("file:///workspace/excluded.R").unwrap();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(excluded.clone(), "# excluded\n", Some(1));
+        state.open_document(child.clone(), "value <- 1\n", Some(1));
+        let meta = crate::cross_file::CrossFileMetadata {
+            sources: vec![crate::cross_file::ForwardSource {
+                resolved_uri: Some(child),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let pin_count = state.open_pin_recompute_count;
+        commit_test_edit(
+            &mut state,
+            &excluded,
+            "# excluded edit\n",
+            meta.clone(),
+            PreparedOpenCommitPlan {
+                graph: vec![open_projection(
+                    excluded.clone(),
+                    meta.clone(),
+                    None,
+                    meta,
+                    true,
+                )],
+                refresh_pins: true,
+                ..PreparedOpenCommitPlan::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&excluded)
+                .iter()
+                .all(|edge| edge.non_lending)
+        );
+        assert_eq!(state.open_pin_recompute_count, pin_count + 1);
+    }
+
+    #[test]
+    fn open_edit_package_only_visibility_change_fans_out() {
+        let root = std::path::PathBuf::from("/work/pkg");
+        let edited = Url::from_file_path(root.join("R/a.R")).unwrap();
+        let sibling = Url::from_file_path(root.join("R/b.R")).unwrap();
+        let old_text = "#' @importFrom stats median\nNULL\n";
+        let new_text = "#' @importFrom stats sd\nNULL\n";
+        let mut state = WorldState::new();
+        state.package_inputs.workspace_root = Some(root);
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        state.package_inputs.description = Some(crate::package_state::DescriptionInput {
+            text: Arc::from("Package: pkg\n"),
+        });
+        let initial = crate::package_state::derive_package_state(
+            &state.package_state,
+            &state.package_inputs,
+            &crate::package_state::PackageInputDelta::Initial,
+        );
+        state.package_state.set_from(initial);
+        let old_delta = crate::package_state::event::translate(
+            &mut state.package_inputs,
+            crate::package_state::event::HandlerEvent::DidChange {
+                uri: edited.clone(),
+                text: Arc::from(old_text),
+            },
+        )
+        .unwrap();
+        state.record_package_input_mutation();
+        state.apply_package_event(&old_delta);
+        state.open_document(edited.clone(), old_text, Some(1));
+        state.open_document(sibling.clone(), "helper <- 1\n", Some(1));
+
+        let effects = commit_test_edit(
+            &mut state,
+            &edited,
+            new_text,
+            crate::cross_file::CrossFileMetadata::default(),
+            PreparedOpenCommitPlan {
+                package_event: Some((edited.clone(), Arc::from(new_text))),
+                package_fanout_uris: vec![sibling.clone()],
+                ..PreparedOpenCommitPlan::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            effects
+                .revalidations
+                .iter()
+                .any(|ticket| ticket.uri == sibling)
+        );
+    }
+
+    #[test]
+    fn open_metadata_seed_union_caps_and_marks_once() {
+        let edited = Url::parse("file:///workspace/edited.R").unwrap();
+        let first = Url::parse("file:///workspace/first.R").unwrap();
+        let evicted = Url::parse("file:///workspace/evicted.R").unwrap();
+        let mut state = WorldState::new();
+        state.cross_file_config.max_revalidations_per_trigger = 2;
+        state.open_document(edited.clone(), "x <- 1\n", Some(1));
+        state.open_document(first.clone(), "first <- 1\n", Some(1));
+        state.open_document(evicted.clone(), "evicted <- 1\n", Some(1));
+        let generation = state.documents.get_record(&edited).unwrap().generation();
+        let captured = state
+            .capture_open_metadata_derivation(&edited, generation)
+            .unwrap();
+        let plan = PreparedOpenCommitPlan {
+            seed_revalidation_uris: vec![first.clone(), evicted.clone(), first.clone()],
+            subject_debounce_ms: Some(77),
+            ..PreparedOpenCommitPlan::default()
+        };
+        let prepared = state
+            .prepare_captured_open_metadata_analysis(
+                captured,
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                plan,
+                Vec::new(),
+            )
+            .unwrap();
+        let effects = state
+            .try_commit_analysis(PreparedAnalysisCommit::OpenMetadata(Box::new(prepared)))
+            .unwrap();
+
+        assert_eq!(effects.revalidations.len(), 2);
+        assert_eq!(effects.revalidations[0].uri, edited);
+        assert_eq!(effects.revalidations[0].debounce_ms, 77);
+        let selected = effects.revalidations[1].uri.clone();
+        let dropped = if selected == first { evicted } else { first };
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&selected),
+            1
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&dropped),
+            0
+        );
+    }
+
+    #[test]
+    fn open_edit_full_sync_then_utf16_ranges_preserve_rmd_raw_and_masked_views() {
+        let uri = Url::parse("file:///workspace/report.Rmd").unwrap();
+        let mut state = WorldState::new();
+        state.open_document_with_language_id(
+            uri.clone(),
+            "old prose\n```{r}\nold <- 0\n```\n",
+            Some(1),
+            Some("rmd"),
+        );
+        let changes = [
+            full_change("intro 🎉\n```{r}\nx <- 1\n```\n"),
+            TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 8,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 8,
+                    },
+                }),
+                range_length: None,
+                text: "!".to_owned(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 2,
+                        character: 1,
+                    },
+                }),
+                range_length: None,
+                text: "中".to_owned(),
+            },
+        ];
+        let edit = state.prepare_document_changes(&uri, changes, 2).unwrap();
+        let analysis_text = edit.document().analysis_text();
+        assert!(analysis_text.contains("中 <- 1"));
+        assert!(!analysis_text.contains("intro"));
+        state
+            .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+                PreparedOpenEditAnalysis::new(
+                    edit,
+                    Arc::new(crate::cross_file::extract_metadata(&analysis_text)),
+                    PreparedOpenCommitPlan::default(),
+                ),
+            )))
+            .unwrap();
+        let document = state.documents.get(&uri).unwrap();
+        assert_eq!(document.text(), "intro 🎉!\n```{r}\n中 <- 1\n```\n");
+        assert!(document.analysis_text().contains("中 <- 1"));
+        assert!(!document.analysis_text().contains("intro"));
+    }
+
+    #[test]
+    fn open_edit_rejects_metadata_cross_kind_change_without_side_effects() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        let cached = cache_snapshot(7, 11);
+        state
+            .cross_file_file_cache
+            .insert(uri.clone(), cached.clone(), "on disk".to_owned());
+
+        let edit = state
+            .prepare_document_changes(&uri, [full_change("stale <- 2\n")], 2)
+            .unwrap();
+        let generation = state.documents.get_record(&uri).unwrap().generation();
+        let mut refreshed = crate::cross_file::CrossFileMetadata::default();
+        refreshed.working_directory = Some("/new/context".to_owned());
+        state
+            .replace_open_document_metadata_if_current(&uri, generation, Arc::new(refreshed))
+            .unwrap();
+        let record_after_refresh = state.documents.get_record(&uri).unwrap().generation();
+        let graph_authority_after_refresh = state.workspace_graph_authority_generation;
+        let open_authority_after_refresh = state.open_context_authority_generation;
+
+        assert!(matches!(
+            state.commit_document_changes(
+                &uri,
+                edit,
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+            ),
+            Err(AnalysisCommitRejected::StaleBasis)
+        ));
+        assert_eq!(
+            state.documents.get_record(&uri).unwrap().generation(),
+            record_after_refresh
+        );
+        assert_eq!(
+            state.documents.get(&uri).unwrap().text(),
+            "before <- 1\n",
+            "stale edit must not overwrite the metadata-refreshed record"
+        );
+        assert_eq!(state.cross_file_file_cache.get_snapshot(&uri), Some(cached));
+        assert_eq!(
+            state.workspace_graph_authority_generation,
+            graph_authority_after_refresh
+        );
+        assert_eq!(
+            state.open_context_authority_generation,
+            open_authority_after_refresh
+        );
+    }
+
+    #[test]
+    fn open_metadata_rejects_edit_cross_kind_change_without_side_effects() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        let stale_basis = state.capture_open_analysis_basis(&uri).unwrap();
+        let stale_generation = state.documents.get_record(&uri).unwrap().generation();
+
+        let edit = state
+            .prepare_document_changes(&uri, [full_change("after <- 2\n")], 2)
+            .unwrap();
+        state
+            .commit_document_changes(
+                &uri,
+                edit,
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+            )
+            .unwrap();
+        let committed_generation = state.documents.get_record(&uri).unwrap().generation();
+        let graph_authority = state.workspace_graph_authority_generation;
+        let open_authority = state.open_context_authority_generation;
+
+        let mut stale_metadata = crate::cross_file::CrossFileMetadata::default();
+        stale_metadata.working_directory = Some("/stale".to_owned());
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::OpenMetadata(Box::new(
+                PreparedOpenMetadataAnalysis::new(
+                    stale_basis,
+                    uri.clone(),
+                    stale_generation,
+                    Arc::new(stale_metadata),
+                    PreparedOpenCommitPlan::default(),
+                ),
+            ))),
+            Err(AnalysisCommitRejected::StaleBasis)
+        );
+        let current = state.documents.get_record(&uri).unwrap();
+        assert_eq!(current.generation(), committed_generation);
+        assert_eq!(current.document().text(), "after <- 2\n");
+        assert_eq!(
+            current.metadata().working_directory,
+            None,
+            "stale metadata must not replace the edited record"
+        );
+        assert_eq!(state.workspace_graph_authority_generation, graph_authority);
+        assert_eq!(state.open_context_authority_generation, open_authority);
+    }
+
+    fn prepared_captured_metadata(
+        state: &WorldState,
+        captured: CapturedOpenMetadataAnalysis,
+    ) -> PreparedOpenMetadataAnalysis {
+        state
+            .prepare_captured_open_metadata_analysis(
+                captured,
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                PreparedOpenCommitPlan::default(),
+                Vec::new(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn open_metadata_rejects_changed_raw_and_closed_snapshot_authorities() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let raw_parent = Url::parse("file:///workspace/raw-parent.R").unwrap();
+        let closed_parent = Url::parse("file:///workspace/closed-parent.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        state.cross_file_file_cache.insert(
+            raw_parent.clone(),
+            cache_snapshot(1, 1),
+            "raw <- 1\n".to_owned(),
+        );
+        state.insert_workspace_document_for_test(
+            closed_parent.clone(),
+            Document::new_with_uri("closed <- 1\n", None, &closed_parent),
+        );
+        let generation = state.documents.get_record(&uri).unwrap().generation();
+
+        let captured_raw = state
+            .capture_open_metadata_derivation(&uri, generation)
+            .unwrap();
+        state.cross_file_file_cache.insert(
+            raw_parent,
+            cache_snapshot(2, 2),
+            "raw <- 2\n".to_owned(),
+        );
+        let prepared = prepared_captured_metadata(&state, captured_raw);
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::OpenMetadata(Box::new(prepared))),
+            Err(AnalysisCommitRejected::StaleBasis)
+        );
+
+        let generation = state.documents.get_record(&uri).unwrap().generation();
+        let captured_closed = state
+            .capture_open_metadata_derivation(&uri, generation)
+            .unwrap();
+        state.insert_workspace_document_for_test(
+            closed_parent.clone(),
+            Document::new_with_uri("closed <- 2\n", None, &closed_parent),
+        );
+        let prepared = prepared_captured_metadata(&state, captured_closed);
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::OpenMetadata(Box::new(prepared))),
+            Err(AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(state.documents.get(&uri).unwrap().text(), "before <- 1\n");
+    }
+
+    #[test]
+    fn open_metadata_rejects_changed_target_raw_authority() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        state.cross_file_file_cache.insert(
+            uri.clone(),
+            cache_snapshot(1, 1),
+            "disk <- 1\n".to_owned(),
+        );
+        let generation = state.documents.get_record(&uri).unwrap().generation();
+        let captured = state
+            .capture_open_metadata_derivation(&uri, generation)
+            .unwrap();
+        state.cross_file_file_cache.insert(
+            uri.clone(),
+            cache_snapshot(2, 2),
+            "disk <- 2\n".to_owned(),
+        );
+        let prepared = prepared_captured_metadata(&state, captured);
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::OpenMetadata(Box::new(prepared))),
+            Err(AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(state.documents.get(&uri).unwrap().text(), "before <- 1\n");
+    }
+
+    #[test]
+    fn open_metadata_rejects_changed_open_context_and_editor_eligibility() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        state.open_document(parent.clone(), "parent <- 1\n", Some(1));
+        let generation = state.documents.get_record(&uri).unwrap().generation();
+
+        let captured_open = state
+            .capture_open_metadata_derivation(&uri, generation)
+            .unwrap();
+        let parent_generation = state.documents.get_record(&parent).unwrap().generation();
+        state
+            .replace_open_document_metadata_if_current(
+                &parent,
+                parent_generation,
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+            )
+            .unwrap();
+        let prepared = prepared_captured_metadata(&state, captured_open);
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::OpenMetadata(Box::new(prepared))),
+            Err(AnalysisCommitRejected::StaleBasis)
+        );
+
+        let generation = state.documents.get_record(&uri).unwrap().generation();
+        let captured_eligibility = state
+            .capture_open_metadata_derivation(&uri, generation)
+            .unwrap();
+        state.replace_editor_diagnostic_uris(Some(HashSet::new()));
+        let prepared = prepared_captured_metadata(&state, captured_eligibility);
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::OpenMetadata(Box::new(prepared))),
+            Err(AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(state.documents.get(&uri).unwrap().text(), "before <- 1\n");
+    }
+
+    #[test]
+    fn open_edit_rejects_changed_raw_authority_and_preserves_new_cache_entry() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        state.cross_file_file_cache.insert(
+            uri.clone(),
+            cache_snapshot(3, 1),
+            "old disk".to_owned(),
+        );
+        let edit = state
+            .prepare_document_changes(&uri, [full_change("stale <- 2\n")], 2)
+            .unwrap();
+        let new_snapshot = cache_snapshot(4, 2);
+        state.cross_file_file_cache.insert(
+            uri.clone(),
+            new_snapshot.clone(),
+            "new disk".to_owned(),
+        );
+
+        assert!(matches!(
+            state.commit_document_changes(
+                &uri,
+                edit,
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+            ),
+            Err(AnalysisCommitRejected::StaleBasis)
+        ));
+        assert_eq!(
+            state.cross_file_file_cache.get_snapshot(&uri),
+            Some(new_snapshot)
+        );
+        assert_eq!(
+            state.cross_file_file_cache.get(&uri).as_deref(),
+            Some("new disk")
+        );
+        assert_eq!(state.documents.get(&uri).unwrap().text(), "before <- 1\n");
+    }
+
+    #[test]
+    fn open_edit_rejects_editor_eligibility_context_change() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        let edit = state
+            .prepare_document_changes(&uri, [full_change("stale <- 2\n")], 2)
+            .unwrap();
+        state.replace_editor_diagnostic_uris(Some(HashSet::new()));
+        let open_authority = state.open_context_authority_generation;
+
+        assert!(matches!(
+            state.commit_document_changes(
+                &uri,
+                edit,
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+            ),
+            Err(AnalysisCommitRejected::StaleBasis)
+        ));
+        assert_eq!(state.open_context_authority_generation, open_authority);
+        assert_eq!(state.documents.get(&uri).unwrap().text(), "before <- 1\n");
+    }
+
+    #[test]
+    fn open_edit_rejects_changed_raw_parent_context() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        let edit = state
+            .prepare_document_changes(&uri, [full_change("stale <- 2\n")], 2)
+            .unwrap();
+        let edit = state
+            .attach_open_edit_context_authorities(edit, vec![parent.clone()])
+            .ok()
+            .unwrap();
+        state.cross_file_file_cache.insert(
+            parent.clone(),
+            cache_snapshot(3, 9),
+            "new parent".to_owned(),
+        );
+
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+                PreparedOpenEditAnalysis::new(
+                    edit,
+                    Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                    PreparedOpenCommitPlan::default(),
+                ),
+            ))),
+            Err(AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(
+            state.cross_file_file_cache.get(&parent).as_deref(),
+            Some("new parent")
+        );
+        assert_eq!(state.documents.get(&uri).unwrap().text(), "before <- 1\n");
+    }
+
+    #[test]
+    fn open_edit_rejects_changed_closed_parent_context() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        state.insert_workspace_document_for_test(
+            parent.clone(),
+            Document::new_with_uri("parent <- 1\n", None, &parent),
+        );
+        let edit = state
+            .prepare_document_changes(&uri, [full_change("stale <- 2\n")], 2)
+            .unwrap();
+        let edit = state
+            .attach_open_edit_context_authorities(edit, vec![parent.clone()])
+            .ok()
+            .unwrap();
+        state.insert_workspace_document_for_test(
+            parent.clone(),
+            Document::new_with_uri("parent <- 2\n", None, &parent),
+        );
+
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+                PreparedOpenEditAnalysis::new(
+                    edit,
+                    Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                    PreparedOpenCommitPlan::default(),
+                ),
+            ))),
+            Err(AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(state.documents.get(&uri).unwrap().text(), "before <- 1\n");
+    }
+
+    #[test]
+    fn open_edit_rejects_changed_open_parent_context() {
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        state.open_document(parent.clone(), "parent <- 1\n", Some(1));
+        let edit = state
+            .prepare_document_changes(&uri, [full_change("stale <- 2\n")], 2)
+            .unwrap();
+        let generation = state.documents.get_record(&parent).unwrap().generation();
+        state
+            .replace_open_document_metadata_if_current(
+                &parent,
+                generation,
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+                PreparedOpenEditAnalysis::new(
+                    edit,
+                    Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                    PreparedOpenCommitPlan::default(),
+                ),
+            ))),
+            Err(AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(state.documents.get(&uri).unwrap().text(), "before <- 1\n");
+    }
 
     #[test]
     fn decode_source_plain_utf8() {

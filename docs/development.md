@@ -227,6 +227,19 @@ fixpoint as workspace scans. Thus a changed child never commits metadata
 derived from the pre-batch version of a parent changed or removed in the same
 watcher group. Authority rejection permits one fresh reread/rederive retry.
 
+Open-buffer edits and detached `didOpen` re-enrichment use the same
+`WorldState::try_commit_analysis` boundary. Their basis includes the exact
+open-record generation and provenance, editor/lifecycle eligibility,
+closed-index and raw-cache generations, and bounded alias/context identities.
+Parsing and inherited-context derivation may run off-lock, but document,
+metadata, graph, cache, pin, package, and fanout effects become visible only
+after one write-lock validation. If an edit's context set exceeds the internal
+hard ceiling, Raven keeps the exact prepared buffer and commits a fail-closed
+local projection; one context-only retry is allowed when unrelated authority
+changes, but a changed target token or a second invalidation discards the work.
+Every dependent ticket returned by the commit owns a force-republish marker and
+must be scheduled exactly once.
+
 The package-state-local static-source closure walker in `package_state/mod.rs`
 owns the traversal mechanics shared by `.Rprofile` and testthat preambles: LIFO
 order, visited/routing deduplication, rich forward path resolution, and the common

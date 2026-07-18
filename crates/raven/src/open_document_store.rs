@@ -44,6 +44,23 @@ pub struct OpenDocumentProvenance {
     pub lifecycle_epoch: Option<DiagnosticsEpoch>,
 }
 
+/// Exact non-mutating identity for one open-document slot.
+///
+/// `Absent` participates in install CAS; `Present` carries both the
+/// never-reused analysis generation and editor/lifecycle provenance so tests
+/// and commit bases cannot accidentally fall back to LSP version/revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenRecordToken {
+    uri: Url,
+    identity: Option<(AnalysisGeneration, OpenDocumentProvenance)>,
+}
+
+impl OpenRecordToken {
+    pub(crate) fn uri(&self) -> &Url {
+        &self.uri
+    }
+}
+
 /// One coherent immutable open-document analysis snapshot.
 pub struct OpenDocumentRecord {
     document: Document,
@@ -130,6 +147,29 @@ pub struct OpenDocumentStore {
 impl OpenDocumentStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn record_token(&self, uri: &Url) -> OpenRecordToken {
+        OpenRecordToken {
+            uri: uri.clone(),
+            identity: self
+                .records
+                .get(uri)
+                .map(|record| (record.generation(), record.provenance())),
+        }
+    }
+
+    pub(crate) fn record_token_is_current(&self, token: &OpenRecordToken) -> bool {
+        self.records
+            .get(token.uri())
+            .map(|record| (record.generation(), record.provenance()))
+            == token.identity
+    }
+
+    pub(crate) fn generation_is_current(&self, uri: &Url, expected: AnalysisGeneration) -> bool {
+        self.records
+            .get(uri)
+            .is_some_and(|record| record.generation() == expected)
     }
 
     fn mint_generation(&mut self) -> AnalysisGeneration {

@@ -8,6 +8,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use lru::LruCache;
@@ -75,6 +76,7 @@ pub struct CrossFileFileCache {
     inner: RwLock<LruCache<Url, CachedFile>>,
     /// Cached file existence by path (LRU-bounded)
     existence: RwLock<LruCache<PathBuf, bool>>,
+    content_generation: AtomicU64,
 }
 
 impl std::fmt::Debug for CrossFileFileCache {
@@ -103,6 +105,7 @@ impl CrossFileFileCache {
         Self {
             inner: RwLock::new(LruCache::new(content_cap)),
             existence: RwLock::new(LruCache::new(existence_cap)),
+            content_generation: AtomicU64::new(0),
         }
     }
 
@@ -150,10 +153,29 @@ impl CrossFileFileCache {
             .map(|c| c.snapshot.clone())
     }
 
+    pub(crate) fn content_generation(&self) -> u64 {
+        self.content_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn snapshot_entries(&self) -> Vec<(Url, FileSnapshot, String)> {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|(uri, cached)| {
+                        (uri.clone(), cached.snapshot.clone(), cached.content.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Insert content into cache. LRU eviction automatically bounds memory.
     pub fn insert(&self, uri: Url, snapshot: FileSnapshot, content: String) {
         if let Ok(mut guard) = self.inner.write() {
             guard.push(uri, CachedFile { snapshot, content });
+            self.content_generation.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -161,6 +183,7 @@ impl CrossFileFileCache {
     pub fn invalidate(&self, uri: &Url) {
         if let Ok(mut guard) = self.inner.write() {
             guard.pop(uri);
+            self.content_generation.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -168,6 +191,7 @@ impl CrossFileFileCache {
     pub fn invalidate_all(&self) {
         if let Ok(mut guard) = self.inner.write() {
             guard.clear();
+            self.content_generation.fetch_add(1, Ordering::AcqRel);
         }
         if let Ok(mut guard) = self.existence.write() {
             guard.clear();
