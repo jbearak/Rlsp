@@ -8839,73 +8839,74 @@ struct WatchedFinalizationBundle {
     reserved_tickets: Vec<crate::state::AnalysisRevalidationTicket>,
 }
 
-fn spawn_watched_deferred_routing_finalization(
+async fn run_watched_deferred_routing_finalization(
     state_arc: Arc<RwLock<WorldState>>,
     client: Client,
     traversal_truncation: Arc<TraversalTruncationState>,
     mut routing: crate::state::PackageRoutingCommitEffects,
     mut bundle: WatchedFinalizationBundle,
+    await_reserved_tickets: bool,
 ) {
-    tokio::spawn(async move {
-        let transfer = loop {
-            match run_system_file_convergence_transaction_for_routing_owner(
-                &state_arc,
-                routing.owner,
-            )
+    let transfer = loop {
+        match run_system_file_convergence_transaction_for_routing_owner(&state_arc, routing.owner)
             .await
-            {
-                SystemFileConvergenceOutcome::Committed(transfer)
-                | SystemFileConvergenceOutcome::Superseded(transfer) => break transfer,
-                SystemFileConvergenceOutcome::Deferred => {
-                    tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
-                    routing.owner = state_arc.read().await.system_file_routing_owner_identity();
-                }
+        {
+            SystemFileConvergenceOutcome::Committed(transfer)
+            | SystemFileConvergenceOutcome::Superseded(transfer) => break transfer,
+            SystemFileConvergenceOutcome::Deferred => {
+                tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+                routing.owner = state_arc.read().await.system_file_routing_owner_identity();
             }
-        };
-        bundle.transfer_handles.push(transfer.handle);
-        let tickets = {
-            let mut state = state_arc.write().await;
-            let reserved_current_uris: std::collections::HashSet<Url> = bundle
-                .reserved_tickets
-                .iter()
-                .filter(|ticket| !ticket.trigger.is_stale(&state, &ticket.uri))
-                .map(|ticket| ticket.uri.clone())
-                .collect();
-            bundle
-                .candidates
-                .retain(|candidate| !reserved_current_uris.contains(&candidate.uri));
-            let fallback: Vec<_> = state
-                .documents
-                .keys()
-                .filter(|uri| !reserved_current_uris.contains(*uri))
-                .cloned()
-                .collect();
-            finalize_analysis_handoff_candidates_excluding_or_fallback(
-                &mut state,
-                bundle.transfer_handles,
-                bundle.candidates,
-                fallback,
-                &reserved_current_uris,
-            )
-        };
-        for ticket in bundle.reserved_tickets {
-            tokio::spawn(run_debounced_diagnostics(
-                state_arc.clone(),
-                client.clone(),
-                ticket.uri,
-                ticket.debounce_ms,
-                ticket.trigger,
-                Some(traversal_truncation.clone()),
-            ));
         }
-        Backend::publish_diagnostics_for_tickets_bounded(
-            state_arc,
-            client,
-            tickets,
-            Some(traversal_truncation),
+    };
+    bundle.transfer_handles.push(transfer.handle);
+    let tickets = {
+        let mut state = state_arc.write().await;
+        let reserved_current_uris: std::collections::HashSet<Url> = bundle
+            .reserved_tickets
+            .iter()
+            .filter(|ticket| !ticket.trigger.is_stale(&state, &ticket.uri))
+            .map(|ticket| ticket.uri.clone())
+            .collect();
+        bundle
+            .candidates
+            .retain(|candidate| !reserved_current_uris.contains(&candidate.uri));
+        let fallback: Vec<_> = state
+            .documents
+            .keys()
+            .filter(|uri| !reserved_current_uris.contains(*uri))
+            .cloned()
+            .collect();
+        finalize_analysis_handoff_candidates_excluding_or_fallback(
+            &mut state,
+            bundle.transfer_handles,
+            bundle.candidates,
+            fallback,
+            &reserved_current_uris,
         )
-        .await;
-    });
+    };
+    for ticket in bundle.reserved_tickets {
+        let task = run_debounced_diagnostics(
+            state_arc.clone(),
+            client.clone(),
+            ticket.uri,
+            ticket.debounce_ms,
+            ticket.trigger,
+            Some(traversal_truncation.clone()),
+        );
+        if await_reserved_tickets {
+            task.await;
+        } else {
+            tokio::spawn(task);
+        }
+    }
+    Backend::publish_diagnostics_for_tickets_bounded(
+        state_arc,
+        client,
+        tickets,
+        Some(traversal_truncation),
+    )
+    .await;
 }
 
 /// Run one complete watched-files transaction: derive closed-file mutations
@@ -9362,7 +9363,7 @@ async fn run_watched_resync_batch(
     }
 
     if let Some(routing) = deferred_routing {
-        spawn_watched_deferred_routing_finalization(
+        let finalization = run_watched_deferred_routing_finalization(
             state_arc,
             client,
             traversal_truncation,
@@ -9372,7 +9373,13 @@ async fn run_watched_resync_batch(
                 candidates: package_transfer_candidates,
                 reserved_tickets,
             },
+            await_reserved_tickets,
         );
+        if await_reserved_tickets {
+            finalization.await;
+        } else {
+            tokio::spawn(finalization);
+        }
         return;
     }
 
@@ -32379,6 +32386,113 @@ mod project_config_initialize_tests {
                 .cross_file_file_cache
                 .get(&child_uri)
                 .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_delete_only_awaits_deferred_routing_finalization() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("inst")).unwrap();
+        let description_text = "Package: oldpkg\nVersion: 1.0.0\n";
+        let description = tmp.path().join("DESCRIPTION");
+        let helper = tmp.path().join("inst/helper.R");
+        let consumer_text =
+            "source(system.file(\"helper.R\", package = \"oldpkg\"))\nhelper_value\n";
+        fs::write(&description, description_text).unwrap();
+        fs::write(&helper, "helper_value <- 1\n").unwrap();
+        fs::write(tmp.path().join("consumer.R"), consumer_text).unwrap();
+        let (svc, consumer_uri) = open_in_workspace(&tmp, "consumer.R", "r", consumer_text).await;
+        let backend = svc.inner();
+        seed_package_description_input(backend, tmp.path(), description_text).await;
+        run_system_file_convergence_transfer(&backend.state, None)
+            .await
+            .expect("the initial package routing must converge");
+        let helper_uri = Url::from_file_path(&helper).unwrap();
+        assert!(has_dependency_edge(
+            &*backend.state.read().await,
+            &consumer_uri,
+            &helper_uri
+        ));
+        let attempt_baseline = {
+            let mut state = backend.state.write().await;
+            state.system_file_test_reject_remaining = 2;
+            state.system_file_test_commit_attempts
+        };
+
+        fs::remove_file(&description).unwrap();
+        let first_pause = backend
+            .state
+            .read()
+            .await
+            .system_file_pre_commit_test_pause
+            .arm(Url::parse("raven-test://system-file-pre-commit").unwrap());
+        let deletion = backend.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: Url::from_file_path(&description).unwrap(),
+                typ: FileChangeType::DELETED,
+            }],
+        });
+        tokio::pin!(deletion);
+        tokio::select! {
+            _ = first_pause.wait_arrived() => {}
+            _ = &mut deletion => panic!("delete-only handler skipped the first routing attempt"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("delete-only handler did not reach the first routing attempt")
+            }
+        }
+        first_pause.release();
+
+        let second_pause = backend
+            .state
+            .read()
+            .await
+            .system_file_pre_commit_test_pause
+            .arm(Url::parse("raven-test://system-file-pre-commit").unwrap());
+        tokio::select! {
+            _ = second_pause.wait_arrived() => {}
+            _ = &mut deletion => panic!("delete-only handler skipped the second routing attempt"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("delete-only handler did not reach the second routing attempt")
+            }
+        }
+        second_pause.release();
+
+        let deferred_pause = backend
+            .state
+            .read()
+            .await
+            .system_file_pre_commit_test_pause
+            .arm(Url::parse("raven-test://system-file-pre-commit").unwrap());
+        tokio::select! {
+            biased;
+            _ = &mut deletion => {
+                panic!("delete-only handler returned before deferred routing finalization")
+            }
+            _ = deferred_pause.wait_arrived() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("deferred routing owner did not reach finalization")
+            }
+        }
+        assert_eq!(
+            backend.state.read().await.system_file_test_commit_attempts,
+            attempt_baseline + 2,
+            "the retained owner starts only after both immediate attempts are exhausted"
+        );
+        deferred_pause.release();
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut deletion)
+            .await
+            .expect("delete-only handler must finish after deferred finalization is released");
+
+        let state = backend.state.read().await;
+        assert_eq!(state.system_file_test_commit_attempts, attempt_baseline + 3);
+        assert!(state.package_state.workspace().is_none());
+        assert!(!has_dependency_edge(&state, &consumer_uri, &helper_uri));
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&consumer_uri),
+            0,
+            "deferred delete-only diagnostics must publish before the handler returns"
         );
     }
 
