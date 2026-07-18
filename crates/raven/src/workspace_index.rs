@@ -138,9 +138,9 @@ pub struct WorkspaceIndex {
     metrics: RwLock<WorkspaceIndexMetrics>,
     /// URIs protected from LRU eviction.
     ///
-    /// Mirrors `DocumentStore::pinned_uris` so closed-but-reachable
-    /// neighbors of open documents are not silently dropped under cache
-    /// pressure, which would force `compute_artifacts_with_metadata`
+    /// Mirrors the open documents' graph neighborhood so closed-but-reachable
+    /// neighbors are not silently dropped under cache pressure, which would
+    /// force `compute_artifacts_with_metadata`
     /// recomputation on the fallback path. Lock order: when both `inner`
     /// and `pinned` need to be held simultaneously, acquire `inner` first.
     pinned: RwLock<HashSet<Url>>,
@@ -597,7 +597,7 @@ impl WorkspaceIndex {
         pending
             .iter()
             .filter(|(uri, scheduled_at)| {
-                // Skip open URIs - they are managed by DocumentStore
+                // Skip open URIs - they are managed by open-document authority
                 if open_uris.contains(*uri) {
                     return false;
                 }
@@ -611,7 +611,7 @@ impl WorkspaceIndex {
     /// Process pending updates (called periodically)
     ///
     /// Processes URIs that have been in the queue longer than debounce_ms.
-    /// Skips URIs that are currently open (they are managed by DocumentStore).
+    /// Skips URIs that are currently open (they are managed by open-document authority).
     ///
     /// **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
     ///
@@ -670,7 +670,7 @@ impl WorkspaceIndex {
 
     /// Remove a URI from the pending update queue
     ///
-    /// Used when a file is opened (becomes managed by DocumentStore)
+    /// Used when a file is opened (becomes managed by open-document authority)
     /// or when a file is deleted.
     ///
     /// # Arguments

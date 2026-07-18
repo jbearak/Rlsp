@@ -492,7 +492,7 @@ fn budget_scope_resolution_50_file_workspace_auto() {
 
 #[test]
 fn budget_single_file_completion() {
-    use raven::state::{Document, WorldState, scan_workspace};
+    use raven::state::{WorldState, scan_workspace};
     use tower_lsp::lsp_types::Position;
 
     // Create a small fixture workspace for realistic completion context
@@ -517,9 +517,7 @@ fn budget_single_file_completion() {
         let path = entry.path();
         let content = std::fs::read_to_string(&path).unwrap();
         let uri = Url::from_file_path(&path).unwrap();
-        state
-            .documents
-            .insert(uri.clone(), Document::new_with_uri(&content, None, &uri));
+        state.open_document(uri, &content, None);
     }
 
     // Run workspace scan and apply index (populates cross-file state)

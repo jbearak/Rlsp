@@ -16,7 +16,7 @@ use tree_sitter::Point;
 use tree_sitter::Query;
 use tree_sitter::QueryCursor;
 
-use crate::content_provider::ContentProvider;
+use crate::content_provider::{ContentProvider, OpenDocumentsView};
 use crate::cross_file::dependency::compute_inherited_working_directory;
 use crate::cross_file::{ScopedSymbol, scope};
 use crate::file_type::{FileType, file_type_from_uri};
@@ -454,10 +454,10 @@ impl DiagnosticsSnapshot {
     pub fn build_with_open_documents(
         state: &WorldState,
         uri: &Url,
-        open_documents: &HashMap<Url, crate::state::Document>,
+        open_documents: &impl OpenDocumentsView,
     ) -> Option<Self> {
         let build_start = std::time::Instant::now();
-        let doc = open_documents.get(uri)?;
+        let doc = open_documents.document(uri)?;
         let tree = doc.tree.as_ref()?.clone();
         // Analysis text (masked for Rmd/Quarto, raw otherwise). `tree` was
         // parsed from this exact text, so the two stay consistent and every
@@ -474,7 +474,7 @@ impl DiagnosticsSnapshot {
         // only this single entry, while neighbors stay Arc-wrapped.
         //
         // `get_enriched_metadata` is masked-correct for open Rmd/Quarto docs:
-        // the DocumentStore arm now stores metadata derived from the masked
+        // the open-document authority arm now stores metadata derived from the masked
         // analysis text at did_open/did_change time (#343 Task 5), and the
         // remaining tiers mask too. So a `# raven: cd` in prose is ignored while
         // chunk `source()`/`library()` calls are captured — no Rmd special case
@@ -564,8 +564,8 @@ impl DiagnosticsSnapshot {
             let close = &cycle.closing_edge;
             close.call_site_line.and_then(|cl| {
                 let content = open_documents
-                    .get(&close.from)
-                    .map(|d| d.text())
+                    .document(&close.from)
+                    .map(crate::state::Document::text)
                     .or_else(|| state.cross_file_file_cache.get(&close.from));
                 content.and_then(|t| t.lines().nth(cl as usize).map(|s| s.trim().to_string()))
             })
@@ -4655,15 +4655,15 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
     let max_results = state.symbol_config.workspace_max_results;
 
     // 1. Open documents (highest priority)
-    for uri in state.document_store.uris() {
+    for uri in state.documents.uris() {
         if symbols.len() >= max_results {
             break;
         }
         seen_uris.insert(uri.clone());
-        if let Some(doc) = state.document_store.get_without_touch(&uri) {
+        if let Some(record) = state.documents.get_record(&uri) {
             collect_workspace_symbols_from_artifacts(
                 &uri,
-                &doc.artifacts,
+                record.artifacts(),
                 &lower_query,
                 &mut symbols,
             );
@@ -4710,18 +4710,7 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
         }
     }
 
-    // 4. Legacy documents (AST fallback)
-    if symbols.len() < max_results {
-        collect_legacy_ast_symbols(
-            &state.documents,
-            &lower_query,
-            max_results,
-            &mut seen_uris,
-            &mut symbols,
-        );
-    }
-
-    // 5. Legacy workspace index (AST fallback)
+    // 4. Legacy workspace index (AST fallback)
     if symbols.len() < max_results {
         collect_legacy_ast_symbols(
             &state.workspace_index,
@@ -12972,7 +12961,7 @@ mod invalid_assignment_target_tests {
 
 /// Build a `DiagnosticsSnapshot` for an Rmd document inserted directly into
 /// `state.documents` (so `get_enriched_metadata` resolves the masked
-/// `documents` arm rather than the raw DocumentStore entry). The `.Rmd`/`.qmd`
+/// `documents` arm rather than the raw open-document authority entry). The `.Rmd`/`.qmd`
 /// URI makes the document classify as Rmd (masked analysis). `configure` runs
 /// before the document is inserted, so it can flip `lint_config`,
 /// `cross_file_config`, etc.
@@ -21831,7 +21820,7 @@ pub fn goto_definition_with_cancel(
                     scope_key,
                     root,
                     &content_provider,
-                    &state.document_store.uris(),
+                    &state.documents.uris(),
                     &state.workspace_index_new,
                     cancel,
                 );
@@ -21938,7 +21927,7 @@ pub fn goto_definition_with_cancel(
                 scope_key,
                 root,
                 &content_provider,
-                &state.document_store.uris(),
+                &state.documents.uris(),
                 &state.workspace_index_new,
                 cancel,
             );
@@ -21946,7 +21935,7 @@ pub fn goto_definition_with_cancel(
     }
 
     // Search all open documents using ContentProvider
-    for file_uri in state.document_store.uris() {
+    for file_uri in state.documents.uris() {
         if cancel.is_cancelled() {
             return None;
         }
@@ -21992,28 +21981,6 @@ pub fn goto_definition_with_cancel(
                 uri: symbol.source_uri.clone(),
                 range: scoped_symbol_range(symbol),
             }));
-        }
-    }
-
-    // Fallback: Search legacy open documents
-    for (file_uri, doc) in &state.documents {
-        if cancel.is_cancelled() {
-            return None;
-        }
-        if file_uri == uri {
-            continue;
-        }
-        if let Some(tree) = &doc.tree {
-            // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
-            let file_text = doc.analysis_text();
-            if let Some(def_range) =
-                find_definition_try_both(tree.root_node(), name, scope_key, &file_text)
-            {
-                return Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: file_uri.clone(),
-                    range: def_range,
-                }));
-            }
         }
     }
 
@@ -22130,7 +22097,7 @@ fn scoped_symbol_default_end(defined_column: u32, name: &str) -> u32 {
 /// which also carries function-local and `rm()`-removed bindings and would yield
 /// phantom targets.
 ///
-/// Determinism: the document store and workspace index iterate in an unspecified
+/// Determinism: the open-document store and workspace index iterate in an unspecified
 /// order, so candidates are collected and the one with the lexicographically smallest
 /// source-file URI string is returned. A package with two top-level defs of the same
 /// name is itself a load-time error in R; we deterministically return one of them
@@ -22142,7 +22109,7 @@ fn resolve_package_internal_goto(
     scope_key: &str,
     workspace_root: &std::path::Path,
     content_provider: &impl ContentProvider,
-    document_store_uris: &[Url],
+    open_document_uris: &[Url],
     workspace_index: &crate::workspace_index::WorkspaceIndex,
     cancel: &DiagCancelToken,
 ) -> Option<GotoDefinitionResponse> {
@@ -22190,9 +22157,9 @@ fn resolve_package_internal_goto(
         true
     };
 
-    // Open documents (DocumentStore) then closed files (workspace index): a single
+    // Open documents then closed files (workspace index): a single
     // sweep over both covers the open + closed cases the spec requires.
-    for file_uri in document_store_uris {
+    for file_uri in open_document_uris {
         if !consider(file_uri, &mut best) {
             return None;
         }
@@ -22239,8 +22206,8 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
 
         collect_stan_references(&occurrences, name, uri, &mut locations);
 
-        // Search all open documents using new DocumentStore.
-        for file_uri in state.document_store.uris() {
+        // Search all authoritative open documents.
+        for file_uri in state.documents.uris() {
             if &file_uri == uri {
                 continue;
             }
@@ -22262,7 +22229,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
         // Search workspace index using new WorkspaceIndex.
         for (file_uri, entry) in state.workspace_index_new.iter() {
             if &file_uri == uri
-                || state.document_store.contains(&file_uri)
+                || state.documents.contains_key(&file_uri)
                 || file_type_from_uri(&file_uri) != FileType::Stan
             {
                 continue;
@@ -22271,20 +22238,6 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
             let file_text = entry.contents.to_string();
             let file_occurrences = collect_stan_identifier_occurrences(&file_text);
             collect_stan_references(&file_occurrences, name, &file_uri, &mut locations);
-        }
-
-        // Fallback: Search legacy open documents.
-        for (file_uri, doc) in &state.documents {
-            if file_uri == uri
-                || state.document_store.contains(file_uri)
-                || doc.file_type != FileType::Stan
-            {
-                continue;
-            }
-
-            let file_text = doc.text();
-            let file_occurrences = collect_stan_identifier_occurrences(&file_text);
-            collect_stan_references(&file_occurrences, name, file_uri, &mut locations);
         }
 
         // Fallback: Search legacy workspace index.
@@ -22313,7 +22266,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
         collect_jags_references(&occurrences, name, uri, &mut locations);
 
         // Search all open JAGS documents.
-        for file_uri in state.document_store.uris() {
+        for file_uri in state.documents.uris() {
             if &file_uri == uri {
                 continue;
             }
@@ -22335,7 +22288,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
         // Search workspace index.
         for (file_uri, entry) in state.workspace_index_new.iter() {
             if &file_uri == uri
-                || state.document_store.contains(&file_uri)
+                || state.documents.contains_key(&file_uri)
                 || file_type_from_uri(&file_uri) != FileType::Jags
             {
                 continue;
@@ -22344,20 +22297,6 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
             let file_text = entry.contents.to_string();
             let file_occurrences = collect_jags_identifier_occurrences(&file_text);
             collect_jags_references(&file_occurrences, name, &file_uri, &mut locations);
-        }
-
-        // Fallback: Search legacy open documents.
-        for (file_uri, doc) in &state.documents {
-            if file_uri == uri
-                || state.document_store.contains(file_uri)
-                || doc.file_type != FileType::Jags
-            {
-                continue;
-            }
-
-            let file_text = doc.text();
-            let file_occurrences = collect_jags_identifier_occurrences(&file_text);
-            collect_jags_references(&file_occurrences, name, file_uri, &mut locations);
         }
 
         // Fallback: Search legacy workspace index.
@@ -22401,19 +22340,19 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     // Search current document
     find_references_in_tree(tree.root_node(), name, &text, uri, &mut locations);
 
-    // Search all open documents using new DocumentStore.
-    // Pair the DocumentStore tree with its analysis text (masked for Rmd/Quarto,
+    // Search all authoritative open documents.
+    // Pair each document tree with its analysis text (masked for Rmd/Quarto,
     // raw otherwise) — never `get_content` (which is RAW): the tree's byte
     // offsets index into the masked text, so slicing raw content mis-slices
     // (and can panic on a non-UTF-8 boundary) for Rmd/Quarto files (#343).
-    for file_uri in state.document_store.uris() {
+    for file_uri in state.documents.uris() {
         if &file_uri == uri {
             continue; // Already searched
         }
-        if let Some(doc_state) = state.document_store.get_without_touch(&file_uri)
-            && let Some(tree) = &doc_state.tree
+        if let Some(document) = state.documents.get(&file_uri)
+            && let Some(tree) = &document.tree
         {
-            let file_text = doc_state.analysis_text();
+            let file_text = document.analysis_text();
             find_references_in_tree(
                 tree.root_node(),
                 name,
@@ -22429,7 +22368,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     // while `contents` is RAW — pair the tree with the masked analysis view so
     // byte offsets align (#343).
     for (file_uri, entry) in state.workspace_index_new.iter() {
-        if &file_uri == uri || state.document_store.contains(&file_uri) {
+        if &file_uri == uri || state.documents.contains_key(&file_uri) {
             continue; // Already searched
         }
         if let Some(tree) = &entry.tree {
@@ -22442,22 +22381,6 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
                 &file_uri,
                 &mut locations,
             );
-        }
-    }
-
-    // Fallback: Search legacy open documents
-    for (file_uri, doc) in &state.documents {
-        if file_uri == uri {
-            continue; // Already searched
-        }
-        // Skip if already found in new stores
-        if state.document_store.contains(file_uri) {
-            continue;
-        }
-        if let Some(tree) = &doc.tree {
-            // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
-            let file_text = doc.analysis_text();
-            find_references_in_tree(tree.root_node(), name, &file_text, file_uri, &mut locations);
         }
     }
 
@@ -22724,7 +22647,7 @@ fn find_user_function_signature(
     }
 
     // 2. Search open documents (skip current_uri)
-    for (uri, doc) in &state.documents {
+    for (uri, doc) in state.documents.iter() {
         if uri == current_uri {
             continue;
         }
@@ -36749,7 +36672,7 @@ result <- data %>% filter(x > 0)
         );
     }
 
-    /// Open an untitled `.Rmd` buffer into the `DocumentStore` exactly as
+    /// Open an untitled `.Rmd` buffer into the authoritative store exactly as
     /// `did_open` does for an editor `languageId: "rmd"` — no file extension,
     /// classified by languageId. Before #343's untitled-buffer fix the store
     /// re-classified by path, parsed the buffer RAW, and leaked prose symbols.
@@ -36758,10 +36681,14 @@ result <- data %>% filter(x > 0)
         let meta = crate::cross_file::extract_metadata(&crate::cross_file::analysis_text_for_kind(
             chunk_kind, content,
         ));
-        state
-            .document_store
-            .open_with_metadata(uri.clone(), content, 1, chunk_kind, meta)
-            .await;
+        state.open_document_with_language_id_and_metadata(
+            uri.clone(),
+            content,
+            Some(1),
+            Some("rmd"),
+            Arc::new(meta),
+            None,
+        );
     }
 
     #[tokio::test]
@@ -67898,10 +67825,7 @@ mod issue_149_utf16_handlers {
         let mut state = create_state();
         let use_uri = add_doc(&mut state, "file:///use.R", "éclair\n");
         let def_uri = Url::parse("file:///def.R").unwrap();
-        state
-            .document_store
-            .open(def_uri.clone(), "éclair <- 1\n", 1)
-            .await;
+        state.open_document_with_language_id(def_uri.clone(), "éclair <- 1\n", Some(1), Some("r"));
 
         let result = goto_definition(&state, &use_uri, Position::new(0, 1));
 
@@ -68619,7 +68543,7 @@ mod issue_459_backtick_navigation_tests {
     /// unquoted `scope_key` (`my_func`) matches.
     ///
     /// The defining file is added via the legacy `add_doc` harness (writes only
-    /// `state.documents`, not the workspace index / `document_store`) and has NO
+    /// `state.documents`, not the workspace index / `open-document authority`) and has NO
     /// `source()` link to the using file. So the in-scope primary
     /// `scope.symbols` lookup misses, BOTH `exported_interface` arms miss (the
     /// def was never indexed), and resolution falls through to the legacy
@@ -68955,14 +68879,11 @@ mod load_all_internal_goto_tests {
         state
     }
 
-    /// Insert `content` as an OPEN document (DocumentStore) — open docs are
+    /// Insert `content` as an OPEN document — open docs are
     /// authoritative for artifacts.
     fn open_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
         let uri = Url::parse(uri_str).expect("invalid URI");
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            state.document_store.open(uri.clone(), content, 1).await;
-        });
+        state.open_document_with_language_id(uri.clone(), content, Some(1), Some("r"));
         uri
     }
 
@@ -69332,7 +69253,7 @@ mod load_all_internal_goto_tests {
         );
     }
 
-    /// The resolver works whether the defining R/ file is OPEN (DocumentStore) or
+    /// The resolver works whether the defining R/ file is OPEN (open-document authority) or
     /// CLOSED (workspace index) — both reachable via the ContentProvider.
     #[test]
     fn goto_load_all_internal_open_and_closed() {
@@ -69366,7 +69287,10 @@ mod load_all_internal_goto_tests {
                 "load_all()\nopen_fn()\n",
             );
             let l = scalar(goto(&state, &caller, Position::new(1, 1)));
-            assert_eq!(l.uri, def, "resolves via the DocumentStore (open file)");
+            assert_eq!(
+                l.uri, def,
+                "resolves via the open-document authority (open file)"
+            );
         }
     }
 }
@@ -69419,14 +69343,7 @@ mod load_all_owner_display_tests {
 
     async fn open_doc(state: &mut WorldState, uri_str: &str, content: &str) -> Url {
         let uri = Url::parse(uri_str).expect("invalid URI");
-        // `hover` reads the document text via `state.get_document` (the legacy
-        // `state.documents` map), while cross-file scope reads artifacts via the
-        // content provider (the document store). Populate both.
-        state.document_store.open(uri.clone(), content, 1).await;
-        state.documents.insert(
-            uri.clone(),
-            crate::state::Document::new_with_uri(content, None, &uri),
-        );
+        state.open_document_with_language_id(uri.clone(), content, Some(1), Some("r"));
         uri
     }
 

@@ -170,14 +170,17 @@ use tree_sitter::Parser;
 use tree_sitter::Tree;
 
 use crate::chunks::{ChunkKind, classify_chunk_document, classify_chunk_document_for};
-use crate::content_provider::DefaultContentProvider;
+use crate::content_provider::{DefaultContentProvider, OpenDocumentsView};
 use crate::cross_file::revalidation::{CrossFileDiagnosticsGate, DiagnosticsEpoch};
 use crate::cross_file::{
     CrossFileActivityState, CrossFileConfig, CrossFileFileCache, CrossFileRevalidationState,
     CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
 };
-use crate::document_store::DocumentStore;
 use crate::file_type::{FileType, file_type_from_language_id_or_uri, file_type_from_uri};
+use crate::open_document_store::{
+    AnalysisGeneration, OpenDocumentCommitError, OpenDocumentRecord, OpenDocumentStore,
+    PreparedOpenDocument,
+};
 use crate::package_library::PackageLibrary;
 use crate::parameter_resolver::SignatureCache;
 use crate::workspace_index::WorkspaceIndex;
@@ -285,7 +288,7 @@ impl Document {
         let contents = Rope::from_str(text);
         // Mask Rmd/Quarto bodies so the R parser only sees real R code; plain R
         // (and JAGS/Stan) keep their raw text. Routed through the shared
-        // `masked_analysis_text` chokepoint so this and the DocumentStore can
+        // `masked_analysis_text` chokepoint so this and the open-document authority can
         // never derive divergent analysis views.
         let masked_text = crate::cross_file::masked_analysis_text(chunk_kind, text);
         let analysis_text = masked_text.as_deref().unwrap_or(text);
@@ -307,33 +310,62 @@ impl Document {
         }
     }
 
+    /// Apply one LSP content change and rebuild the derived analysis view.
+    ///
+    /// Single-change callers keep the historical API. `didChange` handlers
+    /// should prefer [`Self::apply_changes`] so a notification containing
+    /// several sequential edits reparses only the final text.
     pub fn apply_change(&mut self, change: TextDocumentContentChangeEvent) {
-        // Always apply the edit to the RAW contents exactly as before — LSP
-        // incremental sync, chunk detection, and the outline all rely on the
-        // verbatim source.
-        if let Some(range) = change.range {
-            let start_line = range.start.line as usize;
-            let start_utf16_char = range.start.character as usize;
-            let end_line = range.end.line as usize;
-            let end_utf16_char = range.end.character as usize;
+        self.apply_changes(std::iter::once(change));
+    }
 
-            let start_line_text = self.contents.line(start_line).to_string();
-            let end_line_text = self.contents.line(end_line).to_string();
+    /// Apply a sequential LSP change batch, then rebuild derived data once.
+    ///
+    /// LSP ranges in one notification are interpreted in order, against the
+    /// text produced by the preceding change. The raw rope therefore still
+    /// mutates once per event, while masking, parsing, and package extraction
+    /// run exactly once for the notification's final text. `revision` advances
+    /// once per event to preserve the pre-consolidation freshness identity.
+    pub fn apply_changes(
+        &mut self,
+        changes: impl IntoIterator<Item = TextDocumentContentChangeEvent>,
+    ) {
+        let mut applied = 0_u64;
 
-            let start_char = utf16_offset_to_char_offset(&start_line_text, start_utf16_char);
-            let end_char = utf16_offset_to_char_offset(&end_line_text, end_utf16_char);
+        for change in changes {
+            // Always apply the edit to the RAW contents exactly as before — LSP
+            // incremental sync, chunk detection, and the outline all rely on the
+            // verbatim source.
+            if let Some(range) = change.range {
+                let start_line = range.start.line as usize;
+                let start_utf16_char = range.start.character as usize;
+                let end_line = range.end.line as usize;
+                let end_utf16_char = range.end.character as usize;
 
-            let start_idx = self.contents.line_to_char(start_line) + start_char;
-            let end_idx = self.contents.line_to_char(end_line) + end_char;
+                let start_line_text = self.contents.line(start_line).to_string();
+                let end_line_text = self.contents.line(end_line).to_string();
 
-            self.contents.remove(start_idx..end_idx);
-            self.contents.insert(start_idx, &change.text);
-        } else {
-            // Full document sync
-            self.contents = Rope::from_str(&change.text);
+                let start_char = utf16_offset_to_char_offset(&start_line_text, start_utf16_char);
+                let end_char = utf16_offset_to_char_offset(&end_line_text, end_utf16_char);
+
+                let start_idx = self.contents.line_to_char(start_line) + start_char;
+                let end_idx = self.contents.line_to_char(end_line) + end_char;
+
+                self.contents.remove(start_idx..end_idx);
+                self.contents.insert(start_idx, &change.text);
+            } else {
+                // Full document sync
+                self.contents = Rope::from_str(&change.text);
+            }
+
+            applied = applied.wrapping_add(1);
         }
 
-        self.revision += 1;
+        if applied == 0 {
+            return;
+        }
+
+        self.revision = self.revision.wrapping_add(applied);
 
         let raw_text = self.contents.to_string();
         // Re-derive the analysis text and parse the tree from it.
@@ -522,10 +554,20 @@ fn parse_r_text(text: &str) -> Option<Tree> {
     parser.parse(text, None)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread parse counter used to pin the single-parse batch-edit
+    /// contract without introducing synchronization into production builds.
+    static DOCUMENT_PARSE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Parse `text` (the analysis text — masked for Rmd, raw otherwise) into a
 /// tree-sitter tree appropriate for `file_type`. All current file types parse
 /// with the R grammar.
 fn parse_document_text(text: &str, file_type: FileType) -> Option<Tree> {
+    #[cfg(test)]
+    DOCUMENT_PARSE_COUNT.with(|count| count.set(count.get().wrapping_add(1)));
+
     match file_type {
         FileType::R | FileType::Jags | FileType::Stan => parse_r_text(text),
     }
@@ -652,8 +694,8 @@ fn extract_data_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
 /// resolved suffix below a trusted prefix so source edges match index keys, and
 /// does not make symlink or case aliases equivalent LSP identities.
 pub struct WorldState {
-    // Document management (new architecture)
-    pub document_store: DocumentStore,
+    /// Sole authority for editor-owned documents.
+    pub(crate) documents: OpenDocumentStore,
     pub workspace_index_new: WorkspaceIndex,
 
     // Legacy fields (kept for migration compatibility)
@@ -669,7 +711,6 @@ pub struct WorldState {
     /// aliases and symlink targets discovered at open time): a graph URI that
     /// aliases an open buffer is treated as open for revalidation, live content,
     /// and watched-file vetoes, but publish work still targets the client URI.
-    pub documents: HashMap<Url, Document>,
     pub open_document_aliases: OpenDocumentAliases,
     pub workspace_index: HashMap<Url, Document>,
 
@@ -1264,12 +1305,11 @@ impl WorldState {
         log::info!("    max_chain_depth: {:?}", config.max_chain_depth_severity);
 
         Self {
-            // New architecture components
-            document_store: DocumentStore::new(Default::default()),
+            // Analysis authority
+            documents: OpenDocumentStore::new(),
             workspace_index_new: WorkspaceIndex::new(Default::default()),
 
             // Legacy fields (kept for migration compatibility)
-            documents: HashMap::new(),
             open_document_aliases: OpenDocumentAliases::default(),
             workspace_index: HashMap::new(),
 
@@ -1368,6 +1408,25 @@ impl WorldState {
             .then(|| self.diagnostics_gate.begin_epoch(uri))
     }
 
+    /// Begin a lifecycle for an already-open document and project the epoch
+    /// into its immutable analysis provenance.
+    pub(crate) fn begin_open_document_diagnostic_lifecycle(
+        &mut self,
+        uri: &Url,
+    ) -> Option<DiagnosticsEpoch> {
+        let epoch = self.begin_diagnostic_lifecycle(uri)?;
+        if let Some(generation) = self
+            .documents
+            .get_record(uri)
+            .map(|record| record.generation())
+        {
+            self.documents
+                .replace_lifecycle_epoch_if_current(uri, generation, Some(epoch))
+                .expect("open lifecycle replacement remains current under the state write lock");
+        }
+        Some(epoch)
+    }
+
     /// Retire `uri`'s diagnostics lifecycle: cancel pending debounced work
     /// and clear all gate state including the lifecycle epoch. Call on every
     /// "URI stops being diagnostic-eligible" transition: `did_close` and tab
@@ -1377,6 +1436,23 @@ impl WorldState {
     pub(crate) fn retire_diagnostic_lifecycle(&self, uri: &Url) {
         self.cross_file_revalidation.cancel(uri);
         self.diagnostics_gate.clear(uri);
+    }
+
+    /// Retire diagnostics for a document that remains open.
+    ///
+    /// Tab removal clears the publish gate and also replaces the immutable
+    /// record so its provenance cannot advertise the retired epoch.
+    pub(crate) fn retire_open_document_diagnostic_lifecycle(&mut self, uri: &Url) {
+        self.retire_diagnostic_lifecycle(uri);
+        if let Some(generation) = self
+            .documents
+            .get_record(uri)
+            .map(|record| record.generation())
+        {
+            self.documents
+                .replace_lifecycle_epoch_if_current(uri, generation, None)
+                .expect("open lifecycle retirement remains current under the state write lock");
+        }
     }
 
     /// Retire every diagnostics lifecycle and cancel all pending debounced
@@ -1629,7 +1705,14 @@ impl WorldState {
     ///
     /// **Validates: Requirements 4.1, 13.1, 13.2**
     pub fn content_provider(&self) -> DefaultContentProvider<'_> {
-        self.content_provider_with_documents(&self.documents)
+        DefaultContentProvider::with_legacy(
+            &self.documents,
+            &self.workspace_index_new,
+            &self.cross_file_file_cache,
+            &self.workspace_index,
+            &self.cross_file_workspace_index,
+            &self.open_document_aliases,
+        )
     }
 
     /// Like [`Self::content_provider`] but with an explicit open-documents map
@@ -1642,13 +1725,12 @@ impl WorldState {
     /// field is shared by reference (immutable after the workspace scan).
     pub fn content_provider_with_documents<'a>(
         &'a self,
-        documents: &'a HashMap<Url, Document>,
+        documents: &'a impl OpenDocumentsView,
     ) -> DefaultContentProvider<'a> {
         DefaultContentProvider::with_legacy(
-            &self.document_store,
+            documents,
             &self.workspace_index_new,
             &self.cross_file_file_cache,
-            documents,
             &self.workspace_index,
             &self.cross_file_workspace_index,
             &self.open_document_aliases,
@@ -1742,19 +1824,19 @@ impl WorldState {
     ///
     /// The pinned set is the transitive dependency neighborhood of every open
     /// document — closed-but-reachable files included. Pinned entries are
-    /// protected from LRU eviction in `DocumentStore`, `WorkspaceIndex`, and
+    /// protected from LRU eviction in `WorkspaceIndex` and
     /// `CrossFileWorkspaceIndex`, so closed-but-reachable documents survive
     /// across edits to other files and avoid the `compute_artifacts_with_metadata`
-    /// recomputation fallback. `DocumentStore` only physically holds open
-    /// documents; closed neighbors live in the two workspace indexes, so all
-    /// three caches must share the same pin set to fully cover the contract.
+    /// recomputation fallback. Open documents live in the non-evictable
+    /// open-document authority; closed neighbors live in the two workspace
+    /// indexes, so both closed caches share the same pin set.
     ///
     /// Call after the open set changes (`did_open` / `did_close`) or after a
     /// dependency-graph edge change touches an open file.
     pub fn recompute_open_neighborhood_pins(&mut self) {
-        let mut open_uris: Vec<Url> = self.document_store.uris();
+        let mut open_uris: Vec<Url> = self.documents.uris();
         let mut seen_open_roots: HashSet<Url> = open_uris.iter().cloned().collect();
-        for open_uri in self.document_store.uris() {
+        for open_uri in self.documents.uris() {
             for canonical_uri in self.canonical_uris_for_open_document(&open_uri) {
                 if seen_open_roots.insert(canonical_uri.clone()) {
                     open_uris.push(canonical_uri);
@@ -1762,7 +1844,6 @@ impl WorldState {
             }
         }
         if open_uris.is_empty() {
-            self.document_store.set_pinned_uris(HashSet::new());
             self.workspace_index_new.set_pinned_uris(HashSet::new());
             self.cross_file_workspace_index
                 .set_pinned_uris(HashSet::new());
@@ -1786,14 +1867,13 @@ impl WorldState {
             effective_max_visited,
         );
 
-        // Mirror the same neighborhood across all three caches. Cloning is
-        // cheap relative to the neighborhood traversal and avoids needing
-        // `Arc<HashSet<Url>>` plumbing through the existing setter signature.
+        // Mirror the same neighborhood across both closed-file caches. Cloning
+        // is cheap relative to the traversal and avoids `Arc<HashSet<Url>>`
+        // plumbing through the existing setter signature.
         self.workspace_index_new
             .set_pinned_uris(neighborhood.clone());
         self.cross_file_workspace_index
             .set_pinned_uris(neighborhood.clone());
-        self.document_store.set_pinned_uris(neighborhood);
     }
 
     /// Resize all LRU caches based on configuration.
@@ -1809,7 +1889,7 @@ impl WorldState {
             .resize(config.cache_workspace_index_max_entries);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_document(&mut self, uri: Url, text: &str, version: Option<i32>) {
         let aliases = self.register_open_document_aliases(&uri);
         self.cross_file_file_cache.invalidate(&uri);
@@ -1818,6 +1898,41 @@ impl WorldState {
         }
         self.documents
             .insert(uri.clone(), Document::new_with_uri(text, version, &uri));
+    }
+
+    /// Open one editor-owned document with its already-enriched metadata.
+    ///
+    /// The mature [`Document`] constructor is the sole masking/parser/package
+    /// derivation path; [`OpenDocumentStore`] derives metadata-dependent scope
+    /// artifacts from that exact tree and analysis text.
+    pub(crate) fn open_document_with_language_id_and_metadata(
+        &mut self,
+        uri: Url,
+        text: &str,
+        version: Option<i32>,
+        language_id: Option<&str>,
+        metadata: Arc<crate::cross_file::CrossFileMetadata>,
+        lifecycle_epoch: Option<DiagnosticsEpoch>,
+    ) -> Arc<OpenDocumentRecord> {
+        let document = Document::new_with_language_id(text, version, &uri, language_id);
+        self.install_open_document(uri, document, metadata, lifecycle_epoch)
+    }
+
+    fn install_open_document(
+        &mut self,
+        uri: Url,
+        document: Document,
+        metadata: Arc<crate::cross_file::CrossFileMetadata>,
+        lifecycle_epoch: Option<DiagnosticsEpoch>,
+    ) -> Arc<OpenDocumentRecord> {
+        let aliases = self.register_open_document_aliases(&uri);
+        self.cross_file_file_cache.invalidate(&uri);
+        self.record_editor_chunk_kind_override(&uri, document.chunk_kind);
+        for alias in aliases {
+            self.cross_file_file_cache.invalidate(&alias);
+        }
+        self.documents
+            .open(uri, document, metadata, lifecycle_epoch)
     }
 
     pub fn open_document_with_language_id(
@@ -1833,19 +1948,16 @@ impl WorldState {
         // mtimes while the buffer is open, when watcher events (and their
         // cache invalidation) are skipped because open docs are
         // authoritative. No reader consults this cache for open documents.
-        let aliases = self.register_open_document_aliases(&uri);
-        self.cross_file_file_cache.invalidate(&uri);
         let document = Document::new_with_language_id(text, version, &uri, language_id);
-        self.record_editor_chunk_kind_override(&uri, document.chunk_kind);
-        for alias in aliases {
-            self.cross_file_file_cache.invalidate(&alias);
-        }
-        self.documents.insert(uri.clone(), document);
+        let analysis_text = document.analysis_text();
+        let metadata = Arc::new(crate::cross_file::extract_metadata(&analysis_text));
+        let lifecycle_epoch = self.diagnostics_gate.current_epoch(&uri);
+        self.install_open_document(uri, document, metadata, lifecycle_epoch);
     }
 
     pub fn close_document(&mut self, uri: &Url) -> Vec<Url> {
         let aliases = self.open_document_aliases.close(uri);
-        self.documents.remove(uri);
+        self.documents.close(uri);
         if let Ok(mut cache) = self.effective_lint_config_cache.lock() {
             cache.remove(uri.as_str());
         }
@@ -1921,15 +2033,45 @@ impl WorldState {
         crate::cross_file::extract_metadata_for_kind(self.chunk_kind_for_closed_file(uri), content)
     }
 
-    pub fn apply_change(&mut self, uri: &Url, change: TextDocumentContentChangeEvent) {
+    /// Prepare one ordered LSP notification batch against the current record.
+    ///
+    /// Cache invalidation happens once for the URI and every registered open
+    /// alias. The returned batch is not visible until
+    /// [`Self::commit_document_changes`] succeeds for its captured generation.
+    pub(crate) fn prepare_document_changes(
+        &mut self,
+        uri: &Url,
+        changes: impl IntoIterator<Item = TextDocumentContentChangeEvent>,
+        version: i32,
+    ) -> Option<PreparedOpenDocument> {
         let aliases = self.canonical_uris_for_open_document(uri);
         self.cross_file_file_cache.invalidate(uri);
         for alias in aliases {
             self.cross_file_file_cache.invalidate(&alias);
         }
-        if let Some(doc) = self.documents.get_mut(uri) {
-            doc.apply_change(change);
-        }
+        self.documents.prepare_changes(uri, changes, version)
+    }
+
+    /// Install a prepared document plus its enriched metadata if still current.
+    pub(crate) fn commit_document_changes(
+        &mut self,
+        uri: &Url,
+        prepared: PreparedOpenDocument,
+        metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    ) -> Result<Arc<OpenDocumentRecord>, OpenDocumentCommitError> {
+        self.documents
+            .commit_prepared_if_current(uri, prepared, metadata)
+    }
+
+    /// Guarded replacement for metadata/artifacts derived off the current text.
+    pub(crate) fn replace_open_document_metadata_if_current(
+        &mut self,
+        uri: &Url,
+        generation: AnalysisGeneration,
+        metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    ) -> Result<Arc<OpenDocumentRecord>, OpenDocumentCommitError> {
+        self.documents
+            .replace_metadata_if_current(uri, generation, metadata)
     }
 
     pub fn get_document(&self, uri: &Url) -> Option<&Document> {
@@ -1973,18 +2115,18 @@ impl WorldState {
     /// Get enriched metadata for a URI, preferring already-enriched sources.
     ///
     /// Priority order:
-    /// 1. DocumentStore (open documents with enriched metadata)
+    /// 1. open-document authority (open documents with enriched metadata)
     /// 2. WorkspaceIndex (new unified index)
     /// 3. Legacy cross_file_workspace_index
     /// 4. Legacy documents HashMap (re-extract metadata)
     /// 5. File cache (re-extract metadata)
     ///
     /// Rmd/Quarto note (issue #343): every tier here is masked-correct for
-    /// open R Markdown / Quarto documents. The DocumentStore arm (tier 1)
+    /// open R Markdown / Quarto documents. The open-document authority arm (tier 1)
     /// stores metadata extracted from the masked analysis text at
     /// `did_open`/`did_change` time (`backend.rs` passes
-    /// `extract_metadata_for_path`, and `DocumentStore::compute_derived`
-    /// re-derives artifacts from the masked text); the legacy-documents arm
+    /// `extract_metadata_for_path`, and the open-document authority re-derives
+    /// artifacts from the masked text); the legacy-documents arm
     /// (tier 4) and the file-cache arm (tier 5) likewise mask via
     /// `analysis_text()` / `extract_metadata_for_uri`. The state-aware file
     /// cache fallback consults persisted editor-language chunk classification
@@ -1997,9 +2139,9 @@ impl WorldState {
     ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
         self.open_document_uri_for_authoritative_uri(uri)
             .and_then(|open_uri| {
-                self.document_store
-                    .get_without_touch(&open_uri)
-                    .map(|doc| doc.metadata.clone())
+                self.documents
+                    .get_record(&open_uri)
+                    .map(|record| record.metadata().clone())
                     .or_else(|| {
                         self.documents.get(&open_uri).map(|doc| {
                             Arc::new(crate::cross_file::extract_metadata(&doc.analysis_text()))
@@ -2108,7 +2250,7 @@ impl WorldState {
             "[Background] Dependency graph built from workspace entries, workspace_scan_complete = true"
         );
 
-        // Now that the graph reflects the workspace, refresh the document_store
+        // Now that the graph reflects the workspace, refresh the closed-index
         // pin set so any file opened before the scan completes picks up its
         // neighborhood.
         self.recompute_open_neighborhood_pins();
@@ -2126,7 +2268,13 @@ impl WorldState {
         cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
         new_index_entries: Vec<(Url, crate::workspace_index::IndexEntry)>,
         graph: DependencyGraph,
-        open_metadata: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+        open_metadata: HashMap<
+            Url,
+            (
+                AnalysisGeneration,
+                Arc<crate::cross_file::CrossFileMetadata>,
+            ),
+        >,
         prepared_pins: HashSet<Url>,
     ) {
         let old_scan_uris: Vec<Url> = self.workspace_index.keys().cloned().collect();
@@ -2136,7 +2284,6 @@ impl WorldState {
         self.workspace_index = index;
         self.cross_file_workspace_index
             .set_pinned_uris(prepared_pins.clone());
-        self.document_store.set_pinned_uris(prepared_pins.clone());
         for (uri, entry) in cross_file_entries {
             self.cross_file_workspace_index.insert(uri, entry);
         }
@@ -2150,8 +2297,9 @@ impl WorldState {
         }
 
         self.cross_file_graph = graph;
-        for (uri, metadata) in open_metadata {
-            self.document_store.replace_metadata(&uri, metadata);
+        for (uri, (generation, metadata)) in open_metadata {
+            self.replace_open_document_metadata_if_current(&uri, generation, metadata)
+                .expect("workspace replay basis was validated immediately before apply");
         }
         self.workspace_scan_complete = true;
         self.recompute_open_neighborhood_pins();
@@ -2299,13 +2447,13 @@ impl WorldState {
         // Open buffers with a selected system.file source (authoritative
         // metadata lives in the document store, not the index).
         let open_affected: Vec<Url> = self
-            .document_store
+            .documents
             .uris()
             .into_iter()
             .filter(|uri| {
-                self.document_store
-                    .get_without_touch(uri)
-                    .is_some_and(|doc| doc.metadata.sources.iter().any(source_selected))
+                self.documents
+                    .get_record(uri)
+                    .is_some_and(|record| record.metadata().sources.iter().any(source_selected))
             })
             .collect();
 
@@ -2375,10 +2523,10 @@ impl WorldState {
         // index-derived edges until the user edits the buffer.
         let index_rebuilt: std::collections::HashSet<Url> = changed_uris.iter().cloned().collect();
         for uri in open_affected {
-            let Some(doc_meta) = self
-                .document_store
-                .get_without_touch(&uri)
-                .map(|doc| doc.metadata.clone())
+            let Some((doc_generation, doc_meta)) = self
+                .documents
+                .get_record(&uri)
+                .map(|record| (record.generation(), record.metadata().clone()))
             else {
                 continue;
             };
@@ -2400,7 +2548,12 @@ impl WorldState {
                 let mut new_meta = (*doc_meta).clone();
                 new_meta.sources = new_sources;
                 let new_meta = Arc::new(new_meta);
-                self.document_store.replace_metadata(&uri, new_meta.clone());
+                self.replace_open_document_metadata_if_current(
+                    &uri,
+                    doc_generation,
+                    new_meta.clone(),
+                )
+                .expect("source convergence basis remains current under the state write lock");
                 new_meta
             } else if index_rebuilt.contains(&uri) {
                 // Unchanged buffer, but the index pass overwrote this file's
@@ -2478,9 +2631,7 @@ impl WorldState {
             if !self.workspace_index_new.contains(&uri) {
                 continue;
             }
-            if self.document_store.get_without_touch(&uri).is_some()
-                || self.is_document_open_or_alias(&uri)
-            {
+            if self.documents.contains_key(&uri) || self.is_document_open_or_alias(&uri) {
                 continue;
             }
             if let Ok(path) = uri.to_file_path()
@@ -2496,15 +2647,14 @@ impl WorldState {
                     .any(|s| s.resolved_uri.as_ref() == Some(&uri))
             });
             let referenced_from_open_doc = || {
-                self.document_store.uris().into_iter().any(|doc_uri| {
-                    self.document_store
-                        .get_without_touch(&doc_uri)
-                        .is_some_and(|doc| {
-                            doc.metadata
-                                .sources
-                                .iter()
-                                .any(|s| s.resolved_uri.as_ref() == Some(&uri))
-                        })
+                self.documents.uris().into_iter().any(|doc_uri| {
+                    self.documents.get_record(&doc_uri).is_some_and(|record| {
+                        record
+                            .metadata()
+                            .sources
+                            .iter()
+                            .any(|s| s.resolved_uri.as_ref() == Some(&uri))
+                    })
                 })
             };
             if referenced_from_index || referenced_from_open_doc() {
@@ -2564,9 +2714,9 @@ impl WorldState {
                 }
             }
         }
-        for doc_uri in self.document_store.uris() {
-            if let Some(doc) = self.document_store.get_without_touch(&doc_uri) {
-                for source in &doc.metadata.sources {
+        for doc_uri in self.documents.uris() {
+            if let Some(record) = self.documents.get_record(&doc_uri) {
+                for source in &record.metadata().sources {
                     if let Some(ref uri) = source.resolved_uri
                         && !self.workspace_index_new.contains(uri)
                     {
@@ -2631,7 +2781,7 @@ pub(crate) struct WorkspaceGraphOverlay {
     pub(crate) uri: Url,
     pub(crate) content: Rope,
     pub(crate) chunk_kind: ChunkKind,
-    /// Normally supplied by `DocumentStore`; tests and compatibility callers
+    /// Normally supplied by `open-document authority`; tests and compatibility callers
     /// may omit it, in which case derivation reparses the Rope off-lock.
     pub(crate) metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
     pub(crate) graph_roots: Vec<Url>,
@@ -3867,6 +4017,54 @@ mod tests {
     }
 
     #[test]
+    fn document_change_batch_applies_sequential_utf16_edits_and_parses_once() {
+        let mut doc = Document::new("a🎉b\nlibrary(old)", Some(1));
+        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
+
+        doc.apply_changes([
+            TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 3,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 3,
+                    },
+                }),
+                range_length: None,
+                text: "x".to_string(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: 1,
+                        character: 8,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 11,
+                    },
+                }),
+                range_length: None,
+                text: "new".to_string(),
+            },
+        ]);
+
+        assert_eq!(doc.text(), "a🎉xb\nlibrary(new)");
+        assert_eq!(doc.loaded_packages, vec!["new"]);
+        assert_eq!(doc.revision, 2, "revision remains per content event");
+        DOCUMENT_PARSE_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "one didChange batch must rebuild the analysis tree once"
+            );
+        });
+    }
+
+    #[test]
     fn test_document_apply_change_utf16_cjk() {
         // CJK characters are 3 bytes in UTF-8, 1 UTF-16 code unit each
         let mut doc = Document::new("a中b", None);
@@ -4497,16 +4695,6 @@ mod tests {
             .workspace_folders
             .push(Url::from_file_path(tmp.path()).unwrap());
         state.open_document_with_language_id(link_uri.clone(), content, Some(1), Some("r"));
-        state
-            .document_store
-            .open_with_metadata(
-                link_uri.clone(),
-                content,
-                1,
-                crate::chunks::ChunkKind::R,
-                crate::cross_file::extract_metadata(content),
-            )
-            .await;
 
         assert_eq!(
             state.open_document_uri_for_authoritative_uri(&canonical_uri),

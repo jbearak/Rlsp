@@ -1834,11 +1834,11 @@ fn remirror_authoritative_alias_roots_after_close(
         let Some(open_uri) = state.open_document_uri_for_authoritative_uri(root) else {
             continue;
         };
-        let Some(open_doc) = state.document_store.get_without_touch(&open_uri) else {
+        let Some(open_doc) = state.documents.get_record(&open_uri) else {
             continue;
         };
-        let meta = open_doc.metadata.clone();
-        let new_interface_hash = open_doc.artifacts.interface_hash;
+        let meta = open_doc.metadata().clone();
+        let new_interface_hash = open_doc.artifacts().interface_hash;
         let root_meta = metadata_for_graph_root(
             state,
             root,
@@ -1966,7 +1966,7 @@ fn extend_with_watched_pre_update_dependents(
 ///
 /// `open_docs` is `(uri, calls_dev_load_all, path)` per open document; the
 /// caller reads `calls_dev_load_all` via the artifact cache peek
-/// (`document_store.get_without_touch`). `max_depth` / `max_visited` must match
+/// (`OpenDocumentStore::get_record`). `max_depth` / `max_visited` must match
 /// the budgets the surrounding handler uses for its other graph walks
 /// (`max_chain_depth` / `max_transitive_dependents_visited`).
 // Deliberate: this mirrors the inputs `DependencyGraph::revalidation_consistent_set`
@@ -2019,7 +2019,7 @@ fn extend_affected_for_load_all_revalidation(
 
 /// Lock-held adapter over [`extend_affected_for_load_all_revalidation`]:
 /// gathers the open-doc carrier flags (via the artifact cache peek
-/// `document_store.get_without_touch`, NOT scope resolution), the workspace
+/// `OpenDocumentStore::get_record`, NOT scope resolution), the workspace
 /// `.Rprofile`'s sentinel-attachment bool, and the source graph from `state`,
 /// then widens `affected` / `affected_set`. Lock-safe — touches only cache
 /// peeks, graph reachability, and per-doc booleans. Called from the
@@ -2044,9 +2044,9 @@ fn extend_affected_for_load_all_revalidation_from_state(
     if !rprofile_attaches_sentinel
         && !state.documents.keys().any(|u| {
             state
-                .document_store
-                .get_without_touch(u)
-                .is_some_and(|doc| doc.artifacts.calls_dev_load_all)
+                .documents
+                .get_record(u)
+                .is_some_and(|record| record.artifacts().calls_dev_load_all)
         })
     {
         return;
@@ -2059,9 +2059,9 @@ fn extend_affected_for_load_all_revalidation_from_state(
         .filter_map(|u| {
             let path = package_scope_workspace_r_path_for_open_document(state, u, pkg_root)?;
             let calls_load_all = state
-                .document_store
-                .get_without_touch(u)
-                .is_some_and(|doc| doc.artifacts.calls_dev_load_all);
+                .documents
+                .get_record(u)
+                .is_some_and(|record| record.artifacts().calls_dev_load_all);
             Some((u.clone(), calls_load_all, path))
         })
         .collect();
@@ -2844,13 +2844,12 @@ mod load_all_revalidation_tests {
         let alias_uri = Url::from_file_path(link.join("analysis.R")).unwrap();
         let canonical_uri = Url::from_file_path(root.join("analysis.R")).unwrap();
         let mut state = WorldState::new();
-        state
-            .documents
-            .insert(alias_uri.clone(), crate::state::Document::new("", Some(1)));
-        state
-            .document_store
-            .open(alias_uri.clone(), "devtools::load_all()\n", 1)
-            .await;
+        state.open_document_with_language_id(
+            alias_uri.clone(),
+            "devtools::load_all()\n",
+            Some(1),
+            Some("r"),
+        );
         state
             .open_document_aliases
             .open(alias_uri.clone(), vec![canonical_uri]);
@@ -3285,7 +3284,7 @@ fn snapshot_preamble_text_overrides(
     state: &WorldState,
 ) -> crate::package_state::preamble::PreambleTextOverrides {
     let mut overrides = crate::package_state::preamble::PreambleTextOverrides::new();
-    for (open_uri, document) in &state.documents {
+    for (open_uri, document) in state.documents.iter() {
         // Resolve and filter aliases before cloning the rope. Untitled,
         // superseded-alias, and excluded documents cannot contribute to a
         // preamble scan. We deliberately do not filter only by the *previous*
@@ -3326,23 +3325,27 @@ fn snapshot_preamble_text_overrides(
 /// content) without hashing or flattening text under the `WorldState` lock.
 #[derive(Clone)]
 struct OpenDocumentSeedIdentity {
+    generation: crate::open_document_store::AnalysisGeneration,
     trigger: DiagnosticsTrigger,
     contents: ropey::Rope,
 }
 
 impl PartialEq for OpenDocumentSeedIdentity {
     fn eq(&self, other: &Self) -> bool {
-        self.trigger == other.trigger && self.contents.is_instance(&other.contents)
+        self.generation == other.generation
+            && self.trigger == other.trigger
+            && self.contents.is_instance(&other.contents)
     }
 }
 
 impl Eq for OpenDocumentSeedIdentity {}
 
 fn open_document_seed_identity(state: &WorldState, uri: &Url) -> Option<OpenDocumentSeedIdentity> {
-    let document = state.documents.get(uri)?;
+    let record = state.documents.get_record(uri)?;
     Some(OpenDocumentSeedIdentity {
+        generation: record.generation(),
         trigger: DiagnosticsTrigger::capture(state, uri),
-        contents: document.contents.clone(),
+        contents: record.document().contents.clone(),
     })
 }
 
@@ -3572,7 +3575,13 @@ struct PreparedWorkspaceScan {
     cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
     new_index_entries: Vec<(Url, crate::workspace_index::IndexEntry)>,
     graph: crate::cross_file::dependency::DependencyGraph,
-    open_metadata: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    open_metadata: HashMap<
+        Url,
+        (
+            crate::open_document_store::AnalysisGeneration,
+            Arc<crate::cross_file::CrossFileMetadata>,
+        ),
+    >,
     workspace_index_pins: std::collections::HashSet<Url>,
     authority: WorkspaceGraphAuthorityIdentity,
 }
@@ -3591,9 +3600,9 @@ fn snapshot_workspace_graph_overlays(state: &WorldState) -> Vec<WorkspaceGraphOv
             content: document.contents.clone(),
             chunk_kind: document.chunk_kind,
             metadata: state
-                .document_store
-                .get_without_touch(uri)
-                .map(|stored| stored.metadata.clone()),
+                .documents
+                .get_record(uri)
+                .map(|record| record.metadata().clone()),
             graph_roots: state.authoritative_revalidation_roots_for_uri(uri),
             excluded: state.is_project_excluded_uri(uri),
         })
@@ -3699,12 +3708,21 @@ async fn prepare_workspace_scan(
         .iter()
         .map(|(uri, _)| uri.clone())
         .collect::<std::collections::HashSet<_>>();
-    let (graph, open_metadata) = derive_workspace_dependency_graph(
+    let (graph, derived_open_metadata) = derive_workspace_dependency_graph(
         &mut complete_entries,
         Some(&resident_roots),
         &open_overlays,
         &context,
     );
+    let open_metadata = derived_open_metadata
+        .into_iter()
+        .filter_map(|(uri, metadata)| {
+            authority
+                .open_documents
+                .get(&uri)
+                .map(|identity| (uri, (identity.generation, metadata)))
+        })
+        .collect();
     let new_index_entries = resident_entries
         .into_iter()
         .map(|(uri, mut entry)| {
@@ -3839,27 +3857,23 @@ async fn run_workspace_scan_until_current(
 async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldState) {
     let mut open_docs: Vec<_> = state
         .documents
-        .iter()
-        .map(|(uri, doc)| {
-            (
-                uri.clone(),
-                doc.text(),
-                doc.version.unwrap_or(0),
-                doc.chunk_kind,
-            )
+        .uris()
+        .into_iter()
+        .filter_map(|uri| {
+            let record = state.documents.get_record(&uri)?;
+            let doc = record.document();
+            (uri, doc.analysis_text(), record.generation()).into()
         })
         .collect();
     open_docs.sort_unstable_by(|(a, ..), (b, ..)| a.as_str().cmp(b.as_str()));
 
-    for (uri, text, version, chunk_kind) in open_docs {
+    for (uri, analysis_text, generation) in open_docs {
         if state.is_project_excluded_uri(&uri) {
             let workspace_root = state.workspace_folders.first().cloned();
-            let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
             let meta = extract_enriched_live_metadata(state, &uri, &analysis_text);
             state
-                .document_store
-                .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
-                .await;
+                .replace_open_document_metadata_if_current(&uri, generation, Arc::new(meta.clone()))
+                .expect("workspace replay basis remains current under the state write lock");
             for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
                 remove_file_from_cross_file_state(state, &graph_root);
             }
@@ -3867,14 +3881,12 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
             continue;
         }
 
-        let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
         let meta = extract_enriched_live_metadata(state, &uri, &analysis_text);
         let workspace_root = state.workspace_folders.first().cloned();
 
         state
-            .document_store
-            .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
-            .await;
+            .replace_open_document_metadata_if_current(&uri, generation, Arc::new(meta.clone()))
+            .expect("workspace replay basis remains current under the state write lock");
 
         let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
         let _ =
@@ -5505,8 +5517,8 @@ async fn resync_file_from_disk(
             .keys()
             .filter(|p| *p != uri)
             .filter(|p| {
-                state.document_store.get_without_touch(p).is_some_and(|d| {
-                    d.metadata.sources.iter().any(|s| {
+                state.documents.get_record(p).is_some_and(|record| {
+                    record.metadata().sources.iter().any(|s| {
                         s.resolved_uri.as_ref() == Some(uri)
                             || std::path::Path::new(&s.path).file_name() == target_name
                     })
@@ -5516,9 +5528,9 @@ async fn resync_file_from_disk(
             .collect();
         for parent in candidate_parents {
             let Some(parent_meta) = state
-                .document_store
-                .get_without_touch(&parent)
-                .map(|d| d.metadata.clone())
+                .documents
+                .get_record(&parent)
+                .map(|record| record.metadata().clone())
             else {
                 continue;
             };
@@ -7727,6 +7739,7 @@ impl LanguageServer for Backend {
             on_demand_enabled,
             packages_to_prefetch,
             packages_enabled,
+            opened_record,
         ) = {
             let mut state = self.state.write().await;
 
@@ -7735,7 +7748,7 @@ impl LanguageServer for Backend {
                 let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
                 let max_forward_depth = state.cross_file_config.max_forward_depth;
                 let packages_enabled = state.cross_file_config.packages_enabled;
-                let (chunk_kind, analysis_text) =
+                let (_chunk_kind, analysis_text) =
                     crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
                 let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
                 let files_to_index = if on_demand_enabled {
@@ -7756,21 +7769,15 @@ impl LanguageServer for Backend {
                 } else {
                     Vec::new()
                 };
-                state
-                    .document_store
-                    .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
-                    .await;
-                state.open_document_with_language_id(
+                let lifecycle_epoch = state.begin_diagnostic_lifecycle(&uri);
+                state.open_document_with_language_id_and_metadata(
                     uri.clone(),
                     &text,
                     Some(version),
                     Some(language_id.as_str()),
+                    Arc::new(meta.clone()),
+                    lifecycle_epoch,
                 );
-                // Fresh diagnostic lifecycle for this open (issue #603). Once
-                // per didOpen: the re-enrichment second pass re-opens the same
-                // document without an eligibility transition and must NOT mint
-                // again.
-                state.begin_diagnostic_lifecycle(&uri);
                 state.cross_file_activity.record_recent(uri.clone());
                 for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
                     remove_file_from_cross_file_state(&mut state, &graph_root);
@@ -7821,37 +7828,25 @@ impl LanguageServer for Backend {
 
             // Extract and enrich metadata with inherited working directory.
             // For Rmd/Quarto docs this masks the prose first so the graph,
-            // DocumentStore, and on-demand indexing see only chunk-body
+            // open record and on-demand indexing see only chunk-body
             // source()/library() calls and directives (#343). Classify by
             // languageId-then-URI so untitled Rmd/Quarto buffers (no file
-            // extension) are masked too — and reuse the same `chunk_kind` for
-            // the DocumentStore open below so its tree/artifacts agree.
-            let (chunk_kind, analysis_text) =
+            // extension) are masked too.
+            let (_chunk_kind, analysis_text) =
                 crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
             let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
             let uri_clone = uri.clone();
             let workspace_root = state.workspace_folders.first().cloned();
 
-            // Update new DocumentStore with enriched metadata (Requirement 1.3).
-            // `chunk_kind` was classified above by languageId-then-URI so
-            // untitled Rmd/Quarto buffers mask their tree/artifacts (#343).
-            state
-                .document_store
-                .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
-                .await;
-
-            // Update legacy documents HashMap (for migration compatibility)
-            state.open_document_with_language_id(
+            let lifecycle_epoch = state.begin_diagnostic_lifecycle(&uri);
+            let opened_record = state.open_document_with_language_id_and_metadata(
                 uri.clone(),
                 &text,
                 Some(version),
                 Some(language_id.as_str()),
+                Arc::new(meta.clone()),
+                lifecycle_epoch,
             );
-            // Fresh diagnostic lifecycle for this open (issue #603). Once per
-            // didOpen: the re-enrichment second pass re-opens the same
-            // document without an eligibility transition and must NOT mint
-            // again.
-            state.begin_diagnostic_lifecycle(&uri);
             // Record as recently opened for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
 
@@ -8051,13 +8046,12 @@ impl LanguageServer for Backend {
                 );
             }
 
-            // Compute new interface_hash after opening the document
-            // Use the document_store which has artifacts computed with metadata (including declared symbols)
+            // Compute new interface_hash after opening the document.
             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
             let new_interface_hash = state
-                .document_store
-                .get_without_touch(&uri)
-                .map(|doc| doc.artifacts.interface_hash);
+                .documents
+                .get_record(&uri)
+                .map(|record| record.artifacts().interface_hash);
 
             // Determine if interface changed (selective invalidation optimization)
             // Only invalidate dependents if the exported interface actually changed
@@ -8170,8 +8164,8 @@ impl LanguageServer for Backend {
                 })
                 .collect();
 
-            // Refresh the document_store pin set: the open set just changed
-            // and the dependency graph may have new edges from the new file.
+            // Refresh the closed-index pin set: the open set just changed and
+            // the dependency graph may have new edges from the new file.
             state.recompute_open_neighborhood_pins();
 
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
@@ -8182,6 +8176,7 @@ impl LanguageServer for Backend {
                 on_demand_enabled,
                 packages_to_prefetch,
                 packages_enabled,
+                opened_record,
             )
         };
 
@@ -8280,11 +8275,9 @@ impl LanguageServer for Backend {
                 let mut state = self.state.write().await;
                 let workspace_root = state.workspace_folders.first().cloned();
 
-                // Masked for Rmd/Quarto (chunk bodies only); raw otherwise.
-                // Classify by languageId-then-URI so untitled buffers mask, and
-                // extract metadata from that same masked view (#343).
-                let (chunk_kind, analysis_text) =
-                    crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
+                // Derive from the exact immutable record installed before the
+                // awaits above. Its generation guards the commit below.
+                let analysis_text = opened_record.document().analysis_text();
                 let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
                 log::trace!(
                     "did_open re-enrich: uri={}, sources={}, sourced_by={}",
@@ -8299,16 +8292,14 @@ impl LanguageServer for Backend {
                     meta.inherited_working_directory
                 );
 
-                state
-                    .document_store
-                    .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
-                    .await;
-                state.open_document_with_language_id(
-                    uri.clone(),
-                    &text,
-                    Some(version),
-                    Some(language_id.as_str()),
-                );
+                if let Err(error) = state.replace_open_document_metadata_if_current(
+                    &uri,
+                    opened_record.generation(),
+                    Arc::new(meta.clone()),
+                ) {
+                    log::trace!("discarding stale didOpen re-enrichment for {uri}: {error:?}");
+                    return;
+                }
 
                 if let Some(forward_ctx) =
                     crate::cross_file::path_resolve::PathContext::from_metadata(
@@ -8406,23 +8397,19 @@ impl LanguageServer for Backend {
             let mut state = self.state.write().await;
             let workspace_root = state.workspace_folders.first().cloned();
 
-            // languageId-then-URI classification masks untitled buffers (#343);
-            // extract metadata from the same masked view so the graph and the
-            // DocumentStore tree/artifacts agree (chunk bodies only for Rmd).
-            let (chunk_kind, analysis_text) =
-                crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
+            // Derive from the exact immutable record installed before the
+            // awaits above. Its generation guards the commit below.
+            let analysis_text = opened_record.document().analysis_text();
             let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
 
-            state
-                .document_store
-                .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
-                .await;
-            state.open_document_with_language_id(
-                uri.clone(),
-                &text,
-                Some(version),
-                Some(language_id.as_str()),
-            );
+            if let Err(error) = state.replace_open_document_metadata_if_current(
+                &uri,
+                opened_record.generation(),
+                Arc::new(meta.clone()),
+            ) {
+                log::trace!("discarding stale didOpen re-enrichment for {uri}: {error:?}");
+                return;
+            }
 
             let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
             let second_result = update_cross_file_graph_for_roots(
@@ -8651,22 +8638,13 @@ impl LanguageServer for Backend {
                 let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
                 let max_forward_depth = state.cross_file_config.max_forward_depth;
                 let packages_enabled = state.cross_file_config.packages_enabled;
-                if let Some(doc) = state.documents.get_mut(&uri) {
-                    doc.version = Some(version);
-                }
-                for change in changes.clone() {
-                    state.apply_change(&uri, change);
-                }
-                let (meta, precomputed_masked) = state
-                    .documents
-                    .get(&uri)
-                    .map(|doc| {
-                        let analysis_text = doc.analysis_text();
-                        let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
-                        let precomputed_masked = doc.is_rmd_document().then_some(analysis_text);
-                        (meta, precomputed_masked)
-                    })
-                    .unwrap_or_default();
+                let Some(prepared) = state.prepare_document_changes(&uri, changes.clone(), version)
+                else {
+                    log::warn!("Ignoring didChange for unopened document {uri}");
+                    return;
+                };
+                let analysis_text = prepared.document().analysis_text();
+                let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
                 let files_to_index = if on_demand_enabled {
                     source_targets_to_index_for_live_diagnostics(
                         &state,
@@ -8686,9 +8664,8 @@ impl LanguageServer for Backend {
                     Vec::new()
                 };
                 state
-                    .document_store
-                    .update_with_metadata(&uri, changes, version, meta.clone(), precomputed_masked)
-                    .await;
+                    .commit_document_changes(&uri, prepared, Arc::new(meta.clone()))
+                    .expect("didChange basis cannot change under the WorldState write lock");
                 state.cross_file_activity.record_recent(uri.clone());
                 for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
                     remove_file_from_cross_file_state(&mut state, &graph_root);
@@ -8723,34 +8700,25 @@ impl LanguageServer for Backend {
             // Capture old metadata before recomputing (for WD change detection)
             let old_meta = state.get_enriched_metadata(&uri);
 
-            // Capture old interface_hash before applying changes (for selective invalidation)
-            // This optimization avoids invalidating dependents when only comments/local vars change
-            // Use document_store which has artifacts computed with metadata (including declared symbols)
+            // Capture old interface_hash before applying changes (for selective invalidation).
             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
             let old_interface_hash = state
-                .document_store
-                .get_without_touch(&uri)
-                .map(|doc| doc.artifacts.interface_hash);
+                .documents
+                .get_record(&uri)
+                .map(|record| record.artifacts().interface_hash);
 
-            // Update legacy documents HashMap first (for migration compatibility)
-            if let Some(doc) = state.documents.get_mut(&uri) {
-                doc.version = Some(version);
-            }
-            for change in changes.clone() {
-                state.apply_change(&uri, change);
-            }
+            let Some(prepared) = state.prepare_document_changes(&uri, changes.clone(), version)
+            else {
+                log::warn!("Ignoring didChange for unopened document {uri}");
+                return;
+            };
             // Record as recently changed for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
 
             // Snapshot the post-change buffer text if this is the workspace-root
             // `.Rprofile`, for the off-lock prelude refresh after this block.
-            if let Some(root) = authoritative_rprofile_root_for_open_document(&state, &uri)
-                && let Some(text) = state
-                    .documents
-                    .get(&uri)
-                    .map(|d| Arc::<str>::from(d.text()))
-            {
-                rprofile_live_edit = Some((root, text));
+            if let Some(root) = authoritative_rprofile_root_for_open_document(&state, &uri) {
+                rprofile_live_edit = Some((root, Arc::<str>::from(prepared.document().text())));
             }
             if let Some(root) = preamble_sourced_root_for_open_document(&state, &uri) {
                 preamble_live_edit = Some((root, file_paths_for_open_document(&state, &uri)));
@@ -8761,123 +8729,77 @@ impl LanguageServer for Backend {
             let package_library = state.package_library.clone();
             let max_chain_depth = state.cross_file_config.max_chain_depth;
 
-            // Extract and enrich metadata with inherited working directory
-            let (
-                packages_to_prefetch,
-                enriched_meta,
-                precomputed_masked,
-                wd_affected,
-                edges_changed,
-            ) = if let Some(doc) = state.documents.get(&uri) {
-                // Analysis text: masked for Rmd/Quarto (chunk bodies only),
-                // raw otherwise. Feeds the graph + DocumentStore (#343).
-                // `apply_change` above already masked this exact raw content
-                // for this doc's fixed chunk kind, so we hand the Rmd mask to
-                // `update_with_metadata` below to skip a second `mask_to_r`
-                // pass per keystroke. Only Rmd carries a mask; plain R's
-                // analysis text equals raw text, so pass `None` there.
-                let text = doc.analysis_text();
-                let mut meta = crate::cross_file::extract_metadata(&text);
-                // Extract first, then move `text` into the mask slot — avoids
-                // cloning the masked String a second time per keystroke.
-                let precomputed_masked = doc.is_rmd_document().then_some(text);
-                let uri_clone = uri.clone();
-                let workspace_root = state.workspace_folders.first().cloned();
-
-                // Enrich metadata with inherited working directory before any use
-                // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
-                crate::cross_file::enrich_metadata_with_inherited_wd(
-                    &mut meta,
-                    &uri_clone,
-                    workspace_root.as_ref(),
-                    |parent_uri| state.get_enriched_metadata(parent_uri),
-                    max_chain_depth,
+            // Extract and enrich metadata from the prepared document's exact
+            // analysis view, then atomically install one coherent record.
+            let text = prepared.document().analysis_text();
+            let mut meta = crate::cross_file::extract_metadata(&text);
+            let workspace_root = state.workspace_folders.first().cloned();
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut meta,
+                &uri,
+                workspace_root.as_ref(),
+                |parent_uri| state.get_enriched_metadata(parent_uri),
+                max_chain_depth,
+            );
+            {
+                let ws = state.package_state.workspace();
+                let ws_name = ws.map(|w| w.name.as_str());
+                let ws_root = ws.map(|w| w.root.as_path());
+                let lib_paths = state.package_library.lib_paths();
+                crate::cross_file::resolve_system_file_sources(
+                    &mut meta, ws_name, ws_root, lib_paths,
                 );
+            }
+            let packages_to_prefetch: Vec<String> = if packages_enabled {
+                let mut packages =
+                    edited_document_warm_packages(&meta.library_calls, prepared.document());
+                packages.extend(namespace_warm_packages(&meta));
+                packages
+            } else {
+                Vec::new()
+            };
+            state
+                .commit_document_changes(&uri, prepared, Arc::new(meta.clone()))
+                .expect("didChange basis cannot change under the WorldState write lock");
 
-                // Resolve system.file() source entries into concrete paths
-                {
-                    let ws = state.package_state.workspace();
-                    let ws_name = ws.map(|w| w.name.as_str());
-                    let ws_root = ws.map(|w| w.root.as_path());
-                    let lib_paths = state.package_library.lib_paths();
-                    crate::cross_file::resolve_system_file_sources(
-                        &mut meta, ws_name, ws_root, lib_paths,
-                    );
-                }
-
-                // Collect package names for prefetch (validate names to
-                // reject suspicious inputs before R subprocess calls)
-                let pkgs: Vec<String> = if packages_enabled {
-                    let mut p = match state.documents.get(&uri_clone) {
-                        Some(doc) => edited_document_warm_packages(&meta.library_calls, doc),
-                        None => extract_loaded_packages_from_library_calls(&meta.library_calls),
-                    };
-                    p.extend(namespace_warm_packages(&meta));
-                    p
-                } else {
-                    Vec::new()
-                };
-
-                let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
-                let graph_result = update_cross_file_graph_for_roots(
-                    &mut state,
-                    &graph_roots,
-                    &meta,
-                    workspace_root.as_ref(),
-                );
-
-                // Invalidate children affected by working directory change (Requirement 8)
-                let mut wd_children = Vec::new();
-                let input_root = graph_roots.first().unwrap_or(&uri);
-                for graph_uri in &graph_roots {
-                    let old_root_meta = old_meta.as_deref().map(|old_meta| {
-                        metadata_for_graph_root(
-                            &state,
-                            graph_uri,
-                            input_root,
-                            old_meta,
-                            workspace_root.as_ref(),
-                        )
-                        .into_owned()
-                    });
-                    let new_root_meta = metadata_for_graph_root(
+            let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
+            let graph_result = update_cross_file_graph_for_roots(
+                &mut state,
+                &graph_roots,
+                &meta,
+                workspace_root.as_ref(),
+            );
+            let mut wd_affected = Vec::new();
+            let input_root = graph_roots.first().unwrap_or(&uri);
+            for graph_uri in &graph_roots {
+                let old_root_meta = old_meta.as_deref().map(|old_meta| {
+                    metadata_for_graph_root(
                         &state,
                         graph_uri,
                         input_root,
-                        &meta,
+                        old_meta,
                         workspace_root.as_ref(),
-                    );
-                    wd_children.extend(
-                        crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-                            graph_uri,
-                            old_root_meta.as_ref(),
-                            new_root_meta.as_ref(),
-                            &state.cross_file_graph,
-                            &state.cross_file_meta,
-                        ),
-                    );
-                }
-
-                (
-                    pkgs,
-                    Some(meta),
-                    precomputed_masked,
-                    wd_children,
-                    graph_result.edges_changed,
-                )
-            } else {
-                (Vec::new(), None, None, Vec::new(), false)
-            };
-
-            // Update new DocumentStore with enriched metadata (Requirement 1.4)
-            if let Some(meta) = enriched_meta {
-                state
-                    .document_store
-                    .update_with_metadata(&uri, changes, version, meta, precomputed_masked)
-                    .await;
-            } else {
-                state.document_store.update(&uri, changes, version).await;
+                    )
+                    .into_owned()
+                });
+                let new_root_meta = metadata_for_graph_root(
+                    &state,
+                    graph_uri,
+                    input_root,
+                    &meta,
+                    workspace_root.as_ref(),
+                );
+                wd_affected.extend(
+                    crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+                        graph_uri,
+                        old_root_meta.as_ref(),
+                        new_root_meta.as_ref(),
+                        &state.cross_file_graph,
+                        &state.cross_file_meta,
+                    ),
+                );
             }
+            let edges_changed = graph_result.edges_changed;
 
             // Update package state via event-driven path when an R/*.R file
             // changes in a package workspace.
@@ -8921,13 +8843,12 @@ impl LanguageServer for Backend {
                 }
             }
 
-            // Compute new interface_hash after applying changes
-            // Use document_store which has artifacts computed with metadata (including declared symbols)
+            // Compute new interface_hash after applying changes.
             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
             let new_interface_hash = state
-                .document_store
-                .get_without_touch(&uri)
-                .map(|doc| doc.artifacts.interface_hash);
+                .documents
+                .get_record(&uri)
+                .map(|record| record.artifacts().interface_hash);
 
             // Determine if interface changed (selective invalidation optimization)
             // Only invalidate dependents if the exported interface actually changed
@@ -9386,7 +9307,7 @@ impl LanguageServer for Backend {
             state.advance_workspace_scan_generation();
 
             // Capture the pre-close view the disk resync needs, BEFORE the
-            // document stores are wiped below. `old_meta` must come from the
+            // open-document record is removed below. `old_meta` must come from the
             // buffer tier: working-directory change detection compares the
             // buffer's `# raven: cd` (what dependents last resolved against)
             // against the disk state the resync installs. The dependent walk
@@ -9401,9 +9322,9 @@ impl LanguageServer for Backend {
             if close_resync {
                 resync_old_meta = state.get_enriched_metadata(uri);
                 resync_old_interface_hash = state
-                    .document_store
-                    .get_without_touch(uri)
-                    .map(|doc| doc.artifacts.interface_hash);
+                    .documents
+                    .get_record(uri)
+                    .map(|record| record.artifacts().interface_hash);
                 // The buffer's chunk classification came from the editor's
                 // languageId (#343); the resync must mask disk content the
                 // same way — path reclassification would parse an
@@ -9441,9 +9362,6 @@ impl LanguageServer for Backend {
                 preamble_close_edit = Some((root, file_paths_for_open_document(&state, uri)));
             }
 
-            // Close in new DocumentStore (Requirement 1.5)
-            state.document_store.close(uri);
-
             // Retire the diagnostic lifecycle: cancel pending revalidation
             // and clear the gate, including the lifecycle epoch (#603) so a
             // worker this cancel cannot reach (not yet scheduled) still
@@ -9453,7 +9371,7 @@ impl LanguageServer for Backend {
             // Remove from activity tracking
             state.cross_file_activity.remove(uri);
 
-            // Close the document (legacy) and tear down any canonical alias
+            // Close the authoritative document and tear down canonical alias
             // entries before watched-generation ownership is returned to disk.
             let closed_aliases = state.close_document(uri);
             if close_resync {
@@ -12605,14 +12523,14 @@ impl Backend {
                 // epoch — #603) retracts Problems now, lets a later tab-open
                 // publish the same document version without a force marker,
                 // and dooms in-flight workers this cancel cannot reach.
-                state.retire_diagnostic_lifecycle(uri);
+                state.retire_open_document_diagnostic_lifecycle(uri);
             }
             for uri in &added {
                 // Fresh lifecycle for each re-added tab. Must run AFTER the
                 // `editor_diagnostic_uris` replacement above: eligibility is
                 // read from it, and minting before the replacement would be
                 // a silent no-op that fails every subsequent publish closed.
-                state.begin_diagnostic_lifecycle(uri);
+                state.begin_open_document_diagnostic_lifecycle(uri);
             }
 
             (removed, added)
@@ -13043,7 +12961,7 @@ fn collect_open_document_packages(
 ) -> (std::collections::HashSet<String>, Vec<(Url, u32)>) {
     let mut doc_pkgs = std::collections::HashSet::new();
     let mut docs = Vec::new();
-    for (uri, doc) in &state.documents {
+    for (uri, doc) in state.documents.iter() {
         for p in &doc.loaded_packages {
             doc_pkgs.insert(p.clone());
         }
@@ -13449,11 +13367,10 @@ async fn run_libpath_consumer(
                     state
                         .workspace_index_new
                         .any_entry(|entry| entry.metadata.sources.iter().any(selected))
-                        || state.document_store.uris().iter().any(|uri| {
-                            state
-                                .document_store
-                                .get_without_touch(uri)
-                                .is_some_and(|doc| doc.metadata.sources.iter().any(selected))
+                        || state.documents.uris().iter().any(|uri| {
+                            state.documents.get_record(uri).is_some_and(|record| {
+                                record.metadata().sources.iter().any(selected)
+                            })
                         })
                 };
                 let system_file_republish: Vec<Url> = if touches_system_file {
@@ -13867,6 +13784,17 @@ mod tests {
                 serde_json::from_value(visible.params().unwrap().clone()).unwrap();
             assert_eq!(visible.uri, visible_uri);
             assert!(!visible.diagnostics.is_empty());
+            let (visible_generation, visible_epoch) = {
+                let state = backend.state.read().await;
+                let record = state.documents.get_record(&visible_uri).unwrap();
+                (
+                    record.generation(),
+                    record
+                        .provenance()
+                        .lifecycle_epoch
+                        .expect("visible document has a live lifecycle"),
+                )
+            };
 
             // Removing the tab retracts its existing Problems while retaining
             // the document in WorldState as a cross-file analysis input.
@@ -13886,14 +13814,12 @@ mod tests {
                 serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
             assert_eq!(cleared.uri, visible_uri);
             assert!(cleared.diagnostics.is_empty());
-            assert!(
-                backend
-                    .state
-                    .read()
-                    .await
-                    .documents
-                    .contains_key(&visible_uri)
-            );
+            {
+                let state = backend.state.read().await;
+                let record = state.documents.get_record(&visible_uri).unwrap();
+                assert!(record.generation() > visible_generation);
+                assert_eq!(record.provenance().lifecycle_epoch, None);
+            }
 
             // A later tab-open may not produce didOpen because the hidden model
             // never closed. The tab transition itself must republish it.
@@ -13919,6 +13845,17 @@ mod tests {
                 serde_json::from_value(restored.params().unwrap().clone()).unwrap();
             assert_eq!(restored.uri, visible_uri);
             assert!(!restored.diagnostics.is_empty());
+            let restored_epoch = backend
+                .state
+                .read()
+                .await
+                .documents
+                .get_record(&visible_uri)
+                .unwrap()
+                .provenance()
+                .lifecycle_epoch
+                .expect("restored document has a fresh lifecycle");
+            assert_ne!(restored_epoch, visible_epoch);
         }
 
         /// Issue #603, race 1 (close → reopen at the same version/revision),
@@ -20350,6 +20287,30 @@ mod project_config_initialize_tests {
         assert!(!authority.is_current_for(&state));
     }
 
+    #[test]
+    fn workspace_scan_authority_rejects_metadata_only_open_generation_change() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        state.open_document(uri.clone(), "x <- 1", Some(1));
+        let authority = WorkspaceGraphAuthorityIdentity::capture(&state);
+        let generation = state.documents.get_record(&uri).unwrap().generation();
+        let mut metadata = crate::cross_file::CrossFileMetadata::default();
+        metadata.working_directory = Some("/new/basis".to_string());
+        state
+            .replace_open_document_metadata_if_current(&uri, generation, Arc::new(metadata))
+            .unwrap();
+
+        assert!(!authority.is_current_for(&state));
+        assert_eq!(
+            state
+                .get_enriched_metadata(&uri)
+                .unwrap()
+                .working_directory
+                .as_deref(),
+            Some("/new/basis")
+        );
+    }
+
     #[tokio::test]
     async fn workspace_scan_preserves_retained_external_graph_roots() {
         let tmp = TempDir::new().unwrap();
@@ -21523,15 +21484,14 @@ mod project_config_initialize_tests {
             }
             let old_meta = state.get_enriched_metadata(&alias_a);
             let old_interface_hash = state
-                .document_store
-                .get_without_touch(&alias_a)
-                .map(|doc| doc.artifacts.interface_hash);
+                .documents
+                .get_record(&alias_a)
+                .map(|record| record.artifacts().interface_hash);
             (roots, old_meta, old_interface_hash)
         };
 
         {
             let mut state = backend.state.write().await;
-            state.document_store.close(&alias_a);
             state.close_document(&alias_a);
             remirror_authoritative_alias_roots_after_close(
                 &mut state,
@@ -30276,7 +30236,7 @@ lineLength = 200
     /// Issue #343: an open Rmd document must flow through the publish-path
     /// dispatch (`publish_diagnostics_inner` Phase 1 build + Phase 2 match
     /// guard) and produce chunk diagnostics. The document is opened via the
-    /// real `did_open` path, whose DocumentStore entry now stores
+    /// real `did_open` path, whose open-document authority entry now stores
     /// masked-derived metadata/tree (#343 Task 5), so the snapshot is
     /// masked-correct: diagnostics fall only on R chunk-body lines, never
     /// prose. This mirrors the exact match arm in `publish_diagnostics_inner`:
@@ -30557,7 +30517,7 @@ infixContinuationStyle = "aligned"
     //
     // These exercise the production did_open / publish / on-demand paths to
     // prove that for an open `.Rmd`, cross-file metadata feeding the
-    // dependency graph, the DocumentStore, and the async missing-file phase
+    // dependency graph, the open-document authority, and the async missing-file phase
     // is derived from the MASKED analysis text (chunk bodies only), never
     // from prose, while raw content remains available to non-analysis
     // consumers.
@@ -30983,11 +30943,11 @@ infixContinuationStyle = "aligned"
         );
     }
 
-    /// Flag #2: after did_open of an Rmd, the DocumentStore exposes
+    /// Flag #2: after did_open of an Rmd, the open record exposes
     /// chunk-defined symbols via `get_artifacts` (not prose garbage), while
     /// `get_content` still returns the verbatim RAW text.
     #[tokio::test]
-    async fn rmd_document_store_artifacts_masked_content_raw() {
+    async fn rmd_open_record_artifacts_masked_content_raw() {
         let tmp = TempDir::new().unwrap();
         let rmd = concat!(
             "# Heading is prose, not a symbol\n",
@@ -31022,11 +30982,11 @@ infixContinuationStyle = "aligned"
             .collect();
         assert!(
             names.iter().any(|n| n == "chunk_symbol"),
-            "DocumentStore artifacts must include the chunk-defined symbol; got {:?}",
+            "open-record artifacts must include the chunk-defined symbol; got {:?}",
             names
         );
 
-        // DocumentStore metadata must be masked-derived (no prose noise).
+        // Open-record metadata must be masked-derived (no prose noise).
         let meta = cp.get_metadata(&uri).expect("metadata available");
         assert!(
             meta.sources.is_empty(),
@@ -31035,12 +30995,12 @@ infixContinuationStyle = "aligned"
         );
     }
 
-    /// Flag #2 / DocumentState invariant: the DocumentStore's `tree` must be
+    /// Flag #2 / Document invariant: the open record's `tree` must be
     /// parsed from the masked analysis text. Pairing the tree with the raw
     /// content would mis-slice; here we assert the tree + analysis_text pair
     /// is self-consistent (the tree's root spans the masked text length).
     #[tokio::test]
-    async fn rmd_document_store_tree_paired_with_masked_text() {
+    async fn rmd_open_record_tree_paired_with_masked_text() {
         let tmp = TempDir::new().unwrap();
         let rmd = "# prose\n\n```{r}\nz <- 1\n```\n";
         fs::write(tmp.path().join("analysis.Rmd"), rmd).unwrap();
@@ -31048,17 +31008,11 @@ infixContinuationStyle = "aligned"
         let backend = svc.inner();
         let state = backend.state.read().await;
 
-        let doc_state = state
-            .document_store
-            .get_without_touch(&uri)
-            .expect("document in store");
-        let analysis = doc_state.analysis_text();
+        let document = state.documents.get(&uri).expect("document in store");
+        let analysis = document.analysis_text();
         let masked = crate::chunks::mask_to_r(rmd);
-        assert_eq!(
-            analysis, masked,
-            "DocumentState analysis_text must be masked"
-        );
-        let tree = doc_state.tree.as_ref().expect("tree parsed");
+        assert_eq!(analysis, masked, "Document analysis_text must be masked");
+        let tree = document.tree.as_ref().expect("tree parsed");
         assert_eq!(
             tree.root_node().end_byte(),
             analysis.len(),

@@ -1154,7 +1154,7 @@ fn format_nse_hint_footer(diags: &[(PathBuf, Diagnostic)]) -> Option<String> {
 fn compute_file_diagnostics_sync(
     state: &crate::state::WorldState,
     uri: &Url,
-    open_documents: &std::collections::HashMap<Url, crate::state::Document>,
+    open_documents: &impl crate::content_provider::OpenDocumentsView,
 ) -> Option<(
     Vec<Diagnostic>,
     crate::cross_file::CrossFileMetadata,

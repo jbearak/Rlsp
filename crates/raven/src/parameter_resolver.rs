@@ -389,28 +389,15 @@ pub fn resolve(
 /// resolution works even when the source file is not open in the editor.
 ///
 /// Priority order (matching the `content_provider` pattern):
-/// 1. Enriched open documents (`state.document_store`)
-/// 2. Legacy open documents (`state.documents`)
-/// 3. New workspace index (`state.workspace_index_new`)
-/// 4. Legacy workspace index (`state.workspace_index`)
-/// 5. File cache (`state.cross_file_file_cache`) — parse on demand
+/// 1. Authoritative open documents (`state.documents`)
+/// 2. New workspace index (`state.workspace_index_new`)
+/// 3. Legacy workspace index (`state.workspace_index`)
+/// 4. File cache (`state.cross_file_file_cache`) — parse on demand
 pub(crate) fn get_text_and_tree(
     state: &WorldState,
     uri: &Url,
 ) -> Option<(String, tree_sitter::Tree)> {
-    // 1. Enriched open documents (authoritative for open files). Return the
-    //    analysis text (masked for Rmd/Quarto, raw otherwise) so the caller's
-    //    byte-offset slices into `tree` align — `contents` is RAW and would
-    //    mis-slice (or panic on a non-UTF-8 boundary) for Rmd/Quarto docs (#343).
-    if let Some(doc) = state.document_store.get_without_touch(uri) {
-        if let Some(tree) = &doc.tree {
-            return Some((doc.analysis_text(), tree.clone()));
-        } else {
-            log::debug!("Document in document_store has no parsed tree: {}", uri);
-        }
-    }
-
-    // 2. Legacy open documents. Return the analysis text (masked for Rmd) so
+    // 1. Open documents. Return the analysis text (masked for Rmd) so
     //    the caller's byte-offset slices into `tree` align; identical to the
     //    raw text for plain R / JAGS / Stan.
     if let Some(doc) = state.documents.get(uri) {
@@ -421,7 +408,7 @@ pub(crate) fn get_text_and_tree(
         }
     }
 
-    // 3. New workspace index (indexed closed files). The entry's `tree` is
+    // 2. New workspace index (indexed closed files). The entry's `tree` is
     //    parsed from the masked analysis text for Rmd/Quarto (on-demand
     //    indexing), while `contents` is RAW — pair the tree with the masked
     //    analysis view so byte offsets align (#343).
@@ -438,7 +425,7 @@ pub(crate) fn get_text_and_tree(
         }
     }
 
-    // 4. Legacy workspace index (analysis text, see step 2).
+    // 3. Legacy workspace index (analysis text, see step 1).
     if let Some(doc) = state.workspace_index.get(uri) {
         if let Some(tree) = &doc.tree {
             return Some((doc.analysis_text(), tree.clone()));
@@ -447,7 +434,7 @@ pub(crate) fn get_text_and_tree(
         }
     }
 
-    // 5. File cache — content available but no pre-parsed tree; parse on demand.
+    // 4. File cache — content available but no pre-parsed tree; parse on demand.
     //    The cache stores RAW content; parse (and return) the masked analysis
     //    text for Rmd/Quarto so a closed `.Rmd` resolves chunk-defined symbols
     //    rather than failing closed, and the (text, tree) pair stays aligned
@@ -2265,17 +2252,14 @@ mod property_tests {
     }
 
     #[tokio::test]
-    async fn get_text_and_tree_pairs_masked_tree_with_masked_text_document_store_arm() {
-        // DocumentStore arm (step 1): an open `.Rmd` whose chunk defines a
+    async fn get_text_and_tree_pairs_masked_tree_with_masked_text_open_record() {
+        // Open-record arm (step 1): an open `.Rmd` whose chunk defines a
         // function, reached via cross-file resolution. Before the fix this
         // returned RAW text paired with the masked tree, panicking on the
         // multibyte prose (or silently mis-slicing for ASCII prose).
         let uri = Url::parse("file:///doc.Rmd").unwrap();
         let mut state = WorldState::new();
-        state
-            .document_store
-            .open(uri.clone(), MULTIBYTE_RMD, 1)
-            .await;
+        state.open_document_with_language_id(uri.clone(), MULTIBYTE_RMD, Some(1), Some("rmd"));
 
         let params = extract_params_via_get_text_and_tree(&state, &uri);
         assert_eq!(

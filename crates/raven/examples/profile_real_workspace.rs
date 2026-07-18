@@ -80,10 +80,7 @@ fn main() {
     let (build_dur, diag_dur, _diag_count) = if data_path.exists() {
         let data_uri = Url::from_file_path(&data_path).unwrap();
         let data_content = std::fs::read_to_string(&data_path).expect("read data.r");
-        state.documents.insert(
-            data_uri.clone(),
-            Document::new_with_uri(&data_content, None, &data_uri),
-        );
+        state.open_document(data_uri.clone(), &data_content, None);
         let result = diagnostics_via_snapshot_profile(&state, &data_uri, &DiagCancelToken::never());
         eprintln!("  snapshot build:      {:?}", result.0);
         eprintln!("  diagnostics compute: {:?}", result.1);
@@ -118,9 +115,7 @@ fn main() {
                 continue;
             }
         };
-        state
-            .documents
-            .insert(uri.clone(), Document::new_with_uri(&content, None, &uri));
+        state.open_document(uri.clone(), &content, None);
         let (b, d, c) = diagnostics_via_snapshot_profile(&state, &uri, &DiagCancelToken::never());
         eprintln!(
             "  {:50} build={:>7.2}ms  diag={:>7.2}ms  total={:>7.2}ms  diags={}",

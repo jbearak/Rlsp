@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use raven::handlers::{DiagCancelToken, diagnostics_via_snapshot_profile};
-use raven::state::{Document, WorldState, scan_workspace};
+use raven::state::{WorldState, scan_workspace};
 use tempfile::TempDir;
 use url::Url;
 
@@ -97,16 +97,10 @@ fn build_state(workspace: &Path) -> WorldState {
         .filter(|p| p.extension().map(|e| e == "R").unwrap_or(false))
         .collect();
     entries.sort();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
     for path in &entries {
         let content = std::fs::read_to_string(path).unwrap();
         let uri = Url::from_file_path(path).unwrap();
-        rt.block_on(state.document_store.open(uri.clone(), &content, 1));
-        state
-            .documents
-            .insert(uri.clone(), Document::new_with_uri(&content, Some(1), &uri));
+        state.open_document_with_language_id(uri.clone(), &content, Some(1), Some("r"));
     }
     let (index, cross_file_entries, new_index_entries) = scan_workspace(&[folder_url], 20);
     state.apply_workspace_index(index, cross_file_entries, new_index_entries);

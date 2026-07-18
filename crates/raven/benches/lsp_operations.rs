@@ -11,7 +11,7 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use tower_lsp::lsp_types::Position;
 use url::Url;
 
-use raven::state::{Document, WorldState, scan_workspace};
+use raven::state::{WorldState, scan_workspace};
 use raven::test_utils::fixture_workspace::{
     FixtureConfig, create_fanout_fixture_workspace, create_fixture_workspace,
     create_single_file_workspace, fanout_parent_uris,
@@ -39,21 +39,11 @@ fn build_state_from_fixture(workspace_path: &std::path::Path) -> WorldState {
         .collect();
     entries.sort_by_key(|e| e.path());
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-
     for entry in &entries {
         let path = entry.path();
         let content = std::fs::read_to_string(&path).unwrap();
         let uri = Url::from_file_path(&path).unwrap();
-        // Populate both stores to mirror production's `did_open`. Keep the
-        // version aligned across stores so cross-store consistency checks
-        // see the same value the runtime would after the first open.
-        rt.block_on(state.document_store.open(uri.clone(), &content, 1));
-        state
-            .documents
-            .insert(uri.clone(), Document::new_with_uri(&content, Some(1), &uri));
+        state.open_document_with_language_id(uri.clone(), &content, Some(1), Some("r"));
     }
 
     // Run workspace scan and apply index (populates cross-file state)

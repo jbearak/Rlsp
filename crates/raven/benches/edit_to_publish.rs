@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use url::Url;
 
 use raven::handlers::{DiagCancelToken, diagnostics_via_snapshot};
-use raven::state::{Document, WorldState, scan_workspace};
+use raven::state::{WorldState, scan_workspace};
 
 // ---------------------------------------------------------------------------
 // Topology generators
@@ -130,7 +130,7 @@ fn write_mixed(dir: &Path, leaves: usize, chain_depth: usize) {
 // ---------------------------------------------------------------------------
 
 /// Build a fully-populated `WorldState` mirroring the LSP at steady-state:
-/// each `.R` file is registered both in the `document_store` (where production
+/// each `.R` file is registered both in the `open-document authority` (where production
 /// caches artifacts) AND in the legacy `documents` HashMap (which `did_change`
 /// still maintains for backward compatibility), and the workspace scan is applied.
 fn build_state(workspace: &Path) -> (WorldState, Arc<Url>) {
@@ -146,18 +146,10 @@ fn build_state(workspace: &Path) -> (WorldState, Arc<Url>) {
         .collect();
     entries.sort();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-
     for path in &entries {
         let content = std::fs::read_to_string(path).unwrap();
         let uri = Url::from_file_path(path).unwrap();
-        // Cache artifacts in document_store (production hot path).
-        rt.block_on(state.document_store.open(uri.clone(), &content, 1));
-        state
-            .documents
-            .insert(uri.clone(), Document::new_with_uri(&content, Some(1), &uri));
+        state.open_document_with_language_id(uri.clone(), &content, Some(1), Some("r"));
     }
 
     let (index, cross_file_entries, new_index_entries) =

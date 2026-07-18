@@ -44,10 +44,9 @@ pub struct CrossFileWorkspaceIndex {
     version: AtomicU64,
     /// URIs protected from LRU eviction.
     ///
-    /// Mirrors `DocumentStore::pinned_uris` so closed-but-reachable
-    /// neighbors of open documents are not silently dropped under cache
-    /// pressure. Lock order: acquire `inner` before `pinned` when both
-    /// are needed.
+    /// Mirrors the open documents' graph neighborhood so closed-but-reachable
+    /// neighbors are not silently dropped under cache pressure. Lock order:
+    /// acquire `inner` before `pinned` when both are needed.
     pinned: RwLock<HashSet<Url>>,
     /// User-configured baseline capacity.
     ///

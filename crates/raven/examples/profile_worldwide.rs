@@ -200,13 +200,10 @@ fn make_state(workspace: &Path) -> WorldState {
     state
 }
 
-fn open_doc(state: &mut WorldState, path: &Path, rt: &tokio::runtime::Runtime) -> Url {
+fn open_doc(state: &mut WorldState, path: &Path, _rt: &tokio::runtime::Runtime) -> Url {
     let text = std::fs::read_to_string(path).unwrap();
     let uri = Url::from_file_path(path).unwrap();
-    rt.block_on(state.document_store.open(uri.clone(), &text, 1));
-    state
-        .documents
-        .insert(uri.clone(), Document::new_with_uri(&text, Some(1), &uri));
+    state.open_document_with_language_id(uri.clone(), &text, Some(1), Some("r"));
     uri
 }
 

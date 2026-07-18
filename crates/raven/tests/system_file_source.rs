@@ -738,7 +738,7 @@ mod lifecycle {
         let text = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
 
         let mut state = state_with_lib(libdir.path());
-        state.document_store.open(uri.clone(), text, 1).await;
+        state.open_document_with_language_id(uri.clone(), text, Some(1), Some("r"));
 
         // Startup pass: otherpkg not installed → stays unresolved.
         state.resolve_system_file_in_workspace();
@@ -748,11 +748,10 @@ mod lifecycle {
         std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
         let changed = state.resolve_system_file_in_workspace();
 
-        let doc = state
-            .document_store
-            .get_without_touch(&uri)
+        let metadata = state
+            .get_enriched_metadata(&uri)
             .expect("document still open");
-        let resolved_uri = doc.metadata.sources[0]
+        let resolved_uri = metadata.sources[0]
             .resolved_uri
             .clone()
             .expect("open-buffer metadata must re-resolve after the install event");
@@ -796,7 +795,7 @@ mod lifecycle {
         let buffer_text = "# edited\nsource(system.file(\"helper.R\", package = \"otherpkg\"))\n";
 
         let mut state = state_with_lib(libdir.path());
-        state.document_store.open(uri.clone(), buffer_text, 1).await;
+        state.open_document_with_language_id(uri.clone(), buffer_text, Some(1), Some("r"));
 
         // First pass resolves the open buffer (did_open-time enrichment):
         // edge from buffer metadata, call site at line 1.
@@ -838,8 +837,6 @@ mod lifecycle {
     /// stale unless it is republished too.
     #[test]
     fn open_dependents_of_changed_files_are_in_republish_set() {
-        use raven::state::Document;
-
         let libdir = tempfile::tempdir().unwrap();
         let child_uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
         let parent_uri = Url::parse("file:///workspace/parent.R").unwrap();
@@ -862,17 +859,11 @@ mod lifecycle {
             .update_file(&parent_uri, &parent_meta, None, |_| None);
 
         // Both files are open documents.
-        state.documents.insert(
-            parent_uri.clone(),
-            Document::new_with_uri("source(\"uses_helper.R\")\n", None, &parent_uri),
-        );
-        state.documents.insert(
+        state.open_document(parent_uri.clone(), "source(\"uses_helper.R\")\n", None);
+        state.open_document(
             child_uri.clone(),
-            Document::new_with_uri(
-                "source(system.file(\"helper.R\", package = \"otherpkg\"))\n",
-                None,
-                &child_uri,
-            ),
+            "source(system.file(\"helper.R\", package = \"otherpkg\"))\n",
+            None,
         );
 
         // Startup pass fails (otherpkg not installed), then the install event.

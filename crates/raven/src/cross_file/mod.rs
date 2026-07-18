@@ -115,7 +115,8 @@ pub fn analysis_text_for_kind(
 /// (the geometry-preserving [`crate::chunks::mask_to_r`] mask) and `None` for
 /// [`ChunkKind::R`](crate::chunks::ChunkKind::R), where analysis text equals raw
 /// text. This is the single masking chokepoint for `masked_text` fields:
-/// [`crate::state::Document`] and [`crate::document_store::DocumentStore`] both
+/// [`crate::state::Document`] and
+/// [`crate::open_document_store::OpenDocumentStore`] both
 /// route through it so their analysis views can never diverge.
 pub(crate) fn masked_analysis_text(
     chunk_kind: crate::chunks::ChunkKind,
@@ -133,7 +134,7 @@ pub(crate) fn masked_analysis_text(
 ///
 /// This is the chokepoint for the `did_open` branches in `backend.rs`, which all
 /// classify the same way before extracting metadata and opening the
-/// `DocumentStore`. `language_id`-then-URI classification (not path-only) is what
+/// `open-document authority`. `language_id`-then-URI classification (not path-only) is what
 /// lets untitled `.Rmd`/`.qmd` buffers — which have no file extension — mask
 /// correctly (#343).
 pub(crate) fn classify_and_mask<'a>(
