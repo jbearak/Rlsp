@@ -309,6 +309,13 @@ already-known Rprofile sourced helper, and testthat preamble/source-closure
 edits: it overlays the exact prepared Rope, scans both source-following inputs
 off-lock, batches those deltas with any ordinary package-file event, derives
 once, and installs the complete projection with the document and graph CAS.
+Every source-following projection used by open, edit, close, or post-seed work
+is captured without scan-time disk fallback: Raven records a byte-hashed
+Valid, Missing, or Invalid observation for each disk-backed root/helper reached
+by the iterative literal-source closure, then rechecks every observation
+immediately before the state CAS. A rewrite, delete, recreate, or encoding
+repair therefore rebases the whole projection rather than combining helper
+bytes observed at different filesystem moments.
 Package state therefore cannot become visible without the matching document,
 graph, lifecycle, and fanout transaction. When any of those projections
 changes routing, the open commit returns its exact routing owner plus unmarked
@@ -326,13 +333,19 @@ After a detached package seed installs, Rprofile and testthat preamble replay
 also form one projection rather than two tails. One package/open-context basis
 owns both scans and the single CAS, so observers see old/old before it and
 new/new afterward. Three rejected whole-pair attempts transfer ownership to one
-coalesced worker keyed by the exact seed identity. A newer seed or an
-authoritative live/config successor cancels that owner; otherwise the worker
-retains both groups and their exact candidates until a stable CAS succeeds,
-then hands them to the usual capped finalizer once. If the same seed still has
-deferred `system.file()` convergence, the tail waits behind that routing owner:
-advancing the package generations first would otherwise invalidate the seed
-identity while its routing transfer is still live.
+coalesced worker keyed by the exact seed identity. A newer seed or authoritative
+live package edit does not silently cancel the tail: the worker recaptures the
+whole pair against the current package basis while retaining the outer
+seed/system handles and exact diagnostic candidates. A root/config successor
+is terminal for that pair but still consumes the retained outer ledger exactly
+once; a later seed fails its install CAS as a strict no-op and transfers to the
+coalesced retry lifecycle while the predecessor coordinator is pending, so it
+cannot overwrite and orphan that ledger. The coordinator unions
+the stable tail candidates with every retained handle and applies the cap,
+reservations, and force markers in one finalization. If the same seed still has
+deferred `system.file()` convergence, its worker transfers the routing handle
+to this coordinator rather than independently finalizing or fresh-capturing
+open URIs.
 
 `didOpen` additionally owns a never-reused per-URI intent generation, whose
 arrival-time target record cannot rebase across an edit, close/reopen, metadata

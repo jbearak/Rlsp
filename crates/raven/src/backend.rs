@@ -4029,7 +4029,7 @@ async fn complete_startup_without_workspace_scan(
         (None, None)
     };
     if let (Some(root), Some(seed)) = (seeded_root, installed.as_mut()) {
-        let affected = Backend::refresh_open_package_inputs_after_seed(
+        let outcome = Backend::refresh_open_package_inputs_after_seed(
             handles.state.clone(),
             handles.client.clone(),
             handles.traversal_truncation.clone(),
@@ -4037,9 +4037,9 @@ async fn complete_startup_without_workspace_scan(
             seed.identity,
         )
         .await;
-        seed.post_seed_candidates = affected;
+        retain_post_seed_refresh_outcome(seed, outcome);
     }
-    let tickets = {
+    let (tickets, deferred) = {
         let mut state = handles.state.write().await;
         let open_uris: Vec<_> = state.documents.keys().cloned().collect();
         let transfer_handles = installed
@@ -4054,15 +4054,53 @@ async fn complete_startup_without_workspace_scan(
                 .into_iter()
                 .flat_map(|installed| installed.post_seed_candidates.iter().cloned()),
         );
-        let handles = transfer_handles;
-        finalize_analysis_handoff_candidates_or_fallback(&mut state, handles, additional, open_uris)
+        if let Some(owner) = installed
+            .as_mut()
+            .and_then(|installed| installed.deferred_post_seed.take())
+        {
+            (
+                Vec::new(),
+                Some((
+                    owner,
+                    DeferredPostSeedFinalization {
+                        handles: transfer_handles,
+                        candidates: additional,
+                    },
+                )),
+            )
+        } else {
+            (
+                finalize_analysis_handoff_candidates_or_fallback(
+                    &mut state,
+                    transfer_handles,
+                    additional,
+                    open_uris,
+                ),
+                None,
+            )
+        }
     };
-    tokio::spawn(Backend::publish_diagnostics_for_tickets_bounded(
-        handles.state.clone(),
-        handles.client.clone(),
-        tickets,
-        Some(handles.traversal_truncation.clone()),
-    ));
+    if let Some((owner, finalization)) = deferred {
+        let handles = handles.clone();
+        tokio::spawn(async move {
+            let tickets =
+                finish_deferred_post_seed_refresh(handles.clone(), owner, finalization).await;
+            Backend::publish_diagnostics_for_tickets_bounded(
+                handles.state,
+                handles.client,
+                tickets,
+                Some(handles.traversal_truncation),
+            )
+            .await;
+        });
+    } else {
+        tokio::spawn(Backend::publish_diagnostics_for_tickets_bounded(
+            handles.state.clone(),
+            handles.client.clone(),
+            tickets,
+            Some(handles.traversal_truncation.clone()),
+        ));
+    }
 }
 
 /// Package-input lifecycle observed immediately before a detached seed begins
@@ -4593,6 +4631,7 @@ struct SeedInstalled {
     system_file: Option<SystemFileTransferredEffects>,
     deferred_system_file: Option<PackageSeedInstalledIdentity>,
     post_seed_candidates: Vec<AnalysisTransferCandidate>,
+    deferred_post_seed: Option<DeferredCombinedPostSeedOwner>,
 }
 
 #[cfg(test)]
@@ -4632,6 +4671,7 @@ struct DerivedCombinedPostSeedRefresh {
     basis: PackageProjectionBasis,
     package: PreparedPackageProjection,
     affected_uris: Vec<Url>,
+    disk: SourceFollowingDiskProjection,
 }
 
 enum CombinedPostSeedRefreshOutcome {
@@ -4639,6 +4679,38 @@ enum CombinedPostSeedRefreshOutcome {
     Committed(Vec<AnalysisTransferCandidate>),
     Superseded,
     Deferred,
+}
+
+#[derive(Clone)]
+struct DeferredCombinedPostSeedOwner {
+    root: std::path::PathBuf,
+    identity: PackageSeedInstalledIdentity,
+}
+
+enum PostSeedRefreshOutcome {
+    Committed(Vec<AnalysisTransferCandidate>),
+    NotApplicable,
+    Deferred(DeferredCombinedPostSeedOwner),
+}
+
+fn retain_post_seed_refresh_outcome(
+    installed: &mut SeedInstalled,
+    outcome: PostSeedRefreshOutcome,
+) {
+    match outcome {
+        PostSeedRefreshOutcome::Committed(candidates) => {
+            installed.post_seed_candidates = candidates;
+        }
+        PostSeedRefreshOutcome::NotApplicable => {}
+        PostSeedRefreshOutcome::Deferred(owner) => {
+            installed.deferred_post_seed = Some(owner);
+        }
+    }
+}
+
+struct DeferredPostSeedFinalization {
+    handles: Vec<AnalysisTransferHandle>,
+    candidates: Vec<AnalysisTransferCandidate>,
 }
 
 fn capture_combined_post_seed_refresh(
@@ -4703,15 +4775,23 @@ fn capture_combined_post_seed_refresh(
 fn derive_combined_post_seed_refresh(
     mut captured: CapturedCombinedPostSeedRefresh,
 ) -> Option<DerivedCombinedPostSeedRefresh> {
+    let preamble_roots =
+        source_following_preamble_roots(&captured.inputs, &captured.root, &captured.overrides);
+    let scans = capture_source_following_scans(
+        &captured.root,
+        captured.overrides,
+        &captured.exclusions,
+        captured.refresh_rprofile,
+        if captured.preamble_paths.is_empty() {
+            Vec::new()
+        } else {
+            preamble_roots
+        },
+    );
     let mut deltas = Vec::new();
     let mut rprofile_changed = false;
     if captured.refresh_rprofile {
-        let scan =
-            crate::package_state::rprofile::scan_workspace_rprofile_with_overrides_and_exclusions(
-                &captured.root,
-                &captured.overrides,
-                &captured.exclusions,
-            );
+        let scan = scans.rprofile.unwrap_or_default();
         if let Some(delta) =
             crate::package_state::event::apply_rprofile_scan(&mut captured.inputs, Some(scan))
         {
@@ -4721,13 +4801,7 @@ fn derive_combined_post_seed_refresh(
     }
     let mut preamble_changed = false;
     if !captured.preamble_paths.is_empty() {
-        let (scan, _) = crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
-            &captured.root,
-            crate::package_state::preamble::PreambleSnapshot::from_inputs(&captured.inputs),
-            &captured.preamble_paths,
-            &captured.overrides,
-            &captured.exclusions,
-        );
+        let scan = scans.preambles.unwrap_or_default();
         if let Some(delta) =
             crate::package_state::event::apply_preamble_scan(&mut captured.inputs, Some(scan))
         {
@@ -4758,6 +4832,7 @@ fn derive_combined_post_seed_refresh(
         basis: captured.basis,
         package: PreparedPackageProjection::new(captured.inputs, next),
         affected_uris,
+        disk: scans.disk,
     })
 }
 
@@ -4825,6 +4900,9 @@ async fn attempt_combined_post_seed_refresh(
                 pause.pause().await;
             }
         }
+        if !derived.disk.is_current() {
+            continue;
+        }
         let mut state = state_arc.write().await;
         #[cfg(test)]
         {
@@ -4859,76 +4937,92 @@ async fn attempt_combined_post_seed_refresh(
     }
 }
 
-async fn schedule_post_seed_refresh_retry(
-    handles: PackageSeedTaskHandles,
-    root: std::path::PathBuf,
-    identity: PackageSeedInstalledIdentity,
-) {
-    {
-        let mut state = handles.state.write().await;
-        if !state.package_seed_installed_identity_is_current(identity)
-            || !state.begin_post_seed_refresh_retry(identity)
+async fn attempt_combined_post_seed_refresh_current(
+    state_arc: &Arc<RwLock<WorldState>>,
+    root: &std::path::Path,
+) -> CombinedPostSeedRefreshOutcome {
+    for _attempt in 0..3 {
+        let captured = {
+            let state = state_arc.read().await;
+            if state.package_inputs.workspace_root.as_deref() != Some(root) {
+                return CombinedPostSeedRefreshOutcome::Superseded;
+            }
+            capture_combined_post_seed_refresh(&state, root)
+        };
+        let Some(captured) = captured else {
+            return CombinedPostSeedRefreshOutcome::NotApplicable;
+        };
+        let Ok(derived) =
+            tokio::task::spawn_blocking(move || derive_combined_post_seed_refresh(captured)).await
+        else {
+            continue;
+        };
+        let Some(derived) = derived else {
+            return CombinedPostSeedRefreshOutcome::NotApplicable;
+        };
+        if !derived.disk.is_current() {
+            continue;
+        }
+        let mut state = state_arc.write().await;
+        if state
+            .try_install_prepared_package_projection(&derived.basis, derived.package)
+            .is_err()
         {
-            return;
+            continue;
         }
+        return CombinedPostSeedRefreshOutcome::Committed(
+            state.capture_analysis_transfer_candidates(derived.affected_uris),
+        );
     }
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
-            {
-                let mut state = handles.state.write().await;
-                if !state.post_seed_refresh_retry_is_current(identity) {
-                    return;
-                }
-                if !state.package_seed_installed_identity_is_current(identity) {
-                    state.complete_post_seed_refresh_retry(identity);
-                    return;
-                }
-            }
-            match attempt_combined_post_seed_refresh(&handles.state, &root, identity).await {
-                CombinedPostSeedRefreshOutcome::Deferred => continue,
-                CombinedPostSeedRefreshOutcome::Superseded => {
-                    handles
-                        .state
-                        .write()
-                        .await
-                        .complete_post_seed_refresh_retry(identity);
-                    return;
-                }
-                CombinedPostSeedRefreshOutcome::NotApplicable => {
-                    handles
-                        .state
-                        .write()
-                        .await
-                        .complete_post_seed_refresh_retry(identity);
-                    return;
-                }
-                CombinedPostSeedRefreshOutcome::Committed(candidates) => {
-                    let tickets = {
-                        let mut state = handles.state.write().await;
-                        if !state.post_seed_refresh_retry_is_current(identity) {
-                            return;
-                        }
-                        let tickets = finalize_exact_analysis_handoff_candidates(
-                            &mut state,
-                            Vec::new(),
-                            candidates,
-                        );
-                        state.complete_post_seed_refresh_retry(identity);
-                        tickets
-                    };
-                    Backend::publish_diagnostics_for_tickets_bounded(
-                        handles.state.clone(),
-                        handles.client.clone(),
-                        tickets,
-                        Some(handles.traversal_truncation.clone()),
-                    )
-                    .await;
-                    return;
-                }
+    CombinedPostSeedRefreshOutcome::Deferred
+}
+
+async fn finish_deferred_post_seed_refresh(
+    handles: PackageSeedTaskHandles,
+    owner: DeferredCombinedPostSeedOwner,
+    mut finalization: DeferredPostSeedFinalization,
+) -> Vec<crate::state::AnalysisRevalidationTicket> {
+    loop {
+        tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+        {
+            let state = handles.state.read().await;
+            if !state.post_seed_refresh_retry_is_current(owner.identity) {
+                return Vec::new();
             }
         }
-    });
+        let outcome = if handles
+            .state
+            .read()
+            .await
+            .package_seed_installed_identity_is_current(owner.identity)
+        {
+            attempt_combined_post_seed_refresh(&handles.state, &owner.root, owner.identity).await
+        } else {
+            attempt_combined_post_seed_refresh_current(&handles.state, &owner.root).await
+        };
+        match outcome {
+            CombinedPostSeedRefreshOutcome::Deferred => continue,
+            CombinedPostSeedRefreshOutcome::Committed(candidates) => {
+                finalization.candidates.extend(candidates);
+            }
+            CombinedPostSeedRefreshOutcome::NotApplicable
+            | CombinedPostSeedRefreshOutcome::Superseded => {}
+        }
+        let mut state = handles.state.write().await;
+        if !state.post_seed_refresh_retry_is_current(owner.identity) {
+            return Vec::new();
+        }
+        if let Some(handle) = state.take_post_seed_system_transfer(owner.identity) {
+            finalization.handles.push(handle);
+        }
+        let tickets = finalize_exact_analysis_handoff_candidates(
+            &mut state,
+            finalization.handles,
+            finalization.candidates,
+        );
+        state.complete_post_seed_refresh_retry(owner.identity);
+        return tickets;
+    }
 }
 
 async fn schedule_system_file_seed_retry(
@@ -4964,6 +5058,13 @@ async fn schedule_system_file_seed_retry(
             let tickets = {
                 let mut state = handles.state.write().await;
                 if !state.system_file_seed_retry_is_current(identity) {
+                    return;
+                }
+                if state.post_seed_refresh_retry_is_current(identity) {
+                    let retained =
+                        state.retain_post_seed_system_transfer(identity, transfer.handle);
+                    debug_assert!(retained);
+                    state.complete_system_file_seed_retry(identity);
                     return;
                 }
                 let open_uris: Vec<_> = state.documents.keys().cloned().collect();
@@ -5091,6 +5192,18 @@ where
     Fut: Future<Output = std::result::Result<PrecomputedPackageSeed, PackageSeedComputeError>>,
 {
     for attempt in 0..PACKAGE_SEED_MAX_ATTEMPTS {
+        // A deferred post-seed coordinator owns an exact outer ledger. A
+        // successor seed must not install (or start its system-file worker)
+        // until that predecessor either commits its tail or terminally
+        // finalizes the retained ledger.
+        if state_arc
+            .read()
+            .await
+            .post_seed_refresh_retry_owner()
+            .is_some()
+        {
+            return StandalonePackageOutcome::Deferred;
+        }
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return StandalonePackageOutcome::Superseded;
         }
@@ -5142,6 +5255,12 @@ where
             if cancel.is_some_and(CancellationToken::is_cancelled) {
                 return StandalonePackageOutcome::Superseded;
             }
+            if state.post_seed_refresh_retry_owner().is_some() {
+                // The predecessor won the race after our last read. Transfer
+                // this successor to the delayed retry owner without installing
+                // any raw, derived, routing, or seed-identity state.
+                return StandalonePackageOutcome::Deferred;
+            }
             candidate.install(&mut state)
         };
         match installed {
@@ -5167,6 +5286,7 @@ where
                     system_file,
                     deferred_system_file,
                     post_seed_candidates: Vec::new(),
+                    deferred_post_seed: None,
                 });
             }
         }
@@ -5252,7 +5372,7 @@ async fn schedule_package_seed_retry(handles: PackageSeedTaskHandles) {
                 schedule_system_file_seed_retry(handles.clone(), identity).await;
             }
 
-            installed.post_seed_candidates = Backend::refresh_open_package_inputs_after_seed(
+            let outcome = Backend::refresh_open_package_inputs_after_seed(
                 handles.state.clone(),
                 handles.client.clone(),
                 handles.traversal_truncation.clone(),
@@ -5260,7 +5380,8 @@ async fn schedule_package_seed_retry(handles: PackageSeedTaskHandles) {
                 installed.identity,
             )
             .await;
-            let tickets = {
+            retain_post_seed_refresh_outcome(&mut installed, outcome);
+            let (tickets, deferred) = {
                 let mut state = handles.state.write().await;
                 let open_uris: Vec<_> = state.documents.keys().cloned().collect();
                 let transfer_handles = installed
@@ -5270,12 +5391,33 @@ async fn schedule_package_seed_retry(handles: PackageSeedTaskHandles) {
                     .unwrap_or_default();
                 let mut additional = state.capture_analysis_transfer_candidates(open_uris.clone());
                 additional.extend(installed.post_seed_candidates.iter().cloned());
-                finalize_analysis_handoff_candidates_or_fallback(
-                    &mut state,
-                    transfer_handles,
-                    additional,
-                    open_uris,
-                )
+                if let Some(owner) = installed.deferred_post_seed.take() {
+                    (
+                        Vec::new(),
+                        Some((
+                            owner,
+                            DeferredPostSeedFinalization {
+                                handles: transfer_handles,
+                                candidates: additional,
+                            },
+                        )),
+                    )
+                } else {
+                    (
+                        finalize_analysis_handoff_candidates_or_fallback(
+                            &mut state,
+                            transfer_handles,
+                            additional,
+                            open_uris,
+                        ),
+                        None,
+                    )
+                }
+            };
+            let tickets = if let Some((owner, finalization)) = deferred {
+                finish_deferred_post_seed_refresh(handles.clone(), owner, finalization).await
+            } else {
+                tickets
             };
             if !tickets.is_empty() {
                 Backend::publish_diagnostics_for_tickets_bounded(
@@ -5372,6 +5514,131 @@ fn observe_package_seed_disk_path(path: &std::path::Path) -> PackageSeedDiskIden
             text: text.into(),
         },
         Err(_) => PackageSeedDiskIdentity::Invalid(Some(snapshot)),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SourceFollowingDiskProjection {
+    entries: std::collections::BTreeMap<std::path::PathBuf, PackageSeedDiskIdentity>,
+}
+
+impl SourceFollowingDiskProjection {
+    fn is_current(&self) -> bool {
+        self.entries
+            .iter()
+            .all(|(path, identity)| observe_package_seed_disk_path(path) == *identity)
+    }
+}
+
+struct CapturedSourceFollowingScans {
+    rprofile: Option<crate::package_state::rprofile::RprofileScan>,
+    preambles: Option<crate::package_state::preamble::PreambleScan>,
+    disk: SourceFollowingDiskProjection,
+}
+
+fn source_following_preamble_roots(
+    inputs: &crate::package_state::PackageInputs,
+    root: &std::path::Path,
+    overrides: &crate::package_state::preamble::PreambleTextOverrides,
+) -> Vec<std::path::PathBuf> {
+    let snapshot = crate::package_state::preamble::PreambleSnapshot::from_inputs(inputs);
+    let mut roots: Vec<_> = snapshot
+        .symbols
+        .keys()
+        .chain(snapshot.attached_packages.keys())
+        .chain(snapshot.sourced_files_by_preamble.keys())
+        .cloned()
+        .collect();
+    roots.extend(
+        overrides
+            .keys()
+            .filter(|path| crate::package_state::preamble::is_testthat_preamble_path(path, root))
+            .cloned(),
+    );
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Capture every disk authority reached by the requested source-following
+/// closures, including missing and invalid targets.
+///
+/// Scans only consume the returned text map. Discovery iterates because a
+/// newly captured helper can reveal another literal source target. The paired
+/// disk projection is rechecked immediately before the owning state CAS, so no
+/// projection can combine bytes observed at different filesystem moments.
+fn capture_source_following_scans(
+    root: &std::path::Path,
+    mut overrides: crate::package_state::preamble::PreambleTextOverrides,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    refresh_rprofile: bool,
+    preamble_roots: Vec<std::path::PathBuf>,
+) -> CapturedSourceFollowingScans {
+    let mut disk = SourceFollowingDiskProjection::default();
+    let rprofile_root = root.join(".Rprofile");
+    let mut pending = std::collections::BTreeSet::new();
+    if refresh_rprofile {
+        pending.insert(rprofile_root);
+    }
+    pending.extend(preamble_roots.iter().cloned());
+
+    loop {
+        let mut captured_new_path = false;
+        for path in std::mem::take(&mut pending) {
+            let routing = crate::package_state::preamble::canonicalize_for_routing(&path);
+            if overrides.contains_key(&path)
+                || overrides.contains_key(&routing)
+                || disk.entries.contains_key(&path)
+                || disk.entries.contains_key(&routing)
+            {
+                continue;
+            }
+            let identity = observe_package_seed_disk_path(&path);
+            if let PackageSeedDiskIdentity::Valid { text, .. } = &identity {
+                let rope = ropey::Rope::from_str(text);
+                overrides.insert(path.clone(), rope.clone());
+                overrides.insert(routing.clone(), rope);
+            }
+            disk.entries.insert(path, identity);
+            captured_new_path = true;
+        }
+
+        let rprofile = refresh_rprofile.then(|| {
+            crate::package_state::rprofile::scan_workspace_rprofile_from_captured_texts_and_exclusions(
+                root,
+                &overrides,
+                exclusions,
+            )
+        });
+        let preambles = (!preamble_roots.is_empty()).then(|| {
+            crate::package_state::preamble::scan_testthat_preambles_from_captured_texts_and_exclusions(
+                root,
+                preamble_roots.clone(),
+                &overrides,
+                exclusions,
+            )
+        });
+        if let Some(scan) = &rprofile {
+            pending.extend(scan.sourced_files.iter().cloned());
+        }
+        if let Some(scan) = &preambles {
+            pending.extend(scan.sourced_files.iter().cloned());
+        }
+        pending.retain(|path| {
+            let routing = crate::package_state::preamble::canonicalize_for_routing(path);
+            !overrides.contains_key(path)
+                && !overrides.contains_key(&routing)
+                && !disk.entries.contains_key(path)
+                && !disk.entries.contains_key(&routing)
+        });
+        if pending.is_empty() {
+            return CapturedSourceFollowingScans {
+                rprofile,
+                preambles,
+                disk,
+            };
+        }
+        debug_assert!(captured_new_path || !pending.is_empty());
     }
 }
 
@@ -6543,15 +6810,23 @@ fn capture_live_package_open_edit_tail(
     }
 }
 
+struct DerivedLivePackageOpenEdit {
+    analysis: PreparedOpenEditAnalysis,
+    disk: SourceFollowingDiskProjection,
+}
+
 fn derive_live_package_open_edit(
     mut captured: CapturedLivePackageOpenEdit,
-) -> PreparedOpenEditAnalysis {
+) -> DerivedLivePackageOpenEdit {
     let Some(root) = captured.root.as_ref() else {
-        return PreparedOpenEditAnalysis::new(
-            captured.prepared,
-            Arc::new(captured.metadata),
-            captured.plan,
-        );
+        return DerivedLivePackageOpenEdit {
+            analysis: PreparedOpenEditAnalysis::new(
+                captured.prepared,
+                Arc::new(captured.metadata),
+                captured.plan,
+            ),
+            disk: SourceFollowingDiskProjection::default(),
+        };
     };
     let affects_rprofile = captured.package_inputs.model_rprofile
         && captured.candidate_paths.iter().any(|path| {
@@ -6571,13 +6846,32 @@ fn derive_live_package_open_edit(
                 )
         });
     if !affects_rprofile && !affects_preamble {
-        return PreparedOpenEditAnalysis::new(
-            captured.prepared,
-            Arc::new(captured.metadata),
-            captured.plan,
-        );
+        return DerivedLivePackageOpenEdit {
+            analysis: PreparedOpenEditAnalysis::new(
+                captured.prepared,
+                Arc::new(captured.metadata),
+                captured.plan,
+            ),
+            disk: SourceFollowingDiskProjection::default(),
+        };
     }
 
+    let preamble_roots = source_following_preamble_roots(
+        &captured.package_inputs,
+        root,
+        &captured.package_text_overrides,
+    );
+    let scans = capture_source_following_scans(
+        root,
+        captured.package_text_overrides,
+        &captured.exclusions,
+        affects_rprofile,
+        if affects_preamble {
+            preamble_roots
+        } else {
+            Vec::new()
+        },
+    );
     let mut deltas = Vec::new();
     if let Some((event_uri, text)) = captured.plan.package_event.take()
         && let Some(delta) = crate::package_state::event::translate(
@@ -6593,12 +6887,7 @@ fn derive_live_package_open_edit(
 
     let mut rprofile_changed = false;
     if affects_rprofile {
-        let scan =
-            crate::package_state::rprofile::scan_workspace_rprofile_with_overrides_and_exclusions(
-                root,
-                &captured.package_text_overrides,
-                &captured.exclusions,
-            );
+        let scan = scans.rprofile.unwrap_or_default();
         if let Some(delta) = crate::package_state::event::apply_rprofile_scan(
             &mut captured.package_inputs,
             Some(scan),
@@ -6610,15 +6899,7 @@ fn derive_live_package_open_edit(
 
     let mut preamble_changed = false;
     if affects_preamble {
-        let (scan, _) = crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
-            root,
-            crate::package_state::preamble::PreambleSnapshot::from_inputs(
-                &captured.package_inputs,
-            ),
-            &captured.candidate_paths,
-            &captured.package_text_overrides,
-            &captured.exclusions,
-        );
+        let scan = scans.preambles.unwrap_or_default();
         if let Some(delta) = crate::package_state::event::apply_preamble_scan(
             &mut captured.package_inputs,
             Some(scan),
@@ -6629,11 +6910,14 @@ fn derive_live_package_open_edit(
     }
 
     if deltas.is_empty() {
-        return PreparedOpenEditAnalysis::new(
-            captured.prepared,
-            Arc::new(captured.metadata),
-            captured.plan,
-        );
+        return DerivedLivePackageOpenEdit {
+            analysis: PreparedOpenEditAnalysis::new(
+                captured.prepared,
+                Arc::new(captured.metadata),
+                captured.plan,
+            ),
+            disk: scans.disk,
+        };
     }
     let delta = if deltas.len() == 1 {
         deltas.pop().expect("one live package delta")
@@ -6666,12 +6950,15 @@ fn derive_live_package_open_edit(
             .seed_revalidation_uris
             .extend(captured.preamble_fanout_uris);
     }
-    PreparedOpenEditAnalysis::with_package(
-        captured.prepared,
-        Arc::new(captured.metadata),
-        PreparedPackageProjection::new(captured.package_inputs, next),
-        captured.plan,
-    )
+    DerivedLivePackageOpenEdit {
+        analysis: PreparedOpenEditAnalysis::with_package(
+            captured.prepared,
+            Arc::new(captured.metadata),
+            PreparedPackageProjection::new(captured.package_inputs, next),
+            captured.plan,
+        ),
+        disk: scans.disk,
+    }
 }
 
 /// Prepare source-following package inputs off-lock and commit them with the
@@ -6707,13 +6994,17 @@ async fn commit_detached_live_package_open_edit(
                 pause.pause().await;
             }
         }
+        if !derived.disk.is_current() {
+            prepared = derived.analysis.into_prepared_edit();
+            continue;
+        }
         let mut state = state_arc.write().await;
-        if !state.open_edit_analysis_basis_is_current(&derived) {
-            prepared = derived.into_prepared_edit();
+        if !state.open_edit_analysis_basis_is_current(&derived.analysis) {
+            prepared = derived.analysis.into_prepared_edit();
             continue;
         }
         let effects = state
-            .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(derived)))
+            .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(derived.analysis)))
             .expect("live package OpenEdit basis was checked under the same write lock");
         state.cross_file_activity.record_recent(uri.clone());
         return Some(effects);
@@ -7272,9 +7563,12 @@ fn file_snapshot_with_bytes_hash(
     }
 }
 
-fn derive_open_close_analysis(
-    mut captured: CapturedOpenCloseAnalysis,
-) -> PreparedOpenCloseAnalysis {
+struct DerivedOpenCloseAnalysis {
+    prepared: PreparedOpenCloseAnalysis,
+    source_following_disk: SourceFollowingDiskProjection,
+}
+
+fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> DerivedOpenCloseAnalysis {
     let mut disk_observations = Vec::new();
     let mut disk_material = HashMap::new();
     for root in &mut captured.roots {
@@ -7502,19 +7796,41 @@ fn derive_open_close_analysis(
     }
     let mut rprofile_changed = false;
     let mut preamble_changed = false;
+    let mut source_following_disk = SourceFollowingDiskProjection::default();
     if let Some(root) = inputs.workspace_root.clone() {
         let affects_rprofile = inputs.model_rprofile
             && captured.candidate_paths.iter().any(|path| {
                 path == &root.join(".Rprofile")
                     || path_in_rprofile_sourced_set(path, &inputs.rprofile_sourced_files)
             });
+        let affects_preamble = inputs.package_mode
+            != crate::cross_file::config::PackageMode::Disabled
+            && captured.candidate_paths.iter().any(|path| {
+                crate::package_state::preamble::is_testthat_preamble_path(path, &root)
+                    || path_in_rprofile_sourced_set(path, &inputs.preamble_sourced_files)
+            });
+        let scans = if affects_rprofile || affects_preamble {
+            let preamble_roots =
+                source_following_preamble_roots(&inputs, &root, &captured.package_text_overrides);
+            Some(capture_source_following_scans(
+                &root,
+                captured.package_text_overrides.clone(),
+                &captured.exclusions,
+                affects_rprofile,
+                if affects_preamble {
+                    preamble_roots
+                } else {
+                    Vec::new()
+                },
+            ))
+        } else {
+            None
+        };
         if affects_rprofile {
-            let scan =
-                crate::package_state::rprofile::scan_workspace_rprofile_with_overrides_and_exclusions(
-                    &root,
-                    &captured.package_text_overrides,
-                    &captured.exclusions,
-                );
+            let scan = scans
+                .as_ref()
+                .and_then(|scans| scans.rprofile.clone())
+                .unwrap_or_default();
             if let Some(delta) =
                 crate::package_state::event::apply_rprofile_scan(&mut inputs, Some(scan))
             {
@@ -7522,26 +7838,20 @@ fn derive_open_close_analysis(
                 rprofile_changed = true;
             }
         }
-        let affects_preamble = inputs.package_mode
-            != crate::cross_file::config::PackageMode::Disabled
-            && captured.candidate_paths.iter().any(|path| {
-                crate::package_state::preamble::is_testthat_preamble_path(path, &root)
-                    || path_in_rprofile_sourced_set(path, &inputs.preamble_sourced_files)
-            });
         if affects_preamble {
-            let (scan, _) = crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
-                &root,
-                crate::package_state::preamble::PreambleSnapshot::from_inputs(&inputs),
-                &captured.candidate_paths,
-                &captured.package_text_overrides,
-                &captured.exclusions,
-            );
+            let scan = scans
+                .as_ref()
+                .and_then(|scans| scans.preambles.clone())
+                .unwrap_or_default();
             if let Some(delta) =
                 crate::package_state::event::apply_preamble_scan(&mut inputs, Some(scan))
             {
                 deltas.push(delta);
                 preamble_changed = true;
             }
+        }
+        if let Some(scans) = scans {
+            source_following_disk = scans.disk;
         }
     }
     let mut package = None;
@@ -7596,17 +7906,20 @@ fn derive_open_close_analysis(
             )
         })
         .collect();
-    PreparedOpenCloseAnalysis::new(
-        captured.basis,
-        captured.intent,
-        captured.uri,
-        captured.expected_aliases,
-        package,
-        plan,
-        resync,
-        disk_observations,
-        watched_roots,
-    )
+    DerivedOpenCloseAnalysis {
+        prepared: PreparedOpenCloseAnalysis::new(
+            captured.basis,
+            captured.intent,
+            captured.uri,
+            captured.expected_aliases,
+            package,
+            plan,
+            resync,
+            disk_observations,
+            watched_roots,
+        ),
+        source_following_disk,
+    }
 }
 
 struct CapturedOpenInstallAnalysis {
@@ -7836,6 +8149,7 @@ impl OpenInstallPrerequisites {
 struct DerivedOpenInstallAnalysis {
     prepared: PreparedOpenInstallAnalysis,
     prerequisites: OpenInstallPrerequisites,
+    source_following_disk: SourceFollowingDiskProjection,
 }
 
 fn derive_open_install_analysis(
@@ -8020,6 +8334,7 @@ fn derive_open_install_analysis(
     let mut package_visibility_changed = false;
     let mut rprofile_changed = false;
     let mut preamble_changed = false;
+    let mut source_following_disk = SourceFollowingDiskProjection::default();
     {
         let mut inputs = captured.package_inputs;
         let mut deltas = Vec::new();
@@ -8079,20 +8394,6 @@ fn derive_open_install_analysis(
                     path == &root.join(".Rprofile")
                         || path_in_rprofile_sourced_set(path, &inputs.rprofile_sourced_files)
                 });
-            if affects_rprofile {
-                let scan = crate::package_state::rprofile::scan_workspace_rprofile_with_overrides_and_exclusions(
-                    &root,
-                    &captured.package_text_overrides,
-                    &captured.exclusions,
-                );
-                if let Some(delta) =
-                    crate::package_state::event::apply_rprofile_scan(&mut inputs, Some(scan))
-                {
-                    deltas.push(delta);
-                    rprofile_changed = true;
-                }
-            }
-
             let affects_preamble = inputs.package_mode
                 != crate::cross_file::config::PackageMode::Disabled
                 && !local_only
@@ -8100,20 +8401,52 @@ fn derive_open_install_analysis(
                     crate::package_state::preamble::is_testthat_preamble_path(path, &root)
                         || path_in_rprofile_sourced_set(path, &inputs.preamble_sourced_files)
                 });
-            if affects_preamble {
-                let (scan, _) = crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+            let scans = if affects_rprofile || affects_preamble {
+                let preamble_roots = source_following_preamble_roots(
+                    &inputs,
                     &root,
-                    crate::package_state::preamble::PreambleSnapshot::from_inputs(&inputs),
-                    &captured.candidate_paths,
                     &captured.package_text_overrides,
-                    &captured.exclusions,
                 );
+                Some(capture_source_following_scans(
+                    &root,
+                    captured.package_text_overrides.clone(),
+                    &captured.exclusions,
+                    affects_rprofile,
+                    if affects_preamble {
+                        preamble_roots
+                    } else {
+                        Vec::new()
+                    },
+                ))
+            } else {
+                None
+            };
+            if affects_rprofile {
+                let scan = scans
+                    .as_ref()
+                    .and_then(|scans| scans.rprofile.clone())
+                    .unwrap_or_default();
+                if let Some(delta) =
+                    crate::package_state::event::apply_rprofile_scan(&mut inputs, Some(scan))
+                {
+                    deltas.push(delta);
+                    rprofile_changed = true;
+                }
+            }
+            if affects_preamble {
+                let scan = scans
+                    .as_ref()
+                    .and_then(|scans| scans.preambles.clone())
+                    .unwrap_or_default();
                 if let Some(delta) =
                     crate::package_state::event::apply_preamble_scan(&mut inputs, Some(scan))
                 {
                     deltas.push(delta);
                     preamble_changed = true;
                 }
+            }
+            if let Some(scans) = scans {
+                source_following_disk = scans.disk;
             }
         }
 
@@ -8172,12 +8505,14 @@ fn derive_open_install_analysis(
     DerivedOpenInstallAnalysis {
         prepared,
         prerequisites,
+        source_following_disk,
     }
 }
 
 async fn commit_detached_open_install(
     state_arc: &Arc<RwLock<WorldState>>,
     prepared: PreparedOpenInstallAnalysis,
+    source_following_disk: SourceFollowingDiskProjection,
     uri: &Url,
     workspace_folders: &[Url],
     expected_aliases: &[Url],
@@ -8204,6 +8539,9 @@ async fn commit_detached_open_install(
     // bounded re-resolution is its linearization point for the install; later
     // filesystem changes converge through watched-file reconciliation.
     if WorldState::resolve_open_alias_candidates(uri, workspace_folders) != expected_aliases {
+        return Err(crate::state::AnalysisCommitRejected::StaleBasis);
+    }
+    if !source_following_disk.is_current() {
         return Err(crate::state::AnalysisCommitRejected::StaleBasis);
     }
 
@@ -10944,6 +11282,7 @@ async fn did_open_transactional(
         match commit_detached_open_install(
             &backend.state,
             derived.prepared,
+            derived.source_following_disk,
             uri,
             &workspace_folders,
             &aliases,
@@ -11147,7 +11486,7 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
         }) else {
             break;
         };
-        let Ok(prepared) =
+        let Ok(derived) =
             tokio::task::spawn_blocking(move || derive_open_close_analysis(captured)).await
         else {
             log::warn!("didClose detached derivation task failed for {uri}");
@@ -11170,57 +11509,60 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
             state.diagnostics_publish_lock.clone()
         };
         let publish_guard = publish_lock.lock().await;
+        let prepared = derived.prepared;
+        let source_following_disk = derived.source_following_disk;
         let disk_observations = prepared.disk_observations().to_vec();
         let disk_is_current = tokio::task::spawn_blocking(move || {
-            disk_observations.iter().all(|observation| {
-                let Ok(path) = observation.uri.to_file_path() else {
-                    return observation.snapshot.is_none();
-                };
-                match observation.snapshot.as_ref() {
-                    Some(expected) if observation.decoded_source => {
-                        let Ok(content) = crate::state::read_source(&path) else {
-                            return false;
-                        };
-                        let Ok(metadata) = std::fs::metadata(&path) else {
-                            return false;
-                        };
-                        crate::cross_file::file_cache::FileSnapshot::with_content_hash(
-                            &metadata, &content,
-                        ) == *expected
-                    }
-                    Some(expected) => {
-                        let Ok(metadata) = std::fs::metadata(&path) else {
-                            return false;
-                        };
-                        if expected.content_hash.is_some() {
-                            let Ok(bytes) = std::fs::read(&path) else {
+            source_following_disk.is_current()
+                && disk_observations.iter().all(|observation| {
+                    let Ok(path) = observation.uri.to_file_path() else {
+                        return observation.snapshot.is_none();
+                    };
+                    match observation.snapshot.as_ref() {
+                        Some(expected) if observation.decoded_source => {
+                            let Ok(content) = crate::state::read_source(&path) else {
                                 return false;
                             };
-                            file_snapshot_with_bytes_hash(&metadata, &bytes) == *expected
-                                && crate::state::read_source(&path).is_err_and(|error| {
+                            let Ok(metadata) = std::fs::metadata(&path) else {
+                                return false;
+                            };
+                            crate::cross_file::file_cache::FileSnapshot::with_content_hash(
+                                &metadata, &content,
+                            ) == *expected
+                        }
+                        Some(expected) => {
+                            let Ok(metadata) = std::fs::metadata(&path) else {
+                                return false;
+                            };
+                            if expected.content_hash.is_some() {
+                                let Ok(bytes) = std::fs::read(&path) else {
+                                    return false;
+                                };
+                                file_snapshot_with_bytes_hash(&metadata, &bytes) == *expected
+                                    && crate::state::read_source(&path).is_err_and(|error| {
+                                        matches!(
+                                            error,
+                                            crate::state::SourceReadError::InvalidEncoding { .. }
+                                        )
+                                    })
+                            } else {
+                                expected.matches_disk(
+                                    &crate::cross_file::file_cache::FileSnapshot::from_metadata(
+                                        &metadata,
+                                    ),
+                                ) && crate::state::read_source(&path).is_err_and(|error| {
                                     matches!(
                                         error,
-                                        crate::state::SourceReadError::InvalidEncoding { .. }
+                                        crate::state::SourceReadError::Io(error)
+                                            if error.kind() != std::io::ErrorKind::NotFound
                                     )
                                 })
-                        } else {
-                            expected.matches_disk(
-                                &crate::cross_file::file_cache::FileSnapshot::from_metadata(
-                                    &metadata,
-                                ),
-                            ) && crate::state::read_source(&path).is_err_and(|error| {
-                                matches!(
-                                    error,
-                                    crate::state::SourceReadError::Io(error)
-                                        if error.kind() != std::io::ErrorKind::NotFound
-                                )
-                            })
+                            }
                         }
+                        None => std::fs::metadata(path)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
                     }
-                    None => std::fs::metadata(path)
-                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-                }
-            })
+                })
         })
         .await
         .unwrap_or(false);
@@ -11603,7 +11945,7 @@ impl LanguageServer for Backend {
                         if package_seed_installed.is_some()
                             && let Some(root) = root_for_pkg_inputs.clone()
                         {
-                            let affected = Backend::refresh_open_package_inputs_after_seed(
+                            let outcome = Backend::refresh_open_package_inputs_after_seed(
                                 state_clone.clone(),
                                 client_clone.clone(),
                                 traversal_truncation.clone(),
@@ -11615,7 +11957,7 @@ impl LanguageServer for Backend {
                             )
                             .await;
                             if let Some(installed) = package_seed_installed.as_mut() {
-                                installed.post_seed_candidates = affected;
+                                retain_post_seed_refresh_outcome(installed, outcome);
                             }
                         }
 
@@ -11657,7 +11999,7 @@ impl LanguageServer for Backend {
                         // Claim the scan's immutable fanout only after package
                         // seeding and prefetch converge. The commit itself
                         // deliberately created no markers or workers.
-                        let tickets = {
+                        let (tickets, deferred) = {
                             let mut state = state_clone.write().await;
                             let mut handles = vec![applied_scan.transfer.handle];
                             if let Some(transfer) = package_seed_installed
@@ -11671,9 +12013,42 @@ impl LanguageServer for Backend {
                                 .map(|installed| installed.post_seed_candidates.clone())
                                 .unwrap_or_default();
                             let fallback: Vec<_> = state.documents.keys().cloned().collect();
-                            finalize_analysis_handoff_candidates_or_fallback(
-                                &mut state, handles, additional, fallback,
+                            if let Some(owner) = package_seed_installed
+                                .as_mut()
+                                .and_then(|installed| installed.deferred_post_seed.take())
+                            {
+                                (
+                                    Vec::new(),
+                                    Some((
+                                        owner,
+                                        DeferredPostSeedFinalization {
+                                            handles,
+                                            candidates: additional,
+                                        },
+                                    )),
+                                )
+                            } else {
+                                (
+                                    finalize_analysis_handoff_candidates_or_fallback(
+                                        &mut state, handles, additional, fallback,
+                                    ),
+                                    None,
+                                )
+                            }
+                        };
+                        let tickets = if let Some((owner, finalization)) = deferred {
+                            finish_deferred_post_seed_refresh(
+                                PackageSeedTaskHandles {
+                                    state: state_clone.clone(),
+                                    client: client_clone.clone(),
+                                    traversal_truncation: traversal_truncation.clone(),
+                                },
+                                owner,
+                                finalization,
                             )
+                            .await
+                        } else {
+                            tickets
                         };
                         tokio::spawn(Backend::publish_diagnostics_for_tickets_bounded(
                             state_clone.clone(),
@@ -14037,6 +14412,7 @@ impl Backend {
         let mut system_file_transfer = None;
         let mut workspace_scan_fallback_affected = Vec::new();
         let mut post_seed_candidates: Vec<AnalysisTransferCandidate> = Vec::new();
+        let mut deferred_post_seed = None;
         if workspace_exclusions_changed {
             let (affected, should_scan) = {
                 let mut state = self.state.write().await;
@@ -14055,7 +14431,7 @@ impl Backend {
                     WorkspaceScanRunOutcome::Committed(applied_scan) => {
                         let root_for_pkg_inputs = applied_scan.workspace_root;
                         let workspace_exclusions = applied_scan.exclusions;
-                        let mut package_seed_identity = None;
+                        let mut installed = None;
                         workspace_scan_transfer = Some(applied_scan.transfer);
                         let package_seed = if let Some(root) = root_for_pkg_inputs.as_ref() {
                             Some(
@@ -14074,7 +14450,7 @@ impl Backend {
                         if let (Some(root), Some(seed)) =
                             (root_for_pkg_inputs.clone(), package_seed)
                         {
-                            let installed = install_package_seed_with_retry(
+                            installed = install_package_seed_with_retry(
                                 &PackageSeedTaskHandles::from_backend(self),
                                 root,
                                 workspace_exclusions.clone(),
@@ -14084,13 +14460,21 @@ impl Backend {
                             .await
                             .into_committed();
                             package_inputs_initialized_by_exclusion_reload = installed.is_some();
-                            package_seed_identity =
-                                installed.as_ref().map(|installed| installed.identity);
-                            if let Some(transfer) = installed
-                                .as_ref()
-                                .and_then(|installed| installed.system_file.as_ref())
-                            {
-                                system_file_transfer = Some(transfer.clone());
+                            if let Some(committed) = installed.as_mut() {
+                                if let Some(transfer) = committed.system_file.as_ref() {
+                                    system_file_transfer = Some(transfer.clone());
+                                }
+                                let outcome = Backend::refresh_open_package_inputs_after_seed(
+                                    self.state.clone(),
+                                    self.client.clone(),
+                                    self.traversal_truncation.clone(),
+                                    root_for_pkg_inputs
+                                        .clone()
+                                        .expect("installed seed has a workspace root"),
+                                    committed.identity,
+                                )
+                                .await;
+                                retain_post_seed_refresh_outcome(committed, outcome);
                             }
                         } else {
                             self.state.write().await.apply_package_event(
@@ -14107,22 +14491,9 @@ impl Backend {
                             )
                         };
 
-                        // Close the seed-install TOCTOU window for preamble
-                        // buffers opened/edited while the reseed was in flight.
-                        if package_inputs_initialized_by_exclusion_reload
-                            && let (Some(root), Some(identity)) =
-                                (root_for_pkg_inputs, package_seed_identity)
-                        {
-                            post_seed_candidates.extend(
-                                Backend::refresh_open_package_inputs_after_seed(
-                                    self.state.clone(),
-                                    self.client.clone(),
-                                    self.traversal_truncation.clone(),
-                                    root,
-                                    identity,
-                                )
-                                .await,
-                            );
+                        if let Some(mut installed) = installed {
+                            post_seed_candidates.extend(installed.post_seed_candidates);
+                            deferred_post_seed = installed.deferred_post_seed.take();
                         }
 
                         if packages_enabled {
@@ -14172,6 +14543,7 @@ impl Backend {
                     if let Some(transfer) = installed.system_file {
                         system_file_transfer = Some(transfer);
                     }
+                    deferred_post_seed = installed.deferred_post_seed;
                 }
             }
         }
@@ -14234,6 +14606,7 @@ impl Backend {
                 if let Some(transfer) = installed.system_file {
                     system_file_transfer = Some(transfer);
                 }
+                deferred_post_seed = installed.deferred_post_seed;
             }
             log::info!("Rebuilt package state after packageMode change (event-driven)");
         }
@@ -14366,11 +14739,14 @@ impl Backend {
             );
         }
 
-        if only_watch_changed {
+        if only_watch_changed && deferred_post_seed.is_none() {
             return Vec::new();
         }
-        if workspace_scan_transfer.is_some() || system_file_transfer.is_some() {
-            let tickets = {
+        if workspace_scan_transfer.is_some()
+            || system_file_transfer.is_some()
+            || deferred_post_seed.is_some()
+        {
+            let (tickets, deferred) = {
                 let mut state = self.state.write().await;
                 let mut handles = Vec::new();
                 if let Some(transfer) = workspace_scan_transfer {
@@ -14383,9 +14759,35 @@ impl Backend {
                 additional.extend(workspace_scan_fallback_affected.clone());
                 let mut additional = state.capture_analysis_transfer_candidates(additional);
                 additional.extend(post_seed_candidates);
-                finalize_analysis_handoff_candidates_or_fallback(
-                    &mut state, handles, additional, open_uris,
+                if let Some(owner) = deferred_post_seed {
+                    (
+                        Vec::new(),
+                        Some((
+                            owner,
+                            DeferredPostSeedFinalization {
+                                handles,
+                                candidates: additional,
+                            },
+                        )),
+                    )
+                } else {
+                    (
+                        finalize_analysis_handoff_candidates_or_fallback(
+                            &mut state, handles, additional, open_uris,
+                        ),
+                        None,
+                    )
+                }
+            };
+            let tickets = if let Some((owner, finalization)) = deferred {
+                finish_deferred_post_seed_refresh(
+                    PackageSeedTaskHandles::from_backend(self),
+                    owner,
+                    finalization,
                 )
+                .await
+            } else {
+                tickets
             };
             Backend::publish_diagnostics_for_tickets_bounded(
                 self.state.clone(),
@@ -15709,7 +16111,7 @@ impl Backend {
         .into_committed();
         let mut installed = installed?;
 
-        installed.post_seed_candidates = Self::refresh_open_package_inputs_after_seed(
+        let outcome = Self::refresh_open_package_inputs_after_seed(
             self.state.clone(),
             self.client.clone(),
             self.traversal_truncation.clone(),
@@ -15717,6 +16119,7 @@ impl Backend {
             installed.identity,
         )
         .await;
+        retain_post_seed_refresh_outcome(&mut installed, outcome);
         Some(installed)
     }
 
@@ -15731,23 +16134,31 @@ impl Backend {
         traversal_truncation: Arc<TraversalTruncationState>,
         root: std::path::PathBuf,
         identity: PackageSeedInstalledIdentity,
-    ) -> Vec<AnalysisTransferCandidate> {
+    ) -> PostSeedRefreshOutcome {
+        // A predecessor already owns an unconsumed outer ledger. Let its
+        // coordinator converge/finalize before this seed can claim a new tail;
+        // replacing the pending identity here would orphan the predecessor's
+        // exact handles and lifecycle candidates.
+        loop {
+            let pending = state_arc.read().await.post_seed_refresh_retry_owner();
+            if pending.is_none() || pending == Some(identity) {
+                break;
+            }
+            tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+        }
         match attempt_combined_post_seed_refresh(&state_arc, &root, identity).await {
-            CombinedPostSeedRefreshOutcome::Committed(candidates) => candidates,
+            CombinedPostSeedRefreshOutcome::Committed(candidates) => {
+                PostSeedRefreshOutcome::Committed(candidates)
+            }
             CombinedPostSeedRefreshOutcome::NotApplicable
-            | CombinedPostSeedRefreshOutcome::Superseded => Vec::new(),
+            | CombinedPostSeedRefreshOutcome::Superseded => PostSeedRefreshOutcome::NotApplicable,
             CombinedPostSeedRefreshOutcome::Deferred => {
-                schedule_post_seed_refresh_retry(
-                    PackageSeedTaskHandles {
-                        state: state_arc,
-                        client,
-                        traversal_truncation,
-                    },
-                    root,
-                    identity,
-                )
-                .await;
-                Vec::new()
+                let _ = (client, traversal_truncation);
+                state_arc
+                    .write()
+                    .await
+                    .begin_post_seed_refresh_retry(identity);
+                PostSeedRefreshOutcome::Deferred(DeferredCombinedPostSeedOwner { root, identity })
             }
         }
     }
@@ -15760,7 +16171,7 @@ impl Backend {
         root: std::path::PathBuf,
     ) -> Vec<AnalysisTransferCandidate> {
         let identity = state_arc.write().await.record_package_seed_installed();
-        Self::refresh_open_package_inputs_after_seed(
+        match Self::refresh_open_package_inputs_after_seed(
             state_arc,
             client,
             traversal_truncation,
@@ -15768,6 +16179,11 @@ impl Backend {
             identity,
         )
         .await
+        {
+            PostSeedRefreshOutcome::Committed(candidates) => candidates,
+            PostSeedRefreshOutcome::NotApplicable => Vec::new(),
+            PostSeedRefreshOutcome::Deferred(_) => Vec::new(),
+        }
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
@@ -31183,6 +31599,97 @@ mod project_config_initialize_tests {
         state.record_package_seed_installed()
     }
 
+    #[test]
+    fn source_following_disk_projection_rejects_rewrite_delete_recreate_and_invalid_repair() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let helper = root.join("helper.R");
+        fs::write(root.join(".Rprofile"), "source(\"helper.R\")\n").unwrap();
+        fs::write(&helper, "before <- 1\n").unwrap();
+        let capture = || {
+            capture_source_following_scans(
+                root,
+                Default::default(),
+                &crate::config_file::CompiledWorkspaceExclusions::default(),
+                true,
+                Vec::new(),
+            )
+            .disk
+        };
+        let routing = crate::package_state::preamble::canonicalize_for_routing(&helper);
+
+        let valid = capture();
+        assert!(matches!(
+            valid.entries.get(&routing),
+            Some(PackageSeedDiskIdentity::Valid { .. })
+        ));
+        fs::write(&helper, "after_ <- 2\n").unwrap();
+        assert!(
+            !valid.is_current(),
+            "a same-length rewrite must fail the byte-hashed observation"
+        );
+
+        let before_delete = capture();
+        fs::remove_file(&helper).unwrap();
+        assert!(!before_delete.is_current(), "deletion must fail Valid");
+        let missing = capture();
+        assert_eq!(
+            missing.entries.get(&routing),
+            Some(&PackageSeedDiskIdentity::Missing)
+        );
+        fs::write(&helper, "reborn <- 3\n").unwrap();
+        assert!(!missing.is_current(), "recreation must fail Missing");
+
+        fs::write(&helper, [0xff, 0xfe, 0xfd]).unwrap();
+        let invalid = capture();
+        assert!(matches!(
+            invalid.entries.get(&routing),
+            Some(PackageSeedDiskIdentity::Invalid(Some(_)))
+        ));
+        fs::write(&helper, "repaired <- 4\n").unwrap();
+        assert!(!invalid.is_current(), "valid replacement must fail Invalid");
+    }
+
+    #[test]
+    fn configuration_seed_retains_committed_post_seed_candidate_for_one_outer_finalization() {
+        let tmp = TempDir::new().unwrap();
+        let uri = Url::from_file_path(tmp.path().join("consumer.R")).unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "consumer <- 1\n", Some(1));
+        state
+            .begin_open_document_diagnostic_lifecycle(&uri)
+            .unwrap();
+        let identity = state.record_package_seed_installed();
+        let candidates = state.capture_analysis_transfer_candidates([uri.clone()]);
+        let mut installed = SeedInstalled {
+            identity,
+            system_file: None,
+            deferred_system_file: None,
+            post_seed_candidates: Vec::new(),
+            deferred_post_seed: None,
+        };
+
+        retain_post_seed_refresh_outcome(
+            &mut installed,
+            PostSeedRefreshOutcome::Committed(candidates),
+        );
+        assert_eq!(installed.post_seed_candidates.len(), 1);
+        let tickets = finalize_analysis_handoff_candidates_or_fallback(
+            &mut state,
+            Vec::new(),
+            installed.post_seed_candidates,
+            Vec::new(),
+        );
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].uri, uri);
+        assert_eq!(state.analysis_revalidation_reservation_count, 1);
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            1,
+            "the configuration outer finalizer owns the committed candidate exactly once"
+        );
+    }
+
     #[tokio::test]
     async fn combined_post_seed_projection_rejects_both_halves_on_basis_drift() {
         let tmp = TempDir::new().unwrap();
@@ -31234,6 +31741,89 @@ mod project_config_initialize_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn combined_post_seed_rechecks_closed_helper_bytes_before_package_cas() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: combinedtail\nVersion: 0.0.1\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"scripts/helper.R\")\n").unwrap();
+        let helper = root.join("scripts/helper.R");
+        fs::write(&helper, "old_helper <- 1\n").unwrap();
+        let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let (identity, pause) = {
+            let mut state = backend.state.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+            let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root.clone(),
+                Some(Arc::from("Package: combinedtail\nVersion: 0.0.1\n")),
+                None,
+                Default::default(),
+                Some(
+                    crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                        &root,
+                        &exclusions,
+                    ),
+                ),
+                None,
+                &exclusions,
+            );
+            state.open_document(
+                rprofile_uri,
+                "source(\"scripts/helper.R\")\nprofile_live <- 1\n",
+                Some(1),
+            );
+            let identity = state.record_package_seed_installed();
+            let pause = state
+                .post_seed_refresh_pre_commit_test_pause
+                .arm(Url::parse(POST_SEED_REFRESH_PRE_COMMIT_PAUSE_URI).unwrap());
+            (identity, pause)
+        };
+
+        let refresh = Backend::refresh_open_package_inputs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            root,
+            identity,
+        );
+        tokio::pin!(refresh);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut refresh => panic!("post-seed refresh skipped the disk CAS barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("post-seed refresh did not reach the disk CAS barrier")
+            }
+        }
+        fs::write(&helper, "new_helper <- 2\n").unwrap();
+        pause.release();
+        let PostSeedRefreshOutcome::Committed(_) = refresh.await else {
+            panic!("one disk race must converge within the bounded foreground attempts");
+        };
+
+        let state = backend.state.read().await;
+        assert!(state.package_inputs.rprofile_symbols.contains("new_helper"));
+        assert!(!state.package_inputs.rprofile_symbols.contains("old_helper"));
+        assert!(
+            state
+                .package_inputs
+                .rprofile_symbols
+                .contains("profile_live")
+        );
+        assert_eq!(
+            state.post_seed_refresh_test_commit_attempts, 1,
+            "the stale disk projection must be rejected before entering the state CAS"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn combined_post_seed_exhaustion_defers_and_completes_under_exact_seed_owner() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
@@ -31264,7 +31854,7 @@ mod project_config_initialize_tests {
             identity
         };
 
-        let candidates = Backend::refresh_open_package_inputs_after_seed(
+        let outcome = Backend::refresh_open_package_inputs_after_seed(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
@@ -31272,7 +31862,9 @@ mod project_config_initialize_tests {
             identity,
         )
         .await;
-        assert!(candidates.is_empty(), "deferred work owns candidates later");
+        let PostSeedRefreshOutcome::Deferred(owner) = outcome else {
+            panic!("forced rejection must transfer the complete tail");
+        };
         {
             let state = backend.state.read().await;
             assert_eq!(state.post_seed_refresh_test_commit_attempts, 3);
@@ -31292,16 +31884,17 @@ mod project_config_initialize_tests {
             );
         }
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let state = backend.state.read().await;
-                if !state.post_seed_refresh_retry_is_current(identity) {
-                    break;
-                }
-                drop(state);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            finish_deferred_post_seed_refresh(
+                PackageSeedTaskHandles::from_backend(backend),
+                owner,
+                DeferredPostSeedFinalization {
+                    handles: Vec::new(),
+                    candidates: Vec::new(),
+                },
+            ),
+        )
         .await
         .expect("the coalesced post-seed worker must converge");
         let state = backend.state.read().await;
@@ -31322,7 +31915,354 @@ mod project_config_initialize_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn combined_post_seed_deferred_owner_cancels_when_a_new_seed_takes_over() {
+    async fn combined_post_seed_deferred_tail_finalizes_one_capped_exact_ledger() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: combinedtail\nVersion: 0.0.1\nSuggests: testthat\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"scripts/shared.R\")\n").unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        fs::write(&preamble, "source(\"../../scripts/shared.R\")\n").unwrap();
+        fs::write(root.join("scripts/shared.R"), "disk_shared <- 1\n").unwrap();
+        let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let preamble_uri = Url::from_file_path(&preamble).unwrap();
+        let first = Url::from_file_path(root.join("first.R")).unwrap();
+        let second = Url::from_file_path(root.join("second.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let (identity, outer, reservations_before) = {
+            let mut state = backend.state.write().await;
+            let identity = establish_combined_post_seed_fixture(
+                &mut state,
+                &root,
+                &rprofile_uri,
+                &preamble_uri,
+            );
+            for uri in [&first, &second] {
+                state.open_document(uri.clone(), "profile_live\n", Some(1));
+                state.begin_open_document_diagnostic_lifecycle(uri).unwrap();
+            }
+            state.cross_file_config.max_revalidations_per_trigger = 1;
+            state.post_seed_refresh_test_reject_remaining = 3;
+            let outer = state.capture_analysis_transfer_candidates([first.clone(), second.clone()]);
+            (
+                identity,
+                outer,
+                state.analysis_revalidation_reservation_count,
+            )
+        };
+
+        let outcome = Backend::refresh_open_package_inputs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            root,
+            identity,
+        )
+        .await;
+        let PostSeedRefreshOutcome::Deferred(owner) = outcome else {
+            panic!("forced rejection must transfer the complete outer ledger");
+        };
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.analysis_revalidation_reservation_count,
+                reservations_before
+            );
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&first)
+                    + state
+                        .diagnostics_gate
+                        .force_republish_count_for_test(&second),
+                0,
+                "deferred derivation cannot reserve or mark before the coordinator"
+            );
+        }
+
+        let tickets = finish_deferred_post_seed_refresh(
+            PackageSeedTaskHandles::from_backend(backend),
+            owner,
+            DeferredPostSeedFinalization {
+                handles: Vec::new(),
+                candidates: outer,
+            },
+        )
+        .await;
+        let state = backend.state.read().await;
+        assert_eq!(tickets.len(), 1, "the union receives one shared cap");
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservations_before + 1,
+            "the complete deferred ledger is reserved exactly once"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&first)
+                + state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&second),
+            1,
+            "only the one cap-selected dependent receives a marker"
+        );
+        assert!(!state.post_seed_refresh_retry_is_current(identity));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successor_deferred_tail_waits_for_predecessor_exact_ledger() {
+        let tmp = TempDir::new().unwrap();
+        let old_root = tmp.path().join("old");
+        let new_root = tmp.path().join("new");
+        for root in [&old_root, &new_root] {
+            fs::create_dir_all(root.join("scripts")).unwrap();
+            fs::write(
+                root.join("DESCRIPTION"),
+                "Package: combinedtail\nVersion: 0.0.1\n",
+            )
+            .unwrap();
+            fs::write(root.join(".Rprofile"), "source(\"scripts/helper.R\")\n").unwrap();
+            fs::write(root.join("scripts/helper.R"), "helper_value <- 1\n").unwrap();
+        }
+        let old_profile = Url::from_file_path(old_root.join(".Rprofile")).unwrap();
+        let old_subject = Url::from_file_path(old_root.join("old-subject.R")).unwrap();
+        let new_profile = Url::from_file_path(new_root.join(".Rprofile")).unwrap();
+        let new_subject = Url::from_file_path(new_root.join("new-subject.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let (old_identity, old_candidates) = {
+            let mut state = backend.state.write().await;
+            establish_package_event_translation_state(&mut state, old_root.clone());
+            state.open_document(
+                old_profile,
+                "source(\"scripts/helper.R\")\nold_profile_live <- 1\n",
+                Some(1),
+            );
+            state.open_document(old_subject.clone(), "old_profile_live\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&old_subject)
+                .unwrap();
+            state.cross_file_config.max_revalidations_per_trigger = 1;
+            state.post_seed_refresh_test_reject_remaining = 3;
+            let identity = state.record_package_seed_installed();
+            let candidates = state.capture_analysis_transfer_candidates([old_subject.clone()]);
+            (identity, candidates)
+        };
+        let old_outcome = Backend::refresh_open_package_inputs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            old_root.clone(),
+            old_identity,
+        )
+        .await;
+        let PostSeedRefreshOutcome::Deferred(old_owner) = old_outcome else {
+            panic!("the predecessor must own a deferred exact ledger");
+        };
+
+        let (new_identity, new_candidates, pause) = {
+            let mut state = backend.state.write().await;
+            establish_package_event_translation_state(&mut state, new_root.clone());
+            state.open_document(
+                new_profile,
+                "source(\"scripts/helper.R\")\nnew_profile_live <- 1\n",
+                Some(1),
+            );
+            state.open_document(new_subject.clone(), "new_profile_live\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&new_subject)
+                .unwrap();
+            let identity = state.record_package_seed_installed();
+            let candidates = state.capture_analysis_transfer_candidates([new_subject.clone()]);
+            let pause = state
+                .post_seed_refresh_pre_commit_test_pause
+                .arm(Url::parse(POST_SEED_REFRESH_PRE_COMMIT_PAUSE_URI).unwrap());
+            (identity, candidates, pause)
+        };
+        let successor_state = backend.state.clone();
+        let successor_client = backend.client.clone();
+        let successor_traversal = backend.traversal_truncation.clone();
+        let successor = tokio::spawn(async move {
+            Backend::refresh_open_package_inputs_after_seed(
+                successor_state,
+                successor_client,
+                successor_traversal,
+                new_root,
+                new_identity,
+            )
+            .await
+        });
+        tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY + PACKAGE_SEED_RETRY_DELAY).await;
+        assert!(
+            !successor.is_finished(),
+            "a successor cannot overwrite the predecessor's pending owner"
+        );
+
+        let old_tickets = finish_deferred_post_seed_refresh(
+            PackageSeedTaskHandles::from_backend(backend),
+            old_owner,
+            DeferredPostSeedFinalization {
+                handles: Vec::new(),
+                candidates: old_candidates,
+            },
+        )
+        .await;
+        assert_eq!(old_tickets.len(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_arrived())
+            .await
+            .expect("the successor starts only after predecessor finalization");
+        backend
+            .state
+            .write()
+            .await
+            .post_seed_refresh_test_reject_remaining = 3;
+        pause.release();
+        let PostSeedRefreshOutcome::Deferred(new_owner) = successor.await.unwrap() else {
+            panic!("forced successor rejection must create its own deferred owner");
+        };
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&old_subject),
+                1
+            );
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&new_subject),
+                0,
+                "the successor cannot double-finalize before owning its ledger"
+            );
+        }
+
+        let new_tickets = finish_deferred_post_seed_refresh(
+            PackageSeedTaskHandles::from_backend(backend),
+            new_owner,
+            DeferredPostSeedFinalization {
+                handles: Vec::new(),
+                candidates: new_candidates,
+            },
+        )
+        .await;
+        let state = backend.state.read().await;
+        assert_eq!(new_tickets.len(), 1);
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&old_subject),
+            1
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&new_subject),
+            1
+        );
+        assert!(
+            state
+                .package_inputs
+                .rprofile_symbols
+                .contains("new_profile_live")
+        );
+        assert!(!state.post_seed_refresh_retry_is_current(new_identity));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successor_seed_install_defers_as_strict_noop_until_predecessor_completes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: successor\nVersion: 0.0.1\n",
+        )
+        .unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let (predecessor, input_generation, record_generation, routing_owner) = {
+            let mut state = backend.state.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+            let predecessor = state.record_package_seed_installed();
+            assert!(state.begin_post_seed_refresh_retry(predecessor));
+            (
+                predecessor,
+                state.package_input_generation(),
+                state.package_state_record_generation_for_test(),
+                state.system_file_routing_owner_generation(),
+            )
+        };
+
+        let outcome = install_package_seed_with_retry(
+            &PackageSeedTaskHandles::from_backend(backend),
+            root.clone(),
+            crate::config_file::CompiledWorkspaceExclusions::default(),
+            false,
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, StandalonePackageOutcome::Deferred));
+        {
+            let state = backend.state.read().await;
+            assert!(state.package_seed_retry.has_pending());
+            assert!(state.package_seed_installed_identity_is_current(predecessor));
+            assert_eq!(state.package_input_generation(), input_generation);
+            assert_eq!(
+                state.package_state_record_generation_for_test(),
+                record_generation
+            );
+            assert_eq!(state.system_file_routing_owner_generation(), routing_owner);
+            assert_eq!(state.analysis_revalidation_reservation_count, 0);
+        }
+
+        let tickets = finish_deferred_post_seed_refresh(
+            PackageSeedTaskHandles::from_backend(backend),
+            DeferredCombinedPostSeedOwner {
+                root: root.clone(),
+                identity: predecessor,
+            },
+            DeferredPostSeedFinalization {
+                handles: Vec::new(),
+                candidates: Vec::new(),
+            },
+        )
+        .await;
+        assert!(tickets.is_empty());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = backend.state.read().await;
+                if !state.package_seed_installed_identity_is_current(predecessor)
+                    && !state.package_seed_retry.has_pending()
+                {
+                    break;
+                }
+                drop(state);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the scheduled successor must install after predecessor completion");
+        let state = backend.state.read().await;
+        assert_eq!(state.package_input_generation(), input_generation + 1);
+        assert_eq!(
+            state.package_state_record_generation_for_test(),
+            record_generation + 1
+        );
+        assert_ne!(state.system_file_routing_owner_generation(), routing_owner);
+        assert_eq!(
+            state.analysis_revalidation_reservation_count, 0,
+            "empty predecessor/successor ledgers cannot create overlapping markers"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn combined_post_seed_deferred_owner_retries_against_a_new_seed_basis() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         fs::create_dir_all(root.join("tests/testthat")).unwrap();
@@ -31351,7 +32291,7 @@ mod project_config_initialize_tests {
             state.post_seed_refresh_test_reject_remaining = 3;
             identity
         };
-        Backend::refresh_open_package_inputs_after_seed(
+        let outcome = Backend::refresh_open_package_inputs_after_seed(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
@@ -31359,33 +32299,37 @@ mod project_config_initialize_tests {
             old_identity,
         )
         .await;
+        let PostSeedRefreshOutcome::Deferred(owner) = outcome else {
+            panic!("forced rejection must transfer the complete tail");
+        };
         {
             let mut state = backend.state.write().await;
             assert!(state.post_seed_refresh_retry_is_current(old_identity));
             let successor = state.record_package_seed_installed();
             assert_ne!(successor, old_identity);
         }
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let state = backend.state.read().await;
-                if !state.post_seed_refresh_retry_is_current(old_identity) {
-                    break;
-                }
-                drop(state);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            finish_deferred_post_seed_refresh(
+                PackageSeedTaskHandles::from_backend(backend),
+                owner,
+                DeferredPostSeedFinalization {
+                    handles: Vec::new(),
+                    candidates: Vec::new(),
+                },
+            ),
+        )
         .await
-        .expect("the superseded deferred owner must terminate");
+        .expect("the deferred owner must converge against the successor basis");
         let state = backend.state.read().await;
         assert!(
-            !state
+            state
                 .package_inputs
                 .rprofile_symbols
                 .contains("profile_live")
         );
         assert!(
-            !state
+            state
                 .package_inputs
                 .preamble_sourced_symbols
                 .get(&preamble)
@@ -31393,7 +32337,7 @@ mod project_config_initialize_tests {
         );
         assert_eq!(
             state.post_seed_refresh_test_commit_attempts, 3,
-            "the successor cancels before the delayed worker attempts a commit"
+            "current-basis retries do not consume the exact-seed test counter"
         );
     }
 
@@ -31427,7 +32371,7 @@ mod project_config_initialize_tests {
             assert!(state.begin_system_file_seed_retry(identity));
             identity
         };
-        Backend::refresh_open_package_inputs_after_seed(
+        let outcome = Backend::refresh_open_package_inputs_after_seed(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
@@ -31435,6 +32379,9 @@ mod project_config_initialize_tests {
             identity,
         )
         .await;
+        let PostSeedRefreshOutcome::Deferred(owner) = outcome else {
+            panic!("the routing owner must defer the complete tail");
+        };
         {
             let state = backend.state.read().await;
             assert!(state.system_file_seed_retry_is_current(identity));
@@ -31453,16 +32400,17 @@ mod project_config_initialize_tests {
             .write()
             .await
             .complete_system_file_seed_retry(identity);
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let state = backend.state.read().await;
-                if !state.post_seed_refresh_retry_is_current(identity) {
-                    break;
-                }
-                drop(state);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            finish_deferred_post_seed_refresh(
+                PackageSeedTaskHandles::from_backend(backend),
+                owner,
+                DeferredPostSeedFinalization {
+                    handles: Vec::new(),
+                    candidates: Vec::new(),
+                },
+            ),
+        )
         .await
         .expect("post-seed convergence must resume after routing ownership clears");
         let state = backend.state.read().await;

@@ -824,6 +824,10 @@ pub struct WorldState {
     /// Exact seed owner currently assigned to the coalesced deferred
     /// Rprofile+preamble convergence worker.
     pending_post_seed_refresh_retry: Option<PackageSeedInstalledIdentity>,
+    /// A same-seed `system.file()` transfer completed while the combined
+    /// post-seed owner was retaining the outer diagnostic ledger.
+    pending_post_seed_system_transfer:
+        Option<(PackageSeedInstalledIdentity, AnalysisTransferHandle)>,
     /// Dedicated latest-owner identity for all `system.file()` routing inputs.
     ///
     /// This is deliberately narrower than `package_input_generation`: unrelated
@@ -2397,6 +2401,10 @@ impl WorldState {
         self.pending_post_seed_refresh_retry == Some(identity)
     }
 
+    pub(crate) fn post_seed_refresh_retry_owner(&self) -> Option<PackageSeedInstalledIdentity> {
+        self.pending_post_seed_refresh_retry
+    }
+
     pub(crate) fn complete_post_seed_refresh_retry(
         &mut self,
         identity: PackageSeedInstalledIdentity,
@@ -2404,6 +2412,42 @@ impl WorldState {
         if self.pending_post_seed_refresh_retry == Some(identity) {
             self.pending_post_seed_refresh_retry = None;
         }
+        if self
+            .pending_post_seed_system_transfer
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == identity)
+        {
+            self.pending_post_seed_system_transfer = None;
+        }
+    }
+
+    pub(crate) fn retain_post_seed_system_transfer(
+        &mut self,
+        identity: PackageSeedInstalledIdentity,
+        handle: AnalysisTransferHandle,
+    ) -> bool {
+        if self.pending_post_seed_refresh_retry != Some(identity) {
+            return false;
+        }
+        self.pending_post_seed_system_transfer = Some((identity, handle));
+        true
+    }
+
+    pub(crate) fn take_post_seed_system_transfer(
+        &mut self,
+        identity: PackageSeedInstalledIdentity,
+    ) -> Option<AnalysisTransferHandle> {
+        if self
+            .pending_post_seed_system_transfer
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == identity)
+        {
+            return self
+                .pending_post_seed_system_transfer
+                .take()
+                .map(|(_, handle)| handle);
+        }
+        None
     }
 }
 
@@ -3462,6 +3506,7 @@ impl WorldState {
             package_seed_install_id: 0,
             pending_system_file_seed_retry: None,
             pending_post_seed_refresh_retry: None,
+            pending_post_seed_system_transfer: None,
             system_file_routing_owner_generation: Self::mint_system_file_routing_owner_generation(),
 
             // Caches

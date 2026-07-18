@@ -104,33 +104,6 @@ pub fn scan_workspace_rprofile_with_root_text_and_exclusions(
     scan_rprofile_worklist(workspace_root, root_text.to_string(), Some(exclusions))
 }
 
-/// Scan `.Rprofile` while preferring authoritative open-buffer text for both
-/// the root and every transitively sourced helper.
-pub(crate) fn scan_workspace_rprofile_with_overrides_and_exclusions(
-    workspace_root: &Path,
-    overrides: &super::preamble::PreambleTextOverrides,
-    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
-) -> RprofileScan {
-    let rprofile_path = workspace_root.join(".Rprofile");
-    if exclusions.is_excluded_path(&rprofile_path) {
-        return RprofileScan::default();
-    }
-    let root_text = overrides
-        .get(&rprofile_path)
-        .map(ToString::to_string)
-        .or_else(|| crate::state::read_source(&rprofile_path).ok());
-    let Some(root_text) = root_text else {
-        return RprofileScan::default();
-    };
-    scan_rprofile_worklist_with_overrides(
-        workspace_root,
-        root_text,
-        Some(exclusions),
-        Some(overrides),
-        true,
-    )
-}
-
 /// Scan a detached seed's exact captured text projection without reopening
 /// missing or invalid source targets from disk.
 pub(crate) fn scan_workspace_rprofile_from_captured_texts_and_exclusions(
