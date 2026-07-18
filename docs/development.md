@@ -178,6 +178,15 @@ then install a concrete, fully in-memory seed under one write lock. Disabled
 modeling choices are represented by empty scans before construction; the central
 installation transaction never traverses the filesystem. After installation,
 callers refresh open preamble documents to close the snapshot-to-install race.
+
+Background workspace scans use a complete immutable candidate rather than
+merging a raw disk scan at commit time. A brief snapshot captures scan inputs,
+retained non-scan entries (including on-demand/external files), authoritative
+open-buffer overlays, and package/system-file routing identity. Metadata and
+the complete dependency graph are derived off-lock. The final write-lock
+boundary validates that authority snapshot, atomically claims the monotonic
+scan generation, and installs the indexes, graph, and refreshed open-document
+metadata together; a stale candidate mutates nothing and is recomputed.
 Keep new seed inputs in that shared helper so startup, exclusion reloads, and
 package-mode rebuilds cannot drift or introduce blocking filesystem work under
 the state lock.

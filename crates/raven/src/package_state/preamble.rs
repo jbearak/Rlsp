@@ -395,17 +395,27 @@ fn read_source_with_overrides(path: &Path, overrides: &PreambleTextOverrides) ->
 }
 
 /// Stable watcher-routing spelling for an existing or currently missing path.
-/// Canonicalizing the parent preserves symlink identity across delete/create
-/// events even though the target itself cannot be canonicalized while absent.
+///
+/// Walk to the nearest existing ancestor, canonicalize that prefix, then append
+/// the missing suffix. This preserves symlink identity across delete/create
+/// events even when both the target and one or more parent directories are
+/// absent.
 pub(crate) fn canonicalize_for_routing(path: &Path) -> PathBuf {
-    path.canonicalize()
-        .unwrap_or_else(|_| match (path.parent(), path.file_name()) {
-            (Some(parent), Some(name)) => parent
-                .canonicalize()
-                .map(|canonical_parent| canonical_parent.join(name))
-                .unwrap_or_else(|_| path.to_path_buf()),
-            _ => path.to_path_buf(),
-        })
+    let mut ancestor = path;
+    let mut missing_suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in missing_suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
+            return path.to_path_buf();
+        };
+        missing_suffix.push(name.to_os_string());
+        ancestor = parent;
+    }
 }
 
 /// Follow one preamble file's transitive static `source()` targets, harvesting

@@ -399,6 +399,14 @@ impl WorkspaceIndex {
             .unwrap_or(0)
     }
 
+    /// Snapshot the URIs protected from LRU eviction.
+    pub(crate) fn pinned_uris(&self) -> HashSet<Url> {
+        self.pinned
+            .read()
+            .map(|pinned| pinned.clone())
+            .unwrap_or_default()
+    }
+
     /// Check if the index is empty
     pub fn is_empty(&self) -> bool {
         self.len() == 0
