@@ -112,6 +112,16 @@ enum RRuntimeDiskIdentity {
         change_seconds: i64,
         #[cfg(unix)]
         change_nanoseconds: i64,
+        #[cfg(windows)]
+        volume_serial_number: Option<u32>,
+        #[cfg(windows)]
+        file_index: Option<u64>,
+        #[cfg(windows)]
+        file_attributes: u32,
+        #[cfg(windows)]
+        creation_time: u64,
+        #[cfg(windows)]
+        last_write_time: u64,
     },
     Missing,
     Invalid,
@@ -222,6 +232,8 @@ impl RSubprocess {
         };
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
+        #[cfg(windows)]
+        use std::os::windows::fs::MetadataExt;
         RRuntimeIdentity {
             requested_path: self.r_path.clone(),
             canonical_path,
@@ -240,6 +252,16 @@ impl RSubprocess {
                 change_seconds: metadata.ctime(),
                 #[cfg(unix)]
                 change_nanoseconds: metadata.ctime_nsec(),
+                #[cfg(windows)]
+                volume_serial_number: metadata.volume_serial_number(),
+                #[cfg(windows)]
+                file_index: metadata.file_index(),
+                #[cfg(windows)]
+                file_attributes: metadata.file_attributes(),
+                #[cfg(windows)]
+                creation_time: metadata.creation_time(),
+                #[cfg(windows)]
+                last_write_time: metadata.last_write_time(),
             },
         }
     }

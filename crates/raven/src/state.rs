@@ -3457,10 +3457,18 @@ impl WorldState {
     pub(crate) fn try_install_sysdata_fallback_projection(
         &mut self,
         basis: &SysdataFallbackBasis,
+        observation: &crate::package_state::sysdata::SysdataFileObservation,
         prepared: PreparedPackageProjection,
         affected_uris: impl IntoIterator<Item = Url>,
     ) -> Result<SysdataFallbackCommitEffects, PackageProjectionInstallRejected> {
-        if !self.sysdata_fallback_basis_is_current(basis) {
+        // This is the only sysdata byte read under the commit write lock. It is
+        // intentionally inside the central commit so no off-lock derivation or
+        // wait for that lock can separate the observation from the authority
+        // CAS. Runtime-identity metadata is revalidated in the same narrow
+        // section below.
+        if !observation.is_current(&basis.workspace_root)
+            || !self.sysdata_fallback_basis_is_current(basis)
+        {
             return Err(PackageProjectionInstallRejected::StaleBasis);
         }
         let routing_owner = self.install_prepared_package_projection(prepared);

@@ -6301,6 +6301,12 @@ struct CapturedSysdataFallback {
     affected_uris: Vec<Url>,
 }
 
+enum SysdataFallbackCapture {
+    Ready(Box<CapturedSysdataFallback>),
+    NotApplicable,
+    Stale,
+}
+
 enum SysdataFallbackAttempt {
     Committed {
         candidates: Vec<AnalysisTransferCandidate>,
@@ -6316,10 +6322,12 @@ enum SysdataFallbackAttempt {
 fn capture_sysdata_fallback(
     state: &WorldState,
     owner: &SysdataFallbackOwner,
-) -> Option<CapturedSysdataFallback> {
-    let (basis, r_path) = state.capture_sysdata_fallback_basis(owner)?;
+) -> SysdataFallbackCapture {
+    let Some((basis, r_path)) = state.capture_sysdata_fallback_basis(owner) else {
+        return SysdataFallbackCapture::NotApplicable;
+    };
     if !state.package_inputs.sysdata_names.is_empty() {
-        return None;
+        return SysdataFallbackCapture::NotApplicable;
     }
     let observation =
         crate::package_state::sysdata::SysdataFileObservation::capture(&owner.workspace_root);
@@ -6327,16 +6335,16 @@ fn capture_sysdata_fallback(
         observation,
         crate::package_state::sysdata::SysdataFileObservation::Valid { .. }
     ) {
-        return None;
+        return SysdataFallbackCapture::Stale;
     }
-    Some(CapturedSysdataFallback {
+    SysdataFallbackCapture::Ready(Box::new(CapturedSysdataFallback {
         basis,
         inputs: state.package_inputs.clone(),
         state: state.package_state.clone(),
         observation,
         r_path,
         affected_uris: state.documents.keys().cloned().collect(),
-    })
+    }))
 }
 
 async fn attempt_sysdata_fallback_using<F, Fut>(
@@ -6355,8 +6363,12 @@ where
         }
         capture_sysdata_fallback(&state, owner)
     };
-    let Some(mut captured) = captured else {
-        return SysdataFallbackAttempt::NotApplicable;
+    let mut captured = match captured {
+        SysdataFallbackCapture::Ready(captured) => *captured,
+        SysdataFallbackCapture::NotApplicable => {
+            return SysdataFallbackAttempt::NotApplicable;
+        }
+        SysdataFallbackCapture::Stale => return SysdataFallbackAttempt::Stale,
     };
     let crate::package_state::sysdata::SysdataFileObservation::Valid { digest, bytes } =
         &captured.observation
@@ -6407,6 +6419,20 @@ where
         &crate::package_state::PackageInputDelta::SysdataNamesChanged,
     );
     let prepared = PreparedPackageProjection::new(captured.inputs, next);
+
+    #[cfg(test)]
+    {
+        let pause = {
+            let state = state_arc.read().await;
+            state
+                .sysdata_fallback_pre_commit_test_pause
+                .take_armed(&Url::parse("raven-test://sysdata-fallback-final-commit").unwrap())
+        };
+        if let Some(pause) = pause {
+            pause.pause().await;
+        }
+    }
+
     let mut state = state_arc.write().await;
     #[cfg(test)]
     {
@@ -6423,6 +6449,7 @@ where
     }
     match state.try_install_sysdata_fallback_projection(
         &captured.basis,
+        &captured.observation,
         prepared,
         captured.affected_uris,
     ) {
@@ -6444,16 +6471,9 @@ where
     F: FnMut(std::path::PathBuf, crate::package_state::ContentDigest, Arc<[u8]>) -> Fut,
     Fut: Future<Output = std::result::Result<std::collections::BTreeSet<String>, String>>,
 {
-    let mut saw_stale = false;
     for attempt in 0..SYSDATA_FALLBACK_MAX_ATTEMPTS {
         match attempt_sysdata_fallback_using(state_arc, owner, &mut load).await {
             SysdataFallbackAttempt::Stale => {
-                saw_stale = true;
-                if attempt + 1 < SYSDATA_FALLBACK_MAX_ATTEMPTS {
-                    tokio::task::yield_now().await;
-                }
-            }
-            SysdataFallbackAttempt::NotApplicable if saw_stale => {
                 if attempt + 1 < SYSDATA_FALLBACK_MAX_ATTEMPTS {
                     tokio::task::yield_now().await;
                 }
@@ -6510,9 +6530,68 @@ async fn finish_sysdata_fallback_commit(
     .await;
 }
 
+async fn complete_sysdata_fallback_without_commit(
+    handles: &PackageSeedTaskHandles,
+    owner: &SysdataFallbackOwner,
+    generation: u64,
+    owns_deferred_retry: bool,
+) {
+    if owns_deferred_retry {
+        // A deferred non-commit owns only its retry token: no package
+        // projection ever installed, so there are deliberately no analysis
+        // candidates or routing handles to finalize. Still validate the exact
+        // owner before draining that bundle so terminal R failure or
+        // non-applicability cannot masquerade as a successor handoff.
+        if !handles
+            .state
+            .read()
+            .await
+            .sysdata_fallback_owner_is_current(owner)
+        {
+            log::trace!("Retiring deferred sysdata fallback under its validated successor");
+        }
+    }
+    handles
+        .state
+        .read()
+        .await
+        .sysdata_fallback_retry
+        .complete(generation);
+}
+
+fn capture_unavailable_sysdata_observation(
+    owner: &SysdataFallbackOwner,
+) -> Option<crate::package_state::sysdata::SysdataFileObservation> {
+    let observation =
+        crate::package_state::sysdata::SysdataFileObservation::capture(&owner.workspace_root);
+    observation.is_unavailable().then_some(observation)
+}
+
+fn deferred_sysdata_observation_has_settled(
+    owner: &SysdataFallbackOwner,
+    observation: &crate::package_state::sysdata::SysdataFileObservation,
+) -> bool {
+    observation.is_unavailable() && observation.is_current(&owner.workspace_root)
+}
+
+fn has_sysdata_fallback_watcher_event(root: &std::path::Path, changes: &[FileEvent]) -> bool {
+    let sysdata_path = root.join("R").join("sysdata.rda");
+    changes.iter().any(|change| {
+        matches!(
+            change.typ,
+            FileChangeType::CREATED | FileChangeType::CHANGED
+        ) && change
+            .uri
+            .to_file_path()
+            .is_ok_and(|path| path == sysdata_path)
+    })
+}
+
 async fn schedule_sysdata_fallback(handles: PackageSeedTaskHandles, owner: SysdataFallbackOwner) {
     let (generation, cancel) = handles.state.read().await.sysdata_fallback_retry.schedule();
     tokio::spawn(async move {
+        let mut owns_deferred_retry = false;
+        let mut unavailable_after_deferred = None;
         loop {
             if cancel.is_cancelled() {
                 handles
@@ -6523,7 +6602,32 @@ async fn schedule_sysdata_fallback(handles: PackageSeedTaskHandles, owner: Sysda
                     .complete(generation);
                 return;
             }
-            match run_sysdata_fallback_transaction(&handles.state, &owner).await {
+            if unavailable_after_deferred
+                .as_ref()
+                .is_some_and(|observation| {
+                    deferred_sysdata_observation_has_settled(&owner, observation)
+                })
+            {
+                complete_sysdata_fallback_without_commit(
+                    &handles,
+                    &owner,
+                    generation,
+                    owns_deferred_retry,
+                )
+                .await;
+                return;
+            }
+            let outcome = run_sysdata_fallback_transaction(&handles.state, &owner).await;
+            if matches!(
+                outcome,
+                SysdataFallbackAttempt::Deferred | SysdataFallbackAttempt::Stale
+            ) {
+                owns_deferred_retry = true;
+                unavailable_after_deferred = capture_unavailable_sysdata_observation(&owner);
+                tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+                continue;
+            }
+            match outcome {
                 SysdataFallbackAttempt::Committed {
                     candidates,
                     routing_owner,
@@ -6538,12 +6642,17 @@ async fn schedule_sysdata_fallback(handles: PackageSeedTaskHandles, owner: Sysda
                         .complete(generation);
                     return;
                 }
-                SysdataFallbackAttempt::Deferred | SysdataFallbackAttempt::Stale => {
-                    tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+                SysdataFallbackAttempt::NotApplicable | SysdataFallbackAttempt::Failed => {
+                    complete_sysdata_fallback_without_commit(
+                        &handles,
+                        &owner,
+                        generation,
+                        owns_deferred_retry,
+                    )
+                    .await;
+                    return;
                 }
-                SysdataFallbackAttempt::NotApplicable
-                | SysdataFallbackAttempt::Failed
-                | SysdataFallbackAttempt::Superseded => {
+                SysdataFallbackAttempt::Superseded => {
                     handles
                         .state
                         .read()
@@ -6552,9 +6661,24 @@ async fn schedule_sysdata_fallback(handles: PackageSeedTaskHandles, owner: Sysda
                         .complete(generation);
                     return;
                 }
+                SysdataFallbackAttempt::Deferred | SysdataFallbackAttempt::Stale => {
+                    unreachable!("retry outcomes continue before terminal dispatch")
+                }
             }
         }
     });
+}
+
+async fn schedule_current_sysdata_fallback(handles: PackageSeedTaskHandles) {
+    let owner = {
+        let state = handles.state.read().await;
+        sysdata_r_fallback_needed(&state)
+            .then(|| state.current_sysdata_fallback_owner())
+            .flatten()
+    };
+    if let Some(owner) = owner {
+        schedule_sysdata_fallback(handles, owner).await;
+    }
 }
 
 #[cfg(test)]
@@ -6565,6 +6689,7 @@ mod sysdata_fallback_transaction_tests {
     use tempfile::TempDir;
 
     const PAUSE_URI: &str = "raven-test://sysdata-fallback-pre-commit";
+    const FINAL_COMMIT_PAUSE_URI: &str = "raven-test://sysdata-fallback-final-commit";
 
     fn loaded_names() -> BTreeSet<String> {
         BTreeSet::from(["internal_value".to_string()])
@@ -6607,11 +6732,24 @@ mod sysdata_fallback_transaction_tests {
     where
         M: FnOnce(&mut WorldState),
     {
+        paused_attempt_at(state, owner, PAUSE_URI, result, mutate).await
+    }
+
+    async fn paused_attempt_at<M>(
+        state: &Arc<RwLock<WorldState>>,
+        owner: &SysdataFallbackOwner,
+        pause_uri: &str,
+        result: std::result::Result<BTreeSet<String>, String>,
+        mutate: M,
+    ) -> SysdataFallbackAttempt
+    where
+        M: FnOnce(&mut WorldState),
+    {
         let pause = state
             .read()
             .await
             .sysdata_fallback_pre_commit_test_pause
-            .arm(Url::parse(PAUSE_URI).unwrap());
+            .arm(Url::parse(pause_uri).unwrap());
         let task_state = Arc::clone(state);
         let task_owner = owner.clone();
         let task = tokio::spawn(async move {
@@ -6683,6 +6821,25 @@ mod sysdata_fallback_transaction_tests {
             matches!(outcome, SysdataFallbackAttempt::Committed { .. }),
             "same-byte recreation preserves the frozen content identity"
         );
+    }
+
+    #[tokio::test]
+    async fn sysdata_fallback_rechecks_file_after_off_lock_derivation() {
+        let tmp = TempDir::new().unwrap();
+        let (state, owner) = fixture(tmp.path(), b"pre-derive bytes");
+        let path = tmp.path().join("R").join("sysdata.rda");
+
+        let outcome = paused_attempt_at(
+            &state,
+            &owner,
+            FINAL_COMMIT_PAUSE_URI,
+            Ok(loaded_names()),
+            |_| fs::write(&path, b"post-derive rewrite").unwrap(),
+        )
+        .await;
+
+        assert!(matches!(outcome, SysdataFallbackAttempt::Stale));
+        assert!(state.read().await.package_inputs.sysdata_names.is_empty());
     }
 
     #[tokio::test]
@@ -6795,29 +6952,129 @@ mod sysdata_fallback_transaction_tests {
     }
 
     #[tokio::test]
-    async fn sysdata_fallback_stale_then_missing_remains_deferred() {
+    async fn sysdata_fallback_without_r_runtime_is_terminally_not_applicable() {
         let tmp = TempDir::new().unwrap();
-        let (state, owner) = fixture(tmp.path(), b"transient bytes");
-        let (generation, _) = state.read().await.sysdata_fallback_retry.schedule();
-        state.write().await.sysdata_fallback_test_reject_remaining = 1;
-        let path = tmp.path().join("R").join("sysdata.rda");
+        let (state, owner) = fixture(tmp.path(), b"runtime-free bytes");
+        state.write().await.install_package_library(
+            Arc::new(crate::package_library::PackageLibrary::new_empty()),
+            true,
+        );
         let mut calls = 0;
 
         let outcome = run_sysdata_fallback_transaction_using(&state, &owner, |_, _, _| {
             calls += 1;
-            if calls == 2 {
-                fs::remove_file(&path).unwrap();
-            }
             std::future::ready(Ok(loaded_names()))
         })
         .await;
 
-        assert!(matches!(outcome, SysdataFallbackAttempt::Deferred));
-        let state = state.read().await;
-        assert_eq!(calls, 2, "the missing third capture must not invoke R");
-        assert!(state.package_inputs.sysdata_names.is_empty());
-        assert!(state.sysdata_fallback_retry.has_pending());
-        state.sysdata_fallback_retry.complete(generation);
+        assert!(matches!(outcome, SysdataFallbackAttempt::NotApplicable));
+        assert_eq!(calls, 0);
+        assert!(state.read().await.package_inputs.sysdata_names.is_empty());
+    }
+
+    #[test]
+    fn sysdata_fallback_watcher_routing_is_exact_and_repair_only() {
+        let tmp = TempDir::new().unwrap();
+        let exact = Url::from_file_path(tmp.path().join("R").join("sysdata.rda")).unwrap();
+        let sibling = Url::from_file_path(tmp.path().join("R").join("other.rda")).unwrap();
+
+        for typ in [FileChangeType::CREATED, FileChangeType::CHANGED] {
+            assert!(has_sysdata_fallback_watcher_event(
+                tmp.path(),
+                &[FileEvent {
+                    uri: exact.clone(),
+                    typ,
+                }],
+            ));
+        }
+        assert!(!has_sysdata_fallback_watcher_event(
+            tmp.path(),
+            &[FileEvent {
+                uri: exact,
+                typ: FileChangeType::DELETED,
+            }],
+        ));
+        assert!(!has_sysdata_fallback_watcher_event(
+            tmp.path(),
+            &[FileEvent {
+                uri: sibling,
+                typ: FileChangeType::CHANGED,
+            }],
+        ));
+    }
+
+    #[tokio::test]
+    async fn sysdata_fallback_stable_unavailable_file_drains_then_repair_gets_fresh_owner() {
+        enum Unavailable {
+            Missing,
+            Invalid,
+        }
+
+        for unavailable in [Unavailable::Missing, Unavailable::Invalid] {
+            let tmp = TempDir::new().unwrap();
+            let (state, owner) = fixture(tmp.path(), b"transient bytes");
+            let uri = Url::from_file_path(tmp.path().join("R").join("open.R")).unwrap();
+            let (generation, _) = {
+                let mut state = state.write().await;
+                state.open_document(uri.clone(), "value <- 1\n", Some(1));
+                state
+                    .begin_open_document_diagnostic_lifecycle(&uri)
+                    .unwrap();
+                state.sysdata_fallback_test_reject_remaining = 1;
+                state.sysdata_fallback_retry.schedule()
+            };
+            let path = tmp.path().join("R").join("sysdata.rda");
+            let mut first_batch_calls = 0;
+
+            let first = run_sysdata_fallback_transaction_using(&state, &owner, |_, _, _| {
+                first_batch_calls += 1;
+                if first_batch_calls == 2 {
+                    fs::remove_file(&path).unwrap();
+                    if matches!(unavailable, Unavailable::Invalid) {
+                        fs::create_dir(&path).unwrap();
+                    }
+                }
+                std::future::ready(Ok(loaded_names()))
+            })
+            .await;
+            assert!(matches!(first, SysdataFallbackAttempt::Deferred));
+            assert_eq!(first_batch_calls, 2);
+
+            let unavailable_observation = capture_unavailable_sysdata_observation(&owner).unwrap();
+            assert!(
+                deferred_sysdata_observation_has_settled(&owner, &unavailable_observation),
+                "one unchanged debounce proves stable unavailability"
+            );
+
+            let current = state.read().await;
+            assert!(current.package_inputs.sysdata_names.is_empty());
+            assert!(current.sysdata_fallback_retry.has_pending());
+            assert_eq!(current.analysis_revalidation_reservation_count, 0);
+            assert_eq!(
+                current
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&uri),
+                0
+            );
+            current.sysdata_fallback_retry.complete(generation);
+            assert!(!current.sysdata_fallback_retry.has_pending());
+            drop(current);
+
+            if matches!(unavailable, Unavailable::Invalid) {
+                fs::remove_dir(&path).unwrap();
+            }
+            fs::write(&path, b"repaired bytes").unwrap();
+            let (fresh_generation, fresh_cancel) =
+                state.read().await.sysdata_fallback_retry.schedule();
+            assert_ne!(fresh_generation, generation);
+            assert!(!fresh_cancel.is_cancelled());
+            assert!(state.read().await.sysdata_fallback_retry.has_pending());
+            state
+                .read()
+                .await
+                .sysdata_fallback_retry
+                .complete(fresh_generation);
+        }
     }
 
     #[tokio::test]
@@ -12973,17 +13230,7 @@ impl LanguageServer for Backend {
 
         // R fallback for sysdata: when the AST scan found nothing AND
         // R/sysdata.rda exists, try loading via an R subprocess.
-        {
-            let owner = {
-                let state = self.state.read().await;
-                sysdata_r_fallback_needed(&state)
-                    .then(|| state.current_sysdata_fallback_owner())
-                    .flatten()
-            };
-            if let Some(owner) = owner {
-                schedule_sysdata_fallback(PackageSeedTaskHandles::from_backend(self), owner).await;
-            }
-        }
+        schedule_current_sysdata_fallback(PackageSeedTaskHandles::from_backend(self)).await;
 
         // Register dynamic file watches for raven.toml / .lintr along the
         // same workspace-root/ancestor paths that project-config discovery
@@ -14104,6 +14351,9 @@ impl LanguageServer for Backend {
         if remaining_changes.is_empty() {
             return;
         }
+        let sysdata_fallback_watcher_event = project_root
+            .as_ref()
+            .is_some_and(|root| has_sysdata_fallback_watcher_event(root, &remaining_changes));
         let mut params = DidChangeWatchedFilesParams {
             changes: remaining_changes,
         };
@@ -14254,9 +14504,9 @@ impl LanguageServer for Backend {
             let traversal_truncation = self.traversal_truncation.clone();
             tokio::spawn(async move {
                 run_watched_resync_batch(
-                    state_arc,
-                    client,
-                    traversal_truncation,
+                    state_arc.clone(),
+                    client.clone(),
+                    traversal_truncation.clone(),
                     WatchedResyncBatch {
                         updates: uris_to_update,
                         affected: affected_open_docs,
@@ -14268,6 +14518,14 @@ impl LanguageServer for Backend {
                     },
                 )
                 .await;
+                if sysdata_fallback_watcher_event {
+                    schedule_current_sysdata_fallback(PackageSeedTaskHandles {
+                        state: state_arc,
+                        client,
+                        traversal_truncation,
+                    })
+                    .await;
+                }
             });
         } else {
             // Preserve the synchronous delete-only handler contract while
@@ -14287,6 +14545,9 @@ impl LanguageServer for Backend {
                 },
             )
             .await;
+            if sysdata_fallback_watcher_event {
+                schedule_current_sysdata_fallback(PackageSeedTaskHandles::from_backend(self)).await;
+            }
         }
     }
 

@@ -832,6 +832,10 @@ impl SysdataFileObservation {
             _ => false,
         }
     }
+
+    pub(crate) fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Missing | Self::Invalid)
+    }
 }
 
 /// R fallback: load `R/sysdata.rda` via an R subprocess and return `ls()` of
