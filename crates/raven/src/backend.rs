@@ -35,7 +35,9 @@ use crate::state::{
     PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis, PreparedOpenCloseDiskInstall,
     PreparedOpenCommitPlan, PreparedOpenEditAnalysis, PreparedOpenGraphProjection,
     PreparedOpenInstallAnalysis, PreparedOpenLifecycleBatch, PreparedOpenPackageInstall,
-    SymbolConfig, WorkspaceGraphDerivationContext, WorkspaceGraphOverlay, WorldState,
+    PreparedWorkspaceOpenMetadata, PreparedWorkspaceScanAnalysis, SymbolConfig,
+    WorkspaceGraphDerivationContext, WorkspaceGraphOverlay, WorkspaceScanDerivationBasis,
+    WorkspaceScanInputBasis, WorkspaceScanIntentToken, WorkspaceScanTransferredEffects, WorldState,
     derive_workspace_dependency_graph,
 };
 use crate::utf16::utf16_column_to_byte_offset;
@@ -133,6 +135,8 @@ const OPEN_LIFECYCLE_POST_UNLOCK_PRE_SPAWN_PAUSE_URI: &str =
 #[cfg(test)]
 const OPEN_LIFECYCLE_ADDED_EFFECTS_COMPLETE_PAUSE_URI: &str =
     "raven-test://open-lifecycle/added-effects-complete";
+#[cfg(test)]
+const WORKSPACE_SCAN_PRE_COMMIT_PAUSE_URI: &str = "raven-test://workspace-scan/pre-commit";
 
 /// Parse the VS Code client's initial tab/peek resource set.
 ///
@@ -3400,152 +3404,54 @@ fn hydrate_package_r_files_from_state(
     r_files
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WorkspaceScanInputSnapshot {
-    generation: u64,
-    workspace_folders: Vec<Url>,
-    max_chain_depth: usize,
-    max_transitive_dependents_visited: usize,
-    exclusion_patterns: Vec<String>,
-    index_workspace: bool,
-}
-
-impl WorkspaceScanInputSnapshot {
-    fn capture(state: &WorldState) -> Self {
-        Self {
-            generation: state.workspace_scan_generation(),
-            workspace_folders: state.workspace_folders.clone(),
-            max_chain_depth: state.cross_file_config.max_chain_depth,
-            max_transitive_dependents_visited: state
-                .cross_file_config
-                .max_transitive_dependents_visited,
-            exclusion_patterns: state.workspace_exclusions.patterns().to_vec(),
-            index_workspace: state.cross_file_config.index_workspace,
-        }
-    }
-
-    fn is_current_for(&self, state: &WorldState) -> bool {
-        state.workspace_scan_generation() == self.generation
-            && state.workspace_folders == self.workspace_folders
-            && state.cross_file_config.max_chain_depth == self.max_chain_depth
-            && state.cross_file_config.max_transitive_dependents_visited
-                == self.max_transitive_dependents_visited
-            && state.workspace_exclusions.patterns() == self.exclusion_patterns.as_slice()
-            && state.cross_file_config.index_workspace == self.index_workspace
-    }
-}
-
 #[derive(Clone)]
 struct WorkspaceScanInputs {
-    snapshot: WorkspaceScanInputSnapshot,
+    basis: WorkspaceScanInputBasis,
     exclusions: crate::config_file::CompiledWorkspaceExclusions,
 }
 
 impl WorkspaceScanInputs {
-    fn capture(state: &WorldState) -> Option<Self> {
-        let snapshot = WorkspaceScanInputSnapshot::capture(state);
-        (snapshot.index_workspace && !snapshot.workspace_folders.is_empty()).then(|| Self {
-            snapshot,
-            exclusions: state.workspace_exclusions.clone(),
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SystemFileRoutingIdentity {
-    workspace_name: Option<String>,
-    workspace_root: Option<std::path::PathBuf>,
-    library_paths: Vec<std::path::PathBuf>,
-}
-
-impl SystemFileRoutingIdentity {
-    fn capture(state: &WorldState) -> Self {
-        let (workspace_name, workspace_root, library_paths) = state.snapshot_system_file_inputs();
-        Self {
-            workspace_name,
-            workspace_root,
-            library_paths,
-        }
+    fn capture(state: &WorldState, intent: WorkspaceScanIntentToken) -> Option<Self> {
+        state
+            .capture_workspace_scan_input_basis(intent)
+            .map(|basis| Self {
+                basis,
+                exclusions: state.workspace_exclusions.clone(),
+            })
     }
 }
 
 #[derive(Clone)]
-struct WorkspaceGraphAuthorityIdentity {
-    graph_authority_generation: u64,
-    workspace_index_version: u64,
-    workspace_index_max_files: usize,
-    workspace_index_max_file_size_bytes: usize,
-    workspace_index_artifact_capacity: usize,
-    workspace_index_pinned: std::collections::HashSet<Url>,
-    package_input_generation: u64,
-    package_config_generation: u64,
-    open_documents: std::collections::BTreeMap<Url, OpenDocumentSeedIdentity>,
-    system_file_routing: SystemFileRoutingIdentity,
-}
-
-impl WorkspaceGraphAuthorityIdentity {
-    fn capture_from_snapshot(
-        state: &WorldState,
-        index: &crate::workspace_index::WorkspaceIndexSnapshot,
-    ) -> Self {
-        Self {
-            graph_authority_generation: state.workspace_graph_authority_generation(),
-            workspace_index_version: index.version,
-            workspace_index_max_files: state.workspace_index.config().max_files,
-            workspace_index_max_file_size_bytes: state.workspace_index.config().max_file_size_bytes,
-            workspace_index_artifact_capacity: index.artifact_capacity_limit,
-            workspace_index_pinned: index.pinned.clone(),
-            package_input_generation: state.package_input_generation(),
-            package_config_generation: state.package_config_generation,
-            open_documents: snapshot_open_document_seed_identities(state),
-            system_file_routing: SystemFileRoutingIdentity::capture(state),
-        }
-    }
-
-    #[cfg(test)]
-    fn capture(state: &WorldState) -> Self {
-        let index = state.workspace_index.authority_snapshot();
-        Self::capture_from_snapshot(state, &index)
-    }
-
-    fn is_current_for(&self, state: &WorldState) -> bool {
-        let index = state.workspace_index.authority_snapshot();
-        state.workspace_graph_authority_generation() == self.graph_authority_generation
-            && index.version == self.workspace_index_version
-            && state.workspace_index.config().max_files == self.workspace_index_max_files
-            && state.workspace_index.config().max_file_size_bytes
-                == self.workspace_index_max_file_size_bytes
-            && index.artifact_capacity_limit == self.workspace_index_artifact_capacity
-            && index.pinned == self.workspace_index_pinned
-            && state.package_input_generation() == self.package_input_generation
-            && state.package_config_generation == self.package_config_generation
-            && snapshot_open_document_seed_identities(state) == self.open_documents
-            && SystemFileRoutingIdentity::capture(state) == self.system_file_routing
-    }
-}
-
-struct PreparedWorkspaceScan {
-    artifact_only: Vec<(Url, crate::workspace_index::ArtifactEntry)>,
-    full_records: Vec<(
-        Url,
-        crate::workspace_index::IndexEntry,
-        crate::workspace_index::ClosedProvenance,
-    )>,
-    graph: crate::cross_file::dependency::DependencyGraph,
-    open_metadata: HashMap<
-        Url,
-        (
-            crate::open_document_store::AnalysisGeneration,
-            Arc<crate::cross_file::CrossFileMetadata>,
-        ),
-    >,
-    workspace_index_pins: std::collections::HashSet<Url>,
-    authority: WorkspaceGraphAuthorityIdentity,
+struct WorkspaceScanOpenCapture {
+    token: crate::open_document_store::OpenRecordToken,
+    record: Arc<crate::open_document_store::OpenDocumentRecord>,
 }
 
 struct AppliedWorkspaceScan {
     workspace_root: Option<std::path::PathBuf>,
     exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    transfer: WorkspaceScanTransferredEffects,
+}
+
+enum WorkspaceScanRunOutcome {
+    Committed(AppliedWorkspaceScan),
+    Superseded,
+    RetryExhausted,
+    Disabled,
+    ScanFailed,
+}
+
+#[cfg(test)]
+impl WorkspaceScanRunOutcome {
+    fn expect_committed(self) -> AppliedWorkspaceScan {
+        match self {
+            Self::Committed(applied) => applied,
+            Self::Superseded => panic!("workspace scan was superseded"),
+            Self::RetryExhausted => panic!("workspace scan exhausted retries"),
+            Self::Disabled => panic!("workspace scan was disabled"),
+            Self::ScanFailed => panic!("workspace scan failed"),
+        }
+    }
 }
 
 fn snapshot_workspace_graph_overlays(state: &WorldState) -> Vec<WorkspaceGraphOverlay> {
@@ -3570,15 +3476,15 @@ fn snapshot_workspace_graph_overlays(state: &WorldState) -> Vec<WorkspaceGraphOv
 /// deterministic order the real cache will receive at commit.
 fn prepare_resident_workspace_entries(
     entries: HashMap<Url, crate::workspace_index::IndexEntry>,
-    authority: &WorkspaceGraphAuthorityIdentity,
+    basis: &WorkspaceScanDerivationBasis,
     pins: &std::collections::HashSet<Url>,
 ) -> Vec<(Url, crate::workspace_index::IndexEntry)> {
     let mut ordered_entries: Vec<_> = entries.into_iter().collect();
     ordered_entries.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
 
     let mut config = crate::workspace_index::WorkspaceIndexConfig::default();
-    config.max_files = authority.workspace_index_max_files;
-    config.max_file_size_bytes = authority.workspace_index_max_file_size_bytes;
+    config.max_files = basis.workspace_index_max_files();
+    config.max_file_size_bytes = basis.workspace_index_max_file_size_bytes();
     let prepared_index = crate::workspace_index::WorkspaceIndex::new(config);
     prepared_index.set_pinned_uris(pins.clone());
     for (uri, entry) in &ordered_entries {
@@ -3593,7 +3499,7 @@ fn prepare_resident_workspace_entries(
 /// that can survive the atomic scan commit.
 fn prepare_resident_artifact_uris(
     entries: &HashMap<Url, crate::workspace_index::IndexEntry>,
-    authority: &WorkspaceGraphAuthorityIdentity,
+    basis: &WorkspaceScanDerivationBasis,
     pins: &std::collections::HashSet<Url>,
 ) -> std::collections::HashSet<Url> {
     let config = crate::workspace_index::WorkspaceIndexConfig {
@@ -3602,7 +3508,7 @@ fn prepare_resident_artifact_uris(
         ..Default::default()
     };
     let prepared = crate::workspace_index::WorkspaceIndex::new(config);
-    prepared.resize_artifacts(authority.workspace_index_artifact_capacity);
+    prepared.resize_artifacts(basis.workspace_index_artifact_capacity());
     prepared.set_pinned_uris(pins.clone());
     let mut ordered: Vec<_> = entries.iter().collect();
     ordered.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
@@ -3628,14 +3534,14 @@ fn prospective_workspace_pins(
     if open_roots.is_empty() {
         return open_roots;
     }
-    let per_seed = inputs.snapshot.max_transitive_dependents_visited;
+    let per_seed = inputs.basis.max_transitive_dependents_visited;
     let effective_max_visited = per_seed
         .saturating_mul(open_roots.len().max(1))
         .min(per_seed.saturating_mul(50))
         .min(WorldState::MULTI_SEED_VISITED_CEILING);
     graph.collect_neighborhood_multi(
         open_roots,
-        inputs.snapshot.max_chain_depth,
+        inputs.basis.max_chain_depth,
         effective_max_visited,
     )
 }
@@ -3644,13 +3550,12 @@ async fn prepare_workspace_scan(
     state_arc: &Arc<RwLock<WorldState>>,
     inputs: &WorkspaceScanInputs,
     result: crate::state::WorkspaceScanResult,
-) -> Option<PreparedWorkspaceScan> {
-    let (open_overlays, authority, retained_entries, chunk_kind_overrides) = {
+) -> Option<PreparedWorkspaceScanAnalysis> {
+    let (open_overlays, mut open_captures, basis, retained_entries, chunk_kind_overrides) = {
         let state = state_arc.read().await;
-        if !inputs.snapshot.is_current_for(&state) {
-            return None;
-        }
         let index_snapshot = state.workspace_index.authority_snapshot();
+        let basis =
+            state.capture_workspace_scan_derivation_basis(&inputs.basis, &index_snapshot)?;
         let dynamic_artifact_uris: std::collections::HashSet<_> = index_snapshot
             .artifacts
             .iter()
@@ -3677,7 +3582,16 @@ async fn prepare_workspace_scan(
             .collect::<Vec<_>>();
         (
             snapshot_workspace_graph_overlays(&state),
-            WorkspaceGraphAuthorityIdentity::capture_from_snapshot(&state, &index_snapshot),
+            state
+                .documents
+                .keys()
+                .filter_map(|uri| {
+                    let record = state.documents.get_record(uri)?.clone();
+                    let token = WorldState::workspace_scan_open_token(&basis, uri)?;
+                    Some((uri.clone(), WorkspaceScanOpenCapture { token, record }))
+                })
+                .collect::<HashMap<_, _>>(),
+            basis,
             (retained_entries, retained_artifacts),
             state.editor_chunk_kind_overrides.clone(),
         )
@@ -3686,7 +3600,7 @@ async fn prepare_workspace_scan(
     let mut result = result;
     crate::state::apply_workspace_scan_chunk_overrides(&mut result, &chunk_kind_overrides);
     let scanned_entries = result;
-    let scan_generation = inputs.snapshot.generation;
+    let scan_generation = inputs.basis.scan_generation();
     let (retained_entries, retained_artifacts) = retained_entries;
     let retained_uris: std::collections::HashSet<_> = retained_entries.keys().cloned().collect();
     let scanned_uris: std::collections::HashSet<_> = scanned_entries.keys().cloned().collect();
@@ -3707,20 +3621,20 @@ async fn prepare_workspace_scan(
                 indexed_at_version: artifact.indexed_at_version,
             });
     }
-    let routing = &authority.system_file_routing;
+    let (workspace_name, package_workspace_root, library_paths) = basis.system_file_inputs();
     let context = WorkspaceGraphDerivationContext {
-        workspace_root: inputs.snapshot.workspace_folders.first().cloned(),
-        max_depth: inputs.snapshot.max_chain_depth,
+        workspace_root: inputs.basis.workspace_folders.first().cloned(),
+        max_depth: inputs.basis.max_chain_depth,
         exclusions: inputs.exclusions.clone(),
-        system_file_workspace_name: routing.workspace_name.clone(),
-        system_file_workspace_root: routing.workspace_root.clone(),
-        system_file_library_paths: routing.library_paths.clone(),
+        system_file_workspace_name: workspace_name,
+        system_file_workspace_root: package_workspace_root,
+        system_file_library_paths: library_paths,
     };
     let (complete_graph, _) =
         derive_workspace_dependency_graph(&mut graph_entries, None, &open_overlays, &context);
     let workspace_index_pins = prospective_workspace_pins(&complete_graph, &open_overlays, inputs);
     let artifact_roots =
-        prepare_resident_artifact_uris(&graph_entries, &authority, &workspace_index_pins);
+        prepare_resident_artifact_uris(&graph_entries, &basis, &workspace_index_pins);
     let (graph, derived_open_metadata) = derive_workspace_dependency_graph(
         &mut graph_entries,
         Some(&artifact_roots),
@@ -3729,16 +3643,27 @@ async fn prepare_workspace_scan(
     );
     complete_entries.retain(|uri, _| artifact_roots.contains(uri));
     let resident_entries =
-        prepare_resident_workspace_entries(complete_entries, &authority, &workspace_index_pins);
+        prepare_resident_workspace_entries(complete_entries, &basis, &workspace_index_pins);
     let open_metadata = derived_open_metadata
         .into_iter()
         .filter_map(|(uri, metadata)| {
-            authority
-                .open_documents
-                .get(&uri)
-                .map(|identity| (uri, (identity.generation, metadata)))
+            let captured = open_captures.remove(&uri)?;
+            let prepared =
+                crate::open_document_store::OpenDocumentStore::prepare_metadata_replacement(
+                    &uri,
+                    &captured.record,
+                    metadata,
+                );
+            Some(PreparedWorkspaceOpenMetadata::new(
+                uri,
+                captured.token,
+                prepared,
+            ))
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if !open_captures.is_empty() {
+        return None;
+    }
     let full_records = resident_entries
         .into_iter()
         .map(|(uri, mut entry)| {
@@ -3787,80 +3712,109 @@ async fn prepare_workspace_scan(
             )
         })
         .collect();
-    Some(PreparedWorkspaceScan {
+    Some(PreparedWorkspaceScanAnalysis::new(
+        inputs.basis.clone(),
+        basis,
         artifact_only,
         full_records,
         graph,
         open_metadata,
         workspace_index_pins,
-        authority,
-    })
+    ))
 }
 
 async fn apply_workspace_scan_if_current(
     state_arc: &Arc<RwLock<WorldState>>,
     inputs: &WorkspaceScanInputs,
     result: crate::state::WorkspaceScanResult,
-) -> bool {
-    let Some(prepared) = prepare_workspace_scan(state_arc, inputs, result).await else {
-        return false;
-    };
-    let mut state = state_arc.write().await;
-    if !inputs.snapshot.is_current_for(&state)
-        || !prepared.authority.is_current_for(&state)
-        || !state.claim_workspace_scan_generation(inputs.snapshot.generation)
+) -> Option<WorkspaceScanTransferredEffects> {
+    let prepared = prepare_workspace_scan(state_arc, inputs, result).await?;
+    #[cfg(test)]
     {
-        return false;
+        let pause = {
+            let state = state_arc.read().await;
+            state
+                .workspace_scan_pre_commit_test_pause
+                .take_armed(&Url::parse(WORKSPACE_SCAN_PRE_COMMIT_PAUSE_URI).unwrap())
+        };
+        if let Some(pause) = pause {
+            pause.pause().await;
+        }
     }
-    state.apply_prepared_workspace_index(
-        prepared.artifact_only,
-        prepared.full_records,
-        prepared.graph,
-        prepared.open_metadata,
-        prepared.workspace_index_pins,
-    );
-    true
+    let mut state = state_arc.write().await;
+    state
+        .try_commit_analysis(PreparedAnalysisCommit::WorkspaceScan(Box::new(prepared)))
+        .ok()?
+        .workspace_scan
 }
 
-/// Recompute the entire scan/candidate until one complete authority snapshot
-/// atomically installs.
-async fn run_workspace_scan_until_current_using<F, Fut>(
+/// Run at most two complete attempts for one latest-arrival scan intent.
+///
+/// A CAS rejection discards the whole attempt. Attempt two recaptures the
+/// pre-I/O basis and repeats disk scan plus graph/artifact derivation from
+/// scratch, while retaining the same arrival intent. A newer intent
+/// supersedes immediately and can never be mistaken for intentional no-scan
+/// completion.
+async fn run_workspace_scan_transaction_using<F, Fut>(
     state_arc: &Arc<RwLock<WorldState>>,
     mut scan: F,
-) -> Option<AppliedWorkspaceScan>
+) -> WorkspaceScanRunOutcome
 where
     F: FnMut(WorkspaceScanInputs) -> Fut,
     Fut: Future<Output = Option<crate::state::WorkspaceScanResult>>,
 {
-    loop {
+    let intent = state_arc.write().await.begin_workspace_scan_intent();
+    for attempt in 0..2 {
         let inputs = {
             let state = state_arc.read().await;
-            WorkspaceScanInputs::capture(&state)
-        }?;
-        let result = scan(inputs.clone()).await?;
-        if apply_workspace_scan_if_current(state_arc, &inputs, result).await {
-            return Some(AppliedWorkspaceScan {
+            WorkspaceScanInputs::capture(&state, intent)
+        };
+        let Some(inputs) = inputs else {
+            let state = state_arc.read().await;
+            return if state.workspace_scan_intent_is_current(intent) {
+                WorkspaceScanRunOutcome::Disabled
+            } else {
+                WorkspaceScanRunOutcome::Superseded
+            };
+        };
+        let Some(result) = scan(inputs.clone()).await else {
+            return WorkspaceScanRunOutcome::ScanFailed;
+        };
+        if let Some(transfer) = apply_workspace_scan_if_current(state_arc, &inputs, result).await {
+            return WorkspaceScanRunOutcome::Committed(AppliedWorkspaceScan {
                 workspace_root: inputs
-                    .snapshot
+                    .basis
                     .workspace_folders
                     .first()
                     .and_then(|uri| uri.to_file_path().ok()),
                 exclusions: inputs.exclusions,
+                transfer,
             });
+        }
+        if !state_arc
+            .read()
+            .await
+            .workspace_scan_intent_is_current(intent)
+        {
+            return WorkspaceScanRunOutcome::Superseded;
+        }
+        if attempt == 1 {
+            return WorkspaceScanRunOutcome::RetryExhausted;
         }
         tokio::task::yield_now().await;
     }
+    unreachable!("the fixed two-attempt loop always returns")
 }
 
-async fn run_workspace_scan_until_current(
+async fn run_workspace_scan_transaction(
     state_arc: &Arc<RwLock<WorldState>>,
-) -> Option<AppliedWorkspaceScan> {
-    run_workspace_scan_until_current_using(state_arc, |inputs| async move {
+) -> WorkspaceScanRunOutcome {
+    run_workspace_scan_transaction_using(state_arc, |inputs| async move {
         match tokio::task::spawn_blocking(move || {
             let scan_start = std::time::Instant::now();
             let result = crate::state::scan_workspace_with_exclusions(
-                &inputs.snapshot.workspace_folders,
-                inputs.snapshot.max_chain_depth,
+                &inputs.basis.workspace_folders,
+                inputs.basis.max_chain_depth,
                 &inputs.exclusions,
             );
             let scan_duration = scan_start.elapsed();
@@ -9840,8 +9794,8 @@ impl LanguageServer for Backend {
         let traversal_truncation = self.traversal_truncation.clone();
         if index_workspace {
             tokio::task::spawn(async move {
-                match run_workspace_scan_until_current(&state_clone).await {
-                    Some(applied_scan) => {
+                match run_workspace_scan_transaction(&state_clone).await {
+                    WorkspaceScanRunOutcome::Committed(applied_scan) => {
                         let root_for_pkg_inputs = applied_scan.workspace_root;
                         let workspace_exclusions = applied_scan.exclusions;
                         // Read DESCRIPTION and NAMESPACE BEFORE acquiring the
@@ -9891,27 +9845,12 @@ impl LanguageServer for Backend {
                             true
                         };
 
-                        // Snapshot trigger versions only after package seeding
-                        // converges, so diagnostics observe the installed input
-                        // transaction rather than an intermediate attempt.
-                        let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
+                        let (pkg_lib, packages_enabled) = {
                             let state = state_clone.read().await;
-                            let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
-                            state
-                                .diagnostics_gate
-                                .mark_force_republish_many(open_keys.iter());
-                            let items: Vec<(Url, DiagnosticsTrigger)> = open_keys
-                                .into_iter()
-                                .map(|uri| {
-                                    let trigger = DiagnosticsTrigger::capture(&state, &uri);
-                                    (uri, trigger)
-                                })
-                                .collect();
-                            let debounce = state.cross_file_config.revalidation_debounce_ms;
                             let pkg_lib = state.package_library.clone();
                             let pkgs_enabled = state.cross_file_config.packages_enabled
                                 && state.package_library_ready;
-                            (items, debounce, pkg_lib, pkgs_enabled)
+                            (pkg_lib, pkgs_enabled)
                         };
                         log::info!("[Background] Workspace index applied");
 
@@ -9962,22 +9901,21 @@ impl LanguageServer for Backend {
                                 .await;
                         }
 
-                        // Revalidate all open documents to pick up auto-detected backward edges
-                        for (uri, trigger) in work_items {
-                            let state_arc = state_clone.clone();
-                            let client = client_clone.clone();
-                            let traversal_truncation = traversal_truncation.clone();
-                            tokio::spawn(run_debounced_diagnostics(
-                                state_arc,
-                                client,
-                                uri,
-                                debounce_ms,
-                                trigger,
-                                Some(traversal_truncation),
-                            ));
-                        }
+                        // Claim the scan's immutable fanout only after package
+                        // seeding and prefetch converge. The commit itself
+                        // deliberately created no markers or workers.
+                        let tickets = state_clone
+                            .write()
+                            .await
+                            .claim_workspace_scan_transfer(&applied_scan.transfer);
+                        tokio::spawn(Backend::publish_diagnostics_for_tickets_bounded(
+                            state_clone.clone(),
+                            client_clone.clone(),
+                            tickets,
+                            Some(traversal_truncation.clone()),
+                        ));
                     }
-                    None => {
+                    WorkspaceScanRunOutcome::Disabled => {
                         log::debug!("Background workspace scan disabled before completion");
                         let (root, exclusions) = {
                             let state = state_clone.read().await;
@@ -9999,6 +9937,17 @@ impl LanguageServer for Backend {
                             exclusions,
                         )
                         .await;
+                    }
+                    WorkspaceScanRunOutcome::Superseded => {
+                        log::debug!("Background workspace scan superseded by a newer scan");
+                    }
+                    WorkspaceScanRunOutcome::RetryExhausted => {
+                        log::warn!(
+                            "Background workspace scan exhausted its two authority attempts"
+                        );
+                    }
+                    WorkspaceScanRunOutcome::ScanFailed => {
+                        log::error!("Background workspace scan failed");
                     }
                 }
             });
@@ -12324,15 +12273,9 @@ impl Backend {
             let trigger_on_open_paren_changed =
                 prev.prev_completion.trigger_on_open_paren != new_trigger_on_open_paren;
 
-            // Mark all open documents for force republish (unless only the
-            // watcher-lifecycle settings changed). Bulk-mark to avoid
-            // per-URI lock churn on workspaces with many open files.
+            // Snapshot candidates now; marker ownership is transferred only
+            // after every config/package/scan reconciliation step converges.
             let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
-            if !only_watch_changed {
-                state
-                    .diagnostics_gate
-                    .mark_force_republish_many(open_uris.iter());
-            }
 
             ReconciliationDecisions {
                 scope_changed,
@@ -12378,6 +12321,7 @@ impl Backend {
         }
 
         let mut package_inputs_initialized_by_exclusion_reload = false;
+        let mut workspace_scan_transfer = None;
         if workspace_exclusions_changed {
             let (affected_len, should_scan) = {
                 let mut state = self.state.write().await;
@@ -12397,10 +12341,11 @@ impl Backend {
             );
 
             if should_scan {
-                match run_workspace_scan_until_current(&self.state).await {
-                    Some(applied_scan) => {
+                match run_workspace_scan_transaction(&self.state).await {
+                    WorkspaceScanRunOutcome::Committed(applied_scan) => {
                         let root_for_pkg_inputs = applied_scan.workspace_root;
                         let workspace_exclusions = applied_scan.exclusions;
+                        workspace_scan_transfer = Some(applied_scan.transfer);
                         let package_seed = if let Some(root) = root_for_pkg_inputs.as_ref() {
                             Some(
                                 PrecomputedPackageSeed::compute_from_state(
@@ -12461,8 +12406,19 @@ impl Backend {
                                 .await;
                         }
                     }
-                    None => {
-                        log::debug!("Workspace exclusion reload scan disabled before completion");
+                    WorkspaceScanRunOutcome::Disabled => {
+                        log::debug!("Workspace exclusion reload scan became disabled");
+                    }
+                    WorkspaceScanRunOutcome::Superseded => {
+                        log::debug!("Workspace exclusion reload scan was superseded");
+                    }
+                    WorkspaceScanRunOutcome::RetryExhausted => {
+                        log::warn!(
+                            "Workspace exclusion reload scan exhausted its two authority attempts"
+                        );
+                    }
+                    WorkspaceScanRunOutcome::ScanFailed => {
+                        log::error!("Workspace exclusion reload scan failed");
                     }
                 }
             } else {
@@ -12487,21 +12443,33 @@ impl Backend {
         if workspace_scan_refresh_needed && !workspace_exclusions_changed {
             // A false -> true transition or a depth change owns its own
             // convergent scan; it cannot depend on the detached startup task.
-            if run_workspace_scan_until_current(&self.state)
-                .await
-                .is_some()
-            {
-                let (package_library, packages_enabled) = {
-                    let state = self.state.read().await;
-                    (
-                        state.package_library.clone(),
-                        state.cross_file_config.packages_enabled
-                            && state.package_library_ready
-                            && !package_settings_changed,
-                    )
-                };
-                if packages_enabled {
-                    prefetch_packages_for_open_documents(&self.state, &package_library).await;
+            match run_workspace_scan_transaction(&self.state).await {
+                WorkspaceScanRunOutcome::Committed(applied_scan) => {
+                    workspace_scan_transfer = Some(applied_scan.transfer);
+                    let (package_library, packages_enabled) = {
+                        let state = self.state.read().await;
+                        (
+                            state.package_library.clone(),
+                            state.cross_file_config.packages_enabled
+                                && state.package_library_ready
+                                && !package_settings_changed,
+                        )
+                    };
+                    if packages_enabled {
+                        prefetch_packages_for_open_documents(&self.state, &package_library).await;
+                    }
+                }
+                WorkspaceScanRunOutcome::Disabled => {
+                    log::debug!("Configuration workspace scan became disabled");
+                }
+                WorkspaceScanRunOutcome::Superseded => {
+                    log::debug!("Configuration workspace scan was superseded");
+                }
+                WorkspaceScanRunOutcome::RetryExhausted => {
+                    log::warn!("Configuration workspace scan exhausted its two authority attempts");
+                }
+                WorkspaceScanRunOutcome::ScanFailed => {
+                    log::error!("Configuration workspace scan failed");
                 }
             }
         }
@@ -12666,8 +12634,27 @@ impl Backend {
         }
 
         if only_watch_changed {
+            return Vec::new();
+        }
+        if let Some(transfer) = workspace_scan_transfer {
+            let tickets = self
+                .state
+                .write()
+                .await
+                .claim_workspace_scan_transfer(&transfer);
+            Backend::publish_diagnostics_for_tickets_bounded(
+                self.state.clone(),
+                self.client.clone(),
+                tickets,
+                Some(self.traversal_truncation.clone()),
+            )
+            .await;
             Vec::new()
         } else {
+            let state = self.state.read().await;
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(open_uris.iter());
             open_uris
         }
     }
@@ -22557,12 +22544,12 @@ mod project_config_initialize_tests {
             .unwrap();
 
         let scan_state = backend.state.clone();
-        let result = run_workspace_scan_until_current_using(&backend.state, move |inputs| {
+        let result = run_workspace_scan_transaction_using(&backend.state, move |inputs| {
             let state = scan_state.clone();
             async move {
                 let scan = crate::state::scan_workspace_with_exclusions(
-                    &inputs.snapshot.workspace_folders,
-                    inputs.snapshot.max_chain_depth,
+                    &inputs.basis.workspace_folders,
+                    inputs.basis.max_chain_depth,
                     &inputs.exclusions,
                 );
                 let mut state = state.write().await;
@@ -22573,7 +22560,7 @@ mod project_config_initialize_tests {
         })
         .await;
         assert!(
-            result.is_none(),
+            matches!(result, WorkspaceScanRunOutcome::Disabled),
             "disabled retry must not apply the stale scan"
         );
 
@@ -22774,15 +22761,15 @@ mod project_config_initialize_tests {
         let state_for_scan = state_arc.clone();
         let path_for_scan = path.clone();
         let uri_for_scan = uri.clone();
-        run_workspace_scan_until_current_using(&state_arc, move |inputs| {
+        run_workspace_scan_transaction_using(&state_arc, move |inputs| {
             let attempt = attempts_for_scan.fetch_add(1, Ordering::SeqCst);
             let state = state_for_scan.clone();
             let path = path_for_scan.clone();
             let uri = uri_for_scan.clone();
             async move {
                 let candidate = crate::state::scan_workspace_with_exclusions(
-                    &inputs.snapshot.workspace_folders,
-                    inputs.snapshot.max_chain_depth,
+                    &inputs.basis.workspace_folders,
+                    inputs.basis.max_chain_depth,
                     &inputs.exclusions,
                 );
                 if attempt == 0 {
@@ -22810,9 +22797,9 @@ mod project_config_initialize_tests {
             }
         })
         .await
-        .expect("a stable candidate must eventually apply");
+        .expect_committed();
 
-        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
             state_arc
                 .read()
@@ -22828,17 +22815,29 @@ mod project_config_initialize_tests {
     #[test]
     fn workspace_scan_authority_rejects_newer_graph_metadata() {
         let mut state = WorldState::new();
-        let authority = WorkspaceGraphAuthorityIdentity::capture(&state);
+        state.workspace_folders = vec![Url::parse("file:///workspace").unwrap()];
+        let intent = state.begin_workspace_scan_intent();
+        let input = state.capture_workspace_scan_input_basis(intent).unwrap();
+        let index = state.workspace_index.authority_snapshot();
+        let authority = state
+            .capture_workspace_scan_derivation_basis(&input, &index)
+            .unwrap();
         state.advance_workspace_graph_authority_generation();
-        assert!(!authority.is_current_for(&state));
+        assert!(!state.workspace_scan_derivation_basis_is_current_for_test(&authority));
     }
 
     #[test]
     fn workspace_scan_authority_rejects_metadata_only_open_generation_change() {
         let mut state = WorldState::new();
         let uri = Url::parse("file:///workspace/open.R").unwrap();
+        state.workspace_folders = vec![Url::parse("file:///workspace").unwrap()];
         state.open_document(uri.clone(), "x <- 1", Some(1));
-        let authority = WorkspaceGraphAuthorityIdentity::capture(&state);
+        let intent = state.begin_workspace_scan_intent();
+        let input = state.capture_workspace_scan_input_basis(intent).unwrap();
+        let index = state.workspace_index.authority_snapshot();
+        let authority = state
+            .capture_workspace_scan_derivation_basis(&input, &index)
+            .unwrap();
         let generation = state.documents.get_record(&uri).unwrap().generation();
         let mut metadata = crate::cross_file::CrossFileMetadata::default();
         metadata.working_directory = Some("/new/basis".to_string());
@@ -22846,7 +22845,7 @@ mod project_config_initialize_tests {
             .replace_open_document_metadata_if_current(&uri, generation, Arc::new(metadata))
             .unwrap();
 
-        assert!(!authority.is_current_for(&state));
+        assert!(!state.workspace_scan_derivation_basis_is_current_for_test(&authority));
         assert_eq!(
             state
                 .get_enriched_metadata(&uri)
@@ -22854,6 +22853,556 @@ mod project_config_initialize_tests {
                 .working_directory
                 .as_deref(),
             Some("/new/basis")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_latest_arrival_wins() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("value.R");
+        fs::write(&path, "old_value <- 1\n").unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        state.write().await.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+        let pause = state
+            .read()
+            .await
+            .workspace_scan_pre_commit_test_pause
+            .arm(Url::parse(WORKSPACE_SCAN_PRE_COMMIT_PAUSE_URI).unwrap());
+        let old_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let old_attempts_for_scan = old_attempts.clone();
+        let old = run_workspace_scan_transaction_using(&state, move |inputs| {
+            old_attempts_for_scan.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Some(crate::state::scan_workspace_with_exclusions(
+                    &inputs.basis.workspace_folders,
+                    inputs.basis.max_chain_depth,
+                    &inputs.exclusions,
+                ))
+            }
+        });
+        tokio::pin!(old);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut old => panic!("old scan skipped precommit barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("old scan timed out"),
+        }
+
+        fs::write(&path, "new_value <- 2\n").unwrap();
+        let fresh = run_workspace_scan_transaction(&state)
+            .await
+            .expect_committed();
+        assert_eq!(
+            state
+                .read()
+                .await
+                .workspace_index
+                .get(&uri)
+                .unwrap()
+                .contents
+                .to_string(),
+            "new_value <- 2\n"
+        );
+
+        pause.release();
+        assert!(matches!(old.await, WorkspaceScanRunOutcome::Superseded));
+        assert_eq!(old_attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            state
+                .write()
+                .await
+                .claim_workspace_scan_transfer(&fresh.transfer)
+                .is_empty(),
+            "the winning transfer has no candidates in this closed-only fixture"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_retry_ceiling_is_two() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        state.write().await.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+        let pause_uri = Url::parse(WORKSPACE_SCAN_PRE_COMMIT_PAUSE_URI).unwrap();
+        let first_pause = state
+            .read()
+            .await
+            .workspace_scan_pre_commit_test_pause
+            .arm(pause_uri.clone());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_scan = attempts.clone();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            run_workspace_scan_transaction_using(&task_state, move |_inputs| {
+                attempts_for_scan.fetch_add(1, Ordering::SeqCst);
+                async { Some(HashMap::new()) }
+            })
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            first_pause.wait_arrived(),
+        )
+        .await
+        .expect("first attempt reaches precommit");
+        let second_pause = {
+            let mut current = state.write().await;
+            current.advance_workspace_scan_generation();
+            current.workspace_scan_pre_commit_test_pause.arm(pause_uri)
+        };
+        first_pause.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            second_pause.wait_arrived(),
+        )
+        .await
+        .expect("second attempt repeats full derivation");
+        state.write().await.advance_workspace_scan_generation();
+        second_pause.release();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            WorkspaceScanRunOutcome::RetryExhausted
+        ));
+        let state = state.read().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(!state.workspace_scan_complete);
+        assert_eq!(state.workspace_index.len(), 0);
+        assert_eq!(state.analysis_revalidation_reservation_count, 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_scan_rejects_open_metadata_aba_without_side_effects() {
+        let tmp = TempDir::new().unwrap();
+        let uri = Url::from_file_path(tmp.path().join("open.R")).unwrap();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        let inputs = {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+            state.open_document(uri.clone(), "x <- 1\n", Some(1));
+            let intent = state.begin_workspace_scan_intent();
+            WorkspaceScanInputs::capture(&state, intent).unwrap()
+        };
+        let prepared = prepare_workspace_scan(&state, &inputs, HashMap::new())
+            .await
+            .unwrap();
+        let mut state = state.write().await;
+        let first_generation = state.documents.get_record(&uri).unwrap().generation();
+        let mut changed = crate::cross_file::CrossFileMetadata::default();
+        changed.working_directory = Some("/changed".to_string());
+        let changed = state
+            .replace_open_document_metadata_if_current(&uri, first_generation, Arc::new(changed))
+            .unwrap();
+        state
+            .replace_open_document_metadata_if_current(
+                &uri,
+                changed.generation(),
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+            )
+            .unwrap();
+        let surviving_generation = state.documents.get_record(&uri).unwrap().generation();
+        let index_version = state.workspace_index.version();
+        let graph_revision = state.cross_file_graph.edge_revision();
+        let reservation_count = state.analysis_revalidation_reservation_count;
+
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::WorkspaceScan(Box::new(prepared))),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(
+            state.documents.get_record(&uri).unwrap().generation(),
+            surviving_generation
+        );
+        assert_eq!(state.workspace_index.version(), index_version);
+        assert_eq!(state.cross_file_graph.edge_revision(), graph_revision);
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservation_count
+        );
+        assert!(!state.workspace_scan_complete);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct WorkspaceScanCentralSnapshot {
+        open: Vec<(
+            Url,
+            crate::open_document_store::AnalysisGeneration,
+            usize,
+            usize,
+        )>,
+        index_version: u64,
+        index_full: Vec<(Url, String, u64, usize, usize)>,
+        index_artifacts: Vec<(
+            Url,
+            u64,
+            crate::workspace_index::ClosedProvenance,
+            usize,
+            usize,
+        )>,
+        index_pins: std::collections::HashSet<Url>,
+        index_artifact_capacity: usize,
+        raw_generation: u64,
+        raw: Vec<(Url, Option<String>)>,
+        graph: String,
+        graph_revision: u64,
+        graph_authority_generation: u64,
+        open_context_authority_generation: u64,
+        workspace_scan_generation: u64,
+        workspace_scan_complete: bool,
+        package_input_generation: u64,
+        package_config_generation: u64,
+        reservations: usize,
+        force_markers: Vec<(Url, u32)>,
+    }
+
+    fn workspace_scan_central_snapshot(
+        state: &WorldState,
+        uris: &[Url],
+    ) -> WorkspaceScanCentralSnapshot {
+        let index = state.workspace_index.authority_snapshot();
+        WorkspaceScanCentralSnapshot {
+            open: uris
+                .iter()
+                .map(|uri| {
+                    let record = state.documents.get_record(uri).unwrap();
+                    (
+                        uri.clone(),
+                        record.generation(),
+                        Arc::as_ptr(record.metadata()) as usize,
+                        Arc::as_ptr(record.artifacts()) as usize,
+                    )
+                })
+                .collect(),
+            index_version: index.version,
+            index_full: index
+                .full
+                .iter()
+                .map(|(uri, entry)| {
+                    (
+                        uri.clone(),
+                        entry.contents.to_string(),
+                        entry.indexed_at_version,
+                        Arc::as_ptr(&entry.metadata) as usize,
+                        Arc::as_ptr(&entry.artifacts) as usize,
+                    )
+                })
+                .collect(),
+            index_artifacts: index
+                .artifacts
+                .iter()
+                .map(|(uri, entry)| {
+                    (
+                        uri.clone(),
+                        entry.indexed_at_version,
+                        entry.provenance,
+                        Arc::as_ptr(&entry.metadata) as usize,
+                        Arc::as_ptr(&entry.artifacts) as usize,
+                    )
+                })
+                .collect(),
+            index_pins: index.pinned,
+            index_artifact_capacity: index.artifact_capacity_limit,
+            raw_generation: state.cross_file_file_cache.content_generation(),
+            raw: uris
+                .iter()
+                .map(|uri| (uri.clone(), state.cross_file_file_cache.get(uri)))
+                .collect(),
+            graph: format!("{:?}", state.cross_file_graph),
+            graph_revision: state.cross_file_graph.edge_revision(),
+            graph_authority_generation: state.workspace_graph_authority_generation(),
+            open_context_authority_generation: state.open_context_authority_generation_for_test(),
+            workspace_scan_generation: state.workspace_scan_generation_for_test(),
+            workspace_scan_complete: state.workspace_scan_complete,
+            package_input_generation: state.package_input_generation(),
+            package_config_generation: state.package_config_generation,
+            reservations: state.analysis_revalidation_reservation_count,
+            force_markers: uris
+                .iter()
+                .map(|uri| {
+                    (
+                        uri.clone(),
+                        state.diagnostics_gate.force_republish_count_for_test(uri),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_scan_last_open_target_rejection_is_atomic_across_all_tiers() {
+        let tmp = TempDir::new().unwrap();
+        let first_uri = Url::from_file_path(tmp.path().join("a.R")).unwrap();
+        let last_uri = Url::from_file_path(tmp.path().join("z.R")).unwrap();
+        fs::write(tmp.path().join("a.R"), "a <- 1\n").unwrap();
+        fs::write(tmp.path().join("z.R"), "z <- 1\n").unwrap();
+        let uris = vec![first_uri.clone(), last_uri.clone()];
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        let inputs = {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+            state.open_document(first_uri.clone(), "a <- 1\n", Some(1));
+            state.open_document(last_uri.clone(), "z <- 1\n", Some(1));
+            state.cross_file_file_cache.insert(
+                first_uri.clone(),
+                crate::cross_file::file_cache::FileSnapshot {
+                    mtime: std::time::SystemTime::UNIX_EPOCH,
+                    size: 9,
+                    content_hash: Some(11),
+                },
+                "raw a <- 1\n".to_string(),
+            );
+            state.cross_file_file_cache.insert(
+                last_uri.clone(),
+                crate::cross_file::file_cache::FileSnapshot {
+                    mtime: std::time::SystemTime::UNIX_EPOCH,
+                    size: 9,
+                    content_hash: Some(13),
+                },
+                "raw z <- 1\n".to_string(),
+            );
+            let intent = state.begin_workspace_scan_intent();
+            WorkspaceScanInputs::capture(&state, intent).unwrap()
+        };
+        let scanned = crate::state::scan_workspace_with_exclusions(
+            &inputs.basis.workspace_folders,
+            inputs.basis.max_chain_depth,
+            &inputs.exclusions,
+        );
+        let prepared = prepare_workspace_scan(&state, &inputs, scanned)
+            .await
+            .unwrap();
+
+        let expected = {
+            let mut state = state.write().await;
+            let generation = state.documents.get_record(&last_uri).unwrap().generation();
+            let mut metadata = crate::cross_file::CrossFileMetadata::default();
+            metadata.working_directory = Some("/last-target-changed".to_string());
+            state
+                .replace_open_document_metadata_if_current(
+                    &last_uri,
+                    generation,
+                    Arc::new(metadata),
+                )
+                .unwrap();
+            workspace_scan_central_snapshot(&state, &uris)
+        };
+
+        {
+            let mut state = state.write().await;
+            assert_eq!(
+                state
+                    .try_commit_analysis(PreparedAnalysisCommit::WorkspaceScan(Box::new(prepared))),
+                Err(crate::state::AnalysisCommitRejected::StaleBasis)
+            );
+            assert_eq!(
+                workspace_scan_central_snapshot(&state, &uris),
+                expected,
+                "rejecting the last target must leave every central authority untouched"
+            );
+        }
+
+        let applied = run_workspace_scan_transaction(&state)
+            .await
+            .expect_committed();
+        let mut state = state.write().await;
+        assert!(state.workspace_scan_complete);
+        assert!(
+            state
+                .claim_workspace_scan_transfer(&applied.transfer)
+                .is_empty(),
+            "epochless open records are installed atomically but do not receive scan fanout"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_raw_only_change_is_not_false_authority() {
+        let tmp = TempDir::new().unwrap();
+        let raw_uri = Url::from_file_path(tmp.path().join("raw.R")).unwrap();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        state.write().await.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+        let pause = state
+            .read()
+            .await
+            .workspace_scan_pre_commit_test_pause
+            .arm(Url::parse(WORKSPACE_SCAN_PRE_COMMIT_PAUSE_URI).unwrap());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_scan = attempts.clone();
+        let scan = run_workspace_scan_transaction_using(&state, move |_inputs| {
+            attempts_for_scan.fetch_add(1, Ordering::SeqCst);
+            async { Some(HashMap::new()) }
+        });
+        tokio::pin!(scan);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut scan => panic!("scan skipped precommit barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("scan timed out"),
+        }
+        state.read().await.cross_file_file_cache.insert(
+            raw_uri.clone(),
+            crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 9,
+                content_hash: Some(7),
+            },
+            "raw <- 1\n".to_string(),
+        );
+        pause.release();
+        scan.await.expect_committed();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .read()
+                .await
+                .cross_file_file_cache
+                .get(&raw_uri)
+                .as_deref(),
+            Some("raw <- 1\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_scan_transfer_is_exact_once_and_excludes_epochless_open() {
+        let tmp = TempDir::new().unwrap();
+        let live_uri = Url::from_file_path(tmp.path().join("live.R")).unwrap();
+        let epochless_uri = Url::from_file_path(tmp.path().join("epochless.R")).unwrap();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        let (inputs, live_before, epochless_before) = {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+            state.open_document(live_uri.clone(), "live <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&live_uri)
+                .unwrap();
+            state.open_document(epochless_uri.clone(), "closed <- 1\n", Some(1));
+            let live_before = state.documents.get_record(&live_uri).unwrap().generation();
+            let epochless_before = state
+                .documents
+                .get_record(&epochless_uri)
+                .unwrap()
+                .generation();
+            let intent = state.begin_workspace_scan_intent();
+            (
+                WorkspaceScanInputs::capture(&state, intent).unwrap(),
+                live_before,
+                epochless_before,
+            )
+        };
+        let prepared = prepare_workspace_scan(&state, &inputs, HashMap::new())
+            .await
+            .unwrap();
+        let mut state = state.write().await;
+        let effects = state
+            .try_commit_analysis(PreparedAnalysisCommit::WorkspaceScan(Box::new(prepared)))
+            .unwrap();
+        let transfer = effects.workspace_scan.unwrap();
+        assert!(state.workspace_scan_complete);
+        assert_ne!(
+            state.documents.get_record(&live_uri).unwrap().generation(),
+            live_before
+        );
+        assert_ne!(
+            state
+                .documents
+                .get_record(&epochless_uri)
+                .unwrap()
+                .generation(),
+            epochless_before
+        );
+        assert_eq!(state.analysis_revalidation_reservation_count, 0);
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&live_uri),
+            0
+        );
+
+        let tickets = state.claim_workspace_scan_transfer(&transfer);
+        assert_eq!(
+            tickets
+                .iter()
+                .map(|ticket| ticket.uri.clone())
+                .collect::<Vec<_>>(),
+            vec![live_uri.clone()]
+        );
+        assert_eq!(state.analysis_revalidation_reservation_count, 1);
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&live_uri),
+            1
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&epochless_uri),
+            0
+        );
+        assert!(state.claim_workspace_scan_transfer(&transfer).is_empty());
+        assert_eq!(state.analysis_revalidation_reservation_count, 1);
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&live_uri),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_scan_transfer_does_not_attach_to_reopened_lifecycle() {
+        let tmp = TempDir::new().unwrap();
+        let uri = Url::from_file_path(tmp.path().join("reopened.R")).unwrap();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        let inputs = {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+            state.open_document(uri.clone(), "value <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+            let intent = state.begin_workspace_scan_intent();
+            WorkspaceScanInputs::capture(&state, intent).unwrap()
+        };
+        let prepared = prepare_workspace_scan(&state, &inputs, HashMap::new())
+            .await
+            .unwrap();
+        let mut state = state.write().await;
+        let effects = state
+            .try_commit_analysis(PreparedAnalysisCommit::WorkspaceScan(Box::new(prepared)))
+            .unwrap();
+        let transfer = effects.workspace_scan.unwrap();
+        let committed_generation = state.documents.get_record(&uri).unwrap().generation();
+        assert_eq!(state.analysis_revalidation_reservation_count, 0);
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            0
+        );
+
+        state.retire_diagnostic_lifecycle(&uri);
+        state.close_document(&uri);
+        state.open_document(uri.clone(), "value <- 1\n", Some(1));
+        let reopened_epoch = state
+            .begin_open_document_diagnostic_lifecycle(&uri)
+            .unwrap();
+        let reopened = state.documents.get_record(&uri).unwrap();
+        assert_ne!(reopened.generation(), committed_generation);
+        assert_eq!(reopened.provenance().lifecycle_epoch, Some(reopened_epoch));
+
+        assert!(
+            state.claim_workspace_scan_transfer(&transfer).is_empty(),
+            "a transferred token from the retired record must not attach to the reopen"
+        );
+        assert_eq!(state.analysis_revalidation_reservation_count, 0);
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            0
+        );
+        assert_eq!(
+            state
+                .documents
+                .get_record(&uri)
+                .unwrap()
+                .provenance()
+                .lifecycle_epoch,
+            Some(reopened_epoch)
         );
     }
 
@@ -22931,9 +23480,9 @@ mod project_config_initialize_tests {
             );
             assert!(state.workspace_index.is_complete(&external_uri));
         }
-        run_workspace_scan_until_current(&backend.state)
+        run_workspace_scan_transaction(&backend.state)
             .await
-            .expect("workspace scan should apply");
+            .expect_committed();
 
         let state = backend.state.read().await;
         assert!(state.workspace_index.get(&external_uri).is_none());
@@ -22990,9 +23539,9 @@ mod project_config_initialize_tests {
             state.cross_file_config.index_workspace = true;
             state.advance_workspace_scan_generation();
         }
-        run_workspace_scan_until_current(&backend.state)
+        run_workspace_scan_transaction(&backend.state)
             .await
-            .expect("workspace scan should apply");
+            .expect_committed();
 
         let state = backend.state.read().await;
         let full_resident: std::collections::HashSet<_> =
@@ -23050,9 +23599,9 @@ mod project_config_initialize_tests {
             state.advance_workspace_scan_generation();
         }
 
-        run_workspace_scan_until_current(&backend.state)
+        run_workspace_scan_transaction(&backend.state)
             .await
-            .expect("workspace scan should apply");
+            .expect_committed();
         assert!(matches!(
             backend.state.read().await.workspace_index.provenance(&uri),
             Some(crate::workspace_index::ClosedProvenance::WorkspaceScan { .. })
@@ -23102,9 +23651,9 @@ mod project_config_initialize_tests {
             state.cross_file_config.index_workspace = true;
             state.advance_workspace_scan_generation();
         }
-        run_workspace_scan_until_current(&backend.state)
+        run_workspace_scan_transaction(&backend.state)
             .await
-            .expect("workspace scan should apply");
+            .expect_committed();
 
         let state = backend.state.read().await;
         assert!(!state.workspace_index.contains(&a_uri));
@@ -23172,9 +23721,9 @@ mod project_config_initialize_tests {
             state.cross_file_config.index_workspace = true;
             state.advance_workspace_scan_generation();
         }
-        run_workspace_scan_until_current(&backend.state)
+        run_workspace_scan_transaction(&backend.state)
             .await
-            .expect("workspace scan should apply");
+            .expect_committed();
 
         let state = backend.state.read().await;
         for name in ["A", "B", "C"] {
@@ -23226,9 +23775,9 @@ mod project_config_initialize_tests {
             state.cross_file_config.index_workspace = true;
             state.advance_workspace_scan_generation();
         }
-        run_workspace_scan_until_current(&backend.state)
+        run_workspace_scan_transaction(&backend.state)
             .await
-            .expect("workspace scan should apply");
+            .expect_committed();
 
         let state = backend.state.read().await;
         assert!(state.workspace_index.contains(&parent_uri));
@@ -23301,9 +23850,9 @@ mod project_config_initialize_tests {
             state.cross_file_config.index_workspace = true;
             state.advance_workspace_scan_generation();
         }
-        run_workspace_scan_until_current(&backend.state)
+        run_workspace_scan_transaction(&backend.state)
             .await
-            .expect("workspace scan should apply");
+            .expect_committed();
 
         assert_eq!(
             backend
@@ -23383,9 +23932,9 @@ mod project_config_initialize_tests {
             state.cross_file_config.index_workspace = true;
             state.advance_workspace_scan_generation();
         }
-        run_workspace_scan_until_current(&backend.state)
+        run_workspace_scan_transaction(&backend.state)
             .await
-            .expect("workspace scan should apply");
+            .expect_committed();
 
         let state = backend.state.read().await;
         assert_eq!(
@@ -23452,9 +24001,9 @@ mod project_config_initialize_tests {
             state.cross_file_config.index_workspace = true;
             state.advance_workspace_scan_generation();
         }
-        run_workspace_scan_until_current(&backend.state)
+        run_workspace_scan_transaction(&backend.state)
             .await
-            .expect("workspace scan should apply");
+            .expect_committed();
 
         let state = backend.state.read().await;
         assert_eq!(
@@ -23531,9 +24080,9 @@ mod project_config_initialize_tests {
             state.cross_file_config.index_workspace = true;
             state.advance_workspace_scan_generation();
         }
-        run_workspace_scan_until_current(&backend.state)
+        run_workspace_scan_transaction(&backend.state)
             .await
-            .expect("workspace scan should apply");
+            .expect_committed();
 
         let state = backend.state.read().await;
         assert_eq!(
@@ -37181,13 +37730,7 @@ infixContinuationStyle = "aligned"
 
         let mut graph = WorldState::new();
         let basis = graph.capture_closed_removal_analysis_basis(&target);
-        graph.apply_prepared_workspace_index(
-            Vec::new(),
-            Vec::new(),
-            crate::cross_file::DependencyGraph::new(),
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
+        graph.advance_workspace_graph_authority_generation();
         let (entry, snapshot, content) = complete_refresh_test_record("stale <- 0\n");
         assert_eq!(
             try_commit_test_closed_analysis(&mut graph, basis, &target, entry, snapshot, content,),
@@ -37292,13 +37835,14 @@ infixContinuationStyle = "aligned"
             provenance: crate::workspace_index::ClosedProvenance::Dynamic,
             record_generation: 0,
         };
-        state.apply_prepared_workspace_index(
-            vec![(parent.clone(), artifact)],
-            Vec::new(),
-            crate::cross_file::DependencyGraph::new(),
-            HashMap::new(),
-            std::collections::HashSet::new(),
-        );
+        state
+            .workspace_index
+            .replace_all_complete(
+                vec![(parent.clone(), artifact)],
+                Vec::new(),
+                std::collections::HashSet::new(),
+            )
+            .unwrap();
         assert!(state.workspace_index.get(&parent).is_none());
         assert!(state.workspace_index.get_artifacts(&parent).is_some());
 
@@ -38050,15 +38594,18 @@ infixContinuationStyle = "aligned"
         let token = complete_refresh_token(&state, &uri);
         let basis = state.capture_closed_refresh_analysis_basis(token);
         let (scan_entry, _, scan_content) = complete_refresh_test_record("scan_value <- 3\n");
-        state.workspace_index.replace_all_complete(
-            Vec::new(),
-            vec![(
-                uri.clone(),
-                scan_entry,
-                crate::workspace_index::ClosedProvenance::WorkspaceScan { generation: 11 },
-            )],
-            std::collections::HashSet::new(),
-        );
+        state
+            .workspace_index
+            .replace_all_complete(
+                Vec::new(),
+                vec![(
+                    uri.clone(),
+                    scan_entry,
+                    crate::workspace_index::ClosedProvenance::WorkspaceScan { generation: 11 },
+                )],
+                std::collections::HashSet::new(),
+            )
+            .unwrap();
         let (stale_entry, snapshot, content) = complete_refresh_test_record("stale_value <- 2\n");
 
         assert_eq!(

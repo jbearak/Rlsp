@@ -123,6 +123,23 @@ impl PreparedOpenDocument {
     }
 }
 
+/// Metadata-dependent open-record payload derived off-lock from one exact
+/// immutable record.
+///
+/// The document itself is not cloned until commit. Its never-reused generation
+/// proves that the tree/text used to derive `artifacts` is still installed.
+pub(crate) struct PreparedOpenMetadataReplacement {
+    base_generation: AnalysisGeneration,
+    metadata: Arc<CrossFileMetadata>,
+    artifacts: Arc<ScopeArtifacts>,
+}
+
+impl PreparedOpenMetadataReplacement {
+    pub(crate) fn base_generation(&self) -> AnalysisGeneration {
+        self.base_generation
+    }
+}
+
 /// Why a guarded record replacement did not commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenDocumentCommitError {
@@ -312,6 +329,50 @@ impl OpenDocumentStore {
         let document = current.document.clone();
         let lifecycle_epoch = current.lifecycle_epoch;
         Ok(self.install(uri.clone(), document, metadata, lifecycle_epoch))
+    }
+
+    /// Derive metadata-dependent artifacts from one captured immutable record.
+    ///
+    /// Callers may run this after dropping the shared state lock: `record`
+    /// remains immutable and the prepared generation is revalidated at commit.
+    pub(crate) fn prepare_metadata_replacement(
+        uri: &Url,
+        record: &OpenDocumentRecord,
+        metadata: Arc<CrossFileMetadata>,
+    ) -> PreparedOpenMetadataReplacement {
+        PreparedOpenMetadataReplacement {
+            base_generation: record.generation,
+            artifacts: Self::artifacts_for(uri, &record.document, &metadata),
+            metadata,
+        }
+    }
+
+    /// Install an already-derived metadata/artifact pair while its exact
+    /// source record remains current.
+    pub(crate) fn commit_prepared_metadata_if_current(
+        &mut self,
+        uri: &Url,
+        prepared: PreparedOpenMetadataReplacement,
+    ) -> Result<Arc<OpenDocumentRecord>, OpenDocumentCommitError> {
+        let current = self
+            .records
+            .get(uri)
+            .ok_or(OpenDocumentCommitError::Missing)?;
+        if current.generation != prepared.base_generation {
+            return Err(OpenDocumentCommitError::Stale {
+                expected: prepared.base_generation,
+                actual: current.generation,
+            });
+        }
+        let document = current.document.clone();
+        let lifecycle_epoch = current.lifecycle_epoch;
+        Ok(self.install_with_artifacts(
+            uri.clone(),
+            document,
+            prepared.metadata,
+            prepared.artifacts,
+            lifecycle_epoch,
+        ))
     }
 
     /// Replace only lifecycle provenance while the record is current.

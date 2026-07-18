@@ -179,17 +179,30 @@ modeling choices are represented by empty scans before construction; the central
 installation transaction never traverses the filesystem. After installation,
 callers refresh open preamble documents to close the snapshot-to-install race.
 
-Background workspace scans use a complete immutable candidate rather than
-merging a raw disk scan at commit time. A brief snapshot captures scan inputs,
-retained non-scan entries (including on-demand/external files), authoritative
-open-buffer overlays, and package/system-file routing identity. Metadata and
-the complete dependency graph are derived off-lock. The final write-lock
-boundary validates that authority snapshot, atomically claims the monotonic
-scan generation, and installs the indexes, graph, and refreshed open-document
-metadata together; a stale candidate mutates nothing and is recomputed.
-Keep new seed inputs in that shared helper so startup, exclusion reloads, and
-package-mode rebuilds cannot drift or introduce blocking filesystem work under
-the state lock.
+Background workspace scans use a process-wide latest-arrival intent and a
+complete immutable candidate rather than merging a raw disk scan at commit
+time. Each attempt captures its pre-I/O inputs, performs the disk scan, then
+captures the exact post-I/O authority used to derive retained non-scan entries,
+open-buffer overlays, package/system-file routing, metadata, and the complete
+dependency graph off-lock. The central `PreparedAnalysisCommit::WorkspaceScan`
+write-lock boundary preflights both bases and every exact open-record token,
+then installs the index, graph, refreshed open metadata/artifacts, completion
+state, and authority generations as one transaction. The index replacement is
+an exact-version CAS and is the only fallible operation after preflight, so a
+stale candidate mutates no central tier. Contention permits exactly one second
+full scan-and-derive attempt under the same intent; a newer arrival supersedes
+the old intent immediately, and exhaustion never falls back to a partial or
+no-scan commit.
+
+Diagnostics are deliberately not marked inside that transaction. The commit
+returns a one-shot transfer containing exact post-commit open-record tokens;
+startup or configuration orchestration claims it only after package/config
+convergence. Claiming validates the committed scan generation and current
+diagnostic lifecycle, drops closed/reopened/otherwise replaced records, and
+atomically creates the bounded reservations and force-republish markers once.
+Keep new scan inputs in the shared two-phase basis so startup, exclusion
+reloads, and package-mode rebuilds cannot drift or introduce blocking
+filesystem work under the state lock.
 
 Document analysis has one authority per lifecycle state. Open buffers live in
 `OpenDocumentStore`; all closed records live in `WorkspaceIndex`. The closed

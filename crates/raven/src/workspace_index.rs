@@ -1171,10 +1171,44 @@ impl WorkspaceIndex {
         artifact_only: Vec<(Url, ArtifactEntry)>,
         full_records: Vec<(Url, IndexEntry, ClosedProvenance)>,
         pins: HashSet<Url>,
-    ) {
-        let Ok(mut state) = self.inner.write() else {
-            return;
-        };
+    ) -> Result<(), EnrichmentCommitError> {
+        self.replace_all_complete_if_version(None, artifact_only, full_records, pins)
+            .map(|replaced| {
+                debug_assert!(replaced);
+            })
+    }
+
+    /// Atomically replace all Complete records only while the exact authority
+    /// version captured by a detached transaction remains installed.
+    pub(crate) fn replace_all_complete_if_current(
+        &self,
+        expected_version: u64,
+        artifact_only: Vec<(Url, ArtifactEntry)>,
+        full_records: Vec<(Url, IndexEntry, ClosedProvenance)>,
+        pins: HashSet<Url>,
+    ) -> Result<bool, EnrichmentCommitError> {
+        self.replace_all_complete_if_version(
+            Some(expected_version),
+            artifact_only,
+            full_records,
+            pins,
+        )
+    }
+
+    fn replace_all_complete_if_version(
+        &self,
+        expected_version: Option<u64>,
+        artifact_only: Vec<(Url, ArtifactEntry)>,
+        full_records: Vec<(Url, IndexEntry, ClosedProvenance)>,
+        pins: HashSet<Url>,
+    ) -> Result<bool, EnrichmentCommitError> {
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| EnrichmentCommitError::Unavailable)?;
+        if expected_version.is_some_and(|expected| state.version != expected) {
+            return Ok(false);
+        }
         let next_version = state.version.wrapping_add(1);
         let mut artifacts: std::collections::HashMap<Url, ArtifactEntry> =
             artifact_only.into_iter().collect();
@@ -1221,6 +1255,7 @@ impl WorkspaceIndex {
             push_with_pins(&mut state.full, &pins, uri, entry);
         }
         state.version = next_version;
+        Ok(true)
     }
 
     /// Invalidate entry for a URI
@@ -1857,15 +1892,17 @@ mod tests {
         assert!(done_rx.recv().unwrap().is_some());
         reader.join().unwrap();
 
-        index.replace_all_complete(
-            Vec::new(),
-            vec![(
-                uri.clone(),
-                make_test_entry(1),
-                ClosedProvenance::WorkspaceScan { generation: 7 },
-            )],
-            HashSet::new(),
-        );
+        index
+            .replace_all_complete(
+                Vec::new(),
+                vec![(
+                    uri.clone(),
+                    make_test_entry(1),
+                    ClosedProvenance::WorkspaceScan { generation: 7 },
+                )],
+                HashSet::new(),
+            )
+            .unwrap();
         assert_eq!(index.version(), before + 1);
         let (artifact, full, _) = index.get_complete_views(&uri).unwrap();
         let full = full.unwrap();
@@ -1878,14 +1915,16 @@ mod tests {
         let index = Arc::new(WorkspaceIndex::new(make_test_config()));
         let old = [test_uri("old-a.R"), test_uri("old-b.R")];
         let new = [test_uri("new-a.R"), test_uri("new-b.R")];
-        index.replace_all_complete(
-            Vec::new(),
-            old.iter()
-                .cloned()
-                .map(|uri| (uri, make_test_entry(0), ClosedProvenance::Dynamic))
-                .collect(),
-            HashSet::new(),
-        );
+        index
+            .replace_all_complete(
+                Vec::new(),
+                old.iter()
+                    .cloned()
+                    .map(|uri| (uri, make_test_entry(0), ClosedProvenance::Dynamic))
+                    .collect(),
+                HashSet::new(),
+            )
+            .unwrap();
 
         let writer_index = index.clone();
         let old_writer = old.clone();
@@ -1897,21 +1936,23 @@ mod tests {
                 } else {
                     &old_writer
                 };
-                writer_index.replace_all_complete(
-                    Vec::new(),
-                    selected
-                        .iter()
-                        .cloned()
-                        .map(|uri| {
-                            (
-                                uri,
-                                make_test_entry(generation),
-                                ClosedProvenance::WorkspaceScan { generation },
-                            )
-                        })
-                        .collect(),
-                    HashSet::new(),
-                );
+                writer_index
+                    .replace_all_complete(
+                        Vec::new(),
+                        selected
+                            .iter()
+                            .cloned()
+                            .map(|uri| {
+                                (
+                                    uri,
+                                    make_test_entry(generation),
+                                    ClosedProvenance::WorkspaceScan { generation },
+                                )
+                            })
+                            .collect(),
+                        HashSet::new(),
+                    )
+                    .unwrap();
             }
         });
 

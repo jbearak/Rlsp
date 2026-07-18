@@ -20,6 +20,8 @@ use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
 static NEXT_OPEN_INSTALL_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPEN_CLOSE_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPEN_LIFECYCLE_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_WORKSPACE_SCAN_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_WORKSPACE_SCAN_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Symbol provider configuration
 ///
@@ -184,7 +186,7 @@ use crate::cross_file::{
 use crate::file_type::{FileType, file_type_from_language_id_or_uri, file_type_from_uri};
 use crate::open_document_store::{
     AnalysisGeneration, OpenDocumentRecord, OpenDocumentStore, OpenRecordToken,
-    PreparedOpenDocument,
+    PreparedOpenDocument, PreparedOpenMetadataReplacement,
 };
 use crate::package_library::PackageLibrary;
 use crate::parameter_resolver::SignatureCache;
@@ -861,6 +863,11 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) open_lifecycle_added_effects_complete_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic barrier after a full workspace candidate is derived and
+    /// before its central state CAS.
+    #[cfg(test)]
+    pub(crate) workspace_scan_pre_commit_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
     #[cfg(test)]
     pub(crate) diagnostics_post_publish_lock_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
@@ -989,6 +996,9 @@ pub struct WorldState {
     /// effective settings transition, including the interval before later
     /// asynchronous package rebuild work completes.
     analysis_config_generation: AnalysisConfigGeneration,
+    /// Never-reused-within-state identity for the complete editor-derived
+    /// closed chunk-kind override map consumed by workspace scans.
+    chunk_override_generation: ChunkOverrideGeneration,
     /// Last-known editor-derived chunk classification for file-backed
     /// documents whose editor language made the file behave differently from
     /// path classification.
@@ -1000,6 +1010,10 @@ pub struct WorldState {
     /// Quarto files. Entries exist only when the editor-derived kind differs
     /// from [`classify_chunk_document`] for the URI path, and cross-file state
     /// removal prunes them with the rest of the URI's closed-file state.
+    ///
+    /// Production writes must use [`Self::record_editor_chunk_kind_override`]
+    /// or [`Self::prune_editor_chunk_kind_override`] so detached scans observe
+    /// the matching authority generation.
     pub editor_chunk_kind_overrides: HashMap<Url, ChunkKind>,
     /// State-wide source for watched-file resync generations.
     ///
@@ -1037,6 +1051,11 @@ pub struct WorldState {
     /// this before their state can race a scan. A scan claims the exact token
     /// under the final write lock before installing its complete candidate.
     workspace_scan_generation: u64,
+    /// Latest-arrival owner for top-level full workspace scans.
+    workspace_scan_intent: Option<WorkspaceScanIntentState>,
+    /// Unmarked fanout from the latest committed scan, claimable once after
+    /// package/config convergence.
+    workspace_scan_transfer: Option<WorkspaceScanTransferState>,
     /// Monotonic identity for graph/open-metadata mutations that do not
     /// necessarily change document text or either workspace-index version.
     workspace_graph_authority_generation: u64,
@@ -1245,6 +1264,21 @@ enum OpenLifecycleIntentState {
     Committed(u64),
 }
 
+/// Latest-arrival ownership for one top-level full workspace scan.
+///
+/// The process-wide generation is never reused. Both allowed full attempts
+/// retain the same token; a newer driver permanently supersedes the older one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkspaceScanIntentToken {
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceScanIntentState {
+    Pending(u64),
+    Committed(u64),
+}
+
 impl OpenCloseIntentToken {
     pub(crate) fn uri(&self) -> &Url {
         &self.uri
@@ -1292,6 +1326,75 @@ struct EditorEligibilityGeneration(u64);
 /// Typed freshness identity for every parsed analysis setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AnalysisConfigGeneration(u64);
+
+/// Typed freshness identity for the editor-derived closed chunk-kind map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkOverrideGeneration(u64);
+
+/// Exact pre-I/O inputs for one workspace scan attempt.
+///
+/// This is captured after the top-level driver mints its intent but before
+/// disk I/O. A changed generation or newer intent rejects the result without
+/// allowing an older driver to rebase onto the newer request.
+#[derive(Clone)]
+pub(crate) struct WorkspaceScanInputBasis {
+    intent: WorkspaceScanIntentToken,
+    scan_generation: u64,
+    analysis_config_generation: AnalysisConfigGeneration,
+    chunk_override_generation: ChunkOverrideGeneration,
+    pub(crate) workspace_folders: Vec<Url>,
+    pub(crate) max_chain_depth: usize,
+    pub(crate) max_transitive_dependents_visited: usize,
+    pub(crate) exclusion_patterns: Vec<String>,
+    pub(crate) index_workspace: bool,
+}
+
+impl WorkspaceScanInputBasis {
+    pub(crate) fn scan_generation(&self) -> u64 {
+        self.scan_generation
+    }
+}
+
+/// Exact post-scan authority snapshot used by detached graph and metadata
+/// derivation.
+#[derive(Clone)]
+pub(crate) struct WorkspaceScanDerivationBasis {
+    input: WorkspaceScanInputBasis,
+    graph_revision: u64,
+    graph_authority_generation: u64,
+    open_context_authority_generation: OpenContextAuthorityGeneration,
+    workspace_index_version: u64,
+    workspace_index_max_files: usize,
+    workspace_index_max_file_size_bytes: usize,
+    workspace_index_artifact_capacity: usize,
+    workspace_index_pinned: HashSet<Url>,
+    package_input_generation: u64,
+    package_config_generation: u64,
+    system_file_routing: SystemFileRoutingStamp,
+    open_records: std::collections::BTreeMap<Url, OpenRecordToken>,
+}
+
+impl WorkspaceScanDerivationBasis {
+    pub(crate) fn workspace_index_max_files(&self) -> usize {
+        self.workspace_index_max_files
+    }
+
+    pub(crate) fn workspace_index_max_file_size_bytes(&self) -> usize {
+        self.workspace_index_max_file_size_bytes
+    }
+
+    pub(crate) fn workspace_index_artifact_capacity(&self) -> usize {
+        self.workspace_index_artifact_capacity
+    }
+
+    pub(crate) fn system_file_inputs(&self) -> (Option<String>, Option<PathBuf>, Vec<PathBuf>) {
+        (
+            self.system_file_routing.workspace_name.clone(),
+            self.system_file_routing.workspace_root.clone(),
+            self.system_file_routing.library_paths.clone(),
+        )
+    }
+}
 
 #[derive(Clone)]
 enum AnalysisContextAuthority {
@@ -1529,11 +1632,79 @@ pub(crate) enum PreparedAnalysisCommit {
     Upsert(Box<PreparedClosedAnalysis>),
     Remove { basis: Box<AnalysisBasis>, uri: Url },
     Batch(Vec<PreparedClosedMutation>),
+    WorkspaceScan(Box<PreparedWorkspaceScanAnalysis>),
     OpenEdit(Box<PreparedOpenEditAnalysis>),
     OpenMetadata(Box<PreparedOpenMetadataAnalysis>),
     OpenAliasReconcile(Box<PreparedOpenAliasReconcileAnalysis>),
     OpenInstall(Box<PreparedOpenInstallAnalysis>),
     OpenClose(Box<PreparedOpenCloseAnalysis>),
+}
+
+/// One open metadata/artifact replacement derived from the exact immutable
+/// record named by `token`.
+pub(crate) struct PreparedWorkspaceOpenMetadata {
+    uri: Url,
+    token: OpenRecordToken,
+    prepared: PreparedOpenMetadataReplacement,
+}
+
+impl PreparedWorkspaceOpenMetadata {
+    pub(crate) fn new(
+        uri: Url,
+        token: OpenRecordToken,
+        prepared: PreparedOpenMetadataReplacement,
+    ) -> Self {
+        Self {
+            uri,
+            token,
+            prepared,
+        }
+    }
+}
+
+/// Complete off-lock workspace replacement candidate.
+///
+/// The central commit validates both phases plus every open token before the
+/// first mutation, then installs this exact index/graph/open projection.
+pub(crate) struct PreparedWorkspaceScanAnalysis {
+    input: WorkspaceScanInputBasis,
+    basis: WorkspaceScanDerivationBasis,
+    artifact_only: Vec<(Url, crate::workspace_index::ArtifactEntry)>,
+    full_records: Vec<(
+        Url,
+        crate::workspace_index::IndexEntry,
+        crate::workspace_index::ClosedProvenance,
+    )>,
+    graph: DependencyGraph,
+    open_metadata: Vec<PreparedWorkspaceOpenMetadata>,
+    workspace_index_pins: HashSet<Url>,
+}
+
+impl PreparedWorkspaceScanAnalysis {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        input: WorkspaceScanInputBasis,
+        basis: WorkspaceScanDerivationBasis,
+        artifact_only: Vec<(Url, crate::workspace_index::ArtifactEntry)>,
+        full_records: Vec<(
+            Url,
+            crate::workspace_index::IndexEntry,
+            crate::workspace_index::ClosedProvenance,
+        )>,
+        graph: DependencyGraph,
+        open_metadata: Vec<PreparedWorkspaceOpenMetadata>,
+        workspace_index_pins: HashSet<Url>,
+    ) -> Self {
+        Self {
+            input,
+            basis,
+            artifact_only,
+            full_records,
+            graph,
+            open_metadata,
+            workspace_index_pins,
+        }
+    }
 }
 
 pub(crate) struct PreparedOpenInstallAnalysis {
@@ -1748,6 +1919,27 @@ pub(crate) struct AnalysisRevalidationTicket {
     pub(crate) debounce_ms: u64,
 }
 
+/// One-shot identity for unmarked workspace-scan fanout transferred to
+/// post-seed/config orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkspaceScanTransferIdentity {
+    intent_generation: u64,
+    commit_generation: u64,
+    committed_scan_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceScanTransferredEffects {
+    identity: WorkspaceScanTransferIdentity,
+}
+
+#[derive(Clone)]
+struct WorkspaceScanTransferState {
+    identity: WorkspaceScanTransferIdentity,
+    candidates: Vec<(Url, OpenRecordToken)>,
+    claimed: bool,
+}
+
 /// Parsed payload owned by one active-document notification arrival.
 pub(crate) struct PreparedOpenLifecycleBatch {
     intent: OpenLifecycleIntentToken,
@@ -1794,6 +1986,7 @@ pub(crate) struct AnalysisCommitEffects {
     pub(crate) affected_candidates: Vec<Url>,
     pub(crate) open: Option<OpenAnalysisCommitOutcome>,
     pub(crate) close: Option<OpenCloseCommitOutcome>,
+    pub(crate) workspace_scan: Option<WorkspaceScanTransferredEffects>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1878,8 +2071,181 @@ impl WorldState {
         self.workspace_scan_generation
     }
 
+    fn mint_workspace_scan_intent_generation() -> u64 {
+        NEXT_WORKSPACE_SCAN_INTENT_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("workspace-scan intent generation counter exhausted")
+    }
+
+    fn mint_workspace_scan_commit_generation() -> u64 {
+        NEXT_WORKSPACE_SCAN_COMMIT_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("workspace-scan commit generation counter exhausted")
+    }
+
+    /// Begin one top-level scan driver. A newer arrival tombstones any older
+    /// driver and its unclaimed transferred effects.
+    pub(crate) fn begin_workspace_scan_intent(&mut self) -> WorkspaceScanIntentToken {
+        let generation = Self::mint_workspace_scan_intent_generation();
+        self.workspace_scan_intent = Some(WorkspaceScanIntentState::Pending(generation));
+        self.workspace_scan_transfer = None;
+        WorkspaceScanIntentToken { generation }
+    }
+
+    pub(crate) fn workspace_scan_intent_is_current(
+        &self,
+        intent: WorkspaceScanIntentToken,
+    ) -> bool {
+        self.workspace_scan_intent == Some(WorkspaceScanIntentState::Pending(intent.generation))
+    }
+
+    /// Capture the pre-I/O half of one full attempt.
+    ///
+    /// Attempt two calls this again and then repeats disk scan + derivation
+    /// from scratch, but retains the same latest-arrival `intent`.
+    pub(crate) fn capture_workspace_scan_input_basis(
+        &self,
+        intent: WorkspaceScanIntentToken,
+    ) -> Option<WorkspaceScanInputBasis> {
+        if !self.workspace_scan_intent_is_current(intent)
+            || !self.cross_file_config.index_workspace
+            || self.workspace_folders.is_empty()
+        {
+            return None;
+        }
+        Some(WorkspaceScanInputBasis {
+            intent,
+            scan_generation: self.workspace_scan_generation,
+            analysis_config_generation: self.analysis_config_generation,
+            chunk_override_generation: self.chunk_override_generation,
+            workspace_folders: self.workspace_folders.clone(),
+            max_chain_depth: self.cross_file_config.max_chain_depth,
+            max_transitive_dependents_visited: self
+                .cross_file_config
+                .max_transitive_dependents_visited,
+            exclusion_patterns: self.workspace_exclusions.patterns().to_vec(),
+            index_workspace: self.cross_file_config.index_workspace,
+        })
+    }
+
+    fn workspace_scan_input_basis_is_current(&self, basis: &WorkspaceScanInputBasis) -> bool {
+        self.workspace_scan_intent_is_current(basis.intent)
+            && self.workspace_scan_generation == basis.scan_generation
+            && self.analysis_config_generation == basis.analysis_config_generation
+            && self.chunk_override_generation == basis.chunk_override_generation
+            && self.workspace_folders == basis.workspace_folders
+            && self.cross_file_config.max_chain_depth == basis.max_chain_depth
+            && self.cross_file_config.max_transitive_dependents_visited
+                == basis.max_transitive_dependents_visited
+            && self.workspace_exclusions.patterns() == basis.exclusion_patterns.as_slice()
+            && self.cross_file_config.index_workspace == basis.index_workspace
+    }
+
+    /// Capture the post-I/O authority half used for detached graph/open
+    /// derivation. The caller holds one state read lock while taking
+    /// `index_snapshot`, open overlays, and this basis.
+    pub(crate) fn capture_workspace_scan_derivation_basis(
+        &self,
+        input: &WorkspaceScanInputBasis,
+        index_snapshot: &crate::workspace_index::WorkspaceIndexSnapshot,
+    ) -> Option<WorkspaceScanDerivationBasis> {
+        if !self.workspace_scan_input_basis_is_current(input) {
+            return None;
+        }
+        let (workspace_name, workspace_root, library_paths) = self.snapshot_system_file_inputs();
+        Some(WorkspaceScanDerivationBasis {
+            input: input.clone(),
+            graph_revision: self.cross_file_graph.edge_revision(),
+            graph_authority_generation: self.workspace_graph_authority_generation,
+            open_context_authority_generation: self.open_context_authority_generation,
+            workspace_index_version: index_snapshot.version,
+            workspace_index_max_files: self.workspace_index.config().max_files,
+            workspace_index_max_file_size_bytes: self.workspace_index.config().max_file_size_bytes,
+            workspace_index_artifact_capacity: index_snapshot.artifact_capacity_limit,
+            workspace_index_pinned: index_snapshot.pinned.clone(),
+            package_input_generation: self.package_input_generation(),
+            package_config_generation: self.package_config_generation,
+            system_file_routing: SystemFileRoutingStamp {
+                workspace_name,
+                workspace_root,
+                library_paths,
+            },
+            open_records: self
+                .documents
+                .keys()
+                .map(|uri| (uri.clone(), self.documents.record_token(uri)))
+                .collect(),
+        })
+    }
+
+    fn workspace_scan_derivation_basis_is_current(
+        &self,
+        basis: &WorkspaceScanDerivationBasis,
+    ) -> bool {
+        let index = self.workspace_index.authority_snapshot();
+        if !self.workspace_scan_input_basis_is_current(&basis.input)
+            || self.cross_file_graph.edge_revision() != basis.graph_revision
+            || self.workspace_graph_authority_generation != basis.graph_authority_generation
+            || self.open_context_authority_generation != basis.open_context_authority_generation
+            || index.version != basis.workspace_index_version
+            || self.workspace_index.config().max_files != basis.workspace_index_max_files
+            || self.workspace_index.config().max_file_size_bytes
+                != basis.workspace_index_max_file_size_bytes
+            || index.artifact_capacity_limit != basis.workspace_index_artifact_capacity
+            || index.pinned != basis.workspace_index_pinned
+            || self.package_input_generation() != basis.package_input_generation
+            || self.package_config_generation != basis.package_config_generation
+        {
+            return false;
+        }
+        let current_open: std::collections::BTreeMap<_, _> = self
+            .documents
+            .keys()
+            .map(|uri| (uri.clone(), self.documents.record_token(uri)))
+            .collect();
+        if current_open != basis.open_records {
+            return false;
+        }
+        let (workspace_name, workspace_root, library_paths) = self.snapshot_system_file_inputs();
+        basis.system_file_routing
+            == (SystemFileRoutingStamp {
+                workspace_name,
+                workspace_root,
+                library_paths,
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_scan_derivation_basis_is_current_for_test(
+        &self,
+        basis: &WorkspaceScanDerivationBasis,
+    ) -> bool {
+        self.workspace_scan_derivation_basis_is_current(basis)
+    }
+
+    pub(crate) fn workspace_scan_open_token(
+        basis: &WorkspaceScanDerivationBasis,
+        uri: &Url,
+    ) -> Option<OpenRecordToken> {
+        basis.open_records.get(uri).cloned()
+    }
+
     pub(crate) fn workspace_graph_authority_generation(&self) -> u64 {
         self.workspace_graph_authority_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_scan_generation_for_test(&self) -> u64 {
+        self.workspace_scan_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_context_authority_generation_for_test(&self) -> u64 {
+        self.open_context_authority_generation.0
     }
 
     pub(crate) fn advance_workspace_graph_authority_generation(&mut self) {
@@ -1911,16 +2277,7 @@ impl WorldState {
     /// Retire detached scans captured before a closed-file or scan-input write.
     pub(crate) fn advance_workspace_scan_generation(&mut self) {
         self.workspace_scan_generation = self.workspace_scan_generation.wrapping_add(1);
-    }
-
-    /// Atomically claim one scan generation. Advancing on success prevents two
-    /// peers captured from the same state from both installing.
-    pub(crate) fn claim_workspace_scan_generation(&mut self, expected: u64) -> bool {
-        if self.workspace_scan_generation != expected {
-            return false;
-        }
-        self.advance_workspace_scan_generation();
-        true
+        self.workspace_scan_transfer = None;
     }
 
     /// Current operational generation of raw package inputs.
@@ -2220,6 +2577,9 @@ impl WorldState {
             open_lifecycle_added_effects_complete_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
+            workspace_scan_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
             diagnostics_post_publish_lock_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
@@ -2263,12 +2623,15 @@ impl WorldState {
             editor_diagnostic_uris: None,
             editor_eligibility_generation: EditorEligibilityGeneration(0),
             analysis_config_generation: AnalysisConfigGeneration(0),
+            chunk_override_generation: ChunkOverrideGeneration(0),
             editor_chunk_kind_overrides: HashMap::new(),
             watched_file_resync_generation_counter: 0,
             watched_file_resync_generations: HashMap::new(),
             libpath_watcher_handle: None,
             package_library_ready: false,
             workspace_scan_generation: 0,
+            workspace_scan_intent: None,
+            workspace_scan_transfer: None,
             workspace_graph_authority_generation: 0,
             open_context_authority_generation: OpenContextAuthorityGeneration(0),
             open_install_intents: HashMap::new(),
@@ -2363,7 +2726,10 @@ impl WorldState {
         let previously_eligible: HashSet<Url> = self
             .documents
             .keys()
-            .filter(|uri| self.diagnostics_publish_allowed(uri))
+            .filter(|uri| {
+                self.diagnostics_publish_allowed(uri)
+                    && self.diagnostics_gate.current_epoch(uri).is_some()
+            })
             .cloned()
             .collect();
         let newly_eligible: HashSet<Url> = self
@@ -3098,11 +3464,15 @@ impl WorldState {
     /// close. Untitled and other non-file URIs never have closed disk state, so
     /// they also clear any stale entry.
     pub fn record_editor_chunk_kind_override(&mut self, uri: &Url, chunk_kind: ChunkKind) {
+        let old = self.editor_chunk_kind_overrides.get(uri).copied();
         if uri.to_file_path().is_err() || chunk_kind == classify_chunk_document(uri.path()) {
             self.editor_chunk_kind_overrides.remove(uri);
         } else {
             self.editor_chunk_kind_overrides
                 .insert(uri.clone(), chunk_kind);
+        }
+        if self.editor_chunk_kind_overrides.get(uri).copied() != old {
+            self.chunk_override_generation.0 = self.chunk_override_generation.0.wrapping_add(1);
         }
     }
 
@@ -3113,7 +3483,9 @@ impl WorldState {
     /// a later recreated file starts from path classification until the editor
     /// supplies a fresh language signal.
     pub fn prune_editor_chunk_kind_override(&mut self, uri: &Url) {
-        self.editor_chunk_kind_overrides.remove(uri);
+        if self.editor_chunk_kind_overrides.remove(uri).is_some() {
+            self.chunk_override_generation.0 = self.chunk_override_generation.0.wrapping_add(1);
+        }
     }
 
     /// Return the chunk kind to use for closed-file disk content.
@@ -3699,6 +4071,7 @@ impl WorldState {
             affected_candidates: Vec::new(),
             open: None,
             close: None,
+            workspace_scan: None,
         }
     }
 
@@ -3715,6 +4088,9 @@ impl WorldState {
         prepared: PreparedAnalysisCommit,
     ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
         let mutations = match prepared {
+            PreparedAnalysisCommit::WorkspaceScan(prepared) => {
+                return self.try_commit_workspace_scan(*prepared);
+            }
             PreparedAnalysisCommit::OpenClose(prepared) => {
                 return self.try_commit_open_close(*prepared);
             }
@@ -3739,6 +4115,151 @@ impl WorldState {
             PreparedAnalysisCommit::Batch(mutations) => mutations,
         };
         self.try_commit_closed_batch(mutations)
+    }
+
+    /// Atomically install one complete workspace-scan projection.
+    ///
+    /// Every authority and every open target is preflighted before the index
+    /// lock is acquired. After `replace_all_complete` succeeds, the remaining
+    /// operations are infallible in-memory swaps under the same `WorldState`
+    /// write lock. No diagnostics marker or worker is created here; exact
+    /// post-commit open tokens are transferred for one later claim after
+    /// package/config convergence.
+    fn try_commit_workspace_scan(
+        &mut self,
+        mut prepared: PreparedWorkspaceScanAnalysis,
+    ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
+        if !self.workspace_scan_input_basis_is_current(&prepared.input)
+            || !self.workspace_scan_derivation_basis_is_current(&prepared.basis)
+        {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+
+        prepared
+            .open_metadata
+            .sort_unstable_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
+        if prepared
+            .open_metadata
+            .windows(2)
+            .any(|pair| pair[0].uri == pair[1].uri)
+        {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+        let expected_targets: Vec<_> = prepared.basis.open_records.keys().cloned().collect();
+        let actual_targets: Vec<_> = prepared
+            .open_metadata
+            .iter()
+            .map(|replacement| replacement.uri.clone())
+            .collect();
+        if actual_targets != expected_targets
+            || prepared.open_metadata.iter().any(|replacement| {
+                prepared.basis.open_records.get(&replacement.uri) != Some(&replacement.token)
+                    || !self.documents.record_token_is_current(&replacement.token)
+                    || !self.documents.generation_is_current(
+                        &replacement.uri,
+                        replacement.prepared.base_generation(),
+                    )
+            })
+        {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+
+        let replaced = self
+            .workspace_index
+            .replace_all_complete_if_current(
+                prepared.basis.workspace_index_version,
+                prepared.artifact_only,
+                prepared.full_records,
+                prepared.workspace_index_pins,
+            )
+            .map_err(|_| AnalysisCommitRejected::StaleBasis)?;
+        if !replaced {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+        // The input basis was validated under this same WorldState write lock.
+        // Advance directly after the index CAS; unlike `claim_*`, this cannot
+        // fail after the first mutation.
+        debug_assert_eq!(
+            self.workspace_scan_generation,
+            prepared.input.scan_generation
+        );
+        self.advance_workspace_scan_generation();
+
+        for replacement in prepared.open_metadata {
+            self.documents
+                .commit_prepared_metadata_if_current(&replacement.uri, replacement.prepared)
+                .expect("all workspace-scan open targets were prevalidated");
+        }
+        self.cross_file_graph = prepared.graph;
+        self.workspace_scan_complete = true;
+        self.advance_workspace_graph_authority_generation();
+        self.advance_open_context_authority_generation();
+        self.workspace_scan_intent = Some(WorkspaceScanIntentState::Committed(
+            prepared.input.intent.generation,
+        ));
+
+        let identity = WorkspaceScanTransferIdentity {
+            intent_generation: prepared.input.intent.generation,
+            commit_generation: Self::mint_workspace_scan_commit_generation(),
+            committed_scan_generation: self.workspace_scan_generation,
+        };
+        let mut candidates: Vec<_> = self
+            .documents
+            .keys()
+            .filter(|uri| self.diagnostics_publish_allowed(uri))
+            .map(|uri| (uri.clone(), self.documents.record_token(uri)))
+            .collect();
+        candidates.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        self.workspace_scan_transfer = Some(WorkspaceScanTransferState {
+            identity,
+            candidates,
+            claimed: false,
+        });
+
+        Ok(AnalysisCommitEffects {
+            revalidations: Vec::new(),
+            affected_candidates: Vec::new(),
+            open: None,
+            close: None,
+            workspace_scan: Some(WorkspaceScanTransferredEffects { identity }),
+        })
+    }
+
+    /// Claim a committed scan's unmarked fanout exactly once.
+    ///
+    /// Candidates whose exact open records were replaced, closed, or reopened
+    /// after the scan are dropped; their owning transition is responsible for
+    /// current diagnostics. Marking and trigger capture happen together under
+    /// the caller's state write lock.
+    pub(crate) fn claim_workspace_scan_transfer(
+        &mut self,
+        transferred: &WorkspaceScanTransferredEffects,
+    ) -> Vec<AnalysisRevalidationTicket> {
+        let Some(state) = self.workspace_scan_transfer.as_mut() else {
+            return Vec::new();
+        };
+        if state.claimed
+            || state.identity != transferred.identity
+            || self.workspace_scan_generation != state.identity.committed_scan_generation
+            || self.workspace_scan_intent
+                != Some(WorkspaceScanIntentState::Committed(
+                    state.identity.intent_generation,
+                ))
+        {
+            return Vec::new();
+        }
+        state.claimed = true;
+        let candidates = std::mem::take(&mut state.candidates);
+        let uris: Vec<_> = candidates
+            .into_iter()
+            .filter(|(uri, token)| {
+                self.documents.record_token_is_current(token)
+                    && self.diagnostics_publish_allowed(uri)
+                    && self.diagnostics_gate.current_epoch(uri).is_some()
+            })
+            .map(|(uri, _)| uri)
+            .collect();
+        self.reserve_analysis_revalidations(uris).revalidations
     }
 
     fn try_commit_open_close(
@@ -3810,6 +4331,7 @@ impl WorldState {
             close: Some(OpenCloseCommitOutcome {
                 resync: prepared.resync,
             }),
+            workspace_scan: None,
         })
     }
 
@@ -3880,6 +4402,7 @@ impl WorldState {
                 packages_to_prefetch,
             }),
             close: None,
+            workspace_scan: None,
         })
     }
 
@@ -3925,6 +4448,7 @@ impl WorldState {
                 packages_to_prefetch,
             }),
             close: None,
+            workspace_scan: None,
         })
     }
 
@@ -3964,6 +4488,7 @@ impl WorldState {
                 packages_to_prefetch,
             }),
             close: None,
+            workspace_scan: None,
         })
     }
 
@@ -4013,6 +4538,7 @@ impl WorldState {
                 packages_to_prefetch: Vec::new(),
             }),
             close: None,
+            workspace_scan: None,
         })
     }
 
@@ -4569,7 +5095,8 @@ impl WorldState {
             })
             .collect();
         self.workspace_index
-            .replace_all_complete(Vec::new(), records, HashSet::new());
+            .replace_all_complete(Vec::new(), records, HashSet::new())
+            .expect("workspace index lock poisoned");
 
         log::info!("Applied {} workspace files", self.workspace_index.len());
 
@@ -4597,43 +5124,6 @@ impl WorldState {
         };
         let processed = processed_workspace_document(uri.clone(), document, snapshot);
         self.workspace_index.insert(uri, processed.entry);
-    }
-
-    /// Install a complete workspace-scan candidate whose graph was derived
-    /// off-lock from the exact post-commit unified entry set.
-    ///
-    /// Callers validate every captured authority identity and claim the scan
-    /// generation under the surrounding write lock immediately before calling.
-    /// This method performs only in-memory replacement.
-    pub(crate) fn apply_prepared_workspace_index(
-        &mut self,
-        artifact_only: Vec<(Url, crate::workspace_index::ArtifactEntry)>,
-        full_records: Vec<(
-            Url,
-            crate::workspace_index::IndexEntry,
-            crate::workspace_index::ClosedProvenance,
-        )>,
-        graph: DependencyGraph,
-        open_metadata: HashMap<
-            Url,
-            (
-                AnalysisGeneration,
-                Arc<crate::cross_file::CrossFileMetadata>,
-            ),
-        >,
-        prepared_pins: HashSet<Url>,
-    ) {
-        self.workspace_index
-            .replace_all_complete(artifact_only, full_records, prepared_pins);
-
-        self.cross_file_graph = graph;
-        self.advance_workspace_graph_authority_generation();
-        for (uri, (generation, metadata)) in open_metadata {
-            self.replace_open_document_metadata_if_current(&uri, generation, metadata)
-                .expect("workspace replay basis was validated immediately before apply");
-        }
-        self.workspace_scan_complete = true;
-        self.recompute_open_neighborhood_pins();
     }
 
     /// Build the dependency graph from all entries in the workspace index.
