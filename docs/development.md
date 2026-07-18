@@ -343,7 +343,12 @@ callers retain theirs and retry after the predecessor completes. A newer seed
 or unrelated authoritative live package edit does not silently cancel the
 tail: the coordinator recaptures the whole pair against the current package
 basis while retaining the outer seed/system handles and exact diagnostic
-candidates. A root/config successor is terminal for that pair but still
+candidates. The package-projection basis carries an explicit foreground or
+exact-coordinator ownership expectation, so registration or routing ownership
+that changes after a tail capture rejects the whole projection at the central
+CAS. A coordinator whose registration requires routing convergence cannot
+commit until that exact transfer is deposited in its retained ledger. A
+root/config successor is terminal for that pair but still
 consumes the retained outer ledger exactly once; a later seed fails its install
 CAS as a strict no-op and transfers to the coalesced retry lifecycle while the
 predecessor coordinator is pending, so it cannot overwrite and orphan that

@@ -828,6 +828,9 @@ pub struct WorldState {
     /// post-seed owner was retaining the outer diagnostic ledger.
     pending_post_seed_system_transfer:
         Option<(PackageSeedInstalledIdentity, AnalysisTransferHandle)>,
+    /// Whether the current post-seed coordinator must receive a routing
+    /// transfer before its package tail may commit.
+    pending_post_seed_requires_system_transfer: bool,
     /// Exact outer ledgers deposited by the deferred owner's callers before
     /// any post-seed or system worker is allowed to run.
     pending_post_seed_outer_handles: Vec<AnalysisTransferHandle>,
@@ -2081,6 +2084,14 @@ pub(crate) struct PackageProjectionBasis {
     exclusion_patterns: Vec<String>,
     package_mode: crate::cross_file::config::PackageMode,
     model_rprofile: bool,
+    post_seed_ownership: PostSeedPackageProjectionOwnership,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostSeedPackageProjectionOwnership {
+    Unrestricted,
+    Foreground(Option<PackageSeedInstalledIdentity>),
+    Coordinator(PackageSeedInstalledIdentity),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2434,6 +2445,9 @@ impl WorldState {
             let added = self.begin_system_file_seed_retry(identity);
             debug_assert!(added || self.system_file_seed_retry_is_current(identity));
         }
+        if registration == PostSeedRefreshOwnerRegistration::Added {
+            self.pending_post_seed_requires_system_transfer = requires_system_file_retry;
+        }
         registration
     }
 
@@ -2454,6 +2468,7 @@ impl WorldState {
     ) {
         if self.pending_post_seed_refresh_retry == Some(identity) {
             self.pending_post_seed_refresh_retry = None;
+            self.pending_post_seed_requires_system_transfer = false;
             self.pending_post_seed_outer_handles.clear();
             self.pending_post_seed_outer_candidates.clear();
         }
@@ -3302,7 +3317,26 @@ impl WorldState {
             exclusion_patterns: self.workspace_exclusions.patterns().to_vec(),
             package_mode: self.package_inputs.package_mode,
             model_rprofile: self.package_inputs.model_rprofile,
+            post_seed_ownership: PostSeedPackageProjectionOwnership::Unrestricted,
         }
+    }
+
+    pub(crate) fn capture_foreground_post_seed_package_projection_basis(
+        &self,
+        identity: Option<PackageSeedInstalledIdentity>,
+    ) -> PackageProjectionBasis {
+        let mut basis = self.capture_package_projection_basis();
+        basis.post_seed_ownership = PostSeedPackageProjectionOwnership::Foreground(identity);
+        basis
+    }
+
+    pub(crate) fn capture_coordinator_post_seed_package_projection_basis(
+        &self,
+        identity: PackageSeedInstalledIdentity,
+    ) -> PackageProjectionBasis {
+        let mut basis = self.capture_package_projection_basis();
+        basis.post_seed_ownership = PostSeedPackageProjectionOwnership::Coordinator(identity);
+        basis
     }
 
     pub(crate) fn try_install_prepared_package_projection(
@@ -3327,6 +3361,25 @@ impl WorldState {
             && self.workspace_exclusions.patterns() == basis.exclusion_patterns
             && self.package_inputs.package_mode == basis.package_mode
             && self.package_inputs.model_rprofile == basis.model_rprofile
+            && match basis.post_seed_ownership {
+                PostSeedPackageProjectionOwnership::Unrestricted => true,
+                PostSeedPackageProjectionOwnership::Foreground(identity) => {
+                    self.pending_post_seed_refresh_retry.is_none()
+                        && self.pending_system_file_seed_retry.is_none()
+                        && identity.is_none_or(|identity| {
+                            self.package_seed_installed_identity_is_current(identity)
+                        })
+                }
+                PostSeedPackageProjectionOwnership::Coordinator(identity) => {
+                    self.pending_post_seed_refresh_retry == Some(identity)
+                        && self.pending_system_file_seed_retry.is_none()
+                        && (!self.pending_post_seed_requires_system_transfer
+                            || self
+                                .pending_post_seed_system_transfer
+                                .as_ref()
+                                .is_some_and(|(owner, _)| *owner == identity))
+                }
+            }
     }
 
     /// Shared derived-record tail for both legacy in-place input adapters and
@@ -3585,6 +3638,7 @@ impl WorldState {
             pending_system_file_seed_retry: None,
             pending_post_seed_refresh_retry: None,
             pending_post_seed_system_transfer: None,
+            pending_post_seed_requires_system_transfer: false,
             pending_post_seed_outer_handles: Vec::new(),
             pending_post_seed_outer_candidates: Vec::new(),
             system_file_routing_owner_generation: Self::mint_system_file_routing_owner_generation(),
