@@ -3860,12 +3860,13 @@ fn finalize_analysis_handoff_candidates_excluding_or_fallback(
     excluded: &std::collections::HashSet<Url>,
 ) -> Vec<crate::state::AnalysisRevalidationTicket> {
     let finalization = WorldState::begin_analysis_transfer_finalization();
+    let mut excluded = excluded.clone();
     loop {
         match state.finalize_analysis_transfers_excluding(
             finalization,
             &handles,
             additional.clone(),
-            excluded,
+            &excluded,
         ) {
             Ok(AnalysisTransferFinalization::Committed(tickets)) => return tickets,
             Ok(AnalysisTransferFinalization::AlreadyFinalized) => return Vec::new(),
@@ -3879,13 +3880,11 @@ fn finalize_analysis_handoff_candidates_excluding_or_fallback(
                 handles[index] = successor;
             }
             Err(AnalysisTransferRejection::AlreadyConsumed { handle }) => {
+                excluded.extend(state.current_consumed_analysis_transfer_candidate_uris(handle));
                 let Some(index) = handles.iter().position(|candidate| *candidate == handle) else {
                     return Vec::new();
                 };
                 handles.remove(index);
-                if handles.is_empty() {
-                    return Vec::new();
-                }
             }
             Err(AnalysisTransferRejection::MissingOrWrongOwner) => {
                 let mut fallback = state.capture_analysis_transfer_candidates(fallback_uris);
@@ -25474,6 +25473,7 @@ mod project_config_initialize_tests {
         fs::create_dir_all(&package).unwrap();
         fs::write(package.join("helper.R"), "helper_value <- 1\n").unwrap();
         let uri = Url::from_file_path(workspace.path().join("live.R")).unwrap();
+        let independent = Url::from_file_path(workspace.path().join("independent.R")).unwrap();
         let source = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
         let state = Arc::new(RwLock::new(WorldState::new()));
         {
@@ -25490,6 +25490,10 @@ mod project_config_initialize_tests {
                     generation,
                     Arc::new(crate::cross_file::extract_metadata(source)),
                 )
+                .unwrap();
+            state.open_document(independent.clone(), "independent <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&independent)
                 .unwrap();
             let mut package_library = crate::package_library::PackageLibrary::new_empty();
             package_library.set_lib_paths(vec![library.path().to_path_buf()]);
@@ -25520,12 +25524,22 @@ mod project_config_initialize_tests {
         let tickets = finalize_analysis_handoff_or_fallback(
             &mut state,
             vec![handle],
-            vec![uri.clone()],
-            vec![uri.clone()],
+            vec![uri.clone(), independent.clone()],
+            vec![uri.clone(), independent.clone()],
         );
 
-        assert!(tickets.is_empty());
-        assert_eq!(state.analysis_revalidation_reservation_count, reservations);
+        assert_eq!(
+            tickets
+                .iter()
+                .map(|ticket| ticket.uri.clone())
+                .collect::<Vec<_>>(),
+            vec![independent.clone()],
+            "the consumed handle owns its overlap, but independent direct candidates must still finalize"
+        );
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservations + 1
+        );
         assert_eq!(
             state.diagnostics_gate.force_republish_count_for_test(&uri),
             markers,
@@ -25595,8 +25609,6 @@ mod project_config_initialize_tests {
                 AnalysisTransferFinalization::Committed(ref tickets)
                     if tickets.iter().any(|ticket| ticket.uri == system_uri)
             ));
-            state.retire_diagnostic_lifecycle(&system_uri);
-            state.close_document(&system_uri);
         }
 
         let workspace_handle = run_workspace_scan_transaction(&state)
@@ -25605,6 +25617,9 @@ mod project_config_initialize_tests {
             .transfer
             .handle;
         let mut state = state.write().await;
+        let system_markers = state
+            .diagnostics_gate
+            .force_republish_count_for_test(&system_uri);
         let tickets = finalize_analysis_handoff_or_fallback(
             &mut state,
             vec![system_handle, workspace_handle],
@@ -25615,12 +25630,111 @@ mod project_config_initialize_tests {
             tickets.iter().any(|ticket| ticket.uri == workspace_uri),
             "the consumed system handle is terminal only for itself"
         );
+        assert!(
+            tickets.iter().all(|ticket| ticket.uri != system_uri),
+            "the valid workspace transfer must not reserve the overlap already owned by the consumed system handle"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&system_uri),
+            system_markers
+        );
         assert_eq!(
             state
                 .diagnostics_gate
                 .force_republish_count_for_test(&workspace_uri),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn consumed_transfer_excludes_only_reserved_current_candidates() {
+        let workspace = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let package = library.path().join("otherpkg");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("helper.R"), "helper_value <- 1\n").unwrap();
+        let dropped = Url::from_file_path(workspace.path().join("dropped.R")).unwrap();
+        let reserved = Url::from_file_path(workspace.path().join("reserved.R")).unwrap();
+        let source = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(workspace.path()).unwrap()];
+            state.cross_file_config.max_revalidations_per_trigger = 1;
+            state.cross_file_activity.active_uri = Some(reserved.clone());
+            for uri in [&dropped, &reserved] {
+                state.open_document(uri.clone(), source, Some(1));
+                state.begin_open_document_diagnostic_lifecycle(uri).unwrap();
+                let generation = state.documents.get_record(uri).unwrap().generation();
+                state
+                    .replace_open_document_metadata_if_current(
+                        uri,
+                        generation,
+                        Arc::new(crate::cross_file::extract_metadata(source)),
+                    )
+                    .unwrap();
+            }
+            let mut package_library = crate::package_library::PackageLibrary::new_empty();
+            package_library.set_lib_paths(vec![library.path().to_path_buf()]);
+            state.install_package_library(Arc::new(package_library), true);
+        }
+        let handle = run_system_file_convergence_transfer(&state, None)
+            .await
+            .unwrap()
+            .handle;
+        {
+            let mut state = state.write().await;
+            let first = state
+                .finalize_analysis_transfers(
+                    WorldState::begin_analysis_transfer_finalization(),
+                    &[handle],
+                    Vec::new(),
+                )
+                .unwrap();
+            assert!(matches!(
+                first,
+                AnalysisTransferFinalization::Committed(ref tickets)
+                    if tickets.len() == 1 && tickets[0].uri == reserved
+            ));
+
+            let dropped_tickets = finalize_analysis_handoff_or_fallback(
+                &mut state,
+                vec![handle],
+                vec![dropped.clone()],
+                vec![dropped.clone()],
+            );
+            assert_eq!(
+                dropped_tickets
+                    .iter()
+                    .map(|ticket| ticket.uri.clone())
+                    .collect::<Vec<_>>(),
+                vec![dropped.clone()],
+                "a cap-dropped candidate was not owned by the consumed finalization"
+            );
+
+            state.retire_diagnostic_lifecycle(&reserved);
+            state.close_document(&reserved);
+            state.open_document(reserved.clone(), source, Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&reserved)
+                .unwrap();
+            let reopened_tickets = finalize_analysis_handoff_or_fallback(
+                &mut state,
+                vec![handle],
+                vec![reserved.clone()],
+                vec![reserved.clone()],
+            );
+            assert_eq!(
+                reopened_tickets
+                    .iter()
+                    .map(|ticket| ticket.uri.clone())
+                    .collect::<Vec<_>>(),
+                vec![reserved.clone()],
+                "a consumed candidate's retired token cannot suppress the reopened lifecycle"
+            );
+        }
     }
 
     #[tokio::test]

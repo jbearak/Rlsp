@@ -1089,8 +1089,9 @@ pub struct WorldState {
     analysis_transfers: HashMap<AnalysisTransferIdentity, AnalysisTransferState>,
     /// Successful successor commits that inherited an older transfer.
     analysis_transfer_successors: HashMap<AnalysisTransferIdentity, AnalysisTransferIdentity>,
-    /// Exact handles already consumed by a successful finalization.
-    analysis_transfers_consumed: HashSet<AnalysisTransferIdentity>,
+    /// Exact handles already consumed by a successful finalization, mapped to
+    /// the exact diagnostic triggers that survived record filtering and the cap.
+    analysis_transfers_consumed: HashMap<AnalysisTransferIdentity, Vec<(Url, DiagnosticsTrigger)>>,
     /// Finalization intents already completed, including fallback completion.
     analysis_transfer_finalizations: HashSet<AnalysisTransferFinalizationId>,
     /// Latest workspace transfer. Pending/failed scans do not change it.
@@ -2581,7 +2582,10 @@ impl WorldState {
             if !unique.insert(handle.identity) {
                 return Err(AnalysisTransferRejection::MissingOrWrongOwner);
             }
-            if self.analysis_transfers_consumed.contains(&handle.identity) {
+            if self
+                .analysis_transfers_consumed
+                .contains_key(&handle.identity)
+            {
                 return Err(AnalysisTransferRejection::AlreadyConsumed { handle: *handle });
             }
             if let Some(successor) = self.analysis_transfer_successors.get(&handle.identity) {
@@ -2597,20 +2601,44 @@ impl WorldState {
             }
         }
 
+        let consumed_identities: Vec<_> = handles.iter().map(|handle| handle.identity).collect();
         for handle in handles {
             let state = self
                 .analysis_transfers
                 .remove(&handle.identity)
                 .expect("all analysis transfer handles were prevalidated");
             additional_candidates.extend(state.candidates);
-            self.analysis_transfers_consumed.insert(handle.identity);
         }
         self.analysis_transfer_finalizations.insert(finalization);
         additional_candidates.retain(|(uri, _)| !excluded.contains(uri));
         let uris = self.current_transfer_candidate_uris(additional_candidates);
-        Ok(AnalysisTransferFinalization::Committed(
-            self.reserve_analysis_revalidations(uris).revalidations,
-        ))
+        let tickets = self.reserve_analysis_revalidations(uris).revalidations;
+        let owned_candidates: Vec<_> = tickets
+            .iter()
+            .map(|ticket| (ticket.uri.clone(), ticket.trigger))
+            .collect();
+        for identity in consumed_identities {
+            self.analysis_transfers_consumed
+                .insert(identity, owned_candidates.clone());
+        }
+        Ok(AnalysisTransferFinalization::Committed(tickets))
+    }
+
+    /// Exact still-current triggers already owned by `handle`'s completed
+    /// finalization. Metadata-only record replacement keeps the same trigger;
+    /// close/reopen changes its epoch, so the new lifecycle is never suppressed
+    /// by URI equality alone.
+    pub(crate) fn current_consumed_analysis_transfer_candidate_uris(
+        &self,
+        handle: AnalysisTransferHandle,
+    ) -> Vec<Url> {
+        self.analysis_transfers_consumed
+            .get(&handle.identity)
+            .into_iter()
+            .flatten()
+            .filter(|(uri, trigger)| !trigger.is_stale(self, uri))
+            .map(|(uri, _trigger)| uri.clone())
+            .collect()
     }
 
     /// Complete a rejected handoff from current exact candidates exactly once.
@@ -3221,7 +3249,7 @@ impl WorldState {
             workspace_scan_intent: None,
             analysis_transfers: HashMap::new(),
             analysis_transfer_successors: HashMap::new(),
-            analysis_transfers_consumed: HashSet::new(),
+            analysis_transfers_consumed: HashMap::new(),
             analysis_transfer_finalizations: HashSet::new(),
             latest_workspace_scan_transfer: None,
             latest_system_file_transfer: None,

@@ -214,9 +214,13 @@ missing/wrong owner. A handle already consumed by another finalization is a
 terminal no-op for that handle: it is removed from a mixed handoff while every
 remaining handle is still prevalidated all-or-none. Treating the consumed
 handle as fallback authority would double-mark candidates that the first
-finalization already owns. Watched batches likewise exclude a pre-reserved
-candidate from a transfer only when the ticket trigger still names the current
-open lifecycle; URI equality alone must not suppress a close/reopen.
+finalization already owns. The consumed-owner ledger retains only triggers that
+survived exact-record filtering and the cap; a later mixed handoff excludes
+those still-current triggers while allowing cap-dropped, independent, or
+reopened-lifecycle candidates to reserve normally. Watched batches likewise
+exclude a pre-reserved candidate from a transfer only when the ticket trigger
+still names the current open lifecycle; URI equality alone must not suppress a
+close/reopen.
 
 Workspace-scan finalization additionally validates the latest committed scan
 intent. Each candidate validates its current diagnostic lifecycle and exact
