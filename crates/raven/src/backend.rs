@@ -15954,6 +15954,25 @@ mod tests {
             let backend = svc.inner();
             open_lifecycle_doc(backend, &uri, "x <- (\n").await;
 
+            let worker_pre_lock_pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_test_pause
+                .arm(uri.clone());
+            let worker_state = Arc::clone(&backend.state);
+            let worker_client = backend.client.clone();
+            let worker_uri = uri.clone();
+            let mut worker = tokio::spawn(async move {
+                super::super::publish_diagnostics_inner(&worker_state, &worker_client, &worker_uri)
+                    .await;
+            });
+            tokio::select! {
+                _ = worker_pre_lock_pause.wait_arrived() => {}
+                _ = &mut worker => panic!("worker skipped pre-publish-lock barrier"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("worker timed out"),
+            }
+
             let batch_pause = backend
                 .state
                 .read()
@@ -15977,11 +15996,24 @@ mod tests {
                 _ = &mut remove => panic!("batch skipped postcommit barrier"),
                 _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("batch timed out"),
             }
-            let worker = backend.publish_diagnostics(&uri);
-            tokio::pin!(worker);
+
+            let worker_post_lock_pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_post_publish_lock_test_pause
+                .arm(uri.clone());
+            worker_pre_lock_pause.release();
             batch_pause.release();
             remove.await;
-            worker.await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                worker_post_lock_pause.wait_arrived(),
+            )
+            .await
+            .expect("worker acquires the publish lock only after the removal clears and unlocks");
+            worker_post_lock_pause.release();
+            worker.await.unwrap();
 
             let clear = tokio::time::timeout(Duration::from_secs(5), socket.next())
                 .await
