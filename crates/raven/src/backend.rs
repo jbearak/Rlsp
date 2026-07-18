@@ -5516,6 +5516,7 @@ struct CapturedOpenCloseAnalysis {
     package_fanout_uris: Vec<Url>,
     rprofile_fanout_uris: Vec<Url>,
     preamble_fanout_uris: Vec<Url>,
+    watched_generations: HashMap<Url, Option<u64>>,
 }
 
 fn capture_open_close_analysis(
@@ -5551,10 +5552,16 @@ fn capture_open_close_analysis(
     }
 
     let mut authoritative_roots = state.authoritative_revalidation_roots_for_uri(&uri);
+    authoritative_roots.push(uri.clone());
     authoritative_roots.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
     authoritative_roots.dedup();
     let mut roots = Vec::with_capacity(authoritative_roots.len());
+    let mut watched_generations = HashMap::new();
     for root in authoritative_roots {
+        watched_generations.insert(
+            root.clone(),
+            state.watched_file_resync_generations.get(&root).copied(),
+        );
         let next_owner = if root != uri && state.documents.contains_key(&root) {
             Some(root.clone())
         } else {
@@ -5644,7 +5651,7 @@ fn capture_open_close_analysis(
         || package_close_uri
             .as_ref()
             .is_some_and(|package_uri| state.is_project_excluded_uri(package_uri));
-    let package_fanout_uris = package_workspace_root
+    let mut package_fanout_uris: Vec<Url> = package_workspace_root
         .as_deref()
         .map(|root| {
             state
@@ -5658,6 +5665,23 @@ fn capture_open_close_analysis(
                 .collect()
         })
         .unwrap_or_default();
+    if let Some(root) = package_workspace_root.as_deref() {
+        let mut seen: std::collections::HashSet<Url> =
+            package_fanout_uris.iter().cloned().collect();
+        seen.insert(uri.clone());
+        extend_affected_for_load_all_revalidation_from_state(
+            &mut package_fanout_uris,
+            &mut seen,
+            state,
+            root,
+        );
+        package_fanout_uris.retain(|candidate| candidate != &uri);
+        cap_watched_file_revalidations(
+            &mut package_fanout_uris,
+            &state.cross_file_activity,
+            state.cross_file_config.max_revalidations_per_trigger,
+        );
+    }
     let rprofile_fanout_uris = package_workspace_root
         .as_deref()
         .map(|root| {
@@ -5716,7 +5740,25 @@ fn capture_open_close_analysis(
         package_fanout_uris,
         rprofile_fanout_uris,
         preamble_fanout_uris,
+        watched_generations,
     })
+}
+
+fn file_snapshot_with_bytes_hash(
+    metadata: &std::fs::Metadata,
+    bytes: &[u8],
+) -> crate::cross_file::file_cache::FileSnapshot {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    crate::cross_file::file_cache::FileSnapshot {
+        mtime: metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        size: metadata.len(),
+        content_hash: Some(hasher.finish()),
+    }
 }
 
 fn derive_open_close_analysis(
@@ -5739,20 +5781,31 @@ fn derive_open_close_analysis(
                 disk_observations.push(OpenCloseDiskObservation {
                     uri: root.uri.clone(),
                     snapshot: None,
+                    decoded_source: true,
                 });
                 continue;
             }
             Err(crate::state::SourceReadError::InvalidEncoding { .. }) => {
+                let snapshot = std::fs::read(&path).ok().and_then(|bytes| {
+                    std::fs::metadata(&path)
+                        .ok()
+                        .map(|metadata| file_snapshot_with_bytes_hash(&metadata, &bytes))
+                });
                 disk_observations.push(OpenCloseDiskObservation {
                     uri: root.uri.clone(),
-                    snapshot: None,
+                    snapshot,
+                    decoded_source: false,
                 });
                 continue;
             }
             Err(_) => {
+                let snapshot = std::fs::metadata(&path).ok().map(|metadata| {
+                    crate::cross_file::file_cache::FileSnapshot::from_metadata(&metadata)
+                });
                 disk_observations.push(OpenCloseDiskObservation {
                     uri: root.uri.clone(),
-                    snapshot: None,
+                    snapshot,
+                    decoded_source: false,
                 });
                 continue;
             }
@@ -5761,6 +5814,7 @@ fn derive_open_close_analysis(
             disk_observations.push(OpenCloseDiskObservation {
                 uri: root.uri.clone(),
                 snapshot: None,
+                decoded_source: true,
             });
             continue;
         };
@@ -5803,6 +5857,7 @@ fn derive_open_close_analysis(
         disk_observations.push(OpenCloseDiskObservation {
             uri: root.uri.clone(),
             snapshot: Some(snapshot.clone()),
+            decoded_source: true,
         });
         disk_material.insert(
             root.uri.clone(),
@@ -5826,6 +5881,7 @@ fn derive_open_close_analysis(
                 .owner_uri
                 .as_ref()
                 .is_some_and(|owner| owner != &root.uri)
+                || disk_material.contains_key(&root.uri)
             {
                 semantic.inherited_working_directory = None;
                 crate::cross_file::enrich_metadata_with_inherited_wd(
@@ -5886,6 +5942,7 @@ fn derive_open_close_analysis(
                     chunk_kind: captured.chunk_kind,
                     old_metadata: Some(Arc::new(semantic)),
                     old_interface_hash: root.interface_hash,
+                    expected_watched_generation: None,
                 });
             }
         } else {
@@ -5896,6 +5953,7 @@ fn derive_open_close_analysis(
                     chunk_kind: captured.chunk_kind,
                     old_metadata: None,
                     old_interface_hash: None,
+                    expected_watched_generation: None,
                 });
             }
         }
@@ -6017,8 +6075,18 @@ fn derive_open_close_analysis(
     let watched_roots = captured
         .roots
         .iter()
-        .filter(|root| root.uri.to_file_path().is_ok())
-        .map(|root| (root.uri.clone(), captured.chunk_kind))
+        .filter(|root| root.owner_uri.is_none() && root.uri.to_file_path().is_ok())
+        .map(|root| {
+            (
+                root.uri.clone(),
+                captured
+                    .watched_generations
+                    .get(&root.uri)
+                    .copied()
+                    .flatten(),
+                captured.chunk_kind,
+            )
+        })
         .collect();
     PreparedOpenCloseAnalysis::new(
         captured.basis,
@@ -7172,12 +7240,64 @@ mod watched_package_input_generation_tests {
 /// The "file is gone" tail of [`resync_file_from_disk`]: veto if the URI was
 /// (re)opened, otherwise remove the file's cross-file state and refresh the
 /// pin set.
+enum RemovalDiskObservation {
+    Missing,
+    Undecodable(crate::cross_file::file_cache::FileSnapshot),
+}
+
 async fn resync_missing_file(
     state_arc: &Arc<RwLock<WorldState>>,
     uri: &Url,
     expected_watched_generation: Option<u64>,
     commit_mode: ResyncCommitMode,
+    observation: RemovalDiskObservation,
 ) -> ResyncOutcome {
+    #[cfg(test)]
+    {
+        let armed = {
+            let state = state_arc.read().await;
+            state.close_resync_pre_commit_test_pause.take_armed(uri)
+        };
+        if let Some(pause_gate) = armed {
+            pause_gate.pause().await;
+        }
+    }
+    let Ok(path) = uri.to_file_path() else {
+        return ResyncOutcome::Skipped;
+    };
+    let publish_lock = {
+        let state = state_arc.read().await;
+        state.diagnostics_publish_lock.clone()
+    };
+    let _publish_guard = publish_lock.lock().await;
+    let observation_is_current = match observation {
+        RemovalDiskObservation::Missing => tokio::fs::metadata(&path)
+            .await
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        RemovalDiskObservation::Undecodable(expected) => {
+            match (
+                tokio::fs::read(&path).await,
+                tokio::fs::metadata(&path).await,
+            ) {
+                (Ok(bytes), Ok(metadata)) => {
+                    file_snapshot_with_bytes_hash(&metadata, &bytes) == expected
+                        && crate::state::read_source_async(&path)
+                            .await
+                            .is_err_and(|error| {
+                                matches!(
+                                    error,
+                                    crate::state::SourceReadError::InvalidEncoding { .. }
+                                )
+                            })
+                }
+                _ => false,
+            }
+        }
+    };
+    if !observation_is_current {
+        log::trace!("Disk resync removal observation changed before CAS: {uri}");
+        return ResyncOutcome::Skipped;
+    }
     let mut state = state_arc.write().await;
     if state.is_document_open_or_alias(uri) {
         return ResyncOutcome::Vetoed;
@@ -7333,8 +7453,14 @@ async fn resync_file_from_disk(
     let content = match crate::state::read_source_async(&path).await {
         Ok(c) => c,
         Err(crate::state::SourceReadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return resync_missing_file(state_arc, uri, expected_watched_generation, commit_mode)
-                .await;
+            return resync_missing_file(
+                state_arc,
+                uri,
+                expected_watched_generation,
+                commit_mode,
+                RemovalDiskObservation::Missing,
+            )
+            .await;
         }
         Err(e @ crate::state::SourceReadError::InvalidEncoding { .. }) => {
             // See the doc comment: removal for the close path (converge with
@@ -7342,11 +7468,21 @@ async fn resync_file_from_disk(
             // watched path (transient non-atomic writes).
             if undecodable_as_missing {
                 log::trace!("Disk resync removing undecodable file state {}: {}", uri, e);
+                let observation = match (
+                    tokio::fs::read(&path).await,
+                    tokio::fs::metadata(&path).await,
+                ) {
+                    (Ok(bytes), Ok(metadata)) => RemovalDiskObservation::Undecodable(
+                        file_snapshot_with_bytes_hash(&metadata, &bytes),
+                    ),
+                    _ => return ResyncOutcome::Skipped,
+                };
                 return resync_missing_file(
                     state_arc,
                     uri,
                     expected_watched_generation,
                     commit_mode,
+                    observation,
                 )
                 .await;
             }
@@ -7364,8 +7500,14 @@ async fn resync_file_from_disk(
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return resync_missing_file(state_arc, uri, expected_watched_generation, commit_mode)
-                .await;
+            return resync_missing_file(
+                state_arc,
+                uri,
+                expected_watched_generation,
+                commit_mode,
+                RemovalDiskObservation::Missing,
+            )
+            .await;
         }
         Err(_) => return ResyncOutcome::Skipped,
     };
@@ -7663,6 +7805,7 @@ async fn run_close_resync(
     client: Client,
     traversal_truncation: Arc<TraversalTruncationState>,
     uri: Url,
+    expected_watched_generation: Option<u64>,
     chunk_kind: Option<crate::chunks::ChunkKind>,
     old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
     old_interface_hash: Option<u64>,
@@ -7693,7 +7836,7 @@ async fn run_close_resync(
         chunk_kind,
         old_meta,
         true,
-        None,
+        expected_watched_generation,
         ResyncCommitMode::Immediate,
     )
     .await
@@ -9290,7 +9433,7 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
                     return observation.snapshot.is_none();
                 };
                 match observation.snapshot.as_ref() {
-                    Some(expected) => {
+                    Some(expected) if observation.decoded_source => {
                         let Ok(content) = crate::state::read_source(&path) else {
                             return false;
                         };
@@ -9300,6 +9443,35 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
                         crate::cross_file::file_cache::FileSnapshot::with_content_hash(
                             &metadata, &content,
                         ) == *expected
+                    }
+                    Some(expected) => {
+                        let Ok(metadata) = std::fs::metadata(&path) else {
+                            return false;
+                        };
+                        if expected.content_hash.is_some() {
+                            let Ok(bytes) = std::fs::read(&path) else {
+                                return false;
+                            };
+                            file_snapshot_with_bytes_hash(&metadata, &bytes) == *expected
+                                && crate::state::read_source(&path).is_err_and(|error| {
+                                    matches!(
+                                        error,
+                                        crate::state::SourceReadError::InvalidEncoding { .. }
+                                    )
+                                })
+                        } else {
+                            expected.matches_disk(
+                                &crate::cross_file::file_cache::FileSnapshot::from_metadata(
+                                    &metadata,
+                                ),
+                            ) && crate::state::read_source(&path).is_err_and(|error| {
+                                matches!(
+                                    error,
+                                    crate::state::SourceReadError::Io(error)
+                                        if error.kind() != std::io::ErrorKind::NotFound
+                                )
+                            })
+                        }
                     }
                     None => std::fs::metadata(path)
                         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
@@ -9397,6 +9569,7 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
                         client.clone(),
                         traversal.clone(),
                         ticket.uri,
+                        ticket.expected_watched_generation,
                         Some(ticket.chunk_kind),
                         ticket.old_metadata,
                         ticket.old_interface_hash,
@@ -15235,6 +15408,7 @@ mod tests {
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
             let collector = tokio::spawn(async move {
+                let mut publications = Vec::new();
                 loop {
                     let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
                         .await
@@ -15248,18 +15422,24 @@ mod tests {
                     if params.uri != uri {
                         continue;
                     }
-                    if params.diagnostics.is_empty() {
-                        return Some(params);
+                    let empty = params.diagnostics.is_empty();
+                    publications.push(params);
+                    if empty {
+                        return publications;
                     }
                 }
             });
             pause.release();
             worker.await.unwrap();
             close.await;
-            let last = collector.await.unwrap();
+            let publications = collector.await.unwrap();
             assert!(
-                last.is_some_and(|params| params.diagnostics.is_empty()),
-                "the close-owned empty publication must be last"
+                publications.len() >= 2
+                    && !publications[publications.len() - 2].diagnostics.is_empty()
+                    && publications
+                        .last()
+                        .is_some_and(|params| params.diagnostics.is_empty()),
+                "the exact order must end with worker nonempty then close empty; got {publications:?}"
             );
         }
 
@@ -23045,6 +23225,7 @@ mod project_config_initialize_tests {
         let alias_b = Url::from_file_path(generated.join("b").join("parent.R")).unwrap();
         let canonical_parent = Url::from_file_path(real.join("parent.R")).unwrap();
         let child_uri = Url::from_file_path(real.join("child.R")).unwrap();
+        let consumer_uri = Url::from_file_path(tmp.path().join("consumer.R")).unwrap();
 
         let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
         let backend = svc.inner();
@@ -23058,12 +23239,43 @@ mod project_config_initialize_tests {
             })
             .await
             .unwrap();
+        backend
+            .state
+            .write()
+            .await
+            .cross_file_config
+            .revalidation_debounce_ms = 60_000;
 
-        open_doc(backend, &alias_a, "r", 1, "source(\"child.R\")\n").await;
-        open_doc(backend, &alias_b, "r", 1, "source(\"child.R\")\n").await;
+        open_doc(
+            backend,
+            &alias_a,
+            "r",
+            1,
+            "source(\"child.R\")\na_only <- 1\n",
+        )
+        .await;
+        open_doc(
+            backend,
+            &alias_b,
+            "r",
+            1,
+            "source(\"child.R\")\nb_only <- 1\n",
+        )
+        .await;
+        open_doc(
+            backend,
+            &consumer_uri,
+            "r",
+            1,
+            "source(\"real/parent.R\")\na_only\n",
+        )
+        .await;
 
-        {
-            let state = backend.state.read().await;
+        let reservation_baseline = {
+            let mut state = backend.state.write().await;
+            state
+                .watched_file_resync_generations
+                .insert(canonical_parent.clone(), 4_242);
             assert!(state.is_project_excluded_uri(&alias_a));
             assert!(state.is_project_excluded_uri(&alias_b));
             assert!(!state.is_project_excluded_uri(&canonical_parent));
@@ -23092,7 +23304,8 @@ mod project_config_initialize_tests {
                     .any(|edge| edge.from == canonical_parent && !edge.non_lending),
                 "precondition: excluded alias must not have a lending reverse edge"
             );
-        }
+            state.analysis_revalidation_reservation_count
+        };
 
         close_doc(backend, &alias_a).await;
 
@@ -23121,6 +23334,22 @@ mod project_config_initialize_tests {
                 .iter()
                 .any(|edge| edge.from == canonical_parent && !edge.non_lending),
             "remirror must not recreate a lending reverse edge from the non-excluded child"
+        );
+        assert_eq!(
+            state.watched_file_resync_generations.get(&canonical_parent),
+            Some(&4_242),
+            "surviving alias ownership must retain canonical watched authority"
+        );
+        assert!(
+            state.analysis_revalidation_reservation_count > reservation_baseline,
+            "the canonical interface handoff must reserve its open dependent"
+        );
+        assert!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&consumer_uri)
+                >= 1,
+            "the canonical dependent must own a close-handoff marker"
         );
     }
 
@@ -29467,6 +29696,15 @@ mod project_config_initialize_tests {
                 "open must resolve the child's source() through the inherited working directory"
             );
         }
+        {
+            let state = backend.state.write().await;
+            state.workspace_index.invalidate(&child_uri);
+            state.cross_file_file_cache.invalidate(&child_uri);
+            assert!(
+                !state.workspace_index.contains(&child_uri),
+                "force the no-shadow fresh-disk close path"
+            );
+        }
 
         close_doc(backend, &child_uri).await;
 
@@ -30699,6 +30937,7 @@ mod project_config_initialize_tests {
             &helper_uri,
             None,
             ResyncCommitMode::Immediate,
+            RemovalDiskObservation::Missing,
         )
         .await;
         assert!(
@@ -34520,6 +34759,68 @@ infixContinuationStyle = "aligned"
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct CloseCentralSnapshot {
+        document: Option<(
+            String,
+            Option<i32>,
+            u64,
+            Option<crate::cross_file::revalidation::DiagnosticsEpoch>,
+        )>,
+        aliases: Vec<Url>,
+        activity: (Option<Url>, Vec<Url>, Vec<Url>),
+        graph: String,
+        index: (u64, Option<String>),
+        raw: (u64, Option<String>),
+        package: (u64, String, crate::package_state::PackageState),
+        watched: HashMap<Url, u64>,
+        chunk_overrides: HashMap<Url, crate::chunks::ChunkKind>,
+        pins: std::collections::HashSet<Url>,
+        reservations: usize,
+        force: u32,
+    }
+
+    fn close_central_snapshot(state: &WorldState, uri: &Url) -> CloseCentralSnapshot {
+        CloseCentralSnapshot {
+            document: state.documents.get_record(uri).map(|record| {
+                (
+                    record.document().text(),
+                    record.document().version,
+                    record.document().revision,
+                    record.provenance().lifecycle_epoch,
+                )
+            }),
+            aliases: state.canonical_uris_for_open_document(uri),
+            activity: (
+                state.cross_file_activity.active_uri.clone(),
+                state.cross_file_activity.visible_uris.clone(),
+                state.cross_file_activity.recent_uris.clone(),
+            ),
+            graph: format!("{:?}", state.cross_file_graph),
+            index: (
+                state.workspace_index.version(),
+                state
+                    .workspace_index
+                    .get(uri)
+                    .map(|entry| entry.contents.to_string()),
+            ),
+            raw: (
+                state.cross_file_file_cache.content_generation(),
+                state.cross_file_file_cache.get(uri),
+            ),
+            package: (
+                state.package_input_generation(),
+                format!("{:?}", state.package_inputs),
+                state.package_state.clone(),
+            ),
+            watched: state.watched_file_resync_generations.clone(),
+            chunk_overrides: state.editor_chunk_kind_overrides.clone(),
+            pins: state.workspace_index.pinned_uris_for_test(),
+            reservations: state.analysis_revalidation_reservation_count,
+            force: state.diagnostics_gate.force_republish_count_for_test(uri),
+        }
+    }
+
     #[tokio::test]
     async fn did_close_target_edit_is_terminal_and_never_rebases() {
         let tmp = TempDir::new().unwrap();
@@ -34541,9 +34842,20 @@ infixContinuationStyle = "aligned"
             }
         }
         change_doc(backend, &uri, 2, "edited <- 2\n").await;
+        let expected = {
+            let state = backend.state.read().await;
+            close_central_snapshot(&state, &uri)
+        };
         pause.release();
         close.await;
         let state = backend.state.read().await;
+        assert_eq!(close_central_snapshot(&state, &uri), expected);
+        assert_eq!(
+            state
+                .open_close_intent_for_test(&uri)
+                .map(|intent| intent.0),
+            Some("cancelled")
+        );
         let record = state.documents.get_record(&uri).expect("edit remains open");
         assert_eq!(record.document().text(), "edited <- 2\n");
         assert_eq!(record.document().version, Some(2));
@@ -34736,6 +35048,26 @@ infixContinuationStyle = "aligned"
             );
             assert!(!state.workspace_index.contains(&uri));
             assert!(state.cross_file_graph.get_dependencies(&uri).is_empty());
+            assert!(state.cross_file_file_cache.get(&uri).is_none());
+            assert!(state.cross_file_activity.active_uri.as_ref() != Some(&uri));
+            assert!(!state.cross_file_activity.visible_uris.contains(&uri));
+            assert!(!state.cross_file_activity.recent_uris.contains(&uri));
+            assert!(state.watched_file_resync_generations.contains_key(&uri));
+            assert_eq!(
+                state.chunk_kind_for_closed_file(&uri),
+                crate::chunks::ChunkKind::R
+            );
+            assert!(!state.workspace_index.pinned_uris_for_test().contains(&uri));
+            assert_eq!(
+                state
+                    .open_close_intent_for_test(&uri)
+                    .map(|intent| intent.0),
+                Some("closed")
+            );
+            assert_eq!(
+                state.diagnostics_gate.force_republish_count_for_test(&uri),
+                0
+            );
         }
         pause.release();
         close.await;
@@ -34828,6 +35160,131 @@ infixContinuationStyle = "aligned"
                 .map(|entry| entry.contents.to_string()),
             Some("disk_before <- 1\n".into()),
             "the stale disk parse must not replace the retained shadow"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_no_shadow_undecodable_disk_still_commits_remove() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, uri) =
+            open_in_workspace(&tmp, "no-shadow-invalid.R", "r", "source(\"old.R\")\n").await;
+        let backend = svc.inner();
+        fs::write(tmp.path().join("no-shadow-invalid.R"), [0x78u8, 0x80, 0x79]).unwrap();
+
+        close_doc(backend, &uri).await;
+
+        let state = backend.state.read().await;
+        assert!(!state.documents.contains_key(&uri));
+        assert!(state.diagnostics_gate.current_epoch(&uri).is_none());
+        assert!(!state.workspace_index.contains(&uri));
+        assert!(state.cross_file_graph.get_dependencies(&uri).is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_resync_missing_observation_rejects_created_file() {
+        let (tmp, svc, uri) = close_resync_fixture("resync-missing-created.R").await;
+        let backend = svc.inner();
+        fs::remove_file(tmp.path().join("resync-missing-created.R")).unwrap();
+        let pause = backend
+            .state
+            .write()
+            .await
+            .close_resync_pre_commit_test_pause
+            .arm(uri.clone());
+        close_doc(backend, &uri).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_arrived())
+            .await
+            .expect("missing close resync reaches its pre-commit barrier");
+        fs::write(
+            tmp.path().join("resync-missing-created.R"),
+            "created_after_read <- 2\n",
+        )
+        .unwrap();
+        pause.release();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .workspace_index
+                .get(&uri)
+                .map(|entry| entry.contents.to_string()),
+            Some("disk_before <- 1\n".into()),
+            "a newly created valid file must veto the stale missing removal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn did_close_retries_non_subject_watched_generation_and_leaves_unrelated_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("owner.R"), "disk <- 1\n").unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        let alias_uri = Url::from_file_path(tmp.path().join("link/owner.R")).unwrap();
+        let canonical_uri = Url::from_file_path(real.join("owner.R")).unwrap();
+        let unrelated_uri = Url::from_file_path(tmp.path().join("unrelated.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        open_doc(backend, &alias_uri, "r", 1, "live <- 1\n").await;
+        let first_pause = {
+            let mut state = backend.state.write().await;
+            state
+                .watched_file_resync_generations
+                .insert(canonical_uri.clone(), 10);
+            state
+                .watched_file_resync_generations
+                .insert(unrelated_uri.clone(), 99);
+            state.did_close_pre_commit_test_pause.arm(alias_uri.clone())
+        };
+        let close = close_doc(backend, &alias_uri);
+        tokio::pin!(close);
+        tokio::select! {
+            _ = first_pause.wait_arrived() => {}
+            _ = &mut close => panic!("close skipped first watched-generation barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("close did not reach first watched-generation barrier")
+            }
+        }
+        let second_pause = {
+            let mut state = backend.state.write().await;
+            state
+                .watched_file_resync_generations
+                .insert(canonical_uri.clone(), 11);
+            state.did_close_pre_commit_test_pause.arm(alias_uri.clone())
+        };
+        first_pause.release();
+        tokio::select! {
+            _ = second_pause.wait_arrived() => {}
+            _ = &mut close => panic!("stale non-subject watched basis committed"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("close did not perform its one fresh watched-basis retry")
+            }
+        }
+        second_pause.release();
+        close.await;
+        let state = backend.state.read().await;
+        assert!(!state.documents.contains_key(&alias_uri));
+        assert_ne!(
+            state.watched_file_resync_generations.get(&canonical_uri),
+            Some(&11)
+        );
+        assert_eq!(
+            state.watched_file_resync_generations.get(&unrelated_uri),
+            Some(&99)
         );
     }
 

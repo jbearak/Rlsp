@@ -409,6 +409,14 @@ impl WorkspaceIndex {
         state.version = state.version.wrapping_add(1);
     }
 
+    #[cfg(test)]
+    pub(crate) fn pinned_uris_for_test(&self) -> HashSet<Url> {
+        self.inner
+            .read()
+            .map(|state| state.pinned.clone())
+            .unwrap_or_default()
+    }
+
     // ========================================================================
     // Read Operations
     // ========================================================================

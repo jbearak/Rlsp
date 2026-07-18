@@ -1471,7 +1471,7 @@ impl PreparedOpenCloseAnalysis {
         plan: PreparedOpenCommitPlan,
         resync: Vec<OpenCloseResyncTicket>,
         disk_observations: Vec<OpenCloseDiskObservation>,
-        watched_roots: Vec<(Url, ChunkKind)>,
+        watched_roots: Vec<(Url, Option<u64>, ChunkKind)>,
     ) -> Self {
         Self {
             basis,
@@ -1523,7 +1523,7 @@ pub(crate) struct PreparedOpenCloseAnalysis {
     plan: PreparedOpenCommitPlan,
     resync: Vec<OpenCloseResyncTicket>,
     disk_observations: Vec<OpenCloseDiskObservation>,
-    watched_roots: Vec<(Url, ChunkKind)>,
+    watched_roots: Vec<(Url, Option<u64>, ChunkKind)>,
 }
 
 /// Whole package-mode projection reduced off-lock for an OpenInstall.
@@ -1540,12 +1540,16 @@ pub(crate) struct OpenCloseResyncTicket {
     pub(crate) chunk_kind: ChunkKind,
     pub(crate) old_metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
     pub(crate) old_interface_hash: Option<u64>,
+    pub(crate) expected_watched_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenCloseDiskObservation {
     pub(crate) uri: Url,
     pub(crate) snapshot: Option<crate::cross_file::file_cache::FileSnapshot>,
+    /// `false` means the exact observed bytes were undecodable source and the
+    /// selected close disposition is Remove rather than InstallClosed.
+    pub(crate) decoded_source: bool,
 }
 
 pub(crate) struct PreparedOpenCloseDiskInstall {
@@ -1560,6 +1564,7 @@ impl PartialEq for OpenCloseResyncTicket {
         self.uri == other.uri
             && self.chunk_kind == other.chunk_kind
             && self.old_interface_hash == other.old_interface_hash
+            && self.expected_watched_generation == other.expected_watched_generation
             && match (&self.old_metadata, &other.old_metadata) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 (None, None) => true,
@@ -2300,6 +2305,15 @@ impl WorldState {
         self.open_close_intents.get(token.uri())
             == Some(&OpenCloseIntentState::Pending(token.generation))
             && self.documents.record_token_is_current(&token.target)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_close_intent_for_test(&self, uri: &Url) -> Option<(&'static str, u64)> {
+        self.open_close_intents.get(uri).map(|intent| match intent {
+            OpenCloseIntentState::Pending(generation) => ("pending", *generation),
+            OpenCloseIntentState::Closed(generation) => ("closed", *generation),
+            OpenCloseIntentState::Cancelled(generation) => ("cancelled", *generation),
+        })
     }
 
     /// Invalidate every pending close for `uri`, including while absent.
@@ -3534,6 +3548,9 @@ impl WorldState {
         if !self.analysis_basis_is_current(&prepared.basis, &prepared.uri, &targets)
             || !self.open_close_intent_is_current(&prepared.intent)
             || self.canonical_uris_for_open_document(&prepared.uri) != prepared.expected_aliases
+            || prepared.watched_roots.iter().any(|(root, expected, _)| {
+                self.watched_file_resync_generations.get(root).copied() != *expected
+            })
         {
             return Err(AnalysisCommitRejected::StaleBasis);
         }
@@ -3542,14 +3559,19 @@ impl WorldState {
             .documents
             .get_record(&prepared.uri)
             .map(|record| record.artifacts().interface_hash);
-        for (root, chunk_kind) in &prepared.watched_roots {
-            self.record_editor_chunk_kind_override(root, *chunk_kind);
-            self.watched_file_resync_generation_counter =
-                self.watched_file_resync_generation_counter.wrapping_add(1);
-            self.watched_file_resync_generations
-                .insert(root.clone(), self.watched_file_resync_generation_counter);
+        let changed_authoritative_roots: Vec<Url> = prepared
+            .plan
+            .graph
+            .iter()
+            .map(|projection| projection.uri.clone())
+            .filter(|root| root != &prepared.uri)
+            .collect();
+        for root in changed_authoritative_roots {
+            prepared
+                .plan
+                .seed_revalidation_uris
+                .extend(self.affected_open_dependents_after_edit(&root, true, true));
         }
-
         self.advance_workspace_scan_generation();
         self.retire_diagnostic_lifecycle(&prepared.uri);
         self.cross_file_activity.remove(&prepared.uri);
@@ -3574,6 +3596,22 @@ impl WorldState {
         }
         let revalidations =
             self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan);
+        // Claim disk-watcher ownership after the prepared graph/index plan:
+        // Remove dispositions prune old claims and chunk overrides as part of
+        // their cleanup, so claiming earlier would erase the close's own token.
+        for (root, _, chunk_kind) in &prepared.watched_roots {
+            self.record_editor_chunk_kind_override(root, *chunk_kind);
+            self.watched_file_resync_generation_counter =
+                self.watched_file_resync_generation_counter.wrapping_add(1);
+            self.watched_file_resync_generations
+                .insert(root.clone(), self.watched_file_resync_generation_counter);
+        }
+        for ticket in &mut prepared.resync {
+            ticket.expected_watched_generation = self
+                .watched_file_resync_generations
+                .get(&ticket.uri)
+                .copied();
+        }
         self.consume_open_close_intent(&prepared.intent);
         self.advance_workspace_graph_authority_generation();
         self.advance_open_context_authority_generation();
