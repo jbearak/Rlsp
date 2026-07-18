@@ -2090,7 +2090,8 @@ pub(crate) struct PackageProjectionBasis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PostSeedPackageProjectionOwnership {
     Unrestricted,
-    Foreground(Option<PackageSeedInstalledIdentity>),
+    ForegroundExact(PackageSeedInstalledIdentity),
+    ForegroundCurrent(PackageSeedInstalledIdentity),
     Coordinator(PackageSeedInstalledIdentity),
 }
 
@@ -2344,6 +2345,7 @@ pub(crate) struct SystemFileTransferredEffects {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PackageSeedInstalledIdentity {
     pub(crate) seed_install_id: u64,
+    pub(crate) package_config_generation: u64,
     pub(crate) package_input_generation: u64,
     pub(crate) package_state_record_generation: u64,
     pub(crate) system_file_routing_owner: SystemFileRoutingOwnerIdentity,
@@ -2364,11 +2366,22 @@ impl WorldState {
     ) -> bool {
         self.package_input_generation() == identity.package_input_generation
             && self.package_state_record_generation == identity.package_state_record_generation
+            && self.package_config_generation == identity.package_config_generation
             && self.system_file_routing_owner_identity() == identity.system_file_routing_owner
             && self.package_library_install_id == identity.package_library_install_id
             && self.package_library_content_generation
                 == identity.package_library_content_generation
             && self.package_seed_install_id == identity.seed_install_id
+    }
+
+    /// Whether `identity` still owns post-seed convergence even when ordinary
+    /// same-configuration package inputs have advanced since installation.
+    pub(crate) fn package_seed_tail_owner_is_current(
+        &self,
+        identity: PackageSeedInstalledIdentity,
+    ) -> bool {
+        self.package_seed_install_id == identity.seed_install_id
+            && self.package_config_generation == identity.package_config_generation
     }
 
     pub(crate) fn begin_system_file_seed_retry(
@@ -2803,6 +2816,7 @@ impl WorldState {
             .expect("package-seed install identity counter exhausted");
         PackageSeedInstalledIdentity {
             seed_install_id: self.package_seed_install_id,
+            package_config_generation: self.package_config_generation,
             package_input_generation: self.package_input_generation(),
             package_state_record_generation: self.package_state_record_generation,
             system_file_routing_owner: self.system_file_routing_owner_identity(),
@@ -3321,12 +3335,21 @@ impl WorldState {
         }
     }
 
-    pub(crate) fn capture_foreground_post_seed_package_projection_basis(
+    pub(crate) fn capture_exact_foreground_post_seed_package_projection_basis(
         &self,
-        identity: Option<PackageSeedInstalledIdentity>,
+        identity: PackageSeedInstalledIdentity,
     ) -> PackageProjectionBasis {
         let mut basis = self.capture_package_projection_basis();
-        basis.post_seed_ownership = PostSeedPackageProjectionOwnership::Foreground(identity);
+        basis.post_seed_ownership = PostSeedPackageProjectionOwnership::ForegroundExact(identity);
+        basis
+    }
+
+    pub(crate) fn capture_current_foreground_post_seed_package_projection_basis(
+        &self,
+        identity: PackageSeedInstalledIdentity,
+    ) -> PackageProjectionBasis {
+        let mut basis = self.capture_package_projection_basis();
+        basis.post_seed_ownership = PostSeedPackageProjectionOwnership::ForegroundCurrent(identity);
         basis
     }
 
@@ -3363,15 +3386,19 @@ impl WorldState {
             && self.package_inputs.model_rprofile == basis.model_rprofile
             && match basis.post_seed_ownership {
                 PostSeedPackageProjectionOwnership::Unrestricted => true,
-                PostSeedPackageProjectionOwnership::Foreground(identity) => {
+                PostSeedPackageProjectionOwnership::ForegroundExact(identity) => {
                     self.pending_post_seed_refresh_retry.is_none()
                         && self.pending_system_file_seed_retry.is_none()
-                        && identity.is_none_or(|identity| {
-                            self.package_seed_installed_identity_is_current(identity)
-                        })
+                        && self.package_seed_installed_identity_is_current(identity)
+                }
+                PostSeedPackageProjectionOwnership::ForegroundCurrent(identity) => {
+                    self.pending_post_seed_refresh_retry.is_none()
+                        && self.pending_system_file_seed_retry.is_none()
+                        && self.package_seed_tail_owner_is_current(identity)
                 }
                 PostSeedPackageProjectionOwnership::Coordinator(identity) => {
                     self.pending_post_seed_refresh_retry == Some(identity)
+                        && self.package_seed_tail_owner_is_current(identity)
                         && self.pending_system_file_seed_retry.is_none()
                         && (!self.pending_post_seed_requires_system_transfer
                             || self

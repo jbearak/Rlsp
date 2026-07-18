@@ -4714,7 +4714,8 @@ struct DeferredPostSeedFinalization {
 
 #[derive(Clone, Copy)]
 enum CombinedPostSeedRefreshOwnership {
-    Foreground(Option<PackageSeedInstalledIdentity>),
+    ForegroundExact(PackageSeedInstalledIdentity),
+    ForegroundCurrent(PackageSeedInstalledIdentity),
     Coordinator(PackageSeedInstalledIdentity),
 }
 
@@ -4766,8 +4767,11 @@ fn capture_combined_post_seed_refresh(
     };
     Some(CapturedCombinedPostSeedRefresh {
         basis: match ownership {
-            CombinedPostSeedRefreshOwnership::Foreground(identity) => {
-                state.capture_foreground_post_seed_package_projection_basis(identity)
+            CombinedPostSeedRefreshOwnership::ForegroundExact(identity) => {
+                state.capture_exact_foreground_post_seed_package_projection_basis(identity)
+            }
+            CombinedPostSeedRefreshOwnership::ForegroundCurrent(identity) => {
+                state.capture_current_foreground_post_seed_package_projection_basis(identity)
             }
             CombinedPostSeedRefreshOwnership::Coordinator(identity) => {
                 state.capture_coordinator_post_seed_package_projection_basis(identity)
@@ -4879,7 +4883,8 @@ async fn attempt_combined_post_seed_refresh(
                 return CombinedPostSeedRefreshOutcome::Superseded;
             }
             match ownership {
-                CombinedPostSeedRefreshOwnership::Foreground(_) => {
+                CombinedPostSeedRefreshOwnership::ForegroundExact(_)
+                | CombinedPostSeedRefreshOwnership::ForegroundCurrent(_) => {
                     if state.post_seed_refresh_retry_owner().is_some() {
                         return CombinedPostSeedRefreshOutcome::Deferred;
                     }
@@ -4976,7 +4981,8 @@ async fn attempt_combined_post_seed_refresh_current(
                 return CombinedPostSeedRefreshOutcome::Superseded;
             }
             match ownership {
-                CombinedPostSeedRefreshOwnership::Foreground(_) => {
+                CombinedPostSeedRefreshOwnership::ForegroundExact(_)
+                | CombinedPostSeedRefreshOwnership::ForegroundCurrent(_) => {
                     if state.post_seed_refresh_retry_owner().is_some() {
                         return CombinedPostSeedRefreshOutcome::Deferred;
                     }
@@ -4989,6 +4995,16 @@ async fn attempt_combined_post_seed_refresh_current(
             }
             if state.system_file_seed_retry_owner().is_some() {
                 return CombinedPostSeedRefreshOutcome::Deferred;
+            }
+            match ownership {
+                CombinedPostSeedRefreshOwnership::ForegroundExact(identity)
+                | CombinedPostSeedRefreshOwnership::ForegroundCurrent(identity)
+                | CombinedPostSeedRefreshOwnership::Coordinator(identity)
+                    if !state.package_seed_tail_owner_is_current(identity) =>
+                {
+                    return CombinedPostSeedRefreshOutcome::Superseded;
+                }
+                _ => {}
             }
             capture_combined_post_seed_refresh(&state, root, ownership)
         };
@@ -5086,7 +5102,7 @@ async fn finish_deferred_post_seed_refresh(
                 return Vec::new();
             }
         }
-        let outcome = if handles
+        let mut outcome = if handles
             .state
             .read()
             .await
@@ -5107,6 +5123,22 @@ async fn finish_deferred_post_seed_refresh(
             )
             .await
         };
+        if matches!(outcome, CombinedPostSeedRefreshOutcome::Superseded) {
+            let should_rebase = {
+                let state = handles.state.read().await;
+                state.post_seed_refresh_retry_is_current(owner.identity)
+                    && state.package_seed_tail_owner_is_current(owner.identity)
+                    && state.package_inputs.workspace_root.as_deref() == Some(owner.root.as_path())
+            };
+            if should_rebase {
+                outcome = attempt_combined_post_seed_refresh_current(
+                    &handles.state,
+                    &owner.root,
+                    CombinedPostSeedRefreshOwnership::Coordinator(owner.identity),
+                )
+                .await;
+            }
+        }
         match outcome {
             CombinedPostSeedRefreshOutcome::Deferred => continue,
             CombinedPostSeedRefreshOutcome::Committed(candidates) => {
@@ -16279,18 +16311,14 @@ impl Backend {
             &state_arc,
             &root,
             identity,
-            CombinedPostSeedRefreshOwnership::Foreground(Some(identity)),
+            CombinedPostSeedRefreshOwnership::ForegroundExact(identity),
         )
         .await;
-        if matches!(outcome, CombinedPostSeedRefreshOutcome::Superseded)
-            && state_arc
-                .read()
-                .await
-                .package_inputs
-                .workspace_root
-                .as_deref()
-                == Some(root.as_path())
-        {
+        if matches!(outcome, CombinedPostSeedRefreshOutcome::Superseded) && {
+            let state = state_arc.read().await;
+            state.package_seed_tail_owner_is_current(identity)
+                && state.package_inputs.workspace_root.as_deref() == Some(root.as_path())
+        } {
             // Package-generation drift within the same root is ancillary, not
             // terminal ownership loss. Recompute the whole source-following
             // projection against the current basis before the caller can
@@ -16298,7 +16326,7 @@ impl Backend {
             outcome = attempt_combined_post_seed_refresh_current(
                 &state_arc,
                 &root,
-                CombinedPostSeedRefreshOwnership::Foreground(None),
+                CombinedPostSeedRefreshOwnership::ForegroundCurrent(identity),
             )
             .await;
         }
@@ -31901,12 +31929,13 @@ mod project_config_initialize_tests {
         let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
         let preamble_uri = Url::from_file_path(&preamble).unwrap();
         let mut state = WorldState::new();
-        establish_combined_post_seed_fixture(&mut state, &root, &rprofile_uri, &preamble_uri);
+        let identity =
+            establish_combined_post_seed_fixture(&mut state, &root, &rprofile_uri, &preamble_uri);
 
         let captured = capture_combined_post_seed_refresh(
             &state,
             &root,
-            CombinedPostSeedRefreshOwnership::Foreground(None),
+            CombinedPostSeedRefreshOwnership::ForegroundExact(identity),
         )
         .expect("both tails are live");
         let derived =
@@ -32103,6 +32132,121 @@ mod project_config_initialize_tests {
                 .get(&preamble)
                 .is_some_and(|symbols| symbols.contains("live_shared"))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_post_seed_rebases_generation_drift_during_exact_attempt() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::create_dir_all(root.join("R")).unwrap();
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: combinedtail\nVersion: 0.0.1\nSuggests: testthat\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"scripts/shared.R\")\n").unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        fs::write(&preamble, "source(\"../../scripts/shared.R\")\n").unwrap();
+        fs::write(root.join("scripts/shared.R"), "disk_shared <- 1\n").unwrap();
+        let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let preamble_uri = Url::from_file_path(&preamble).unwrap();
+        let subject = Url::from_file_path(root.join("subject.R")).unwrap();
+        let unrelated_uri = Url::from_file_path(root.join("R/unrelated.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let identity = {
+            let mut state = backend.state.write().await;
+            let identity = establish_combined_post_seed_fixture(
+                &mut state,
+                &root,
+                &rprofile_uri,
+                &preamble_uri,
+            );
+            state.open_document(subject.clone(), "profile_live\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&subject)
+                .unwrap();
+            state.cross_file_config.max_revalidations_per_trigger = 1;
+            state.post_seed_refresh_test_reject_remaining = 3;
+            identity
+        };
+        let PostSeedRefreshOutcome::Deferred(owner) =
+            Backend::refresh_open_package_inputs_after_seed(
+                backend.state.clone(),
+                backend.client.clone(),
+                backend.traversal_truncation.clone(),
+                root,
+                identity,
+                None,
+            )
+            .await
+        else {
+            panic!("forced exhaustion must return inert deferred work");
+        };
+        let (candidate, pause, reservations_before) = {
+            let mut state = backend.state.write().await;
+            state.post_seed_refresh_test_reject_remaining = 0;
+            let candidate = state.capture_analysis_transfer_candidates([subject.clone()]);
+            let pause = state
+                .post_seed_refresh_pre_commit_test_pause
+                .arm(Url::parse(POST_SEED_REFRESH_PRE_COMMIT_PAUSE_URI).unwrap());
+            (
+                candidate,
+                pause,
+                state.analysis_revalidation_reservation_count,
+            )
+        };
+        let coordinator = tokio::spawn(finish_deferred_post_seed_refresh(
+            PackageSeedTaskHandles::from_backend(backend),
+            owner,
+            DeferredPostSeedFinalization {
+                handles: Vec::new(),
+                candidates: candidate,
+                deferred_system_file: None,
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_arrived())
+            .await
+            .expect("the exact coordinator attempt must reach its commit barrier");
+        {
+            let mut state = backend.state.write().await;
+            let delta = translate_package_event(
+                &mut state,
+                crate::package_state::event::HandlerEvent::DidChange {
+                    uri: unrelated_uri,
+                    text: Arc::from("unrelated <- 1\n"),
+                },
+            )
+            .expect("unrelated package-R drift invalidates the exact seed");
+            state.apply_package_event(&delta);
+        }
+        pause.release();
+        let tickets = tokio::time::timeout(std::time::Duration::from_secs(5), coordinator)
+            .await
+            .expect("the coordinator must rebase instead of dropping its tail")
+            .unwrap();
+        let state = backend.state.read().await;
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservations_before + 1
+        );
+        assert!(
+            state
+                .package_inputs
+                .rprofile_symbols
+                .contains("profile_live")
+        );
+        assert!(
+            state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("live_shared"))
+        );
+        assert!(!state.post_seed_refresh_retry_is_current(identity));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -32726,7 +32870,7 @@ mod project_config_initialize_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn combined_post_seed_deferred_owner_retries_against_a_new_seed_basis() {
+    async fn combined_post_seed_deferred_owner_stops_at_a_new_seed_owner() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         fs::create_dir_all(root.join("tests/testthat")).unwrap();
@@ -32789,20 +32933,22 @@ mod project_config_initialize_tests {
             ),
         )
         .await
-        .expect("the deferred owner must converge against the successor basis");
+        .expect("the deferred owner must hand off at the successor boundary");
         let state = backend.state.read().await;
         assert!(
-            state
+            !state
                 .package_inputs
                 .rprofile_symbols
-                .contains("profile_live")
+                .contains("profile_live"),
+            "the predecessor cannot install a tail owned by the successor seed"
         );
         assert!(
-            state
+            !state
                 .package_inputs
                 .preamble_sourced_symbols
                 .get(&preamble)
-                .is_some_and(|symbols| symbols.contains("live_shared"))
+                .is_some_and(|symbols| symbols.contains("live_shared")),
+            "the successor caller owns current-basis convergence"
         );
         assert_eq!(
             state.post_seed_refresh_test_commit_attempts, 3,

@@ -339,11 +339,14 @@ handle/candidate bundle, and any exact pending `system.file()` dependency under
 one write lock, then starts the workers. Registration distinguishes a new
 owner, the same owner, and a different owner without replacing either ledger;
 same-owner callers deposit their complete bundle, while different-owner
-callers retain theirs and retry after the predecessor completes. A newer seed
-or unrelated authoritative live package edit does not silently cancel the
-tail: the coordinator recaptures the whole pair against the current package
-basis while retaining the outer seed/system handles and exact diagnostic
-candidates. The package-projection basis carries an explicit foreground or
+callers retain theirs and retry after the predecessor completes. An unrelated
+authoritative live package edit does not silently cancel the tail: the
+coordinator recaptures the whole pair against the current package basis while
+retaining the outer seed/system handles and exact diagnostic candidates. A
+different never-reused seed owner, root, or package configuration is a terminal
+handoff boundary: the predecessor still consumes its retained ledger exactly
+once, while the successor caller owns current-basis convergence. The
+package-projection basis carries an explicit foreground or
 exact-coordinator ownership expectation, so registration or routing ownership
 that changes after a tail capture rejects the whole projection at the central
 CAS. A coordinator whose registration requires routing convergence cannot
