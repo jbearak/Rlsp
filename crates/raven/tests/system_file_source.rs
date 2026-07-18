@@ -8,9 +8,9 @@
 //!    (graceful degradation — silent skip, not a spurious error).
 //! 3. Resolution is recoverable across package lifecycle events: a package
 //!    installed/removed after startup, or a workspace `Package:` rename, must
-//!    re-resolve via `resolve_system_file_in_workspace` (the call the
-//!    `LibpathEvent::Changed` consumer and the DESCRIPTION manifest branch
-//!    make) without the user editing the sourcing file.
+//!    re-resolve through the detached two-attempt convergence transaction used
+//!    by the `LibpathEvent::Changed` consumer and DESCRIPTION manifest branch,
+//!    without the user editing the sourcing file.
 //!
 //! Run with: `cargo test --release -p raven --test system_file_source`
 
@@ -244,10 +244,8 @@ fn system_file_transitive_nested_resolution() {
     );
 }
 
-/// `collect_diagnostics_blocking` (the test helper in check.rs) now resolves
-/// workspace system.file() edges, matching `run()`. Previously it skipped
-/// `resolve_system_file_in_workspace`, so installed-package system.file() edges
-/// stayed unresolved in the test harness.
+/// `collect_diagnostics_blocking` (the test helper in check.rs) resolves
+/// workspace system.file() edges, matching `run()`.
 #[test]
 fn system_file_collect_diagnostics_blocking_resolves_installed_package() {
     let workspace = TempDir::new().unwrap();
@@ -296,15 +294,16 @@ fn system_file_collect_diagnostics_blocking_resolves_installed_package() {
 
 // ---------------------------------------------------------------------------
 // Lifecycle recoverability: `WorldState`-level tests exercising
-// `resolve_system_file_in_workspace`, the exact call the
-// `LibpathEvent::Changed` consumer and the DESCRIPTION manifest branch make
-// after a package install/removal or `Package:` rename. No file edits happen
-// between resolution passes — recovery must come from re-resolution alone.
+// the same detached two-attempt transaction as the `LibpathEvent::Changed`
+// consumer and DESCRIPTION manifest branch after a package install/removal or
+// `Package:` rename. No file edits happen between resolution passes — recovery
+// must come from re-resolution alone.
 // ---------------------------------------------------------------------------
 
 mod lifecycle {
     use std::sync::Arc;
 
+    use raven::backend::run_system_file_convergence_for_test;
     use raven::cross_file::FileSnapshot;
     use raven::cross_file::source_detect::SystemFileCall;
     use raven::cross_file::types::{CrossFileMetadata, ForwardSource};
@@ -351,12 +350,21 @@ mod lifecycle {
         state
     }
 
+    async fn converge(
+        state: &mut WorldState,
+        only_packages: Option<std::collections::HashSet<String>>,
+    ) -> Vec<Url> {
+        run_system_file_convergence_for_test(state, only_packages)
+            .await
+            .expect("the exact system.file owner should commit within two attempts")
+    }
+
     /// Package installed AFTER startup: the first resolution pass runs with
     /// non-empty lib_paths and fails (package not installed). The
     /// `LibpathEvent::Changed` consumer then re-runs resolution — the edge must
     /// form without any edit to the sourcing file.
-    #[test]
-    fn edge_forms_after_package_install_without_edit() {
+    #[tokio::test]
+    async fn edge_forms_after_package_install_without_edit() {
         let libdir = tempfile::tempdir().unwrap();
         let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
 
@@ -366,7 +374,7 @@ mod lifecycle {
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
         // Startup pass: lib_paths non-empty, otherpkg not installed.
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
 
         // The source entry must survive the failed attempt — dropping it makes
         // the staleness unrecoverable.
@@ -385,7 +393,7 @@ mod lifecycle {
         let pkg_dir = libdir.path().join("otherpkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
 
         let entry = state
             .workspace_index
@@ -413,8 +421,8 @@ mod lifecycle {
     /// Package REMOVED after a successful resolution: the stale resolved_uri
     /// and dependency edge must be cleared by the next resolution pass, and a
     /// reinstall must bring them back.
-    #[test]
-    fn resolution_clears_after_package_removal_and_recovers_on_reinstall() {
+    #[tokio::test]
+    async fn resolution_clears_after_package_removal_and_recovers_on_reinstall() {
         let libdir = tempfile::tempdir().unwrap();
         let pkg_dir = libdir.path().join("otherpkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -426,7 +434,7 @@ mod lifecycle {
             .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
         let entry = state
             .workspace_index
             .get(&uri)
@@ -438,7 +446,7 @@ mod lifecycle {
 
         // Remove the package, then re-run resolution as the Changed consumer does.
         std::fs::remove_dir_all(&pkg_dir).unwrap();
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
 
         let entry = state
             .workspace_index
@@ -465,7 +473,7 @@ mod lifecycle {
         // Reinstall: resolution must recover.
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
 
         let entry = state
             .workspace_index
@@ -515,8 +523,8 @@ mod lifecycle {
     /// removed and the resolution clears, nothing references that external
     /// entry anymore — it must be dropped from the index rather than linger
     /// in an LRU slot until natural eviction (#425).
-    #[test]
-    fn orphaned_external_entry_dropped_after_package_removal() {
+    #[tokio::test]
+    async fn orphaned_external_entry_dropped_after_package_removal() {
         let libdir = tempfile::tempdir().unwrap();
         let pkg_dir = libdir.path().join("otherpkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -528,7 +536,7 @@ mod lifecycle {
             .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
         let target = state
             .workspace_index
             .get(&uri)
@@ -544,7 +552,7 @@ mod lifecycle {
         );
 
         std::fs::remove_dir_all(&pkg_dir).unwrap();
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
 
         assert!(
             !state.workspace_index.contains(&target),
@@ -555,8 +563,8 @@ mod lifecycle {
     /// A library swap re-targets the resolution to a different installed
     /// copy: the new target must be indexed and the previous one dropped —
     /// nothing points at it anymore (#425).
-    #[test]
-    fn orphaned_external_entry_dropped_after_libpath_retarget() {
+    #[tokio::test]
+    async fn orphaned_external_entry_dropped_after_libpath_retarget() {
         let libdir_a = tempfile::tempdir().unwrap();
         let libdir_b = tempfile::tempdir().unwrap();
         for lib in [&libdir_a, &libdir_b] {
@@ -571,7 +579,7 @@ mod lifecycle {
             .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
         let old_target = state
             .workspace_index
             .get(&uri)
@@ -590,7 +598,7 @@ mod lifecycle {
         let mut lib = PackageLibrary::new_empty();
         lib.set_lib_paths(vec![libdir_b.path().to_path_buf()]);
         state.package_library = Arc::new(lib);
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
 
         let new_target = state
             .workspace_index
@@ -619,8 +627,8 @@ mod lifecycle {
     /// points at it. Here a second file's resolution (whose package the
     /// filtered event pass does not touch) references the same target as the
     /// one being cleared.
-    #[test]
-    fn external_entry_retained_while_another_resolution_references_it() {
+    #[tokio::test]
+    async fn external_entry_retained_while_another_resolution_references_it() {
         let libdir = tempfile::tempdir().unwrap();
         let pkg_dir = libdir.path().join("otherpkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -632,7 +640,7 @@ mod lifecycle {
             .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
         let target = state
             .workspace_index
             .get(&uri)
@@ -659,7 +667,7 @@ mod lifecycle {
         std::fs::remove_dir_all(&pkg_dir).unwrap();
         let pkgs: std::collections::HashSet<String> =
             std::iter::once("otherpkg".to_string()).collect();
-        state.resolve_system_file_in_workspace_for_packages(Some(&pkgs));
+        converge(&mut state, Some(pkgs.clone())).await;
 
         assert!(
             state
@@ -682,8 +690,8 @@ mod lifecycle {
     /// folder, so the resolved target is a workspace file owned by the
     /// workspace scan. The orphan cleanup must never drop entries under a
     /// workspace folder.
-    #[test]
-    fn workspace_entry_not_dropped_by_orphan_cleanup() {
+    #[tokio::test]
+    async fn workspace_entry_not_dropped_by_orphan_cleanup() {
         let workspace = tempfile::tempdir().unwrap();
         // Canonicalize so the resolved target and the folder agree on
         // symlinked temp paths (macOS /var -> /private/var).
@@ -702,7 +710,7 @@ mod lifecycle {
             .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
         let target = state
             .workspace_index
             .get(&uri)
@@ -718,7 +726,7 @@ mod lifecycle {
         );
 
         std::fs::remove_dir_all(&pkg_dir).unwrap();
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
 
         assert!(
             state.workspace_index.contains(&target),
@@ -743,12 +751,12 @@ mod lifecycle {
         state.open_document_with_language_id(uri.clone(), text, Some(1), Some("r"));
 
         // Startup pass: otherpkg not installed → stays unresolved.
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
 
         let pkg_dir = libdir.path().join("otherpkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
-        let changed = state.resolve_system_file_in_workspace();
+        let changed = converge(&mut state, None).await;
 
         let metadata = state
             .get_enriched_metadata(&uri)
@@ -801,7 +809,7 @@ mod lifecycle {
 
         // First pass resolves the open buffer (did_open-time enrichment):
         // edge from buffer metadata, call site at line 1.
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
         assert!(
             state
                 .cross_file_graph
@@ -819,7 +827,7 @@ mod lifecycle {
         // Event pass: the index entry resolves (edge rebuild from index
         // metadata, line 0); the buffer's resolution is unchanged, but its
         // edges must still win.
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
         let deps = state.cross_file_graph.get_dependencies(&uri);
         assert!(
             deps.iter().any(|e| e.call_site_line == Some(1)),
@@ -837,8 +845,8 @@ mod lifecycle {
     /// system.file edge forms after a package install — file_b's cross-file
     /// scope now includes the helper's definitions, so its diagnostics are
     /// stale unless it is republished too.
-    #[test]
-    fn open_dependents_of_changed_files_are_in_republish_set() {
+    #[tokio::test]
+    async fn open_dependents_of_changed_files_are_in_republish_set() {
         let libdir = tempfile::tempdir().unwrap();
         let child_uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
         let parent_uri = Url::parse("file:///workspace/parent.R").unwrap();
@@ -875,11 +883,11 @@ mod lifecycle {
         );
 
         // Startup pass fails (otherpkg not installed), then the install event.
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
         let pkg_dir = libdir.path().join("otherpkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
-        let changed = state.resolve_system_file_in_workspace();
+        let changed = converge(&mut state, None).await;
         assert_eq!(
             changed,
             vec![child_uri.clone()],
@@ -900,8 +908,8 @@ mod lifecycle {
     /// The package-filtered resolution variant (used by the libpath-event
     /// consumer) must only re-probe entries referencing the changed packages,
     /// leaving unrelated resolved entries untouched.
-    #[test]
-    fn filtered_resolution_skips_unrelated_packages() {
+    #[tokio::test]
+    async fn filtered_resolution_skips_unrelated_packages() {
         use std::collections::HashSet;
 
         let libdir = tempfile::tempdir().unwrap();
@@ -921,7 +929,7 @@ mod lifecycle {
             .workspace_index
             .insert(uri_b.clone(), system_file_entry("helper.R", "pkgb"));
 
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
         for uri in [&uri_a, &uri_b] {
             assert!(
                 state.workspace_index.get(uri).unwrap().metadata.sources[0]
@@ -935,7 +943,7 @@ mod lifecycle {
         std::fs::remove_dir_all(libdir.path().join("pkga")).unwrap();
         std::fs::remove_dir_all(libdir.path().join("pkgb")).unwrap();
         let only_b: HashSet<String> = std::iter::once("pkgb".to_string()).collect();
-        let changed = state.resolve_system_file_in_workspace_for_packages(Some(&only_b));
+        let changed = converge(&mut state, Some(only_b.clone())).await;
 
         assert_eq!(
             changed,
@@ -957,7 +965,7 @@ mod lifecycle {
 
         // A later event naming pkga clears the remaining stale entry.
         let only_a: HashSet<String> = std::iter::once("pkga".to_string()).collect();
-        let changed = state.resolve_system_file_in_workspace_for_packages(Some(&only_a));
+        let changed = converge(&mut state, Some(only_a.clone())).await;
         assert_eq!(changed, vec![uri_a.clone()]);
         assert!(
             state.workspace_index.get(&uri_a).unwrap().metadata.sources[0]
@@ -971,8 +979,8 @@ mod lifecycle {
     /// lib_paths, the previously-dropped case) must resolve via branch 1 once
     /// DESCRIPTION names the matching package — the call the manifest-change
     /// branch makes after `apply_package_event`.
-    #[test]
-    fn branch1_resolution_recovers_after_package_rename() {
+    #[tokio::test]
+    async fn branch1_resolution_recovers_after_package_rename() {
         use raven::package_state::{DescriptionInput, PackageInputDelta};
 
         let workspace = tempfile::tempdir().unwrap();
@@ -999,7 +1007,7 @@ mod lifecycle {
             .insert(uri.clone(), system_file_entry("helper.R", "newpkg"));
 
         // Under "Package: oldpkg" the reference to "newpkg" cannot resolve.
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
         let entry = state
             .workspace_index
             .get(&uri)
@@ -1015,7 +1023,7 @@ mod lifecycle {
             text: Arc::from("Package: newpkg\nTitle: T\nVersion: 0.1.0\n"),
         });
         state.apply_package_event(&PackageInputDelta::DescriptionChanged);
-        state.resolve_system_file_in_workspace();
+        converge(&mut state, None).await;
 
         let entry = state
             .workspace_index

@@ -22,6 +22,11 @@ static NEXT_OPEN_CLOSE_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPEN_LIFECYCLE_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_WORKSPACE_SCAN_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_WORKSPACE_SCAN_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_PACKAGE_LIBRARY_INSTALL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SYSTEM_FILE_ROUTING_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_ANALYSIS_TRANSFER_FINALIZATION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SYSTEM_FILE_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_PACKAGE_SEED_INSTALL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Symbol provider configuration
 ///
@@ -191,7 +196,8 @@ use crate::open_document_store::{
 use crate::package_library::PackageLibrary;
 use crate::parameter_resolver::SignatureCache;
 use crate::workspace_index::{
-    ClosedRecordToken, CompleteRefreshToken, EnrichmentClaim, IndexEntry, WorkspaceIndex,
+    ClosedProvenance, ClosedRecordToken, CompleteRefreshToken, EnrichmentClaim, IndexEntry,
+    PreparedWorkspaceIndexTargetedBatch, WorkspaceIndex, WorkspaceIndexTargetedChanges,
 };
 
 /// A parsed document.
@@ -804,6 +810,17 @@ pub struct WorldState {
     // Requirement 13.4: THE Package_Cache SHALL support concurrent read access from multiple LSP handlers
     // Arc allows sharing across async tasks without holding WorldState lock
     pub package_library: Arc<PackageLibrary>,
+    /// Never-reused identity of the currently installed package-library
+    /// object. Value-equal replacements still receive a fresh identity.
+    package_library_install_id: u64,
+    /// In-place package-library content changes relevant to `system.file()`
+    /// routing (package installation/removal beneath an unchanged libpath).
+    package_library_content_generation: u64,
+    /// Dedicated latest-owner identity for all `system.file()` routing inputs.
+    ///
+    /// This is deliberately narrower than `package_input_generation`: unrelated
+    /// Rprofile, preamble, or namespace writes do not supersede convergence.
+    system_file_routing_owner_generation: u64,
 
     // Caches
     pub help_cache: crate::help::HelpCache,
@@ -881,6 +898,16 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) package_init_pre_commit_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) system_file_pre_commit_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) system_file_pre_derivation_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) system_file_test_reject_remaining: usize,
+    #[cfg(test)]
+    pub(crate) system_file_test_commit_attempts: usize,
     /// Deterministic barrier between detached overflow derivation and CAS.
     #[cfg(test)]
     pub(crate) open_edit_fallback_test_pause:
@@ -1053,9 +1080,18 @@ pub struct WorldState {
     workspace_scan_generation: u64,
     /// Latest-arrival owner for top-level full workspace scans.
     workspace_scan_intent: Option<WorkspaceScanIntentState>,
-    /// Unmarked fanout from the latest committed scan, claimable once after
-    /// package/config convergence.
-    workspace_scan_transfer: Option<WorkspaceScanTransferState>,
+    /// Unmarked diagnostic fanout owned by successful analysis commits.
+    analysis_transfers: HashMap<AnalysisTransferIdentity, AnalysisTransferState>,
+    /// Successful successor commits that inherited an older transfer.
+    analysis_transfer_successors: HashMap<AnalysisTransferIdentity, AnalysisTransferIdentity>,
+    /// Exact handles already consumed by a successful finalization.
+    analysis_transfers_consumed: HashSet<AnalysisTransferIdentity>,
+    /// Finalization intents already completed, including fallback completion.
+    analysis_transfer_finalizations: HashSet<AnalysisTransferFinalizationId>,
+    /// Latest workspace transfer. Pending/failed scans do not change it.
+    latest_workspace_scan_transfer: Option<AnalysisTransferIdentity>,
+    /// Latest successful system-file transfer.
+    latest_system_file_transfer: Option<AnalysisTransferIdentity>,
     /// Monotonic identity for graph/open-metadata mutations that do not
     /// necessarily change document text or either workspace-index version.
     workspace_graph_authority_generation: u64,
@@ -1090,6 +1126,8 @@ pub struct WorldState {
     pub workspace_scan_complete: bool,
     /// Container for all derived R package mode state. See package_state/mod.rs.
     pub package_state: crate::package_state::PackageState,
+    /// Exact generation of the derived package-state record.
+    package_state_record_generation: u64,
     /// Inputs to the package-mode `derive` function. Updated by event handlers
     /// before calling `apply_package_event`. See package_state::PackageInputs.
     pub package_inputs: crate::package_state::PackageInputs,
@@ -1416,6 +1454,10 @@ impl AnalysisContextAuthority {
 
 #[derive(Clone, PartialEq, Eq)]
 struct SystemFileRoutingStamp {
+    owner_generation: u64,
+    package_state_record_generation: u64,
+    package_library_install_id: u64,
+    package_library_content_generation: u64,
     workspace_name: Option<String>,
     workspace_root: Option<PathBuf>,
     library_paths: Vec<PathBuf>,
@@ -1633,11 +1675,171 @@ pub(crate) enum PreparedAnalysisCommit {
     Remove { basis: Box<AnalysisBasis>, uri: Url },
     Batch(Vec<PreparedClosedMutation>),
     WorkspaceScan(Box<PreparedWorkspaceScanAnalysis>),
+    SystemFile(Box<PreparedSystemFileAnalysis>),
     OpenEdit(Box<PreparedOpenEditAnalysis>),
     OpenMetadata(Box<PreparedOpenMetadataAnalysis>),
     OpenAliasReconcile(Box<PreparedOpenAliasReconcileAnalysis>),
     OpenInstall(Box<PreparedOpenInstallAnalysis>),
     OpenClose(Box<PreparedOpenCloseAnalysis>),
+}
+
+#[derive(Clone)]
+struct SystemFileAnalysisBasis {
+    routing: SystemFileRoutingStamp,
+    workspace_index_version: u64,
+    workspace_index_max_files: usize,
+    workspace_index_max_file_size_bytes: usize,
+    workspace_index_artifact_capacity: usize,
+    workspace_index_pinned: HashSet<Url>,
+    graph_revision: u64,
+    graph_authority_generation: u64,
+    open_context_authority_generation: OpenContextAuthorityGeneration,
+    analysis_config_generation: AnalysisConfigGeneration,
+    chunk_override_generation: ChunkOverrideGeneration,
+    workspace_folders: Vec<Url>,
+    exclusion_patterns: Vec<String>,
+    max_chain_depth: usize,
+    open_records: std::collections::BTreeMap<Url, OpenRecordToken>,
+}
+
+struct CapturedSystemFileOpen {
+    uri: Url,
+    token: OpenRecordToken,
+    metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    document: Arc<OpenDocumentRecord>,
+    graph_roots: Vec<Url>,
+}
+
+/// Immutable input for one fully detached `system.file()` convergence pass.
+pub(crate) struct CapturedSystemFileAnalysis {
+    basis: SystemFileAnalysisBasis,
+    only_packages: Option<HashSet<String>>,
+    artifacts: Vec<(Url, crate::workspace_index::ArtifactEntry)>,
+    full_content: HashMap<Url, String>,
+    raw_content: HashMap<Url, String>,
+    open: Vec<CapturedSystemFileOpen>,
+    graph: DependencyGraph,
+    exclusions: crate::config_file::CompiledWorkspaceExclusions,
+}
+
+/// Filesystem and graph work completed off the state lock.
+pub(crate) struct PreparedSystemFileDraft {
+    basis: SystemFileAnalysisBasis,
+    index_changes: WorkspaceIndexTargetedChanges,
+    open_metadata: Vec<PreparedWorkspaceOpenMetadata>,
+    graph: DependencyGraph,
+    changed_uris: Vec<Url>,
+    external_observations: Vec<SystemFileExternalObservation>,
+}
+
+pub(crate) struct PreparedSystemFileAnalysis {
+    basis: SystemFileAnalysisBasis,
+    index: Option<PreparedWorkspaceIndexTargetedBatch>,
+    open_metadata: Vec<PreparedWorkspaceOpenMetadata>,
+    graph: DependencyGraph,
+    changed_uris: Vec<Url>,
+    external_observations: Vec<SystemFileExternalObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SystemFileExternalIdentity {
+    Valid(crate::cross_file::file_cache::FileSnapshot),
+    Missing,
+    InvalidBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SystemFileExternalObservation {
+    path: PathBuf,
+    identity: SystemFileExternalIdentity,
+}
+
+fn observe_system_file_external_path(path: &Path) -> SystemFileExternalObservation {
+    observe_system_file_external(path).0
+}
+
+/// Read and classify one external candidate from a single opened file.
+///
+/// The returned text, snapshot, and validity classification all describe the
+/// same bytes. Detached derivation must consume this text instead of reopening
+/// the path; otherwise a write between identity capture and parsing could let
+/// stale artifacts pass the pre-commit identity check.
+fn observe_system_file_external(path: &Path) -> (SystemFileExternalObservation, Option<String>) {
+    use std::io::Read;
+
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            let identity = if error.kind() == std::io::ErrorKind::NotFound {
+                SystemFileExternalIdentity::Missing
+            } else {
+                SystemFileExternalIdentity::InvalidBytes
+            };
+            return (
+                SystemFileExternalObservation {
+                    path: path.to_path_buf(),
+                    identity,
+                },
+                None,
+            );
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return (
+                SystemFileExternalObservation {
+                    path: path.to_path_buf(),
+                    identity: SystemFileExternalIdentity::InvalidBytes,
+                },
+                None,
+            );
+        }
+    };
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return (
+            SystemFileExternalObservation {
+                path: path.to_path_buf(),
+                identity: SystemFileExternalIdentity::InvalidBytes,
+            },
+            None,
+        );
+    }
+    let Ok(content) = decode_source(bytes) else {
+        return (
+            SystemFileExternalObservation {
+                path: path.to_path_buf(),
+                identity: SystemFileExternalIdentity::InvalidBytes,
+            },
+            None,
+        );
+    };
+    let identity = SystemFileExternalIdentity::Valid(
+        crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content),
+    );
+    (
+        SystemFileExternalObservation {
+            path: path.to_path_buf(),
+            identity,
+        },
+        Some(content),
+    )
+}
+
+impl PreparedSystemFileAnalysis {
+    pub(crate) fn external_observations_are_current(&self) -> bool {
+        self.external_observations
+            .iter()
+            .all(|expected| observe_system_file_external_path(&expected.path) == *expected)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_last_open_token_for_test(&mut self) {
+        if let Some(last) = self.open_metadata.last_mut() {
+            last.token = OpenRecordToken::absent_for_test(last.uri.clone());
+        }
+    }
 }
 
 /// One open metadata/artifact replacement derived from the exact immutable
@@ -1935,7 +2137,7 @@ pub(crate) struct AnalysisRevalidationTicket {
 
 /// One-shot identity for unmarked workspace-scan fanout transferred to
 /// post-seed/config orchestration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct WorkspaceScanTransferIdentity {
     intent_generation: u64,
     commit_generation: u64,
@@ -1944,14 +2146,64 @@ pub(crate) struct WorkspaceScanTransferIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspaceScanTransferredEffects {
-    identity: WorkspaceScanTransferIdentity,
+    pub(crate) handle: AnalysisTransferHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SystemFileTransferredEffects {
+    pub(crate) handle: AnalysisTransferHandle,
+    pub(crate) changed_uris: Vec<Url>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PackageSeedInstalledIdentity {
+    pub(crate) seed_install_id: u64,
+    pub(crate) package_input_generation: u64,
+    pub(crate) package_state_record_generation: u64,
+    pub(crate) system_file_routing_owner_generation: u64,
+    pub(crate) package_library_install_id: u64,
+    pub(crate) package_library_content_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SystemFileTransferIdentity {
+    routing_owner_generation: u64,
+    commit_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AnalysisTransferIdentity {
+    WorkspaceScan(WorkspaceScanTransferIdentity),
+    SystemFile(SystemFileTransferIdentity),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct AnalysisTransferHandle {
+    identity: AnalysisTransferIdentity,
 }
 
 #[derive(Clone)]
-struct WorkspaceScanTransferState {
-    identity: WorkspaceScanTransferIdentity,
+struct AnalysisTransferState {
     candidates: Vec<(Url, OpenRecordToken)>,
-    claimed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct AnalysisTransferFinalizationId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnalysisTransferRejection {
+    AlreadyConsumed,
+    Superseded {
+        previous: AnalysisTransferHandle,
+        successor: AnalysisTransferHandle,
+    },
+    MissingOrWrongOwner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AnalysisTransferFinalization {
+    Committed(Vec<AnalysisRevalidationTicket>),
+    AlreadyFinalized,
 }
 
 /// Parsed payload owned by one active-document notification arrival.
@@ -2001,6 +2253,7 @@ pub(crate) struct AnalysisCommitEffects {
     pub(crate) open: Option<OpenAnalysisCommitOutcome>,
     pub(crate) close: Option<OpenCloseCommitOutcome>,
     pub(crate) workspace_scan: Option<WorkspaceScanTransferredEffects>,
+    pub(crate) system_file: Option<SystemFileTransferredEffects>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2081,6 +2334,83 @@ impl WorldState {
         self.package_config_generation = self.package_config_generation.wrapping_add(1);
     }
 
+    fn mint_package_library_install_id() -> u64 {
+        NEXT_PACKAGE_LIBRARY_INSTALL_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("package-library install identity counter exhausted")
+    }
+
+    fn mint_system_file_routing_owner_generation() -> u64 {
+        NEXT_SYSTEM_FILE_ROUTING_OWNER_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("system.file routing owner generation counter exhausted")
+    }
+
+    /// Install a newly built package library and mint every authority identity
+    /// consumed by detached package and `system.file()` work.
+    pub(crate) fn install_package_library(&mut self, library: Arc<PackageLibrary>, ready: bool) {
+        self.package_library = library;
+        self.package_library_install_id = Self::mint_package_library_install_id();
+        self.package_library_content_generation = 0;
+        self.system_file_routing_owner_generation =
+            Self::mint_system_file_routing_owner_generation();
+        self.refresh_local_dev_overlay();
+        self.package_library_ready = ready;
+        self.bump_package_config_generation();
+    }
+
+    /// Record an in-place package-library content change after cache
+    /// invalidation and warmup have completed.
+    pub(crate) fn record_package_library_content_change(&mut self) {
+        self.package_library_content_generation =
+            self.package_library_content_generation.wrapping_add(1);
+        self.system_file_routing_owner_generation =
+            Self::mint_system_file_routing_owner_generation();
+    }
+
+    /// Mint routing ownership even when the installed routing values compare
+    /// equal, as happens when a package seed is replayed.
+    pub(crate) fn record_system_file_routing_owner_change(&mut self) {
+        self.system_file_routing_owner_generation =
+            Self::mint_system_file_routing_owner_generation();
+    }
+
+    pub(crate) fn system_file_routing_owner_generation(&self) -> u64 {
+        self.system_file_routing_owner_generation
+    }
+
+    pub(crate) fn record_package_seed_installed(&self) -> PackageSeedInstalledIdentity {
+        PackageSeedInstalledIdentity {
+            seed_install_id: NEXT_PACKAGE_SEED_INSTALL_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .expect("package-seed install identity counter exhausted"),
+            package_input_generation: self.package_input_generation(),
+            package_state_record_generation: self.package_state_record_generation,
+            system_file_routing_owner_generation: self.system_file_routing_owner_generation,
+            package_library_install_id: self.package_library_install_id,
+            package_library_content_generation: self.package_library_content_generation,
+        }
+    }
+
+    fn system_file_routing_stamp(&self) -> SystemFileRoutingStamp {
+        let (workspace_name, workspace_root, library_paths) = self.snapshot_system_file_inputs();
+        SystemFileRoutingStamp {
+            owner_generation: self.system_file_routing_owner_generation,
+            package_state_record_generation: self.package_state_record_generation,
+            package_library_install_id: self.package_library_install_id,
+            package_library_content_generation: self.package_library_content_generation,
+            workspace_name,
+            workspace_root,
+            library_paths,
+        }
+    }
+
     pub(crate) fn workspace_scan_generation(&self) -> u64 {
         self.workspace_scan_generation
     }
@@ -2101,12 +2431,143 @@ impl WorldState {
             .expect("workspace-scan commit generation counter exhausted")
     }
 
-    /// Begin one top-level scan driver. A newer arrival tombstones any older
-    /// driver and its unclaimed transferred effects.
+    fn mint_system_file_commit_generation() -> u64 {
+        NEXT_SYSTEM_FILE_COMMIT_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("system.file commit generation counter exhausted")
+    }
+
+    pub(crate) fn begin_analysis_transfer_finalization() -> AnalysisTransferFinalizationId {
+        AnalysisTransferFinalizationId(
+            NEXT_ANALYSIS_TRANSFER_FINALIZATION_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .expect("analysis-transfer finalization identity counter exhausted"),
+        )
+    }
+
+    fn install_analysis_transfer(
+        &mut self,
+        identity: AnalysisTransferIdentity,
+        previous: Option<AnalysisTransferIdentity>,
+        mut candidates: Vec<(Url, OpenRecordToken)>,
+    ) -> AnalysisTransferHandle {
+        if let Some(previous) = previous
+            && let Some(inherited) = self.analysis_transfers.remove(&previous)
+        {
+            candidates.extend(inherited.candidates);
+            self.analysis_transfer_successors.insert(previous, identity);
+        }
+        candidates.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        candidates.dedup();
+        self.analysis_transfers
+            .insert(identity, AnalysisTransferState { candidates });
+        AnalysisTransferHandle { identity }
+    }
+
+    /// Atomically consume every supplied transfer and reserve the union of its
+    /// still-current exact-record candidates.
+    ///
+    /// Every handle is prevalidated before any ledger entry, force marker, or
+    /// activity reservation changes. Callers receiving `Superseded` may retry
+    /// with the returned successor because that successor inherited the old
+    /// candidates; other rejections require an idempotent current-state
+    /// fallback through [`Self::finalize_analysis_transfer_fallback`].
+    pub(crate) fn finalize_analysis_transfers(
+        &mut self,
+        finalization: AnalysisTransferFinalizationId,
+        handles: &[AnalysisTransferHandle],
+        mut additional_candidates: Vec<(Url, OpenRecordToken)>,
+    ) -> Result<AnalysisTransferFinalization, AnalysisTransferRejection> {
+        if self.analysis_transfer_finalizations.contains(&finalization) {
+            return Ok(AnalysisTransferFinalization::AlreadyFinalized);
+        }
+        let mut unique = HashSet::with_capacity(handles.len());
+        for handle in handles {
+            if !unique.insert(handle.identity) {
+                return Err(AnalysisTransferRejection::MissingOrWrongOwner);
+            }
+            if self.analysis_transfers_consumed.contains(&handle.identity) {
+                return Err(AnalysisTransferRejection::AlreadyConsumed);
+            }
+            if let Some(successor) = self.analysis_transfer_successors.get(&handle.identity) {
+                return Err(AnalysisTransferRejection::Superseded {
+                    previous: *handle,
+                    successor: AnalysisTransferHandle {
+                        identity: *successor,
+                    },
+                });
+            }
+            if !self.analysis_transfers.contains_key(&handle.identity) {
+                return Err(AnalysisTransferRejection::MissingOrWrongOwner);
+            }
+        }
+
+        for handle in handles {
+            let state = self
+                .analysis_transfers
+                .remove(&handle.identity)
+                .expect("all analysis transfer handles were prevalidated");
+            additional_candidates.extend(state.candidates);
+            self.analysis_transfers_consumed.insert(handle.identity);
+        }
+        self.analysis_transfer_finalizations.insert(finalization);
+        let uris = self.current_transfer_candidate_uris(additional_candidates);
+        Ok(AnalysisTransferFinalization::Committed(
+            self.reserve_analysis_revalidations(uris).revalidations,
+        ))
+    }
+
+    /// Complete a rejected handoff from current exact candidates exactly once.
+    pub(crate) fn finalize_analysis_transfer_fallback(
+        &mut self,
+        finalization: AnalysisTransferFinalizationId,
+        candidates: Vec<(Url, OpenRecordToken)>,
+    ) -> AnalysisTransferFinalization {
+        if !self.analysis_transfer_finalizations.insert(finalization) {
+            return AnalysisTransferFinalization::AlreadyFinalized;
+        }
+        let uris = self.current_transfer_candidate_uris(candidates);
+        AnalysisTransferFinalization::Committed(
+            self.reserve_analysis_revalidations(uris).revalidations,
+        )
+    }
+
+    fn current_transfer_candidate_uris(&self, candidates: Vec<(Url, OpenRecordToken)>) -> Vec<Url> {
+        candidates
+            .into_iter()
+            .filter(|(uri, token)| {
+                self.documents.record_token_is_current(token)
+                    && self.diagnostics_publish_allowed(uri)
+                    && self.diagnostics_gate.current_epoch(uri).is_some()
+            })
+            .map(|(uri, _)| uri)
+            .collect()
+    }
+
+    pub(crate) fn capture_analysis_transfer_candidates(
+        &self,
+        uris: impl IntoIterator<Item = Url>,
+    ) -> Vec<(Url, OpenRecordToken)> {
+        uris.into_iter()
+            .filter(|uri| self.documents.contains_key(uri))
+            .map(|uri| {
+                let token = self.documents.record_token(&uri);
+                (uri, token)
+            })
+            .collect()
+    }
+
+    /// Begin one top-level scan driver.
+    ///
+    /// A newer arrival tombstones the older driver, but a committed unclaimed
+    /// transfer survives until a successful newer commit inherits it.
     pub(crate) fn begin_workspace_scan_intent(&mut self) -> WorkspaceScanIntentToken {
         let generation = Self::mint_workspace_scan_intent_generation();
         self.workspace_scan_intent = Some(WorkspaceScanIntentState::Pending(generation));
-        self.workspace_scan_transfer = None;
         WorkspaceScanIntentToken { generation }
     }
 
@@ -2170,7 +2631,6 @@ impl WorldState {
         if !self.workspace_scan_input_basis_is_current(input) {
             return None;
         }
-        let (workspace_name, workspace_root, library_paths) = self.snapshot_system_file_inputs();
         Some(WorkspaceScanDerivationBasis {
             input: input.clone(),
             graph_revision: self.cross_file_graph.edge_revision(),
@@ -2183,11 +2643,7 @@ impl WorldState {
             workspace_index_pinned: index_snapshot.pinned.clone(),
             package_input_generation: self.package_input_generation(),
             package_config_generation: self.package_config_generation,
-            system_file_routing: SystemFileRoutingStamp {
-                workspace_name,
-                workspace_root,
-                library_paths,
-            },
+            system_file_routing: self.system_file_routing_stamp(),
             open_records: self
                 .documents
                 .keys()
@@ -2224,13 +2680,7 @@ impl WorldState {
         if current_open != basis.open_records {
             return false;
         }
-        let (workspace_name, workspace_root, library_paths) = self.snapshot_system_file_inputs();
-        basis.system_file_routing
-            == (SystemFileRoutingStamp {
-                workspace_name,
-                workspace_root,
-                library_paths,
-            })
+        basis.system_file_routing == self.system_file_routing_stamp()
     }
 
     #[cfg(test)]
@@ -2293,7 +2743,8 @@ impl WorldState {
     ///
     /// A committed diagnostic transfer is not a candidate and deliberately
     /// survives this bump while post-scan package/config work converges. Only
-    /// [`Self::begin_workspace_scan_intent`] supersedes that transfer.
+    /// A successful later scan commit supersedes that transfer only after
+    /// inheriting its unclaimed candidates.
     pub(crate) fn advance_workspace_scan_generation(&mut self) {
         self.workspace_scan_generation = self.workspace_scan_generation.wrapping_add(1);
     }
@@ -2317,12 +2768,24 @@ impl WorldState {
     /// recorded that mutation through `record_package_input_mutation`.
     /// Recomputes `package_state` as a pure function of inputs.
     pub fn apply_package_event(&mut self, delta: &crate::package_state::PackageInputDelta) {
+        let old_routing = self
+            .package_state
+            .workspace()
+            .map(|workspace| (workspace.name.as_str().to_owned(), workspace.root.clone()));
         let new_package_state = crate::package_state::derive_package_state(
             &self.package_state,
             &self.package_inputs,
             delta,
         );
         self.package_state.set_from(new_package_state);
+        self.package_state_record_generation = self.package_state_record_generation.wrapping_add(1);
+        let new_routing = self
+            .package_state
+            .workspace()
+            .map(|workspace| (workspace.name.as_str().to_owned(), workspace.root.clone()));
+        if old_routing != new_routing {
+            self.record_system_file_routing_owner_change();
+        }
 
         // Refresh the package library's local-dev overlay from the freshly-set
         // contribution. `apply_package_event` is the single writer that recomputes
@@ -2549,6 +3012,9 @@ impl WorldState {
             // Initialize with empty state - will be populated via initialize() or async initialization
             // Requirement 13.4: THE Package_Cache SHALL support concurrent read access
             package_library: Arc::new(PackageLibrary::new_empty()),
+            package_library_install_id: Self::mint_package_library_install_id(),
+            package_library_content_generation: 0,
+            system_file_routing_owner_generation: Self::mint_system_file_routing_owner_generation(),
 
             // Caches
             help_cache: crate::help::HelpCache::new(),
@@ -2607,6 +3073,16 @@ impl WorldState {
             package_init_pre_commit_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
+            system_file_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            system_file_pre_derivation_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            system_file_test_reject_remaining: 0,
+            #[cfg(test)]
+            system_file_test_commit_attempts: 0,
+            #[cfg(test)]
             open_edit_fallback_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
@@ -2649,7 +3125,12 @@ impl WorldState {
             package_library_ready: false,
             workspace_scan_generation: 0,
             workspace_scan_intent: None,
-            workspace_scan_transfer: None,
+            analysis_transfers: HashMap::new(),
+            analysis_transfer_successors: HashMap::new(),
+            analysis_transfers_consumed: HashSet::new(),
+            analysis_transfer_finalizations: HashSet::new(),
+            latest_workspace_scan_transfer: None,
+            latest_system_file_transfer: None,
             workspace_graph_authority_generation: 0,
             open_context_authority_generation: OpenContextAuthorityGeneration(0),
             open_install_intents: HashMap::new(),
@@ -2665,6 +3146,7 @@ impl WorldState {
             analysis_revalidation_reservation_count: 0,
             workspace_scan_complete: false,
             package_state: crate::package_state::PackageState::new(),
+            package_state_record_generation: 0,
             package_inputs: crate::package_state::PackageInputs::default(),
             package_input_lifecycle: crate::package_state::PackageInputLifecycle::default(),
             package_seed_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
@@ -3572,7 +4054,6 @@ impl WorldState {
         subject: AnalysisSubjectBasis,
         uri: &Url,
     ) -> AnalysisBasis {
-        let (workspace_name, workspace_root, library_paths) = self.snapshot_system_file_inputs();
         AnalysisBasis {
             subject,
             watched_file_generation: self.watched_file_resync_generations.get(uri).copied(),
@@ -3585,11 +4066,7 @@ impl WorldState {
             open_transition: None,
             package_input_generation: self.package_input_generation(),
             package_config_generation: self.package_config_generation,
-            system_file_routing: SystemFileRoutingStamp {
-                workspace_name,
-                workspace_root,
-                library_paths,
-            },
+            system_file_routing: self.system_file_routing_stamp(),
             analysis_config: AnalysisConfigStamp {
                 workspace_folders: self.workspace_folders.clone(),
                 max_chain_depth: self.cross_file_config.max_chain_depth,
@@ -4046,13 +4523,7 @@ impl WorldState {
         {
             return false;
         }
-        let (workspace_name, workspace_root, library_paths) = self.snapshot_system_file_inputs();
-        basis.system_file_routing
-            == (SystemFileRoutingStamp {
-                workspace_name,
-                workspace_root,
-                library_paths,
-            })
+        basis.system_file_routing == self.system_file_routing_stamp()
             && basis.analysis_config
                 == (AnalysisConfigStamp {
                     workspace_folders: self.workspace_folders.clone(),
@@ -4068,7 +4539,15 @@ impl WorldState {
     }
 
     fn reserve_analysis_revalidations(&mut self, mut affected: Vec<Url>) -> AnalysisCommitEffects {
-        affected.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        // One shared activity-aware cap is applied after every transfer and
+        // collect-only candidate has been unioned. URI order breaks equal
+        // activity scores deterministically; cap-dropped URIs are never marked.
+        affected.sort_by(|left, right| {
+            self.cross_file_activity
+                .priority_score(left)
+                .cmp(&self.cross_file_activity.priority_score(right))
+                .then_with(|| left.as_str().cmp(right.as_str()))
+        });
         affected.dedup();
         affected.truncate(self.cross_file_config.max_revalidations_per_trigger);
         #[cfg(any(test, feature = "test-support"))]
@@ -4090,6 +4569,7 @@ impl WorldState {
             open: None,
             close: None,
             workspace_scan: None,
+            system_file: None,
         }
     }
 
@@ -4108,6 +4588,9 @@ impl WorldState {
         let mutations = match prepared {
             PreparedAnalysisCommit::WorkspaceScan(prepared) => {
                 return self.try_commit_workspace_scan(*prepared);
+            }
+            PreparedAnalysisCommit::SystemFile(prepared) => {
+                return self.try_commit_system_file(*prepared);
             }
             PreparedAnalysisCommit::OpenClose(prepared) => {
                 return self.try_commit_open_close(*prepared);
@@ -4221,25 +4704,27 @@ impl WorldState {
             commit_generation: Self::mint_workspace_scan_commit_generation(),
             committed_scan_generation: self.workspace_scan_generation,
         };
-        let mut candidates: Vec<_> = self
+        let candidates: Vec<_> = self
             .documents
             .keys()
             .filter(|uri| self.diagnostics_publish_allowed(uri))
             .map(|uri| (uri.clone(), self.documents.record_token(uri)))
             .collect();
-        candidates.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-        self.workspace_scan_transfer = Some(WorkspaceScanTransferState {
+        let identity = AnalysisTransferIdentity::WorkspaceScan(identity);
+        let handle = self.install_analysis_transfer(
             identity,
+            self.latest_workspace_scan_transfer,
             candidates,
-            claimed: false,
-        });
+        );
+        self.latest_workspace_scan_transfer = Some(identity);
 
         Ok(AnalysisCommitEffects {
             revalidations: Vec::new(),
             affected_candidates: Vec::new(),
             open: None,
             close: None,
-            workspace_scan: Some(WorkspaceScanTransferredEffects { identity }),
+            workspace_scan: Some(WorkspaceScanTransferredEffects { handle }),
+            system_file: None,
         })
     }
 
@@ -4249,34 +4734,114 @@ impl WorldState {
     /// after the scan are dropped; their owning transition is responsible for
     /// current diagnostics. Marking and trigger capture happen together under
     /// the caller's state write lock.
+    #[cfg(test)]
     pub(crate) fn claim_workspace_scan_transfer(
         &mut self,
         transferred: &WorkspaceScanTransferredEffects,
     ) -> Vec<AnalysisRevalidationTicket> {
-        let Some(state) = self.workspace_scan_transfer.as_mut() else {
-            return Vec::new();
-        };
-        if state.claimed
-            || state.identity != transferred.identity
-            || self.workspace_scan_intent
-                != Some(WorkspaceScanIntentState::Committed(
-                    state.identity.intent_generation,
-                ))
-        {
-            return Vec::new();
+        let finalization = Self::begin_analysis_transfer_finalization();
+        match self.finalize_analysis_transfers(finalization, &[transferred.handle], Vec::new()) {
+            Ok(AnalysisTransferFinalization::Committed(tickets)) => tickets,
+            Ok(AnalysisTransferFinalization::AlreadyFinalized) | Err(_) => Vec::new(),
         }
-        state.claimed = true;
-        let candidates = std::mem::take(&mut state.candidates);
-        let uris: Vec<_> = candidates
-            .into_iter()
-            .filter(|(uri, token)| {
-                self.documents.record_token_is_current(token)
-                    && self.diagnostics_publish_allowed(uri)
-                    && self.diagnostics_gate.current_epoch(uri).is_some()
-            })
-            .map(|(uri, _)| uri)
+    }
+
+    fn system_file_analysis_basis_is_current(&self, basis: &SystemFileAnalysisBasis) -> bool {
+        let index = self.workspace_index.authority_snapshot();
+        let open_records: std::collections::BTreeMap<_, _> = self
+            .documents
+            .keys()
+            .map(|uri| (uri.clone(), self.documents.record_token(uri)))
             .collect();
-        self.reserve_analysis_revalidations(uris).revalidations
+        basis.routing == self.system_file_routing_stamp()
+            && index.version == basis.workspace_index_version
+            && self.workspace_index.config().max_files == basis.workspace_index_max_files
+            && self.workspace_index.config().max_file_size_bytes
+                == basis.workspace_index_max_file_size_bytes
+            && index.artifact_capacity_limit == basis.workspace_index_artifact_capacity
+            && index.pinned == basis.workspace_index_pinned
+            && self.cross_file_graph.edge_revision() == basis.graph_revision
+            && self.workspace_graph_authority_generation == basis.graph_authority_generation
+            && self.open_context_authority_generation == basis.open_context_authority_generation
+            && self.analysis_config_generation == basis.analysis_config_generation
+            && self.chunk_override_generation == basis.chunk_override_generation
+            && self.workspace_folders == basis.workspace_folders
+            && self.workspace_exclusions.patterns() == basis.exclusion_patterns.as_slice()
+            && self.cross_file_config.max_chain_depth == basis.max_chain_depth
+            && open_records == basis.open_records
+    }
+
+    fn try_commit_system_file(
+        &mut self,
+        prepared: PreparedSystemFileAnalysis,
+    ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
+        if !self.system_file_analysis_basis_is_current(&prepared.basis)
+            || prepared.open_metadata.iter().any(|replacement| {
+                prepared.basis.open_records.get(&replacement.uri) != Some(&replacement.token)
+                    || !self.documents.record_token_is_current(&replacement.token)
+                    || !self.documents.generation_is_current(
+                        &replacement.uri,
+                        replacement.prepared.base_generation(),
+                    )
+            })
+        {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+        if let Some(index) = prepared.index
+            && !self
+                .workspace_index
+                .commit_prepared_targeted_batch(index)
+                .map_err(|_| AnalysisCommitRejected::StaleBasis)?
+        {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+
+        let open_changed = !prepared.open_metadata.is_empty();
+        for replacement in prepared.open_metadata {
+            self.documents
+                .commit_prepared_metadata_if_current(&replacement.uri, replacement.prepared)
+                .expect("all system.file open targets were prevalidated");
+        }
+        if open_changed {
+            self.advance_open_context_authority_generation();
+        }
+        let graph_changed = !prepared.changed_uris.is_empty();
+        if graph_changed {
+            self.cross_file_graph = prepared.graph;
+            self.advance_workspace_graph_authority_generation();
+            self.advance_workspace_scan_generation();
+            self.recompute_open_neighborhood_pins();
+        }
+
+        let changed_uris = prepared.changed_uris;
+        let candidate_uris = self.system_file_republish_set(&changed_uris);
+        let candidates = candidate_uris
+            .into_iter()
+            .filter(|uri| self.diagnostics_publish_allowed(uri))
+            .map(|uri| {
+                let token = self.documents.record_token(&uri);
+                (uri, token)
+            })
+            .collect();
+        let identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+            routing_owner_generation: prepared.basis.routing.owner_generation,
+            commit_generation: Self::mint_system_file_commit_generation(),
+        });
+        let handle =
+            self.install_analysis_transfer(identity, self.latest_system_file_transfer, candidates);
+        self.latest_system_file_transfer = Some(identity);
+
+        Ok(AnalysisCommitEffects {
+            revalidations: Vec::new(),
+            affected_candidates: Vec::new(),
+            open: None,
+            close: None,
+            workspace_scan: None,
+            system_file: Some(SystemFileTransferredEffects {
+                handle,
+                changed_uris,
+            }),
+        })
     }
 
     fn try_commit_open_close(
@@ -4349,6 +4914,7 @@ impl WorldState {
                 resync: prepared.resync,
             }),
             workspace_scan: None,
+            system_file: None,
         })
     }
 
@@ -4420,6 +4986,7 @@ impl WorldState {
             }),
             close: None,
             workspace_scan: None,
+            system_file: None,
         })
     }
 
@@ -4466,6 +5033,7 @@ impl WorldState {
             }),
             close: None,
             workspace_scan: None,
+            system_file: None,
         })
     }
 
@@ -4506,6 +5074,7 @@ impl WorldState {
             }),
             close: None,
             workspace_scan: None,
+            system_file: None,
         })
     }
 
@@ -4556,6 +5125,7 @@ impl WorldState {
             }),
             close: None,
             workspace_scan: None,
+            system_file: None,
         })
     }
 
@@ -5225,28 +5795,121 @@ impl WorldState {
         );
     }
 
-    /// Resolve `system.file()` sources in workspace index metadata and rebuild
-    /// dependency graph edges for files whose resolution changed. Must be called
-    /// after `apply_package_event` so that `package_state.workspace()` is
-    /// populated.
-    ///
-    /// Every entry with `system_file.is_some()` is revisited — resolved entries
-    /// keep their `SystemFileCall` (see `resolve_system_file_sources`), so this
-    /// is the single recovery point for package lifecycle events: a package
-    /// install/removal in a watched libpath (`LibpathEvent::Changed`) and a
-    /// workspace `Package:` rename (the DESCRIPTION manifest branch) both call
-    /// this to form, drop, or re-target edges without the user editing the
-    /// sourcing file.
-    ///
-    /// Returns the URIs whose source resolution actually changed, so callers
-    /// can republish diagnostics for exactly those files (expand with
-    /// [`Self::system_file_republish_set`] to include open dependents).
-    pub fn resolve_system_file_in_workspace(&mut self) -> Vec<Url> {
-        self.resolve_system_file_in_workspace_for_packages(None)
+    /// Capture every authority and immutable payload consumed by detached
+    /// `system.file()` convergence.
+    pub(crate) fn capture_system_file_analysis(
+        &self,
+        only_packages: Option<HashSet<String>>,
+    ) -> CapturedSystemFileAnalysis {
+        let index = self.workspace_index.authority_snapshot();
+        let source_selected = |source: &crate::cross_file::ForwardSource| {
+            source.system_file.as_ref().is_some_and(|call| {
+                only_packages
+                    .as_ref()
+                    .is_none_or(|packages| packages.contains(&call.package))
+            })
+        };
+        let raw_content = index
+            .artifacts
+            .iter()
+            .filter(|(_, entry)| entry.metadata.sources.iter().any(source_selected))
+            .filter_map(|(uri, _)| {
+                self.cross_file_file_cache
+                    .get(uri)
+                    .map(|content| (uri.clone(), content))
+            })
+            .collect();
+        let open: Vec<_> = self
+            .documents
+            .keys()
+            .filter_map(|uri| {
+                let record = self.documents.get_record(uri)?.clone();
+                Some(CapturedSystemFileOpen {
+                    uri: uri.clone(),
+                    token: self.documents.record_token(uri),
+                    metadata: record.metadata().clone(),
+                    document: record,
+                    graph_roots: self.authoritative_revalidation_roots_for_uri(uri),
+                })
+            })
+            .collect();
+        let open_records = open
+            .iter()
+            .map(|open| (open.uri.clone(), open.token.clone()))
+            .collect();
+        CapturedSystemFileAnalysis {
+            basis: SystemFileAnalysisBasis {
+                routing: self.system_file_routing_stamp(),
+                workspace_index_version: index.version,
+                workspace_index_max_files: self.workspace_index.config().max_files,
+                workspace_index_max_file_size_bytes: self
+                    .workspace_index
+                    .config()
+                    .max_file_size_bytes,
+                workspace_index_artifact_capacity: index.artifact_capacity_limit,
+                workspace_index_pinned: index.pinned.clone(),
+                graph_revision: self.cross_file_graph.edge_revision(),
+                graph_authority_generation: self.workspace_graph_authority_generation,
+                open_context_authority_generation: self.open_context_authority_generation,
+                analysis_config_generation: self.analysis_config_generation,
+                chunk_override_generation: self.chunk_override_generation,
+                workspace_folders: self.workspace_folders.clone(),
+                exclusion_patterns: self.workspace_exclusions.patterns().to_vec(),
+                max_chain_depth: self.cross_file_config.max_chain_depth,
+                open_records,
+            },
+            only_packages,
+            full_content: index
+                .full
+                .iter()
+                .map(|(uri, entry)| (uri.clone(), entry.contents.to_string()))
+                .collect(),
+            raw_content,
+            artifacts: index.artifacts,
+            open,
+            graph: self.cross_file_graph.clone(),
+            exclusions: self.workspace_exclusions.clone(),
+        }
     }
 
-    /// Package-filtered variant of [`Self::resolve_system_file_in_workspace`]:
-    /// with `Some(packages)`, only entries containing a `system.file()` source
+    /// Attach the exact index CAS state after detached filesystem/graph work.
+    pub(crate) fn finish_system_file_analysis(
+        &self,
+        draft: PreparedSystemFileDraft,
+    ) -> Option<PreparedSystemFileAnalysis> {
+        let has_index_changes = !draft.index_changes.metadata.is_empty()
+            || !draft.index_changes.installs.is_empty()
+            || !draft.index_changes.removals.is_empty()
+            || draft.index_changes.pins != draft.basis.workspace_index_pinned;
+        let index = if has_index_changes {
+            self.workspace_index
+                .prepare_targeted_batch_if_current(
+                    draft.basis.workspace_index_version,
+                    draft.index_changes,
+                )
+                .ok()??
+                .into()
+        } else {
+            None
+        };
+        Some(PreparedSystemFileAnalysis {
+            basis: draft.basis,
+            index,
+            open_metadata: draft.open_metadata,
+            graph: draft.graph,
+            changed_uris: draft.changed_uris,
+            external_observations: draft.external_observations,
+        })
+    }
+
+    /// Deferred synchronous compatibility writer for `raven check`.
+    ///
+    /// The LSP and its behavior tests must use the detached two-attempt
+    /// transaction in `backend`; this method is the intentionally isolated
+    /// final legacy writer until CLI index installation is migrated as its own
+    /// ownership family.
+    ///
+    /// With `Some(packages)`, only entries containing a `system.file()` source
     /// referencing one of those packages are re-resolved; everything else is
     /// neither cloned nor disk-probed. The libpath-event consumer passes the
     /// changed-package set so a package install/removal does not re-probe
@@ -5262,7 +5925,7 @@ impl WorldState {
     /// lifecycle events until the user edited it, and would never recover at
     /// all when the file is absent from the index (unsaved buffer,
     /// `index_workspace = false`).
-    pub fn resolve_system_file_in_workspace_for_packages(
+    pub(crate) fn resolve_system_file_in_workspace_cli_compat(
         &mut self,
         only_packages: Option<&std::collections::HashSet<String>>,
     ) -> Vec<Url> {
@@ -5508,9 +6171,8 @@ impl WorldState {
         }
     }
 
-    /// Expand the changed-URI list from
-    /// [`Self::resolve_system_file_in_workspace`] into the open documents
-    /// whose diagnostics may be affected: the changed files themselves plus
+    /// Expand the changed-URI output of `system.file()` convergence into the
+    /// open documents whose diagnostics may be affected: changed files plus
     /// their open transitive dependents and sibling subtrees. A parent's
     /// cross-file scope traverses forward source edges transitively, so an
     /// edge formed or dropped on a child changes the parent's diagnostics
@@ -5617,6 +6279,343 @@ impl WorldState {
             };
             self.workspace_index.insert(uri, entry);
         }
+    }
+}
+
+/// Resolve selected `system.file()` calls, read newly referenced external
+/// files, and derive graph/open/index replacements without a shared state lock.
+pub(crate) fn prepare_system_file_analysis(
+    captured: CapturedSystemFileAnalysis,
+) -> PreparedSystemFileDraft {
+    let CapturedSystemFileAnalysis {
+        basis,
+        only_packages,
+        artifacts,
+        mut full_content,
+        raw_content,
+        open,
+        mut graph,
+        exclusions,
+    } = captured;
+    let source_selected = |source: &crate::cross_file::ForwardSource| {
+        source.system_file.as_ref().is_some_and(|call| {
+            only_packages
+                .as_ref()
+                .is_none_or(|packages| packages.contains(&call.package))
+        })
+    };
+    let mut considered_external_paths = HashSet::new();
+    {
+        let mut record_considered_path = |source: &crate::cross_file::ForwardSource| {
+            if !source_selected(source) {
+                return;
+            }
+            if let Some(path) = source
+                .resolved_uri
+                .as_ref()
+                .and_then(|uri| uri.to_file_path().ok())
+            {
+                considered_external_paths.insert(path);
+            }
+            let Some(call) = source.system_file.as_ref() else {
+                return;
+            };
+            if basis.routing.workspace_name.as_deref() == Some(call.package.as_str())
+                && let Some(root) = basis.routing.workspace_root.as_ref()
+            {
+                considered_external_paths.insert(
+                    call.parts
+                        .iter()
+                        .fold(root.clone(), |path, part| path.join(part)),
+                );
+            }
+            for library in &basis.routing.library_paths {
+                let package_root = library.join(&call.package);
+                considered_external_paths.insert(
+                    call.parts
+                        .iter()
+                        .fold(package_root, |path, part| path.join(part)),
+                );
+            }
+        };
+        for (_, entry) in &artifacts {
+            for source in &entry.metadata.sources {
+                record_considered_path(source);
+            }
+        }
+        for input in &open {
+            for source in &input.metadata.sources {
+                record_considered_path(source);
+            }
+        }
+    }
+    let mut considered_external_paths: Vec<_> = considered_external_paths.into_iter().collect();
+    considered_external_paths.sort_unstable();
+    let observed_external: HashMap<_, _> = considered_external_paths
+        .into_iter()
+        .map(|path| {
+            let observed = observe_system_file_external(&path);
+            (path, observed)
+        })
+        .collect();
+    let mut external_observations: Vec<_> = observed_external
+        .values()
+        .map(|(observation, _)| observation.clone())
+        .collect();
+    external_observations.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    let workspace_root = basis.workspace_folders.first();
+    let mut closed_metadata: HashMap<_, _> = artifacts
+        .iter()
+        .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+        .collect();
+    let mut provenance: HashMap<_, _> = artifacts
+        .iter()
+        .map(|(uri, entry)| (uri.clone(), entry.provenance))
+        .collect();
+    for (uri, content) in raw_content {
+        full_content.entry(uri).or_insert(content);
+    }
+    let mut changed_uris = Vec::new();
+    let mut old_targets = HashSet::new();
+    let mut metadata_changes = Vec::new();
+    for (uri, entry) in &artifacts {
+        if !entry.metadata.sources.iter().any(source_selected) {
+            continue;
+        }
+        let mut sources = entry.metadata.sources.clone();
+        crate::cross_file::resolve_system_file_source_entries(
+            &mut sources,
+            basis.routing.workspace_name.as_deref(),
+            basis.routing.workspace_root.as_deref(),
+            &basis.routing.library_paths,
+        );
+        if sources == entry.metadata.sources {
+            continue;
+        }
+        old_targets.extend(
+            entry
+                .metadata
+                .sources
+                .iter()
+                .filter_map(|source| source.resolved_uri.clone()),
+        );
+        let mut metadata = (*entry.metadata).clone();
+        metadata.sources = sources;
+        let metadata = Arc::new(metadata);
+        closed_metadata.insert(uri.clone(), metadata.clone());
+        metadata_changes.push((uri.clone(), metadata));
+        changed_uris.push(uri.clone());
+    }
+
+    let mut open_metadata: HashMap<_, _> = open
+        .iter()
+        .map(|input| (input.uri.clone(), input.metadata.clone()))
+        .collect();
+    let mut changed_open = HashSet::new();
+    for input in &open {
+        if !input.metadata.sources.iter().any(source_selected) {
+            continue;
+        }
+        let mut sources = input.metadata.sources.clone();
+        crate::cross_file::resolve_system_file_source_entries(
+            &mut sources,
+            basis.routing.workspace_name.as_deref(),
+            basis.routing.workspace_root.as_deref(),
+            &basis.routing.library_paths,
+        );
+        if sources == input.metadata.sources {
+            continue;
+        }
+        old_targets.extend(
+            input
+                .metadata
+                .sources
+                .iter()
+                .filter_map(|source| source.resolved_uri.clone()),
+        );
+        let mut metadata = (*input.metadata).clone();
+        metadata.sources = sources;
+        open_metadata.insert(input.uri.clone(), Arc::new(metadata));
+        changed_open.insert(input.uri.clone());
+        if !changed_uris.contains(&input.uri) {
+            changed_uris.push(input.uri.clone());
+        }
+    }
+
+    let referenced_targets: HashSet<_> = closed_metadata
+        .values()
+        .chain(open_metadata.values())
+        .flat_map(|metadata| {
+            metadata
+                .sources
+                .iter()
+                .filter_map(|source| source.resolved_uri.clone())
+        })
+        .collect();
+    let existing: HashSet<_> = artifacts.iter().map(|(uri, _)| uri.clone()).collect();
+    let protected_open: HashSet<_> = open
+        .iter()
+        .flat_map(|input| input.graph_roots.iter().cloned())
+        .collect();
+    let workspace_dirs: Vec<_> = basis
+        .workspace_folders
+        .iter()
+        .filter_map(|uri| uri.to_file_path().ok())
+        .collect();
+    let mut removals: Vec<_> = old_targets
+        .into_iter()
+        .filter(|uri| !referenced_targets.contains(uri))
+        .filter(|uri| existing.contains(uri))
+        .filter(|uri| !protected_open.contains(uri))
+        .filter(|uri| {
+            uri.to_file_path()
+                .ok()
+                .is_none_or(|path| !workspace_dirs.iter().any(|root| path.starts_with(root)))
+        })
+        .collect();
+    removals.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok();
+    let mut installs = Vec::new();
+    let mut missing_targets: Vec<_> = referenced_targets
+        .iter()
+        .filter(|uri| !existing.contains(*uri))
+        .cloned()
+        .collect();
+    missing_targets.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    for uri in missing_targets {
+        let Some(path) = uri.to_file_path().ok() else {
+            continue;
+        };
+        let Some((observation, Some(content))) = observed_external.get(&path) else {
+            continue;
+        };
+        let SystemFileExternalIdentity::Valid(snapshot) = &observation.identity else {
+            continue;
+        };
+        let content = content.clone();
+        let tree = parser.parse(&content, None);
+        let metadata = Arc::new(crate::cross_file::extract_metadata(&content));
+        let artifacts = tree.as_ref().map_or_else(
+            || Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+            |tree| {
+                Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+                    &uri,
+                    tree,
+                    &content,
+                    Some(&metadata),
+                ))
+            },
+        );
+        let entry = IndexEntry {
+            contents: Rope::from_str(&content),
+            loaded_packages: extract_loaded_packages(&tree, &content),
+            data_packages: extract_data_packages(&tree, &content),
+            tree,
+            snapshot: snapshot.clone(),
+            metadata,
+            artifacts,
+            indexed_at_version: 0,
+        };
+        full_content.insert(uri.clone(), content);
+        provenance.insert(uri.clone(), ClosedProvenance::Dynamic);
+        installs.push((uri, entry, ClosedProvenance::Dynamic));
+    }
+
+    let changed_closed: HashSet<_> = metadata_changes
+        .iter()
+        .map(|(uri, _)| uri.clone())
+        .collect();
+    for (uri, metadata) in &metadata_changes {
+        let graph_metadata = WorldState::metadata_for_dependency_graph_with_exclusions(
+            &exclusions,
+            uri,
+            metadata,
+            workspace_root,
+        );
+        graph.update_file(uri, graph_metadata.as_ref(), workspace_root, |parent| {
+            full_content.get(parent).cloned()
+        });
+    }
+    for input in &open {
+        if !changed_open.contains(&input.uri) && !changed_closed.contains(&input.uri) {
+            continue;
+        }
+        let metadata = open_metadata
+            .get(&input.uri)
+            .expect("every captured open record has metadata");
+        for root in &input.graph_roots {
+            let root_metadata = if root == &input.uri {
+                metadata.clone()
+            } else {
+                let mut root_metadata = (**metadata).clone();
+                root_metadata.inherited_working_directory = None;
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut root_metadata,
+                    root,
+                    workspace_root,
+                    |parent| {
+                        open_metadata
+                            .get(parent)
+                            .cloned()
+                            .or_else(|| closed_metadata.get(parent).cloned())
+                    },
+                    basis.max_chain_depth,
+                );
+                Arc::new(root_metadata)
+            };
+            let graph_metadata = WorldState::metadata_for_dependency_graph_with_exclusions(
+                &exclusions,
+                root,
+                root_metadata.as_ref(),
+                workspace_root,
+            );
+            graph.update_file(root, graph_metadata.as_ref(), workspace_root, |parent| {
+                full_content.get(parent).cloned()
+            });
+            if exclusions.is_excluded_uri(&input.uri) || exclusions.is_excluded_uri(root) {
+                graph.make_forward_edges_non_lending(root);
+            }
+        }
+    }
+    for uri in &removals {
+        graph.remove_file(uri);
+    }
+
+    let open_metadata = open
+        .into_iter()
+        .filter(|input| changed_open.contains(&input.uri))
+        .map(|input| {
+            let metadata = open_metadata
+                .remove(&input.uri)
+                .expect("changed open metadata was derived above");
+            let prepared = OpenDocumentStore::prepare_metadata_replacement(
+                &input.uri,
+                &input.document,
+                metadata,
+            );
+            PreparedWorkspaceOpenMetadata::new(input.uri, input.token, prepared)
+        })
+        .collect();
+    let mut pins = basis.workspace_index_pinned.clone();
+    for uri in &removals {
+        pins.remove(uri);
+    }
+    changed_uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    changed_uris.dedup();
+    PreparedSystemFileDraft {
+        basis,
+        index_changes: WorkspaceIndexTargetedChanges {
+            metadata: metadata_changes,
+            installs,
+            removals,
+            pins,
+        },
+        open_metadata,
+        graph,
+        changed_uris,
+        external_observations,
     }
 }
 
@@ -6618,6 +7617,256 @@ mod tests {
             parent_content: HashMap::new(),
             make_non_lending,
         }
+    }
+
+    fn transfer_candidate(state: &mut WorldState, uri: &Url) -> (Url, OpenRecordToken) {
+        state.open_document(uri.clone(), "value <- 1\n", Some(1));
+        state.begin_open_document_diagnostic_lifecycle(uri).unwrap();
+        (uri.clone(), state.documents.record_token(uri))
+    }
+
+    fn test_transfer(
+        state: &mut WorldState,
+        identity: AnalysisTransferIdentity,
+        candidate: (Url, OpenRecordToken),
+    ) -> AnalysisTransferHandle {
+        state.install_analysis_transfer(identity, None, vec![candidate])
+    }
+
+    #[test]
+    fn analysis_transfer_multi_consume_is_all_or_none_in_both_orders() {
+        for invalid_first in [false, true] {
+            let uri = Url::parse("file:///workspace/live.R").unwrap();
+            let mut state = WorldState::new();
+            let candidate = transfer_candidate(&mut state, &uri);
+            let valid = test_transfer(
+                &mut state,
+                AnalysisTransferIdentity::WorkspaceScan(WorkspaceScanTransferIdentity {
+                    intent_generation: 1,
+                    commit_generation: 2,
+                    committed_scan_generation: 3,
+                }),
+                candidate,
+            );
+            let invalid = AnalysisTransferHandle {
+                identity: AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+                    routing_owner_generation: 4,
+                    commit_generation: 5,
+                }),
+            };
+            let handles = if invalid_first {
+                vec![invalid, valid]
+            } else {
+                vec![valid, invalid]
+            };
+            let rejected = state.finalize_analysis_transfers(
+                WorldState::begin_analysis_transfer_finalization(),
+                &handles,
+                Vec::new(),
+            );
+            assert_eq!(
+                rejected,
+                Err(AnalysisTransferRejection::MissingOrWrongOwner)
+            );
+            assert_eq!(state.analysis_revalidation_reservation_count, 0);
+            assert_eq!(
+                state.diagnostics_gate.force_republish_count_for_test(&uri),
+                0
+            );
+
+            let committed = state
+                .finalize_analysis_transfers(
+                    WorldState::begin_analysis_transfer_finalization(),
+                    &[valid],
+                    Vec::new(),
+                )
+                .unwrap();
+            assert!(matches!(
+                committed,
+                AnalysisTransferFinalization::Committed(ref tickets)
+                    if tickets.len() == 1 && tickets[0].uri == uri
+            ));
+        }
+    }
+
+    #[test]
+    fn analysis_transfer_overlap_reserves_once_and_replay_is_idempotent() {
+        let uri = Url::parse("file:///workspace/live.R").unwrap();
+        let mut state = WorldState::new();
+        let candidate = transfer_candidate(&mut state, &uri);
+        let first = test_transfer(
+            &mut state,
+            AnalysisTransferIdentity::WorkspaceScan(WorkspaceScanTransferIdentity {
+                intent_generation: 1,
+                commit_generation: 2,
+                committed_scan_generation: 3,
+            }),
+            candidate.clone(),
+        );
+        let second = test_transfer(
+            &mut state,
+            AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+                routing_owner_generation: 4,
+                commit_generation: 5,
+            }),
+            candidate,
+        );
+        let finalization = WorldState::begin_analysis_transfer_finalization();
+        let committed = state
+            .finalize_analysis_transfers(finalization, &[first, second], Vec::new())
+            .unwrap();
+        assert!(matches!(
+            committed,
+            AnalysisTransferFinalization::Committed(ref tickets) if tickets.len() == 1
+        ));
+        assert_eq!(state.analysis_revalidation_reservation_count, 1);
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            1
+        );
+        assert_eq!(
+            state
+                .finalize_analysis_transfers(finalization, &[first, second], Vec::new())
+                .unwrap(),
+            AnalysisTransferFinalization::AlreadyFinalized
+        );
+        assert_eq!(state.analysis_revalidation_reservation_count, 1);
+    }
+
+    #[test]
+    fn analysis_transfer_successor_proves_inheritance_before_supersession() {
+        let uri = Url::parse("file:///workspace/live.R").unwrap();
+        let mut state = WorldState::new();
+        let candidate = transfer_candidate(&mut state, &uri);
+        let old_identity = AnalysisTransferIdentity::WorkspaceScan(WorkspaceScanTransferIdentity {
+            intent_generation: 1,
+            commit_generation: 2,
+            committed_scan_generation: 3,
+        });
+        let old = state.install_analysis_transfer(old_identity, None, vec![candidate.clone()]);
+        let new_identity = AnalysisTransferIdentity::WorkspaceScan(WorkspaceScanTransferIdentity {
+            intent_generation: 4,
+            commit_generation: 5,
+            committed_scan_generation: 6,
+        });
+        let new = state.install_analysis_transfer(new_identity, Some(old_identity), Vec::new());
+        assert_eq!(
+            state.finalize_analysis_transfers(
+                WorldState::begin_analysis_transfer_finalization(),
+                &[old],
+                Vec::new(),
+            ),
+            Err(AnalysisTransferRejection::Superseded {
+                previous: old,
+                successor: new,
+            })
+        );
+        let committed = state
+            .finalize_analysis_transfers(
+                WorldState::begin_analysis_transfer_finalization(),
+                &[new],
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            committed,
+            AnalysisTransferFinalization::Committed(ref tickets)
+                if tickets.len() == 1 && tickets[0].uri == uri
+        ));
+    }
+
+    #[test]
+    fn analysis_transfer_fallback_and_cap_are_marker_exact() {
+        let first = Url::parse("file:///workspace/a.R").unwrap();
+        let second = Url::parse("file:///workspace/b.R").unwrap();
+        let mut state = WorldState::new();
+        state.cross_file_config.max_revalidations_per_trigger = 1;
+        state.cross_file_activity.active_uri = Some(second.clone());
+        let candidates = vec![
+            transfer_candidate(&mut state, &second),
+            transfer_candidate(&mut state, &first),
+        ];
+        let finalization = WorldState::begin_analysis_transfer_finalization();
+        let committed = state.finalize_analysis_transfer_fallback(finalization, candidates.clone());
+        assert!(matches!(
+            committed,
+            AnalysisTransferFinalization::Committed(ref tickets)
+                if tickets.len() == 1 && tickets[0].uri == second
+        ));
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&first),
+            0,
+            "lower-priority cap-dropped candidates must never receive force markers"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&second),
+            1
+        );
+        assert_eq!(
+            state.finalize_analysis_transfer_fallback(finalization, candidates),
+            AnalysisTransferFinalization::AlreadyFinalized
+        );
+        assert_eq!(state.analysis_revalidation_reservation_count, 1);
+    }
+
+    #[test]
+    fn system_file_last_open_target_rejection_is_atomic() {
+        let library = tempfile::tempdir().unwrap();
+        let package = library.path().join("otherpkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("helper.R"), "helper <- 1\n").unwrap();
+        let source = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
+        let first = Url::parse("file:///workspace/a.R").unwrap();
+        let last = Url::parse("file:///workspace/z.R").unwrap();
+        let mut state = WorldState::new();
+        for uri in [&first, &last] {
+            state.open_document(uri.clone(), source, Some(1));
+            let generation = state.documents.get_record(uri).unwrap().generation();
+            state
+                .replace_open_document_metadata_if_current(
+                    uri,
+                    generation,
+                    Arc::new(crate::cross_file::extract_metadata(source)),
+                )
+                .unwrap();
+        }
+        let mut package_library = crate::package_library::PackageLibrary::new_empty();
+        package_library.set_lib_paths(vec![library.path().to_path_buf()]);
+        state.install_package_library(Arc::new(package_library), true);
+
+        let captured = state.capture_system_file_analysis(None);
+        let draft = prepare_system_file_analysis(captured);
+        let mut prepared = state.finish_system_file_analysis(draft).unwrap();
+        prepared.corrupt_last_open_token_for_test();
+        let index_version = state.workspace_index.version();
+        let graph_revision = state.cross_file_graph.edge_revision();
+        let graph_authority = state.workspace_graph_authority_generation;
+        let open_context = state.open_context_authority_generation;
+        let first_generation = state.documents.get_record(&first).unwrap().generation();
+        let last_generation = state.documents.get_record(&last).unwrap().generation();
+        let reservations = state.analysis_revalidation_reservation_count;
+
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::SystemFile(Box::new(prepared))),
+            Err(AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(state.workspace_index.version(), index_version);
+        assert_eq!(state.cross_file_graph.edge_revision(), graph_revision);
+        assert_eq!(state.workspace_graph_authority_generation, graph_authority);
+        assert_eq!(state.open_context_authority_generation, open_context);
+        assert_eq!(
+            state.documents.get_record(&first).unwrap().generation(),
+            first_generation
+        );
+        assert_eq!(
+            state.documents.get_record(&last).unwrap().generation(),
+            last_generation
+        );
+        assert_eq!(state.analysis_revalidation_reservation_count, reservations);
     }
 
     #[test]
@@ -8287,15 +9536,15 @@ mod tests {
         );
     }
 
-    /// `resolve_system_file_in_workspace` is what every library-swap site
-    /// (startup post-ready retry, `raven.refreshPackages`,
-    /// `reconcile_after_config_recompute`) calls to re-resolve deferred
+    /// The detached system-file transaction is what every library-swap site
+    /// (startup post-ready retry, `raven.refreshPackages`, and config
+    /// reconciliation) uses to re-resolve deferred
     /// `system.file()` sources once `lib_paths` become available. Exercise the
     /// full wiring at the `WorldState` level: a workspace-index entry whose
     /// source was deferred (indexed while `lib_paths` was empty) must resolve
     /// in place after the library swap, not just in a detached metadata value.
-    #[test]
-    fn resolve_system_file_in_workspace_re_resolves_after_library_swap() {
+    #[tokio::test]
+    async fn resolve_system_file_in_workspace_re_resolves_after_library_swap() {
         use crate::cross_file::file_cache::FileSnapshot;
         use crate::cross_file::source_detect::SystemFileCall;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
@@ -8354,7 +9603,9 @@ mod tests {
         );
 
         // Before the swap: lib_paths is empty, so the source stays deferred.
-        state.resolve_system_file_in_workspace();
+        crate::backend::run_system_file_convergence_for_test(&mut state, None)
+            .await
+            .expect("deferred convergence should commit");
         let deferred = state
             .workspace_index
             .get_artifact_entry(&uri)
@@ -8370,7 +9621,9 @@ mod tests {
         let mut swapped = crate::package_library::PackageLibrary::new_empty();
         swapped.set_lib_paths(vec![libdir.path().to_path_buf()]);
         state.package_library = Arc::new(swapped);
-        state.resolve_system_file_in_workspace();
+        crate::backend::run_system_file_convergence_for_test(&mut state, None)
+            .await
+            .expect("post-library convergence should commit");
 
         let resolved = state
             .workspace_index
@@ -8534,7 +9787,9 @@ mod tests {
             "canonical child URI must resolve to the symlink-open buffer"
         );
 
-        state.resolve_system_file_in_workspace();
+        crate::backend::run_system_file_convergence_for_test(&mut state, None)
+            .await
+            .expect("deferred convergence should commit");
         assert!(
             state
                 .cross_file_graph
@@ -8546,7 +9801,9 @@ mod tests {
         let mut swapped = crate::package_library::PackageLibrary::new_empty();
         swapped.set_lib_paths(vec![libdir.path().to_path_buf()]);
         state.package_library = Arc::new(swapped);
-        let changed = state.resolve_system_file_in_workspace();
+        let changed = crate::backend::run_system_file_convergence_for_test(&mut state, None)
+            .await
+            .expect("post-library convergence should commit");
 
         assert!(
             changed.iter().any(|uri| uri == &link_uri),

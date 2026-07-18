@@ -1048,8 +1048,8 @@ pub fn resolve_system_file(
 /// dropped: resolution state is recomputed from scratch on every call so that
 /// package lifecycle events (install/removal in a watched libpath, a workspace
 /// `Package:` rename) can re-resolve without re-extracting metadata from
-/// source text. `WorldState::resolve_system_file_in_workspace` revisits every
-/// entry where `system_file.is_some()`. The function is idempotent: calling it
+/// source text. The detached system-file convergence transaction revisits
+/// every entry where `system_file.is_some()`. The function is idempotent: calling it
 /// again with the same inputs yields the same metadata.
 ///
 /// Resolution states after a call:
@@ -2263,13 +2263,13 @@ mod tests {
 
     // ---- P7: system.file edge re-resolution after a library swap ----
     //
-    // Simulates the scenario in `resolve_system_file_in_workspace`: a
+    // Simulates the scenario in system-file convergence: a
     // `ForwardSource` that was previously left with `system_file.is_some()`
     // (lib_paths was empty at index time) is re-resolved once a new
     // `package_library` with non-empty lib_paths is available.
     //
     // The test directly exercises `resolve_system_file_sources` — the same
-    // function called by `resolve_system_file_in_workspace` — with the "before
+    // function called by system-file convergence — with the "before
     // swap" (empty lib_paths, entry stays) and "after swap" (lib_paths now
     // point at the installed package, entry resolves) states.
 

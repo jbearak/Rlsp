@@ -257,7 +257,7 @@ pub(crate) struct WorkspaceIndexSnapshot {
     pub(crate) artifact_capacity_limit: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct IndexState {
     version: u64,
     next_claim_generation: u64,
@@ -265,6 +265,23 @@ struct IndexState {
     full: LruCache<Url, IndexEntry>,
     pinned: HashSet<Url>,
     artifact_user_cap: usize,
+}
+
+/// Targeted Complete-record changes prepared against one exact index version.
+pub(crate) struct WorkspaceIndexTargetedChanges {
+    pub(crate) metadata: Vec<(Url, Arc<CrossFileMetadata>)>,
+    pub(crate) installs: Vec<(Url, IndexEntry, ClosedProvenance)>,
+    pub(crate) removals: Vec<Url>,
+    pub(crate) pins: HashSet<Url>,
+}
+
+/// Fully prepared targeted index state.
+///
+/// Unaffected cache entries retain their record generations and relative LRU
+/// order. Commit is a single exact-version swap under the internal lock.
+pub(crate) struct PreparedWorkspaceIndexTargetedBatch {
+    expected_version: u64,
+    state: IndexState,
 }
 
 fn push_with_pins<V>(
@@ -1193,6 +1210,140 @@ impl WorkspaceIndex {
             full_records,
             pins,
         )
+    }
+
+    /// Prepare a targeted Complete-record transaction without mutating the
+    /// live index.
+    ///
+    /// The internal state is cloned coherently, so unaffected generations,
+    /// Pending leases, residency, capacity, and relative LRU order survive.
+    /// Selected metadata replacements preserve provenance and full/artifact
+    /// residency; installs and removals apply the ordinary pin-aware policy.
+    pub(crate) fn prepare_targeted_batch_if_current(
+        &self,
+        expected_version: u64,
+        mut changes: WorkspaceIndexTargetedChanges,
+    ) -> Result<Option<PreparedWorkspaceIndexTargetedBatch>, EnrichmentCommitError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| EnrichmentCommitError::Unavailable)?;
+        if state.version != expected_version {
+            return Ok(None);
+        }
+        let mut candidate = state.clone();
+        drop(state);
+
+        changes
+            .metadata
+            .sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        changes
+            .installs
+            .sort_unstable_by(|(left, ..), (right, ..)| left.as_str().cmp(right.as_str()));
+        changes
+            .removals
+            .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        if changes
+            .metadata
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0)
+            || changes
+                .installs
+                .windows(2)
+                .any(|pair| pair[0].0 == pair[1].0)
+            || changes.removals.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Ok(None);
+        }
+        let metadata_uris: HashSet<_> = changes.metadata.iter().map(|(uri, _)| uri).collect();
+        let install_uris: HashSet<_> = changes.installs.iter().map(|(uri, ..)| uri).collect();
+        if changes
+            .removals
+            .iter()
+            .any(|uri| metadata_uris.contains(uri) || install_uris.contains(uri))
+            || metadata_uris.iter().any(|uri| install_uris.contains(*uri))
+        {
+            return Ok(None);
+        }
+        if changes.metadata.iter().any(|(uri, _)| {
+            !matches!(
+                candidate.artifacts.peek(uri),
+                Some(ArtifactSlot::Complete(_))
+            )
+        }) {
+            return Ok(None);
+        }
+
+        let next_version = candidate.version.wrapping_add(1);
+        for uri in changes.removals {
+            candidate.artifacts.pop(&uri);
+            candidate.full.pop(&uri);
+        }
+        candidate.pinned = changes.pins;
+        for (uri, metadata) in changes.metadata {
+            let Some(ArtifactSlot::Complete(existing)) = candidate.artifacts.peek(&uri) else {
+                return Ok(None);
+            };
+            let mut artifact = existing.clone();
+            artifact.metadata = metadata.clone();
+            artifact.indexed_at_version = next_version;
+            artifact.record_generation = Self::mint_record_generation();
+            candidate
+                .artifacts
+                .push(uri.clone(), ArtifactSlot::Complete(artifact));
+            if let Some(mut full) = candidate.full.pop(&uri) {
+                full.metadata = metadata;
+                full.indexed_at_version = next_version;
+                candidate.full.push(uri, full);
+            }
+        }
+        for (uri, mut entry, provenance) in changes.installs {
+            entry.indexed_at_version = next_version;
+            let mut artifact = ArtifactEntry::from(&entry);
+            artifact.indexed_at_version = next_version;
+            artifact.provenance = provenance;
+            Self::install_complete_locked(
+                &mut candidate,
+                uri,
+                artifact,
+                Some(entry),
+                self.config.max_file_size_bytes,
+            );
+        }
+        let user_cap_nz = Self::effective_cap_for(&self.config);
+        let user_cap = user_cap_nz.get();
+        if candidate.full.cap().get() > user_cap && candidate.full.len() <= user_cap {
+            candidate.full.resize(user_cap_nz);
+        }
+        let artifact_user_cap = candidate.artifact_user_cap;
+        if let Some(cap) = NonZeroUsize::new(artifact_user_cap)
+            && candidate.artifacts.cap().get() > artifact_user_cap
+            && candidate.artifacts.len() <= artifact_user_cap
+        {
+            candidate.artifacts.resize(cap);
+        }
+        candidate.version = next_version;
+        Ok(Some(PreparedWorkspaceIndexTargetedBatch {
+            expected_version,
+            state: candidate,
+        }))
+    }
+
+    /// Commit a previously prepared targeted batch if its source version is
+    /// still current.
+    pub(crate) fn commit_prepared_targeted_batch(
+        &self,
+        prepared: PreparedWorkspaceIndexTargetedBatch,
+    ) -> Result<bool, EnrichmentCommitError> {
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| EnrichmentCommitError::Unavailable)?;
+        if state.version != prepared.expected_version {
+            return Ok(false);
+        }
+        *state = prepared.state;
+        Ok(true)
     }
 
     fn replace_all_complete_if_version(

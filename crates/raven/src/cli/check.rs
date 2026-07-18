@@ -305,7 +305,7 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     // Resolve system.file() sources now that both package state AND library
     // paths are available (maybe_init_r populates lib_paths from R discovery
     // and additionalLibraryPaths).
-    state.resolve_system_file_in_workspace();
+    state.resolve_system_file_in_workspace_cli_compat(None);
 
     // R fallback for sysdata: when the AST scan found nothing AND
     // R/sysdata.rda exists, load it via the R subprocess (see
@@ -2791,7 +2791,7 @@ infixContinuationStyle = "indented"
             state.cross_file_config.packages_missing_package_severity = None;
         }
         maybe_init_r(&mut state, &root).await;
-        state.resolve_system_file_in_workspace();
+        state.resolve_system_file_in_workspace_cli_compat(None);
         maybe_load_sysdata_fallback(&mut state).await;
         let mut operator_error = false;
         let targets = collect_report_targets_with_exclusions(

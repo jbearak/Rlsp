@@ -194,15 +194,24 @@ full scan-and-derive attempt under the same intent; a newer arrival supersedes
 the old intent immediately, and exhaustion never falls back to a partial or
 no-scan commit.
 
-Diagnostics are deliberately not marked inside that transaction. The commit
-returns a one-shot transfer containing exact post-commit open-record tokens;
-startup or configuration orchestration claims it only after package/config
-convergence. Claiming validates the exact transfer and latest committed scan
-intent plus each current diagnostic lifecycle, drops
-closed/reopened/otherwise replaced records, and atomically creates the bounded
-reservations and force-republish markers once. Ordinary closed/open mutations
-may advance scan-input authority while this transfer waits; only a newer
-top-level scan intent tombstones it.
+Diagnostics are deliberately not marked inside analysis transactions. Workspace
+scan and system-file commits return exact one-shot transfer handles containing
+post-commit open-record tokens. Startup, configuration, package, libpath, and
+manifest orchestration finalize all handles at one shared boundary after their
+collect-only convergence work. Finalization prevalidates every handle before
+consuming any, unions and deduplicates candidates, applies the trigger cap, and
+atomically creates reservations plus force-republish markers exactly once.
+Overlapping handles therefore cannot double-mark a URI. A successful newer
+commit inherits an unclaimed predecessor before recording a typed successor;
+the predecessor is rejected with proof naming that successor, while failed or
+pending attempts leave the predecessor claimable. Fallback uses the same
+finalization identity and is idempotent.
+
+Workspace-scan finalization additionally validates the latest committed scan
+intent. Each candidate validates its current diagnostic lifecycle and exact
+open-record token, dropping closed, reopened, or otherwise replaced records.
+Ordinary closed/open mutations may advance scan-input authority while a
+transfer waits; only a successful newer transfer supersedes it.
 Keep new scan inputs in the shared two-phase basis so startup, exclusion
 reloads, and package-mode rebuilds cannot drift or introduce blocking
 filesystem work under the state lock.
@@ -1053,11 +1062,11 @@ change list through both strict folds.
 
 `system.file(package = "pkg", "path/to/file.R")` calls are used by packages to reference installed data files. Raven resolves these to concrete paths and adds them as forward-source edges so cross-file analysis works across package boundaries.
 
-**Lifecycle:** Resolution is deferred until `lib_paths` are ready — the workspace scan may run before the package library is initialized. `resolve_system_file_in_workspace()` in `state.rs` is called at the end of the workspace scan, after `PackageLibrary` initialization completes, on every `LibpathEvent::Changed` (package install/removal under a watched libpath), and after a DESCRIPTION/NAMESPACE manifest change (`backend.rs`). All calls are idempotent.
+**Lifecycle:** Resolution is deferred until `lib_paths` are ready — the workspace scan may run before the package library is initialized. Startup, library replacement, every `LibpathEvent::Changed` (package install/removal under a watched libpath), and DESCRIPTION/NAMESPACE manifest changes run one detached convergence transaction (`backend.rs`). Each exact routing owner gets at most two complete attempts; a newer routing/library owner supersedes old work immediately.
 
-**Retention:** `resolve_system_file_sources()` never clears `ForwardSource.system_file` and never drops unresolved entries — resolution state (`path`, `resolved_uri`) is recomputed from scratch on every pass. This is what makes the lifecycle events above recoverable without re-extracting metadata: an edge to a not-yet-installed package forms once the package appears, a stale edge to a removed package is cleared, and a workspace `Package:` rename re-targets self-package (branch 1) references. An unresolved entry is inert (empty `path`, no `resolved_uri`): the dependency graph and scope resolution produce no edge for it and the missing-file collectors skip it (`ForwardSource::exempt_from_missing_file_diagnostics` is the single predicate). `resolve_system_file_in_workspace()` covers both metadata stores — the workspace index (closed files) and the document store (open buffers, whose metadata is authoritative and read in preference to the index) — and returns the URIs whose resolution actually changed; `system_file_republish_set()` expands them with open transitive dependents (a parent's scope traverses child edges, so a child's new edge changes the parent's diagnostics). The libpath-event consumer uses the package-filtered variant (`resolve_system_file_in_workspace_for_packages`) behind a cheap `any_entry` pre-check, so workspaces without matching system.file sources never take the write lock and unrelated resolved entries are never re-probed (see `crates/raven/tests/system_file_source.rs` `lifecycle` tests).
+**Retention:** `resolve_system_file_sources()` never clears `ForwardSource.system_file` and never drops unresolved entries — resolution state (`path`, `resolved_uri`) is recomputed from scratch on every pass. This is what makes the lifecycle events above recoverable without re-extracting metadata: an edge to a not-yet-installed package forms once the package appears, a stale edge to a removed package is cleared, and a workspace `Package:` rename re-targets self-package (branch 1) references. An unresolved entry is inert (empty `path`, no `resolved_uri`): the dependency graph and scope resolution produce no edge for it and the missing-file collectors skip it (`ForwardSource::exempt_from_missing_file_diagnostics` is the single predicate). Convergence covers both metadata stores — the workspace index (closed files) and the authoritative document store (open buffers) — and commits metadata, external installs/removals, graph edges, pins, and open metadata as one validated unit. The libpath consumer supplies a package filter, so unrelated sources are neither resolved nor disk-probed.
 
-**Locking discipline:** Callers must not hold the `WorldState` read lock across resolution. `WorldState::snapshot_system_file_inputs()` captures workspace name, workspace root, and `lib_paths` under the lock; the caller then drops the guard before calling `cross_file::resolve_system_file_sources()`. See `crates/raven/src/state.rs` and `backend.rs` for the two call sites.
+**Ownership and locking:** Capture clones the exact routing/library/package, index, graph, configuration, and open-record authorities under a short read lock. Resolution, external reads/parsing, and graph derivation run on owned data in a blocking worker with no `WorldState` guard. Every external candidate is opened and read once; its valid/missing/invalid identity and any parsed artifacts come from those same bytes. Immediately before the central CAS, Raven rereads and compares every identity, then validates all central authorities and final open targets before mutating any tier. Raw file-cache contents are inputs only, never freshness authority. `raven check` retains one explicitly named CLI compatibility writer until CLI index installation is migrated as a separate ownership family; LSP callers and lifecycle tests do not use it.
 
 **Re-resolution:** If a `system.file()` source edge resolves to a path that was previously reported as an error (`unresolved-source-path`), the diagnostic is retracted once resolution succeeds.
 
