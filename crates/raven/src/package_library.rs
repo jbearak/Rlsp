@@ -113,10 +113,11 @@ pub(crate) fn load_all_owner_display(contrib_package_name: Option<&str>) -> Stri
     }
 }
 
-/// Workspace-local internal symbol set exposed by a `load_all()` virtual attached
-/// package. Built from the active `PackageScopeContribution`; refreshed by the single
-/// contribution writer (`apply_package_event`). Holds names only — go-to-definition
-/// derives locations from the workspace index, never from here.
+/// Workspace-local internal symbol set exposed by a `load_all()` virtual
+/// attached package. Built from the active `PackageScopeContribution`;
+/// refreshed by the shared derived-package installer. Holds names only —
+/// go-to-definition derives locations from the workspace index, never from
+/// here.
 #[derive(Debug, Clone, Default)]
 pub struct LocalDevPackage {
     /// Union of r_internal ∪ sysdata ∪ onload ∪ imported symbol names.
@@ -444,7 +445,7 @@ pub struct PackageLibrary {
     providers: Vec<Box<dyn PackageMetadataProvider>>,
     /// Local-dev overlay: sentinel -> workspace-local internal symbols.
     /// Consulted by the three resolution chokepoints before the installed caches.
-    /// Refreshed by `apply_package_event` (the single contribution writer).
+    /// Refreshed by the shared derived-package installer.
     local_dev_overlay: ArcSwap<Option<Arc<LocalDevPackage>>>,
 }
 
@@ -542,7 +543,11 @@ impl PackageLibrary {
         !self.providers.is_empty()
     }
 
-    /// Replace the local-dev overlay (single writer: `apply_package_event`).
+    /// Replace the local-dev overlay.
+    ///
+    /// Package-state contribution changes call this only from the shared
+    /// derived-package installer. Package-library replacement paths separately
+    /// reapply the current contribution to the new library object.
     pub fn set_local_dev_overlay(&self, overlay: Option<Arc<LocalDevPackage>>) {
         self.local_dev_overlay.store(Arc::new(overlay));
     }

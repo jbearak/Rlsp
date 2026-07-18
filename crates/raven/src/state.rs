@@ -851,6 +851,8 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) did_open_reservation_snapshot_for_test: Vec<(Url, u32)>,
     #[cfg(test)]
+    pub(crate) did_change_reservation_snapshot_for_test: Vec<(Url, u64)>,
+    #[cfg(test)]
     pub(crate) did_open_commit_snapshot_for_test: Option<DidOpenCommitSnapshot>,
     /// Deterministic barrier after detached derivation and before the
     /// commit-time alias-topology recheck.
@@ -1460,7 +1462,7 @@ impl AnalysisContextAuthority {
 
 #[derive(Clone, PartialEq, Eq)]
 struct SystemFileRoutingStamp {
-    owner_generation: u64,
+    owner: SystemFileRoutingOwnerIdentity,
     package_state_record_generation: u64,
     package_library_install_id: u64,
     package_library_content_generation: u64,
@@ -1625,7 +1627,7 @@ impl PreparedOpenInstallAnalysis {
         metadata: Arc<crate::cross_file::CrossFileMetadata>,
         artifacts: Arc<crate::cross_file::scope::ScopeArtifacts>,
         aliases: Vec<Url>,
-        package: Option<PreparedOpenPackageInstall>,
+        package: Option<PreparedPackageProjection>,
         plan: PreparedOpenCommitPlan,
     ) -> Self {
         Self {
@@ -1652,7 +1654,7 @@ impl PreparedOpenCloseAnalysis {
         intent: OpenCloseIntentToken,
         uri: Url,
         expected_aliases: Vec<Url>,
-        package: Option<PreparedOpenPackageInstall>,
+        package: Option<PreparedPackageProjection>,
         plan: PreparedOpenCommitPlan,
         resync: Vec<OpenCloseResyncTicket>,
         disk_observations: Vec<OpenCloseDiskObservation>,
@@ -1937,7 +1939,7 @@ pub(crate) struct PreparedOpenInstallAnalysis {
     metadata: Arc<crate::cross_file::CrossFileMetadata>,
     artifacts: Arc<crate::cross_file::scope::ScopeArtifacts>,
     aliases: Vec<Url>,
-    package: Option<PreparedOpenPackageInstall>,
+    package: Option<PreparedPackageProjection>,
     plan: PreparedOpenCommitPlan,
 }
 
@@ -1946,17 +1948,42 @@ pub(crate) struct PreparedOpenCloseAnalysis {
     intent: OpenCloseIntentToken,
     uri: Url,
     expected_aliases: Vec<Url>,
-    package: Option<PreparedOpenPackageInstall>,
+    package: Option<PreparedPackageProjection>,
     plan: PreparedOpenCommitPlan,
     resync: Vec<OpenCloseResyncTicket>,
     disk_observations: Vec<OpenCloseDiskObservation>,
     watched_roots: Vec<(Url, Option<u64>, ChunkKind)>,
 }
 
-/// Whole package-mode projection reduced off-lock for an OpenInstall.
-pub(crate) struct PreparedOpenPackageInstall {
+/// Whole package-mode projection reduced off-lock and installed atomically
+/// with its owning analysis transaction.
+pub(crate) struct PreparedPackageProjection {
     pub(crate) inputs: crate::package_state::PackageInputs,
     pub(crate) state: crate::package_state::PackageState,
+    routing_owner: PackageRoutingOwnerPolicy,
+}
+
+impl PreparedPackageProjection {
+    pub(crate) fn new(
+        inputs: crate::package_state::PackageInputs,
+        state: crate::package_state::PackageState,
+    ) -> Self {
+        Self {
+            inputs,
+            state,
+            routing_owner: PackageRoutingOwnerPolicy::IfChanged,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackageRoutingOwnerPolicy {
+    /// Mint a new routing owner only when the effective package name or root
+    /// changes.
+    IfChanged,
+    /// A full seed/reseed owns a fresh routing lifecycle even when its
+    /// effective name and root compare equal.
+    FreshSeedOwner,
 }
 
 /// Immutable fresh-disk convergence work released only after the close
@@ -2117,6 +2144,13 @@ pub(crate) struct PreparedOpenCommitPlan {
     pub(crate) close_disk_installs: Vec<PreparedOpenCloseDiskInstall>,
 }
 
+#[derive(Default)]
+struct OpenCommitPlanEffects {
+    revalidations: Vec<AnalysisRevalidationTicket>,
+    transfer_candidates: Vec<AnalysisTransferCandidate>,
+    package_routing_owner: Option<SystemFileRoutingOwnerIdentity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenAnalysisCommitOutcome {
     pub(crate) generation: AnalysisGeneration,
@@ -2141,7 +2175,27 @@ pub(crate) struct AnalysisRevalidationTicket {
     pub(crate) debounce_ms: u64,
 }
 
-pub(crate) type AnalysisTransferCandidate = (Url, OpenRecordToken);
+/// Exact unmarked diagnostic work carried across a multi-phase analysis
+/// transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnalysisTransferCandidate {
+    pub(crate) uri: Url,
+    record: OpenRecordToken,
+    trigger: DiagnosticsTrigger,
+    reservation: AnalysisTransferReservationPolicy,
+}
+
+/// Reservation semantics captured by the outer transaction and retained
+/// through transfer union, capping, and delayed finalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalysisTransferReservationPolicy {
+    /// Edited/open subject: always wins the cap, keeps its exact debounce, and
+    /// relies on its document version instead of a force-republish marker.
+    Subject { debounce_ms: u64 },
+    /// Dependent/system/scan candidate: activity-prioritized, force-marked,
+    /// and scheduled with the current dependent debounce.
+    Dependent,
+}
 
 /// One-shot identity for unmarked workspace-scan fanout transferred to
 /// post-seed/config orchestration.
@@ -2168,10 +2222,14 @@ pub(crate) struct PackageSeedInstalledIdentity {
     pub(crate) seed_install_id: u64,
     pub(crate) package_input_generation: u64,
     pub(crate) package_state_record_generation: u64,
-    pub(crate) system_file_routing_owner_generation: u64,
+    pub(crate) system_file_routing_owner: SystemFileRoutingOwnerIdentity,
     pub(crate) package_library_install_id: u64,
     pub(crate) package_library_content_generation: u64,
 }
+
+/// Exact never-reused owner of one `system.file()` routing lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SystemFileRoutingOwnerIdentity(u64);
 
 impl WorldState {
     /// Whether the complete package seed/library/routing record installed by a
@@ -2182,8 +2240,7 @@ impl WorldState {
     ) -> bool {
         self.package_input_generation() == identity.package_input_generation
             && self.package_state_record_generation == identity.package_state_record_generation
-            && self.system_file_routing_owner_generation
-                == identity.system_file_routing_owner_generation
+            && self.system_file_routing_owner_identity() == identity.system_file_routing_owner
             && self.package_library_install_id == identity.package_library_install_id
             && self.package_library_content_generation
                 == identity.package_library_content_generation
@@ -2220,7 +2277,7 @@ impl WorldState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SystemFileTransferIdentity {
-    routing_owner_generation: u64,
+    routing_owner: SystemFileRoutingOwnerIdentity,
     commit_generation: u64,
 }
 
@@ -2237,19 +2294,25 @@ pub(crate) struct AnalysisTransferHandle {
 
 #[cfg(test)]
 impl AnalysisTransferHandle {
-    pub(crate) fn system_file_routing_owner_generation_for_test(self) -> Option<u64> {
+    pub(crate) fn system_file_routing_owner_for_test(
+        self,
+    ) -> Option<SystemFileRoutingOwnerIdentity> {
         match self.identity {
             AnalysisTransferIdentity::WorkspaceScan(_) => None,
-            AnalysisTransferIdentity::SystemFile(identity) => {
-                Some(identity.routing_owner_generation)
-            }
+            AnalysisTransferIdentity::SystemFile(identity) => Some(identity.routing_owner),
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackageRoutingCommitEffects {
+    pub(crate) owner: SystemFileRoutingOwnerIdentity,
+    pub(crate) candidates: Vec<AnalysisTransferCandidate>,
+}
+
 #[derive(Clone)]
 struct AnalysisTransferState {
-    candidates: Vec<(Url, OpenRecordToken)>,
+    candidates: Vec<AnalysisTransferCandidate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2321,6 +2384,9 @@ pub(crate) struct AnalysisCommitEffects {
     pub(crate) close: Option<OpenCloseCommitOutcome>,
     pub(crate) workspace_scan: Option<WorkspaceScanTransferredEffects>,
     pub(crate) system_file: Option<SystemFileTransferredEffects>,
+    /// Unmarked outer open-transaction fanout held until exact-owner
+    /// `system.file()` convergence contributes its transfer candidates.
+    pub(crate) package_routing: Option<PackageRoutingCommitEffects>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2446,8 +2512,18 @@ impl WorldState {
             Self::mint_system_file_routing_owner_generation();
     }
 
+    #[cfg(test)]
     pub(crate) fn system_file_routing_owner_generation(&self) -> u64 {
         self.system_file_routing_owner_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn package_state_record_generation_for_test(&self) -> u64 {
+        self.package_state_record_generation
+    }
+
+    pub(crate) fn system_file_routing_owner_identity(&self) -> SystemFileRoutingOwnerIdentity {
+        SystemFileRoutingOwnerIdentity(self.system_file_routing_owner_generation)
     }
 
     pub(crate) fn record_package_seed_installed(&mut self) -> PackageSeedInstalledIdentity {
@@ -2460,7 +2536,7 @@ impl WorldState {
             seed_install_id: self.package_seed_install_id,
             package_input_generation: self.package_input_generation(),
             package_state_record_generation: self.package_state_record_generation,
-            system_file_routing_owner_generation: self.system_file_routing_owner_generation,
+            system_file_routing_owner: self.system_file_routing_owner_identity(),
             package_library_install_id: self.package_library_install_id,
             package_library_content_generation: self.package_library_content_generation,
         }
@@ -2469,7 +2545,7 @@ impl WorldState {
     fn system_file_routing_stamp(&self) -> SystemFileRoutingStamp {
         let (workspace_name, workspace_root, library_paths) = self.snapshot_system_file_inputs();
         SystemFileRoutingStamp {
-            owner_generation: self.system_file_routing_owner_generation,
+            owner: self.system_file_routing_owner_identity(),
             package_state_record_generation: self.package_state_record_generation,
             package_library_install_id: self.package_library_install_id,
             package_library_content_generation: self.package_library_content_generation,
@@ -2521,7 +2597,7 @@ impl WorldState {
         &mut self,
         identity: AnalysisTransferIdentity,
         previous: Option<AnalysisTransferIdentity>,
-        mut candidates: Vec<(Url, OpenRecordToken)>,
+        mut candidates: Vec<AnalysisTransferCandidate>,
     ) -> AnalysisTransferHandle {
         if let Some(previous) = previous
             && let Some(inherited) = self.analysis_transfers.remove(&previous)
@@ -2529,7 +2605,7 @@ impl WorldState {
             candidates.extend(inherited.candidates);
             self.analysis_transfer_successors.insert(previous, identity);
         }
-        candidates.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        candidates.sort_unstable_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
         candidates.dedup();
         self.analysis_transfers
             .insert(identity, AnalysisTransferState { candidates });
@@ -2551,7 +2627,7 @@ impl WorldState {
         &mut self,
         finalization: AnalysisTransferFinalizationId,
         handles: &[AnalysisTransferHandle],
-        additional_candidates: Vec<(Url, OpenRecordToken)>,
+        additional_candidates: Vec<AnalysisTransferCandidate>,
     ) -> Result<AnalysisTransferFinalization, AnalysisTransferRejection> {
         self.finalize_analysis_transfers_excluding(
             finalization,
@@ -2576,7 +2652,7 @@ impl WorldState {
         &mut self,
         finalization: AnalysisTransferFinalizationId,
         handles: &[AnalysisTransferHandle],
-        mut additional_candidates: Vec<(Url, OpenRecordToken)>,
+        mut additional_candidates: Vec<AnalysisTransferCandidate>,
         transfer_excluded: &HashSet<Url>,
         all_excluded: &HashSet<Url>,
     ) -> Result<AnalysisTransferFinalization, AnalysisTransferRejection> {
@@ -2617,12 +2693,14 @@ impl WorldState {
             transfer_candidates.extend(state.candidates);
         }
         self.analysis_transfer_finalizations.insert(finalization);
-        transfer_candidates
-            .retain(|(uri, _)| !transfer_excluded.contains(uri) && !all_excluded.contains(uri));
-        additional_candidates.retain(|(uri, _)| !all_excluded.contains(uri));
+        transfer_candidates.retain(|candidate| {
+            !transfer_excluded.contains(&candidate.uri) && !all_excluded.contains(&candidate.uri)
+        });
+        additional_candidates.retain(|candidate| !all_excluded.contains(&candidate.uri));
         additional_candidates.extend(transfer_candidates);
-        let uris = self.current_transfer_candidate_uris(additional_candidates);
-        let tickets = self.reserve_analysis_revalidations(uris).revalidations;
+        let tickets = self
+            .reserve_analysis_transfer_candidates(additional_candidates)
+            .revalidations;
         let owned_candidates: Vec<_> = tickets
             .iter()
             .map(|ticket| (ticket.uri.clone(), ticket.trigger))
@@ -2655,38 +2733,50 @@ impl WorldState {
     pub(crate) fn finalize_analysis_transfer_fallback(
         &mut self,
         finalization: AnalysisTransferFinalizationId,
-        candidates: Vec<(Url, OpenRecordToken)>,
+        candidates: Vec<AnalysisTransferCandidate>,
     ) -> AnalysisTransferFinalization {
         if !self.analysis_transfer_finalizations.insert(finalization) {
             return AnalysisTransferFinalization::AlreadyFinalized;
         }
-        let uris = self.current_transfer_candidate_uris(candidates);
         AnalysisTransferFinalization::Committed(
-            self.reserve_analysis_revalidations(uris).revalidations,
+            self.reserve_analysis_transfer_candidates(candidates)
+                .revalidations,
         )
     }
 
-    fn current_transfer_candidate_uris(&self, candidates: Vec<(Url, OpenRecordToken)>) -> Vec<Url> {
+    fn current_transfer_candidates(
+        &self,
+        candidates: Vec<AnalysisTransferCandidate>,
+    ) -> Vec<AnalysisTransferCandidate> {
         candidates
             .into_iter()
-            .filter(|(uri, token)| {
-                self.documents.record_token_is_current(token)
-                    && self.diagnostics_publish_allowed(uri)
-                    && self.diagnostics_gate.current_epoch(uri).is_some()
+            .filter(|candidate| {
+                self.documents.record_token_is_current(&candidate.record)
+                    && !candidate.trigger.is_stale(self, &candidate.uri)
+                    && self.diagnostics_publish_allowed(&candidate.uri)
+                    && self
+                        .diagnostics_gate
+                        .current_epoch(&candidate.uri)
+                        .is_some()
             })
-            .map(|(uri, _)| uri)
             .collect()
     }
 
     pub(crate) fn capture_analysis_transfer_candidates(
         &self,
         uris: impl IntoIterator<Item = Url>,
-    ) -> Vec<(Url, OpenRecordToken)> {
+    ) -> Vec<AnalysisTransferCandidate> {
         uris.into_iter()
             .filter(|uri| self.documents.contains_key(uri))
             .map(|uri| {
-                let token = self.documents.record_token(&uri);
-                (uri, token)
+                let record = self.documents.record_token(&uri);
+                let trigger = DiagnosticsTrigger::capture(self, &uri);
+                AnalysisTransferCandidate {
+                    uri,
+                    record,
+                    trigger,
+                    reservation: AnalysisTransferReservationPolicy::Dependent,
+                }
             })
             .collect()
     }
@@ -2898,29 +2988,84 @@ impl WorldState {
     /// recorded that mutation through `record_package_input_mutation`.
     /// Recomputes `package_state` as a pure function of inputs.
     pub fn apply_package_event(&mut self, delta: &crate::package_state::PackageInputDelta) {
-        let old_routing = self
-            .package_state
-            .workspace()
-            .map(|workspace| (workspace.name.as_str().to_owned(), workspace.root.clone()));
+        let _ = self
+            .apply_package_event_with_routing_policy(delta, PackageRoutingOwnerPolicy::IfChanged);
+    }
+
+    /// Compatibility tail for the current seed writer.
+    ///
+    /// The prepared seed migration will replace the preceding in-place raw
+    /// writes with a complete [`PreparedPackageProjection`]. Until then this
+    /// keeps the seed-only fresh-routing policy inside the shared derived
+    /// installer instead of minting ownership as a detached side effect.
+    pub(crate) fn apply_package_seed_event(
+        &mut self,
+        delta: &crate::package_state::PackageInputDelta,
+    ) {
+        let _ = self.apply_package_event_with_routing_policy(
+            delta,
+            PackageRoutingOwnerPolicy::FreshSeedOwner,
+        );
+    }
+
+    fn apply_package_event_with_routing_policy(
+        &mut self,
+        delta: &crate::package_state::PackageInputDelta,
+        routing_owner: PackageRoutingOwnerPolicy,
+    ) -> Option<SystemFileRoutingOwnerIdentity> {
         let new_package_state = crate::package_state::derive_package_state(
             &self.package_state,
             &self.package_inputs,
             delta,
         );
+        self.install_derived_package_state(new_package_state, routing_owner)
+    }
+
+    /// Install one complete raw+derived package projection.
+    ///
+    /// Detached callers prepare both values from the same immutable snapshot.
+    /// Embedded open transactions call this only after their outer analysis
+    /// basis has passed preflight, so the input replacement, derived record,
+    /// routing owner, and local-dev overlay become visible as one in-memory
+    /// commit.
+    fn install_prepared_package_projection(
+        &mut self,
+        prepared: PreparedPackageProjection,
+    ) -> Option<SystemFileRoutingOwnerIdentity> {
+        self.package_inputs = prepared.inputs;
+        self.record_package_input_mutation();
+        self.install_derived_package_state(prepared.state, prepared.routing_owner)
+    }
+
+    /// Shared derived-record tail for both legacy in-place input adapters and
+    /// complete prepared package projections.
+    fn install_derived_package_state(
+        &mut self,
+        new_package_state: crate::package_state::PackageState,
+        routing_owner: PackageRoutingOwnerPolicy,
+    ) -> Option<SystemFileRoutingOwnerIdentity> {
+        let old_routing = self
+            .package_state
+            .workspace()
+            .map(|workspace| (workspace.name.as_str().to_owned(), workspace.root.clone()));
         self.package_state.set_from(new_package_state);
         self.package_state_record_generation = self.package_state_record_generation.wrapping_add(1);
         let new_routing = self
             .package_state
             .workspace()
             .map(|workspace| (workspace.name.as_str().to_owned(), workspace.root.clone()));
-        if old_routing != new_routing {
+        let routing_changed = matches!(routing_owner, PackageRoutingOwnerPolicy::FreshSeedOwner)
+            || old_routing != new_routing;
+        if routing_changed {
             self.record_system_file_routing_owner_change();
         }
 
         // Refresh the package library's local-dev overlay from the freshly-set
-        // contribution. `apply_package_event` is the single writer that recomputes
-        // the contribution, so this is the one correct refresh point.
+        // contribution. Every in-place event and prepared projection converges
+        // through this derived-record installer, so this is the one correct
+        // refresh point.
         self.refresh_local_dev_overlay();
+        routing_changed.then(|| self.system_file_routing_owner_identity())
     }
 
     /// (Re)build the package library's local-dev overlay from the current
@@ -3163,6 +3308,8 @@ impl WorldState {
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
             did_open_reservation_snapshot_for_test: Vec::new(),
+            #[cfg(test)]
+            did_change_reservation_snapshot_for_test: Vec::new(),
             #[cfg(test)]
             did_open_commit_snapshot_for_test: None,
             #[cfg(test)]
@@ -4706,6 +4853,88 @@ impl WorldState {
             close: None,
             workspace_scan: None,
             system_file: None,
+            package_routing: None,
+        }
+    }
+
+    fn reserve_analysis_transfer_candidates(
+        &mut self,
+        candidates: Vec<AnalysisTransferCandidate>,
+    ) -> AnalysisCommitEffects {
+        let candidates = self.current_transfer_candidates(candidates);
+        let mut candidates_by_uri: HashMap<Url, AnalysisTransferCandidate> =
+            HashMap::with_capacity(candidates.len());
+        for candidate in candidates {
+            match candidates_by_uri.entry(candidate.uri.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if matches!(
+                        candidate.reservation,
+                        AnalysisTransferReservationPolicy::Subject { .. }
+                    ) && matches!(
+                        entry.get().reservation,
+                        AnalysisTransferReservationPolicy::Dependent
+                    ) {
+                        entry.insert(candidate);
+                    }
+                }
+            }
+        }
+        let mut candidates: Vec<_> = candidates_by_uri.into_values().collect();
+        candidates.sort_by(|left, right| {
+            let left_priority = match left.reservation {
+                AnalysisTransferReservationPolicy::Subject { .. } => 0,
+                AnalysisTransferReservationPolicy::Dependent => self
+                    .cross_file_activity
+                    .priority_score(&left.uri)
+                    .saturating_add(1),
+            };
+            let right_priority = match right.reservation {
+                AnalysisTransferReservationPolicy::Subject { .. } => 0,
+                AnalysisTransferReservationPolicy::Dependent => self
+                    .cross_file_activity
+                    .priority_score(&right.uri)
+                    .saturating_add(1),
+            };
+            left_priority
+                .cmp(&right_priority)
+                .then_with(|| left.uri.as_str().cmp(right.uri.as_str()))
+        });
+        candidates.truncate(self.cross_file_config.max_revalidations_per_trigger);
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.analysis_revalidation_reservation_count += candidates.len();
+        }
+        self.diagnostics_gate.mark_force_republish_many(
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.reservation == AnalysisTransferReservationPolicy::Dependent
+                })
+                .map(|candidate| &candidate.uri),
+        );
+        AnalysisCommitEffects {
+            revalidations: candidates
+                .into_iter()
+                .map(|candidate| AnalysisRevalidationTicket {
+                    uri: candidate.uri,
+                    trigger: candidate.trigger,
+                    debounce_ms: match candidate.reservation {
+                        AnalysisTransferReservationPolicy::Subject { debounce_ms } => debounce_ms,
+                        AnalysisTransferReservationPolicy::Dependent => {
+                            self.cross_file_config.revalidation_debounce_ms
+                        }
+                    },
+                })
+                .collect(),
+            affected_candidates: Vec::new(),
+            open: None,
+            close: None,
+            workspace_scan: None,
+            system_file: None,
+            package_routing: None,
         }
     }
 
@@ -4840,12 +5069,13 @@ impl WorldState {
             commit_generation: Self::mint_workspace_scan_commit_generation(),
             committed_scan_generation: self.workspace_scan_generation,
         };
-        let candidates: Vec<_> = self
+        let candidate_uris: Vec<_> = self
             .documents
             .keys()
             .filter(|uri| self.diagnostics_publish_allowed(uri))
-            .map(|uri| (uri.clone(), self.documents.record_token(uri)))
+            .cloned()
             .collect();
+        let candidates = self.capture_analysis_transfer_candidates(candidate_uris);
         let identity = AnalysisTransferIdentity::WorkspaceScan(identity);
         let handle = self.install_analysis_transfer(
             identity,
@@ -4861,6 +5091,7 @@ impl WorldState {
             close: None,
             workspace_scan: Some(WorkspaceScanTransferredEffects { handle }),
             system_file: None,
+            package_routing: None,
         })
     }
 
@@ -4951,16 +5182,13 @@ impl WorldState {
 
         let changed_uris = prepared.changed_uris;
         let candidate_uris = self.system_file_republish_set(&changed_uris);
-        let candidates = candidate_uris
-            .into_iter()
-            .filter(|uri| self.diagnostics_publish_allowed(uri))
-            .map(|uri| {
-                let token = self.documents.record_token(&uri);
-                (uri, token)
-            })
-            .collect();
+        let candidates = self.capture_analysis_transfer_candidates(
+            candidate_uris
+                .into_iter()
+                .filter(|uri| self.diagnostics_publish_allowed(uri)),
+        );
         let identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
-            routing_owner_generation: prepared.basis.routing.owner_generation,
+            routing_owner: prepared.basis.routing.owner,
             commit_generation: Self::mint_system_file_commit_generation(),
         });
         let handle =
@@ -4977,6 +5205,7 @@ impl WorldState {
                 handle,
                 changed_uris,
             }),
+            package_routing: None,
         })
     }
 
@@ -5008,12 +5237,9 @@ impl WorldState {
         if let Ok(mut cache) = self.effective_lint_config_cache.lock() {
             cache.remove(prepared.uri.as_str());
         }
-        if let Some(package) = prepared.package {
-            self.package_inputs = package.inputs;
-            self.package_state.set_from(package.state);
-            self.record_package_input_mutation();
-            self.refresh_local_dev_overlay();
-        }
+        let package_routing_owner = prepared
+            .package
+            .and_then(|package| self.install_prepared_package_projection(package));
 
         for install in prepared.plan.close_disk_installs.drain(..) {
             self.workspace_index
@@ -5021,8 +5247,13 @@ impl WorldState {
             self.cross_file_file_cache
                 .insert(install.uri, install.snapshot, install.content);
         }
-        let revalidations =
-            self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan);
+        let plan_effects = self.apply_open_commit_plan(
+            &prepared.uri,
+            old_interface,
+            prepared.plan,
+            package_routing_owner.is_some(),
+        );
+        let package_routing_owner = plan_effects.package_routing_owner.or(package_routing_owner);
         // Claim disk-watcher ownership after the prepared graph/index plan:
         // Remove dispositions prune old claims and chunk overrides as part of
         // their cleanup, so claiming earlier would erase the close's own token.
@@ -5043,7 +5274,7 @@ impl WorldState {
         self.advance_workspace_graph_authority_generation();
         self.advance_open_context_authority_generation();
         Ok(AnalysisCommitEffects {
-            revalidations,
+            revalidations: plan_effects.revalidations,
             affected_candidates: Vec::new(),
             open: None,
             close: Some(OpenCloseCommitOutcome {
@@ -5051,6 +5282,10 @@ impl WorldState {
             }),
             workspace_scan: None,
             system_file: None,
+            package_routing: package_routing_owner.map(|owner| PackageRoutingCommitEffects {
+                owner,
+                candidates: plan_effects.transfer_candidates,
+            }),
         })
     }
 
@@ -5100,20 +5335,22 @@ impl WorldState {
             prepared.artifacts,
             lifecycle_epoch,
         );
-        if let Some(package) = prepared.package {
-            self.package_inputs = package.inputs;
-            self.package_state.set_from(package.state);
-            self.record_package_input_mutation();
-            self.refresh_local_dev_overlay();
-        }
+        let package_routing_owner = prepared
+            .package
+            .and_then(|package| self.install_prepared_package_projection(package));
         let packages_to_prefetch = prepared.plan.packages_to_prefetch.clone();
-        let revalidations =
-            self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan);
+        let plan_effects = self.apply_open_commit_plan(
+            &prepared.uri,
+            old_interface,
+            prepared.plan,
+            package_routing_owner.is_some(),
+        );
+        let package_routing_owner = plan_effects.package_routing_owner.or(package_routing_owner);
         self.consume_open_install_intent(&prepared.intent);
         self.advance_workspace_graph_authority_generation();
         self.advance_open_context_authority_generation();
         Ok(AnalysisCommitEffects {
-            revalidations,
+            revalidations: plan_effects.revalidations,
             affected_candidates: Vec::new(),
             open: Some(OpenAnalysisCommitOutcome {
                 generation: committed.generation(),
@@ -5123,6 +5360,10 @@ impl WorldState {
             close: None,
             workspace_scan: None,
             system_file: None,
+            package_routing: package_routing_owner.map(|owner| PackageRoutingCommitEffects {
+                owner,
+                candidates: plan_effects.transfer_candidates,
+            }),
         })
     }
 
@@ -5155,12 +5396,13 @@ impl WorldState {
             self.cross_file_file_cache.invalidate(&raw_uri);
         }
         let packages_to_prefetch = prepared.plan.packages_to_prefetch.clone();
-        let revalidations =
-            self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan);
+        let plan_effects =
+            self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan, false);
+        let package_routing_owner = plan_effects.package_routing_owner;
         self.advance_workspace_graph_authority_generation();
         self.advance_open_context_authority_generation();
         Ok(AnalysisCommitEffects {
-            revalidations,
+            revalidations: plan_effects.revalidations,
             affected_candidates: Vec::new(),
             open: Some(OpenAnalysisCommitOutcome {
                 generation: committed.generation(),
@@ -5170,6 +5412,10 @@ impl WorldState {
             close: None,
             workspace_scan: None,
             system_file: None,
+            package_routing: package_routing_owner.map(|owner| PackageRoutingCommitEffects {
+                owner,
+                candidates: plan_effects.transfer_candidates,
+            }),
         })
     }
 
@@ -5196,8 +5442,9 @@ impl WorldState {
             .replace_metadata_if_current(&prepared.uri, prepared.expected, prepared.metadata)
             .map_err(|_| AnalysisCommitRejected::StaleBasis)?;
         let packages_to_prefetch = prepared.plan.packages_to_prefetch.clone();
-        let revalidations =
-            self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan);
+        let revalidations = self
+            .apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan, false)
+            .revalidations;
         self.advance_workspace_graph_authority_generation();
         self.advance_open_context_authority_generation();
         Ok(AnalysisCommitEffects {
@@ -5211,6 +5458,7 @@ impl WorldState {
             close: None,
             workspace_scan: None,
             system_file: None,
+            package_routing: None,
         })
     }
 
@@ -5243,8 +5491,9 @@ impl WorldState {
         for raw_uri in raw_uris {
             self.cross_file_file_cache.invalidate(&raw_uri);
         }
-        let revalidations =
-            self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan);
+        let revalidations = self
+            .apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan, false)
+            .revalidations;
         self.advance_workspace_graph_authority_generation();
         self.advance_open_context_authority_generation();
         let record = self
@@ -5262,6 +5511,7 @@ impl WorldState {
             close: None,
             workspace_scan: None,
             system_file: None,
+            package_routing: None,
         })
     }
 
@@ -5270,7 +5520,8 @@ impl WorldState {
         uri: &Url,
         old_interface: Option<u64>,
         plan: PreparedOpenCommitPlan,
-    ) -> Vec<AnalysisRevalidationTicket> {
+        defer_reservation: bool,
+    ) -> OpenCommitPlanEffects {
         let closing_subject = plan.closing_subject;
         let replacement_interface_hash = plan.replacement_interface_hash;
         // A close can change several authoritative spellings at once: the
@@ -5366,6 +5617,7 @@ impl WorldState {
             .collect();
 
         let mut package_visibility_changed = false;
+        let mut package_routing_owner = None;
         if let Some((event_uri, text)) = plan.package_event {
             let old_namespace = self.package_state.namespace_model().cloned();
             let old_contribution = self.package_state.scope_contribution().clone();
@@ -5377,7 +5629,10 @@ impl WorldState {
                 crate::package_state::event::translate(&mut self.package_inputs, event)
             {
                 self.record_package_input_mutation();
-                self.apply_package_event(&delta);
+                package_routing_owner = self.apply_package_event_with_routing_policy(
+                    &delta,
+                    PackageRoutingOwnerPolicy::IfChanged,
+                );
                 package_visibility_changed = self.package_state.namespace_model()
                     != old_namespace.as_ref()
                     || self.package_state.scope_contribution() != &old_contribution;
@@ -5423,6 +5678,25 @@ impl WorldState {
         }
 
         let mut affected: Vec<Url> = affected.into_iter().collect();
+        if defer_reservation || package_routing_owner.is_some() {
+            let subject_debounce_ms = plan
+                .subject_debounce_ms
+                .unwrap_or(self.cross_file_config.edited_file_debounce_ms);
+            let mut transfer_candidates = self.capture_analysis_transfer_candidates(affected);
+            if let Some(subject) = transfer_candidates
+                .iter_mut()
+                .find(|candidate| candidate.uri == *uri)
+            {
+                subject.reservation = AnalysisTransferReservationPolicy::Subject {
+                    debounce_ms: subject_debounce_ms,
+                };
+            }
+            return OpenCommitPlanEffects {
+                transfer_candidates,
+                package_routing_owner,
+                ..OpenCommitPlanEffects::default()
+            };
+        }
         affected.sort_by_cached_key(|candidate| {
             if candidate == uri {
                 0
@@ -5439,7 +5713,7 @@ impl WorldState {
         }
         self.diagnostics_gate
             .mark_force_republish_many(affected.iter().filter(|candidate| *candidate != uri));
-        affected
+        let revalidations = affected
             .into_iter()
             .filter(|affected_uri| !closing_subject || affected_uri != uri)
             .map(|affected_uri| AnalysisRevalidationTicket {
@@ -5452,7 +5726,12 @@ impl WorldState {
                 trigger: DiagnosticsTrigger::capture(self, &affected_uri),
                 uri: affected_uri,
             })
-            .collect()
+            .collect();
+        OpenCommitPlanEffects {
+            revalidations,
+            transfer_candidates: Vec::new(),
+            package_routing_owner,
+        }
     }
 
     fn try_commit_closed_batch(
@@ -7192,8 +7471,8 @@ pub(crate) fn derive_workspace_dependency_graph(
 ///
 /// Package-mode state (workspace/namespace model, roxygen cache, NAMESPACE
 /// imports) is intentionally **not** produced here. The canonical derivation
-/// is `derive_package_state`, invoked through `apply_package_event` after
-/// the caller populates `WorldState::package_inputs`.
+/// is `derive_package_state`; event adapters and prepared package projections
+/// install its result through the shared `WorldState` derived-record seam.
 ///
 /// **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
 pub type WorkspaceScanResult = HashMap<Url, crate::workspace_index::IndexEntry>;
@@ -7759,18 +8038,68 @@ mod tests {
         }
     }
 
-    fn transfer_candidate(state: &mut WorldState, uri: &Url) -> (Url, OpenRecordToken) {
+    fn transfer_candidate(state: &mut WorldState, uri: &Url) -> AnalysisTransferCandidate {
         state.open_document(uri.clone(), "value <- 1\n", Some(1));
         state.begin_open_document_diagnostic_lifecycle(uri).unwrap();
-        (uri.clone(), state.documents.record_token(uri))
+        state
+            .capture_analysis_transfer_candidates([uri.clone()])
+            .pop()
+            .unwrap()
     }
 
     fn test_transfer(
         state: &mut WorldState,
         identity: AnalysisTransferIdentity,
-        candidate: (Url, OpenRecordToken),
+        candidate: AnalysisTransferCandidate,
     ) -> AnalysisTransferHandle {
         state.install_analysis_transfer(identity, None, vec![candidate])
+    }
+
+    #[test]
+    fn analysis_transfer_subject_policy_wins_global_uri_dedup_before_cap() {
+        for cap in [1, 2] {
+            let subject_uri = Url::parse("file:///workspace/DESCRIPTION").unwrap();
+            let dependent_uri = Url::parse("file:///workspace/R/consumer.R").unwrap();
+            let mut state = WorldState::new();
+            state.cross_file_config.max_revalidations_per_trigger = cap;
+            let mut subject = transfer_candidate(&mut state, &subject_uri);
+            let dependent_duplicate = subject.clone();
+            subject.reservation = AnalysisTransferReservationPolicy::Subject { debounce_ms: 17 };
+            let dependent = transfer_candidate(&mut state, &dependent_uri);
+
+            let effects = state.reserve_analysis_transfer_candidates(vec![
+                subject,
+                dependent,
+                dependent_duplicate,
+            ]);
+
+            assert_eq!(effects.revalidations[0].uri, subject_uri);
+            assert_eq!(effects.revalidations[0].debounce_ms, 17);
+            assert_eq!(
+                effects
+                    .revalidations
+                    .iter()
+                    .filter(|ticket| ticket.uri == subject_uri)
+                    .count(),
+                1,
+                "Subject(A), Dependent(B), Dependent(A) must globally merge A"
+            );
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&subject_uri),
+                0,
+                "the merged subject must keep its no-force policy"
+            );
+            assert_eq!(effects.revalidations.len(), cap);
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&dependent_uri),
+                u32::from(cap == 2),
+                "the dependent is force-marked only when it survives the cap"
+            );
+        }
     }
 
     #[test]
@@ -7790,7 +8119,7 @@ mod tests {
             );
             let invalid = AnalysisTransferHandle {
                 identity: AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
-                    routing_owner_generation: 4,
+                    routing_owner: SystemFileRoutingOwnerIdentity(4),
                     commit_generation: 5,
                 }),
             };
@@ -7838,7 +8167,7 @@ mod tests {
             let valid = test_transfer(
                 &mut state,
                 AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
-                    routing_owner_generation: 1,
+                    routing_owner: SystemFileRoutingOwnerIdentity(1),
                     commit_generation: 2,
                 }),
                 candidate,
@@ -7899,7 +8228,7 @@ mod tests {
         let second = test_transfer(
             &mut state,
             AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
-                routing_owner_generation: 4,
+                routing_owner: SystemFileRoutingOwnerIdentity(4),
                 commit_generation: 5,
             }),
             candidate,
@@ -8347,6 +8676,105 @@ mod tests {
                 .iter()
                 .any(|ticket| ticket.uri == sibling)
         );
+    }
+
+    #[test]
+    fn prepared_package_projection_advances_both_records_and_routing_owner() {
+        let root = std::path::PathBuf::from("/work/pkg");
+        let mut state = WorldState::new();
+        let mut inputs = state.package_inputs.clone();
+        inputs.workspace_root = Some(root);
+        inputs.package_mode = crate::cross_file::config::PackageMode::Enabled;
+        inputs.description = Some(crate::package_state::DescriptionInput {
+            text: Arc::from("Package: pkg\n"),
+        });
+        let derived = crate::package_state::derive_package_state(
+            &state.package_state,
+            &inputs,
+            &crate::package_state::PackageInputDelta::Initial,
+        );
+        let input_generation = state.package_input_generation();
+        let record_generation = state.package_state_record_generation;
+        let routing_owner = state.system_file_routing_owner_generation();
+
+        state.install_prepared_package_projection(PreparedPackageProjection::new(inputs, derived));
+
+        assert_eq!(state.package_input_generation(), input_generation + 1);
+        assert_eq!(state.package_state_record_generation, record_generation + 1);
+        assert_ne!(state.system_file_routing_owner_generation(), routing_owner);
+        assert_eq!(
+            state
+                .package_state
+                .workspace()
+                .map(|workspace| workspace.name.as_str()),
+            Some("pkg")
+        );
+    }
+
+    #[test]
+    fn prepared_nonrouting_projection_preserves_routing_owner() {
+        let root = std::path::PathBuf::from("/work/pkg");
+        let mut state = WorldState::new();
+        let mut initial_inputs = state.package_inputs.clone();
+        initial_inputs.workspace_root = Some(root);
+        initial_inputs.package_mode = crate::cross_file::config::PackageMode::Enabled;
+        initial_inputs.description = Some(crate::package_state::DescriptionInput {
+            text: Arc::from("Package: pkg\n"),
+        });
+        let initial_state = crate::package_state::derive_package_state(
+            &state.package_state,
+            &initial_inputs,
+            &crate::package_state::PackageInputDelta::Initial,
+        );
+        state.install_prepared_package_projection(PreparedPackageProjection::new(
+            initial_inputs,
+            initial_state,
+        ));
+
+        let mut namespace_inputs = state.package_inputs.clone();
+        namespace_inputs.namespace = Some(crate::package_state::NamespaceInput {
+            text: Arc::from("export(foo)\n"),
+        });
+        let namespace_state = crate::package_state::derive_package_state(
+            &state.package_state,
+            &namespace_inputs,
+            &crate::package_state::PackageInputDelta::NamespaceChanged,
+        );
+        let record_generation = state.package_state_record_generation;
+        let routing_owner = state.system_file_routing_owner_generation();
+
+        state.install_prepared_package_projection(PreparedPackageProjection::new(
+            namespace_inputs,
+            namespace_state,
+        ));
+
+        assert_eq!(state.package_state_record_generation, record_generation + 1);
+        assert_eq!(state.system_file_routing_owner_generation(), routing_owner);
+    }
+
+    #[test]
+    fn value_equal_seed_event_mints_fresh_routing_owner() {
+        let root = std::path::PathBuf::from("/work/pkg");
+        let mut state = WorldState::new();
+        state.package_inputs.workspace_root = Some(root);
+        state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Enabled;
+        state.package_inputs.description = Some(crate::package_state::DescriptionInput {
+            text: Arc::from("Package: pkg\n"),
+        });
+        state.record_package_input_mutation();
+        state.apply_package_seed_event(&crate::package_state::PackageInputDelta::Initial);
+        let first_owner = state.system_file_routing_owner_generation();
+        let record_generation = state.package_state_record_generation;
+
+        state.record_package_input_mutation();
+        state.apply_package_seed_event(&crate::package_state::PackageInputDelta::Initial);
+
+        assert_ne!(
+            state.system_file_routing_owner_generation(),
+            first_owner,
+            "a value-equal seed replay starts a new routing ownership lifecycle"
+        );
+        assert_eq!(state.package_state_record_generation, record_generation + 1);
     }
 
     #[test]

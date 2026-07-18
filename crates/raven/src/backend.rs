@@ -31,15 +31,16 @@ use crate::handlers;
 use crate::indentation;
 use crate::state::{
     AnalysisBasis, AnalysisTransferCandidate, AnalysisTransferFinalization, AnalysisTransferHandle,
-    AnalysisTransferRejection, DiagnosticsTrigger, IndentationSettings, OpenCloseDiskObservation,
-    OpenCloseIntentToken, OpenCloseResyncTicket, OpenInstallIntentToken,
-    PackageSeedInstalledIdentity, PreparedAnalysisCommit, PreparedOpenAliasReconcileAnalysis,
-    PreparedOpenCloseAnalysis, PreparedOpenCloseDiskInstall, PreparedOpenCommitPlan,
-    PreparedOpenEditAnalysis, PreparedOpenGraphProjection, PreparedOpenInstallAnalysis,
-    PreparedOpenLifecycleBatch, PreparedOpenPackageInstall, PreparedWorkspaceOpenMetadata,
-    PreparedWorkspaceScanAnalysis, SymbolConfig, SystemFileTransferredEffects,
-    WorkspaceGraphDerivationContext, WorkspaceGraphOverlay, WorkspaceScanDerivationBasis,
-    WorkspaceScanInputBasis, WorkspaceScanIntentToken, WorkspaceScanTransferredEffects, WorldState,
+    AnalysisTransferRejection, DiagnosticsTrigger, IndentationSettings, OpenCloseCommitOutcome,
+    OpenCloseDiskObservation, OpenCloseIntentToken, OpenCloseResyncTicket, OpenInstallIntentToken,
+    PackageRoutingCommitEffects, PackageSeedInstalledIdentity, PreparedAnalysisCommit,
+    PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis, PreparedOpenCloseDiskInstall,
+    PreparedOpenCommitPlan, PreparedOpenEditAnalysis, PreparedOpenGraphProjection,
+    PreparedOpenInstallAnalysis, PreparedOpenLifecycleBatch, PreparedPackageProjection,
+    PreparedWorkspaceOpenMetadata, PreparedWorkspaceScanAnalysis, SymbolConfig,
+    SystemFileRoutingOwnerIdentity, SystemFileTransferredEffects, WorkspaceGraphDerivationContext,
+    WorkspaceGraphOverlay, WorkspaceScanDerivationBasis, WorkspaceScanInputBasis,
+    WorkspaceScanIntentToken, WorkspaceScanTransferredEffects, WorldState,
     derive_workspace_dependency_graph,
 };
 use crate::utf16::utf16_column_to_byte_offset;
@@ -3891,8 +3892,60 @@ fn finalize_analysis_handoff_candidates_excluding_or_fallback(
             }
             Err(AnalysisTransferRejection::MissingOrWrongOwner) => {
                 let mut fallback = state.capture_analysis_transfer_candidates(fallback_uris);
-                fallback.retain(|(uri, _)| !all_excluded.contains(uri));
+                fallback.retain(|candidate| !all_excluded.contains(&candidate.uri));
                 return match state.finalize_analysis_transfer_fallback(finalization, fallback) {
+                    AnalysisTransferFinalization::Committed(tickets) => tickets,
+                    AnalysisTransferFinalization::AlreadyFinalized => Vec::new(),
+                };
+            }
+        }
+    }
+}
+
+/// Finalize a routing-triggered open transaction from only the exact
+/// record+diagnostic identities captured by its outer commit.
+///
+/// Unlike URI fallback used by generic startup/config orchestration, this path
+/// must never fresh-capture a close/reopen lifecycle while a deferred
+/// `system.file()` owner is converging.
+fn finalize_exact_analysis_handoff_candidates(
+    state: &mut WorldState,
+    mut handles: Vec<AnalysisTransferHandle>,
+    additional: Vec<AnalysisTransferCandidate>,
+) -> Vec<crate::state::AnalysisRevalidationTicket> {
+    let finalization = WorldState::begin_analysis_transfer_finalization();
+    let mut transfer_excluded = std::collections::HashSet::new();
+    loop {
+        match state.finalize_analysis_transfers_excluding(
+            finalization,
+            &handles,
+            additional.clone(),
+            &transfer_excluded,
+            &std::collections::HashSet::new(),
+        ) {
+            Ok(AnalysisTransferFinalization::Committed(tickets)) => return tickets,
+            Ok(AnalysisTransferFinalization::AlreadyFinalized) => return Vec::new(),
+            Err(AnalysisTransferRejection::Superseded {
+                previous,
+                successor,
+            }) => {
+                let Some(index) = handles.iter().position(|handle| *handle == previous) else {
+                    return Vec::new();
+                };
+                handles[index] = successor;
+            }
+            Err(AnalysisTransferRejection::AlreadyConsumed { handle }) => {
+                transfer_excluded
+                    .extend(state.current_consumed_analysis_transfer_candidate_uris(handle));
+                let Some(index) = handles.iter().position(|candidate| *candidate == handle) else {
+                    return Vec::new();
+                };
+                handles.remove(index);
+            }
+            Err(AnalysisTransferRejection::MissingOrWrongOwner) => {
+                return match state
+                    .finalize_analysis_transfer_fallback(finalization, additional.clone())
+                {
                     AnalysisTransferFinalization::Committed(tickets) => tickets,
                     AnalysisTransferFinalization::AlreadyFinalized => Vec::new(),
                 };
@@ -3934,9 +3987,36 @@ async fn run_system_file_convergence_transaction_for_seed(
 ) -> SystemFileConvergenceOutcome {
     lift_system_file_owner_outcome(
         state_arc,
-        run_system_file_convergence_transaction_owned(state_arc, None, Some(identity)).await,
+        run_system_file_convergence_transaction_owned(
+            state_arc,
+            None,
+            Some(RequiredSystemFileOwner::Seed(identity)),
+        )
+        .await,
     )
     .await
+}
+
+async fn run_system_file_convergence_transaction_for_routing_owner(
+    state_arc: &Arc<RwLock<WorldState>>,
+    owner: SystemFileRoutingOwnerIdentity,
+) -> SystemFileConvergenceOutcome {
+    lift_system_file_owner_outcome(
+        state_arc,
+        run_system_file_convergence_transaction_owned(
+            state_arc,
+            None,
+            Some(RequiredSystemFileOwner::Routing(owner)),
+        )
+        .await,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum RequiredSystemFileOwner {
+    Routing(SystemFileRoutingOwnerIdentity),
+    Seed(PackageSeedInstalledIdentity),
 }
 
 async fn lift_system_file_owner_outcome(
@@ -3964,24 +4044,27 @@ async fn lift_system_file_owner_outcome(
 async fn run_system_file_convergence_transaction_owned(
     state_arc: &Arc<RwLock<WorldState>>,
     only_packages: Option<std::collections::HashSet<String>>,
-    required_seed: Option<PackageSeedInstalledIdentity>,
+    required_owner: Option<RequiredSystemFileOwner>,
 ) -> SystemFileOwnerOutcome {
-    let owner = if let Some(identity) = required_seed {
-        let state = state_arc.read().await;
-        if !state.package_seed_installed_identity_is_current(identity) {
-            return SystemFileOwnerOutcome::Superseded;
+    let owner = match required_owner {
+        Some(RequiredSystemFileOwner::Routing(owner)) => owner,
+        Some(RequiredSystemFileOwner::Seed(identity)) => {
+            let state = state_arc.read().await;
+            if !state.package_seed_installed_identity_is_current(identity) {
+                return SystemFileOwnerOutcome::Superseded;
+            }
+            identity.system_file_routing_owner
         }
-        identity.system_file_routing_owner_generation
-    } else {
-        state_arc
-            .read()
-            .await
-            .system_file_routing_owner_generation()
+        None => state_arc.read().await.system_file_routing_owner_identity(),
     };
     let owner_is_current = |state: &WorldState| {
-        state.system_file_routing_owner_generation() == owner
-            && required_seed
-                .is_none_or(|identity| state.package_seed_installed_identity_is_current(identity))
+        state.system_file_routing_owner_identity() == owner
+            && match required_owner {
+                Some(RequiredSystemFileOwner::Seed(identity)) => {
+                    state.package_seed_installed_identity_is_current(identity)
+                }
+                Some(RequiredSystemFileOwner::Routing(_)) | None => true,
+            }
     };
     for attempt in 0..2 {
         let captured = {
@@ -4075,6 +4158,49 @@ async fn run_system_file_convergence_transaction_owned(
         tokio::task::yield_now().await;
     }
     unreachable!("the fixed two-attempt system.file loop always returns")
+}
+
+async fn try_finalize_open_package_routing(
+    state_arc: &Arc<RwLock<WorldState>>,
+    routing: PackageRoutingCommitEffects,
+) -> std::result::Result<Vec<crate::state::AnalysisRevalidationTicket>, PackageRoutingCommitEffects>
+{
+    let transfer =
+        match run_system_file_convergence_transaction_for_routing_owner(state_arc, routing.owner)
+            .await
+        {
+            SystemFileConvergenceOutcome::Committed(transfer)
+            | SystemFileConvergenceOutcome::Superseded(transfer) => transfer,
+            SystemFileConvergenceOutcome::Deferred => return Err(routing),
+        };
+    let tickets = {
+        let mut state = state_arc.write().await;
+        finalize_exact_analysis_handoff_candidates(
+            &mut state,
+            vec![transfer.handle],
+            routing.candidates,
+        )
+    };
+    Ok(tickets)
+}
+
+/// Own a committed open transaction's exact outer candidates until one
+/// bounded `system.file()` transaction succeeds. Each delayed iteration adopts
+/// the current validated routing successor while retaining the original exact
+/// record+diagnostic identities, so close/reopen cannot redirect old work to a
+/// new lifecycle.
+async fn await_open_package_routing(
+    state_arc: &Arc<RwLock<WorldState>>,
+    mut routing: PackageRoutingCommitEffects,
+) -> Vec<crate::state::AnalysisRevalidationTicket> {
+    loop {
+        match try_finalize_open_package_routing(state_arc, routing).await {
+            Ok(tickets) => return tickets,
+            Err(deferred) => routing = deferred,
+        }
+        tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+        routing.owner = state_arc.read().await.system_file_routing_owner_identity();
+    }
 }
 
 /// Test-support adapter that runs the real detached two-attempt
@@ -5041,8 +5167,7 @@ fn install_package_seed(
     // A seed replay is a fresh routing owner even when DESCRIPTION and root
     // values compare equal. Detached system-file convergence must not attach
     // its effects to the prior installation.
-    state.record_system_file_routing_owner_change();
-    state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+    state.apply_package_seed_event(&crate::package_state::PackageInputDelta::Initial);
 
     Some(state.record_package_seed_installed())
 }
@@ -6385,10 +6510,7 @@ fn derive_open_close_analysis(
         package_visibility_changed = next.namespace_model()
             != captured.package_state.namespace_model()
             || next.scope_contribution() != captured.package_state.scope_contribution();
-        package = Some(PreparedOpenPackageInstall {
-            inputs,
-            state: next,
-        });
+        package = Some(PreparedPackageProjection::new(inputs, next));
     }
 
     let mut seed_revalidation_uris = Vec::new();
@@ -6962,10 +7084,7 @@ fn derive_open_install_analysis(
             package_visibility_changed = next.namespace_model()
                 != captured.package_state.namespace_model()
                 || next.scope_contribution() != captured.package_state.scope_contribution();
-            package = Some(PreparedOpenPackageInstall {
-                inputs,
-                state: next,
-            });
+            package = Some(PreparedPackageProjection::new(inputs, next));
         }
     }
 
@@ -8646,7 +8765,7 @@ async fn run_watched_resync_batch(
             .map(|ticket| ticket.uri.clone())
             .collect();
         let mut additional = state.capture_analysis_transfer_candidates(affected_for_async);
-        additional.retain(|(uri, _)| !reserved_current_uris.contains(uri));
+        additional.retain(|candidate| !reserved_current_uris.contains(&candidate.uri));
         let fallback: Vec<_> = state
             .documents
             .keys()
@@ -9667,6 +9786,48 @@ async fn did_open_transactional(
         .await
         {
             Ok(mut effects) => {
+                let packages_to_prefetch = effects
+                    .open
+                    .as_ref()
+                    .expect("OpenInstall returns its immutable outcome")
+                    .packages_to_prefetch
+                    .clone();
+                let has_package_routing = effects.package_routing.is_some();
+                if has_package_routing {
+                    backend
+                        .prefetch_open_install_packages(uri, packages_to_prefetch.clone())
+                        .await;
+                }
+                if let Some(routing) = effects.package_routing.take() {
+                    match try_finalize_open_package_routing(&backend.state, routing).await {
+                        Ok(tickets) => effects.revalidations = tickets,
+                        Err(routing) => {
+                            backend
+                                .state
+                                .write()
+                                .await
+                                .cross_file_activity
+                                .record_recent(uri.clone());
+                            let state = backend.state.clone();
+                            let client = backend.client.clone();
+                            let traversal = backend.traversal_truncation.clone();
+                            tokio::spawn(async move {
+                                let tickets = await_open_package_routing(&state, routing).await;
+                                Backend::publish_diagnostics_for_tickets_bounded(
+                                    state,
+                                    client,
+                                    tickets,
+                                    Some(traversal),
+                                )
+                                .await;
+                            });
+                            if excluded {
+                                backend.publish_diagnostics(uri).await;
+                            }
+                            return true;
+                        }
+                    }
+                }
                 #[cfg(test)]
                 {
                     let mut state = backend.state.write().await;
@@ -9699,14 +9860,15 @@ async fn did_open_transactional(
                                 .collect(),
                         });
                 }
-                let packages_to_prefetch = effects
+                let _open = effects
                     .open
                     .take()
-                    .expect("OpenInstall returns its immutable outcome")
-                    .packages_to_prefetch;
-                backend
-                    .prefetch_open_install_packages(uri, packages_to_prefetch)
-                    .await;
+                    .expect("OpenInstall outcome remains available after routing convergence");
+                if !has_package_routing {
+                    backend
+                        .prefetch_open_install_packages(uri, packages_to_prefetch)
+                        .await;
+                }
                 #[cfg(test)]
                 {
                     let pause = {
@@ -9751,6 +9913,60 @@ async fn did_open_transactional(
         .await
         .cancel_open_install_intent_if_current(&intent);
     true
+}
+
+fn spawn_open_close_continuation(
+    state: Arc<RwLock<WorldState>>,
+    client: Client,
+    traversal: Arc<TraversalTruncationState>,
+    effects: crate::state::AnalysisCommitEffects,
+    close: OpenCloseCommitOutcome,
+) {
+    if close.resync.is_empty() {
+        for ticket in effects.revalidations {
+            tokio::spawn(run_debounced_diagnostics(
+                state.clone(),
+                client.clone(),
+                ticket.uri,
+                ticket.debounce_ms,
+                ticket.trigger,
+                Some(traversal.clone()),
+            ));
+        }
+        return;
+    }
+    tokio::spawn(async move {
+        // Drain the atomic shadow/remirror reservation before a fresh disk
+        // transaction can reserve the same URI. Otherwise its schedule would
+        // cancel this worker and strand one force marker. Disk convergence
+        // follows, so observers see shadow A before fresh disk C and each real
+        // transition publishes once.
+        for ticket in effects.revalidations {
+            run_debounced_diagnostics(
+                state.clone(),
+                client.clone(),
+                ticket.uri,
+                ticket.debounce_ms,
+                ticket.trigger,
+                Some(traversal.clone()),
+            )
+            .await;
+        }
+        for ticket in close.resync {
+            run_close_resync(
+                state.clone(),
+                client.clone(),
+                traversal.clone(),
+                ticket.uri,
+                ticket.expected_watched_generation,
+                Some(ticket.chunk_kind),
+                ticket.old_metadata,
+                ticket.old_interface_hash,
+                Vec::new(),
+            )
+            .await;
+        }
+    });
 }
 
 async fn did_close_transactional(backend: &Backend, uri: &Url) {
@@ -9903,45 +10119,29 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
             .close
             .take()
             .expect("OpenClose commit returns immutable close effects");
-        if close.resync.is_empty() {
-            backend.spawn_analysis_commit_effects(effects);
-        } else {
-            let state = backend.state.clone();
-            let client = backend.client.clone();
-            let traversal = backend.traversal_truncation.clone();
-            tokio::spawn(async move {
-                // Drain the atomic shadow/remirror reservation before a fresh
-                // disk transaction can reserve the same URI. Otherwise its
-                // schedule would cancel this worker and strand one force
-                // marker. Disk convergence follows, so observers see shadow A
-                // before fresh disk C and each real transition publishes once.
-                for ticket in effects.revalidations {
-                    run_debounced_diagnostics(
-                        state.clone(),
-                        client.clone(),
-                        ticket.uri,
-                        ticket.debounce_ms,
-                        ticket.trigger,
-                        Some(traversal.clone()),
-                    )
-                    .await;
+        if let Some(routing) = effects.package_routing.take() {
+            match try_finalize_open_package_routing(&backend.state, routing).await {
+                Ok(tickets) => effects.revalidations = tickets,
+                Err(routing) => {
+                    let state = backend.state.clone();
+                    let client = backend.client.clone();
+                    let traversal = backend.traversal_truncation.clone();
+                    tokio::spawn(async move {
+                        let mut effects = effects;
+                        effects.revalidations = await_open_package_routing(&state, routing).await;
+                        spawn_open_close_continuation(state, client, traversal, effects, close);
+                    });
+                    return;
                 }
-                for ticket in close.resync {
-                    run_close_resync(
-                        state.clone(),
-                        client.clone(),
-                        traversal.clone(),
-                        ticket.uri,
-                        ticket.expected_watched_generation,
-                        Some(ticket.chunk_kind),
-                        ticket.old_metadata,
-                        ticket.old_interface_hash,
-                        Vec::new(),
-                    )
-                    .await;
-                }
-            });
+            }
         }
+        spawn_open_close_continuation(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            effects,
+            close,
+        );
         return;
     }
 
@@ -10884,7 +11084,13 @@ impl LanguageServer for Backend {
         let mut preamble_live_edit: Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> = None;
 
         // Compute affected files and debounce config while holding write lock
-        let (work_items, packages_to_prefetch, packages_enabled, package_library) = {
+        let (
+            mut work_items,
+            packages_to_prefetch,
+            packages_enabled,
+            package_library,
+            package_routing,
+        ) = {
             let mut state = self.state.write().await;
 
             if state.is_project_excluded_uri(&uri) {
@@ -11095,7 +11301,7 @@ impl LanguageServer for Backend {
                 packages_to_prefetch: packages_to_prefetch.clone(),
                 ..PreparedOpenCommitPlan::default()
             };
-            let effects = match state
+            let mut effects = match state
                 .attach_open_edit_context_authorities(prepared, attempted_contexts)
             {
                 Ok(prepared) => {
@@ -11129,13 +11335,36 @@ impl LanguageServer for Backend {
                 .expect("open edit returns its immutable outcome")
                 .packages_to_prefetch
                 .clone();
+            let package_routing = effects.package_routing.take();
             (
                 effects.revalidations,
                 packages_to_prefetch,
                 packages_enabled,
                 package_library,
+                package_routing,
             )
         };
+
+        let mut deferred_package_routing = None;
+        if let Some(routing) = package_routing {
+            match try_finalize_open_package_routing(&self.state, routing).await {
+                Ok(tickets) => work_items = tickets,
+                Err(routing) => {
+                    work_items.clear();
+                    deferred_package_routing = Some(routing);
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            self.state
+                .write()
+                .await
+                .did_change_reservation_snapshot_for_test = work_items
+                .iter()
+                .map(|ticket| (ticket.uri.clone(), ticket.debounce_ms))
+                .collect();
+        }
 
         // Live `.Rprofile` edit: refresh the prelude from the in-memory buffer
         // (off-lock scan + apply + fanout) so open scripts/ update as you type.
@@ -11299,21 +11528,37 @@ impl LanguageServer for Backend {
             });
         }
 
-        // Spawn the immutable tickets reserved atomically with the analysis
-        // commit. Callers do not recompute debounce or freshness after unlock.
-        for ticket in work_items {
-            let state_arc = self.state.clone();
+        if let Some(routing) = deferred_package_routing {
+            let state = self.state.clone();
             let client = self.client.clone();
-            let traversal_truncation = self.traversal_truncation.clone();
+            let traversal = self.traversal_truncation.clone();
+            tokio::spawn(async move {
+                let tickets = await_open_package_routing(&state, routing).await;
+                Backend::publish_diagnostics_for_tickets_bounded(
+                    state,
+                    client,
+                    tickets,
+                    Some(traversal),
+                )
+                .await;
+            });
+        } else {
+            // Spawn the immutable tickets reserved atomically with the analysis
+            // commit. Callers do not recompute debounce or freshness after unlock.
+            for ticket in work_items {
+                let state_arc = self.state.clone();
+                let client = self.client.clone();
+                let traversal_truncation = self.traversal_truncation.clone();
 
-            tokio::spawn(run_debounced_diagnostics(
-                state_arc,
-                client,
-                ticket.uri,
-                ticket.debounce_ms,
-                ticket.trigger,
-                Some(traversal_truncation),
-            ));
+                tokio::spawn(run_debounced_diagnostics(
+                    state_arc,
+                    client,
+                    ticket.uri,
+                    ticket.debounce_ms,
+                    ticket.trigger,
+                    Some(traversal_truncation),
+                ));
+            }
         }
 
         self.check_and_warn_traversal_truncation().await;
@@ -14563,7 +14808,7 @@ impl Backend {
             )
             .await,
         );
-        affected.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        affected.sort_unstable_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
         affected.dedup();
         affected
     }
@@ -14668,13 +14913,12 @@ impl Backend {
                 snapshot_open_document_seed_identities(&state)
             };
             if outcome.applied && identities_after == identities_before {
-                affected
-                    .sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+                affected.sort_unstable_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
                 affected.dedup();
                 return affected;
             }
         }
-        affected.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        affected.sort_unstable_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
         affected.dedup();
         affected
     }
@@ -25785,7 +26029,7 @@ mod project_config_initialize_tests {
         )
         .await;
         assert!(
-            stale.iter().any(|(candidate, _)| candidate == &uri),
+            stale.iter().any(|candidate| candidate.uri == uri),
             "the real post-seed refresh must capture the affected open consumer"
         );
 
@@ -25835,7 +26079,7 @@ mod project_config_initialize_tests {
             state.record_system_file_routing_owner_change();
             let newer_seed = state.record_package_seed_installed();
             assert_ne!(newer_seed, old_seed);
-            newer_seed.system_file_routing_owner_generation
+            newer_seed.system_file_routing_owner
         };
         pause.release();
 
@@ -25843,9 +26087,7 @@ mod project_config_initialize_tests {
             panic!("the stale seed must hand off to an explicit current-owner transfer");
         };
         assert_eq!(
-            successor
-                .handle
-                .system_file_routing_owner_generation_for_test(),
+            successor.handle.system_file_routing_owner_for_test(),
             Some(successor_owner)
         );
     }
@@ -25867,7 +26109,7 @@ mod project_config_initialize_tests {
         let successor_owner = {
             let mut state = state.write().await;
             state.record_system_file_routing_owner_change();
-            state.system_file_routing_owner_generation()
+            state.system_file_routing_owner_identity()
         };
         pause.release();
 
@@ -25876,9 +26118,7 @@ mod project_config_initialize_tests {
             .unwrap()
             .expect("the shared startup/config consumer must preserve a successor transfer");
         assert_eq!(
-            successor
-                .handle
-                .system_file_routing_owner_generation_for_test(),
+            successor.handle.system_file_routing_owner_for_test(),
             Some(successor_owner)
         );
     }
@@ -32774,6 +33014,519 @@ mod project_config_initialize_tests {
             state.package_inputs.description.as_ref().map(|d| &*d.text),
             Some(disk_description),
             "didClose must read the canonical DESCRIPTION path and revert to disk"
+        );
+    }
+
+    /// A dirty DESCRIPTION buffer changes same-package `system.file()` routing
+    /// in the same transaction that installs the raw and derived package
+    /// records. The outer open fanout and the routing transfer are reserved
+    /// once, after exact-owner convergence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_description_open_retargets_system_file_with_one_exact_handoff() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("inst")).unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(
+            tmp.path().join("DESCRIPTION"),
+            "Package: diskpkg\nVersion: 1.0\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("inst/helper.R"), "helper_value <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                tmp.path().to_path_buf(),
+                Some(Arc::from("Package: diskpkg\nVersion: 1.0\n")),
+                None,
+                Default::default(),
+                None,
+                None,
+                &exclusions,
+            );
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+        }
+
+        let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
+        let consumer_uri = Url::from_file_path(tmp.path().join("R/consumer.R")).unwrap();
+        let helper_uri = Url::from_file_path(tmp.path().join("inst/helper.R")).unwrap();
+        open_doc(
+            backend,
+            &consumer_uri,
+            "r",
+            1,
+            "source(system.file(\"helper.R\", package = \"bufferpkg\"))\nhelper_value\n",
+        )
+        .await;
+
+        let (input_generation, record_generation, routing_owner, reservations, consumer_markers) = {
+            let state = backend.state.read().await;
+            assert!(
+                !has_dependency_edge(&state, &consumer_uri, &helper_uri),
+                "the dirty package name is not active before DESCRIPTION opens"
+            );
+            (
+                state.package_input_generation(),
+                state.package_state_record_generation_for_test(),
+                state.system_file_routing_owner_generation(),
+                state.analysis_revalidation_reservation_count,
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&consumer_uri),
+            )
+        };
+
+        open_doc(
+            backend,
+            &description_uri,
+            "r",
+            1,
+            "Package: bufferpkg\nVersion: 2.0\n",
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .package_workspace()
+                .map(|workspace| workspace.name.as_str()),
+            Some("bufferpkg")
+        );
+        assert_eq!(state.package_input_generation(), input_generation + 1);
+        assert_eq!(
+            state.package_state_record_generation_for_test(),
+            record_generation + 1
+        );
+        assert_ne!(state.system_file_routing_owner_generation(), routing_owner);
+        assert!(
+            has_dependency_edge(&state, &consumer_uri, &helper_uri),
+            "the exact routing owner must retarget the already-open consumer"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&consumer_uri),
+            consumer_markers + 1,
+            "the routing consumer must be marked exactly once"
+        );
+        assert_eq!(
+            state.analysis_revalidation_reservation_count - reservations,
+            state.did_open_reservation_snapshot_for_test.len(),
+            "the one final handoff must account for every reservation"
+        );
+        assert_eq!(
+            state
+                .did_open_reservation_snapshot_for_test
+                .iter()
+                .filter(|(uri, _)| uri == &consumer_uri)
+                .count(),
+            1,
+            "the system.file transfer and outer fanout must union the consumer"
+        );
+    }
+
+    /// Editing an already-open DESCRIPTION uses the same routing handoff as
+    /// open/close. The authoritative package-source consumer belongs to both
+    /// outer package fanout and the `system.file()` transfer, so one final cap
+    /// must deduplicate it before reserving diagnostics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_description_edit_retargets_system_file_with_one_exact_handoff() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("inst")).unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        let disk_description = "Package: diskpkg\nVersion: 1.0\n";
+        fs::write(tmp.path().join("DESCRIPTION"), disk_description).unwrap();
+        fs::write(tmp.path().join("inst/helper.R"), "helper_value <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                tmp.path().to_path_buf(),
+                Some(Arc::from(disk_description)),
+                None,
+                Default::default(),
+                None,
+                None,
+                &exclusions,
+            );
+            state.cross_file_config.max_revalidations_per_trigger = 1;
+            state.cross_file_config.edited_file_debounce_ms = 37;
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+        }
+
+        let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
+        let consumer_uri = Url::from_file_path(tmp.path().join("R/consumer.R")).unwrap();
+        let helper_uri = Url::from_file_path(tmp.path().join("inst/helper.R")).unwrap();
+        open_doc(
+            backend,
+            &consumer_uri,
+            "r",
+            1,
+            "source(system.file(\"helper.R\", package = \"bufferpkg\"))\nhelper_value\n",
+        )
+        .await;
+        open_doc(backend, &description_uri, "r", 1, disk_description).await;
+
+        let (
+            input_generation,
+            record_generation,
+            routing_owner,
+            reservations,
+            description_markers,
+            consumer_markers,
+        ) = {
+            let state = backend.state.read().await;
+            assert!(
+                !has_dependency_edge(&state, &consumer_uri, &helper_uri),
+                "the edited package name is not active before didChange"
+            );
+            (
+                state.package_input_generation(),
+                state.package_state_record_generation_for_test(),
+                state.system_file_routing_owner_generation(),
+                state.analysis_revalidation_reservation_count,
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&description_uri),
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&consumer_uri),
+            )
+        };
+
+        change_doc(
+            backend,
+            &description_uri,
+            2,
+            "Package: bufferpkg\nVersion: 2.0\n",
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .package_workspace()
+                .map(|workspace| workspace.name.as_str()),
+            Some("bufferpkg")
+        );
+        assert_eq!(state.package_input_generation(), input_generation + 1);
+        assert_eq!(
+            state.package_state_record_generation_for_test(),
+            record_generation + 1
+        );
+        assert_ne!(state.system_file_routing_owner_generation(), routing_owner);
+        assert!(
+            has_dependency_edge(&state, &consumer_uri, &helper_uri),
+            "didChange must converge the exact routing owner before scheduling diagnostics"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&description_uri),
+            description_markers,
+            "the edited subject relies on its version and must not receive a force marker"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&consumer_uri),
+            consumer_markers,
+            "cap one must drop the overlapping dependent after preserving the subject"
+        );
+        assert_eq!(
+            state.analysis_revalidation_reservation_count - reservations,
+            1,
+            "one cap-one finalization must reserve the edited subject exactly once"
+        );
+        assert_eq!(
+            state.did_change_reservation_snapshot_for_test,
+            vec![(description_uri, 37)],
+            "the routed subject ticket must retain the captured edited-file debounce"
+        );
+    }
+
+    /// Closing a dirty DESCRIPTION restores disk package identity and performs
+    /// the same exact-owner routing handoff before the close continuation is
+    /// spawned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_description_close_restores_system_file_with_one_exact_handoff() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("inst")).unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        let disk_description = "Package: diskpkg\nVersion: 1.0\n";
+        fs::write(tmp.path().join("DESCRIPTION"), disk_description).unwrap();
+        fs::write(tmp.path().join("inst/helper.R"), "helper_value <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                tmp.path().to_path_buf(),
+                Some(Arc::from(disk_description)),
+                None,
+                Default::default(),
+                None,
+                None,
+                &exclusions,
+            );
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+        }
+
+        let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
+        let consumer_uri = Url::from_file_path(tmp.path().join("R/consumer.R")).unwrap();
+        let helper_uri = Url::from_file_path(tmp.path().join("inst/helper.R")).unwrap();
+        open_doc(
+            backend,
+            &consumer_uri,
+            "r",
+            1,
+            "source(system.file(\"helper.R\", package = \"diskpkg\"))\nhelper_value\n",
+        )
+        .await;
+        open_doc(
+            backend,
+            &description_uri,
+            "r",
+            1,
+            "Package: bufferpkg\nVersion: 2.0\n",
+        )
+        .await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !has_dependency_edge(&state, &consumer_uri, &helper_uri),
+                "the dirty DESCRIPTION must first remove disk-package routing"
+            );
+        }
+
+        let (input_generation, record_generation, routing_owner, reservations, consumer_markers) = {
+            let state = backend.state.read().await;
+            (
+                state.package_input_generation(),
+                state.package_state_record_generation_for_test(),
+                state.system_file_routing_owner_generation(),
+                state.analysis_revalidation_reservation_count,
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&consumer_uri),
+            )
+        };
+        close_doc(backend, &description_uri).await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .package_workspace()
+                .map(|workspace| workspace.name.as_str()),
+            Some("diskpkg")
+        );
+        assert_eq!(state.package_input_generation(), input_generation + 1);
+        assert_eq!(
+            state.package_state_record_generation_for_test(),
+            record_generation + 1
+        );
+        assert_ne!(state.system_file_routing_owner_generation(), routing_owner);
+        assert!(
+            has_dependency_edge(&state, &consumer_uri, &helper_uri),
+            "closing the dirty DESCRIPTION must restore disk-package routing"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&consumer_uri),
+            consumer_markers + 1,
+            "the restored routing consumer must be marked exactly once"
+        );
+        assert!(
+            state.analysis_revalidation_reservation_count > reservations,
+            "the close routing handoff must reserve its exact candidates"
+        );
+    }
+
+    /// When the two immediate routing attempts are exhausted, the delayed
+    /// owner must retain exact record+diagnostic identities. Closing and
+    /// reopening a candidate before delayed finalization must not redirect the
+    /// old transaction's marker or reservation into the new lifecycle.
+    #[tokio::test(start_paused = true)]
+    async fn deferred_description_edit_drops_close_reopen_candidate_lifecycle() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("inst")).unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        let disk_description = "Package: diskpkg\nVersion: 1.0\n";
+        fs::write(tmp.path().join("DESCRIPTION"), disk_description).unwrap();
+        fs::write(tmp.path().join("inst/helper.R"), "helper_value <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                tmp.path().to_path_buf(),
+                Some(Arc::from(disk_description)),
+                None,
+                Default::default(),
+                None,
+                None,
+                &exclusions,
+            );
+            state.cross_file_config.max_revalidations_per_trigger = 1;
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+        }
+
+        let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
+        let consumer_uri = Url::from_file_path(tmp.path().join("R/consumer.R")).unwrap();
+        let helper_uri = Url::from_file_path(tmp.path().join("inst/helper.R")).unwrap();
+        let consumer_text =
+            "source(system.file(\"helper.R\", package = \"bufferpkg\"))\nhelper_value\n";
+        open_doc(backend, &consumer_uri, "r", 1, consumer_text).await;
+        open_doc(backend, &description_uri, "r", 1, disk_description).await;
+        let immediate_attempt_baseline = {
+            let mut state = backend.state.write().await;
+            state.system_file_test_reject_remaining = 2;
+            state.system_file_test_commit_attempts
+        };
+
+        change_doc(
+            backend,
+            &description_uri,
+            2,
+            "Package: bufferpkg\nVersion: 2.0\n",
+        )
+        .await;
+        assert_eq!(
+            backend.state.read().await.system_file_test_commit_attempts,
+            immediate_attempt_baseline + 2,
+            "the edit transaction must exhaust exactly its two immediate attempts"
+        );
+
+        let delayed_pause = backend
+            .state
+            .read()
+            .await
+            .system_file_pre_derivation_test_pause
+            .arm(Url::parse("raven-test://system-file-pre-derivation").unwrap());
+        close_doc(backend, &consumer_uri).await;
+        open_doc(backend, &consumer_uri, "r", 1, consumer_text).await;
+        delayed_pause.wait_arrived().await;
+
+        let (reopened_epoch, reservations, markers, description_markers) = {
+            let state = backend.state.read().await;
+            assert!(
+                has_dependency_edge(&state, &consumer_uri, &helper_uri),
+                "the reopened lifecycle must resolve against current buffer package identity"
+            );
+            (
+                state
+                    .diagnostics_gate
+                    .current_epoch(&consumer_uri)
+                    .expect("the reopened document has a diagnostic lifecycle"),
+                state.analysis_revalidation_reservation_count,
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&consumer_uri),
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&description_uri),
+            )
+        };
+        delayed_pause.release();
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state.system_file_test_commit_attempts >= immediate_attempt_baseline + 3
+            })
+            .await,
+            "the delayed exact owner must eventually converge"
+        );
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.diagnostics_gate.current_epoch(&consumer_uri),
+            Some(reopened_epoch),
+            "delayed convergence must not replace the reopened lifecycle"
+        );
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservations + 1,
+            "only the still-current DESCRIPTION candidate may survive delayed finalization"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&consumer_uri),
+            markers,
+            "the stale outer candidate must not mark the reopened lifecycle"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&description_uri),
+            description_markers,
+            "the surviving DESCRIPTION subject must keep its no-force reservation policy"
         );
     }
 
