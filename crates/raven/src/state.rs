@@ -23,6 +23,7 @@ static NEXT_OPEN_LIFECYCLE_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_WORKSPACE_SCAN_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_WORKSPACE_SCAN_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_PACKAGE_LIBRARY_INSTALL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_LIBRARY_REPLACEMENT_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_SYSTEM_FILE_ROUTING_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_LIBPATH_WATCHER_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_ANALYSIS_TRANSFER_FINALIZATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -817,6 +818,14 @@ pub struct WorldState {
     /// In-place package-library content changes relevant to `system.file()`
     /// routing (package installation/removal beneath an unchanged libpath).
     package_library_content_generation: u64,
+    /// Latest package-library replacement whose unpublished cache/routing
+    /// candidate is still allowed to commit.
+    ///
+    /// Additive watcher mutations may still commit while this is present, but
+    /// they preserve this intent. The replacement driver must then rebase the
+    /// same intent onto the additive winner and repeat its unpublished
+    /// clear/warm/derive round; it must never mint a replacement retry intent.
+    pending_library_replacement: Option<LibraryReplacementIntent>,
     /// Never-reused identity of the most recently installed package seed.
     package_seed_install_id: u64,
     /// Exact seed owner currently assigned to the coalesced deferred
@@ -1832,6 +1841,10 @@ pub(crate) enum LibraryRoutingMutation {
     Dropped,
 }
 
+/// Never-reused owner of one package-library replacement request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LibraryReplacementIntent(u64);
+
 /// Exact old authority owned by one package-library routing driver.
 ///
 /// The library `Arc` and operation epoch cover cache work that deliberately
@@ -1852,12 +1865,24 @@ pub(crate) struct LibraryRoutingBasis {
     packages_additional_library_paths: Vec<PathBuf>,
     workspace_folders: Vec<Url>,
     watcher_owner: Option<LibpathWatcherOwner>,
+    replacement_intent: Option<LibraryReplacementIntent>,
     mutation: LibraryRoutingMutation,
 }
 
 impl LibraryRoutingBasis {
     pub(crate) fn cache_operation_epoch(&self) -> u64 {
         self.cache_operation_epoch
+    }
+
+    pub(crate) fn is_replacement(&self) -> bool {
+        self.mutation == LibraryRoutingMutation::Replacement
+    }
+}
+
+impl OpenPackageWarmBasis {
+    pub(crate) fn record_successfully_warmed(&mut self, packages: HashSet<String>) {
+        self.requested_packages = packages.clone();
+        self.successfully_warmed = packages;
     }
 }
 
@@ -1875,7 +1900,43 @@ pub(crate) struct PreparedLibraryRoutingAnalysis {
     pub(crate) prospective: ProspectiveLibraryRouting,
     pub(crate) library: Arc<PackageLibrary>,
     pub(crate) ready: bool,
+    pub(crate) warm_basis: Option<OpenPackageWarmBasis>,
     pub(crate) system_file: PreparedSystemFileAnalysis,
+}
+
+/// Compact proof that an unpublished replacement cache was warmed for the
+/// exact open/scope/package authorities that remain current at its final CAS.
+///
+/// This deliberately contains only tokens and generations. Package collection
+/// and cross-file scope traversal happen from a detached snapshot before the R
+/// warm; the final state write compares this proof synchronously and never
+/// performs scope work while holding `WorldState`.
+#[derive(Clone)]
+pub(crate) struct OpenPackageWarmBasis {
+    candidate_library: Arc<PackageLibrary>,
+    workspace_index_version: u64,
+    workspace_index_max_files: usize,
+    workspace_index_max_file_size_bytes: usize,
+    workspace_index_artifact_capacity: usize,
+    workspace_index_pinned: HashSet<Url>,
+    graph_revision: u64,
+    graph_authority_generation: u64,
+    open_context_authority_generation: OpenContextAuthorityGeneration,
+    editor_eligibility_generation: EditorEligibilityGeneration,
+    analysis_config_generation: AnalysisConfigGeneration,
+    chunk_override_generation: ChunkOverrideGeneration,
+    raw_cache_generation: u64,
+    package_input_generation: u64,
+    package_config_generation: u64,
+    package_state_record_generation: u64,
+    workspace_folders: Vec<Url>,
+    exclusion_patterns: Vec<String>,
+    max_chain_depth: usize,
+    max_transitive_dependents_visited: usize,
+    backward_dependencies: crate::cross_file::config::BackwardDependencyMode,
+    open_records: std::collections::BTreeMap<Url, OpenRecordToken>,
+    requested_packages: HashSet<String>,
+    successfully_warmed: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2936,8 +2997,10 @@ impl WorldState {
     /// invalidation and warmup have completed.
     #[cfg(test)]
     pub(crate) fn record_package_library_content_change(&mut self) {
-        self.package_library_content_generation =
-            self.package_library_content_generation.wrapping_add(1);
+        self.package_library_content_generation = self
+            .package_library_content_generation
+            .checked_add(1)
+            .expect("package-library content generation exhausted");
         self.system_file_routing_owner_generation =
             Self::mint_system_file_routing_owner_generation();
     }
@@ -2999,7 +3062,7 @@ impl WorldState {
     }
 
     pub(crate) fn capture_library_routing_basis(
-        &self,
+        &mut self,
         expected_library: &Arc<PackageLibrary>,
         cache_operation_epoch: u64,
         mutation: LibraryRoutingMutation,
@@ -3010,6 +3073,19 @@ impl WorldState {
         {
             return None;
         }
+        let replacement_intent = match mutation {
+            LibraryRoutingMutation::Replacement => {
+                let generation = NEXT_LIBRARY_REPLACEMENT_INTENT_GENERATION
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        current.checked_add(1)
+                    })
+                    .expect("library-replacement intent generation counter exhausted");
+                let intent = LibraryReplacementIntent(generation);
+                self.pending_library_replacement = Some(intent);
+                Some(intent)
+            }
+            LibraryRoutingMutation::Changed | LibraryRoutingMutation::Dropped => None,
+        };
         Some(LibraryRoutingBasis {
             library: Arc::clone(&self.package_library),
             cache_operation_epoch,
@@ -3026,8 +3102,63 @@ impl WorldState {
                 .clone(),
             workspace_folders: self.workspace_folders.clone(),
             watcher_owner,
+            replacement_intent,
             mutation,
         })
+    }
+
+    fn library_replacement_basis_is_current(&self, basis: &LibraryRoutingBasis) -> bool {
+        match basis.mutation {
+            LibraryRoutingMutation::Replacement => {
+                self.pending_library_replacement == basis.replacement_intent
+            }
+            LibraryRoutingMutation::Changed | LibraryRoutingMutation::Dropped => {
+                basis.replacement_intent.is_none()
+            }
+        }
+    }
+
+    /// Retire an unpublished replacement only when it still owns the pending
+    /// slot. A newer replacement keeps its own intent and inherited/current
+    /// open-document convergence responsibility.
+    pub(crate) fn abort_library_replacement(&mut self, basis: &LibraryRoutingBasis) {
+        if basis.mutation == LibraryRoutingMutation::Replacement
+            && self.pending_library_replacement == basis.replacement_intent
+        {
+            self.pending_library_replacement = None;
+        }
+    }
+
+    /// Rebase the same pending replacement intent onto an additive
+    /// package-library winner. Configuration/package-input changes are not an
+    /// additive lineage and therefore reject instead of silently adopting a
+    /// different replacement request.
+    pub(crate) fn rebase_library_replacement_basis(
+        &self,
+        basis: &LibraryRoutingBasis,
+        expected_library: &Arc<PackageLibrary>,
+        cache_operation_epoch: u64,
+    ) -> Option<LibraryRoutingBasis> {
+        if basis.mutation != LibraryRoutingMutation::Replacement
+            || self.pending_library_replacement != basis.replacement_intent
+            || !Arc::ptr_eq(&self.package_library, expected_library)
+            || self.package_input_generation() != basis.package_input_generation
+            || self.package_config_generation != basis.package_config_generation
+            || self.package_state_record_generation != basis.package_state_record_generation
+            || self.package_library_ready != basis.ready
+            || self.cross_file_config.packages_enabled != basis.packages_enabled
+            || self.cross_file_config.packages_r_path != basis.packages_r_path
+            || self.cross_file_config.packages_additional_library_paths
+                != basis.packages_additional_library_paths
+            || self.workspace_folders != basis.workspace_folders
+        {
+            return None;
+        }
+        let mut rebased = basis.clone();
+        rebased.library = Arc::clone(&self.package_library);
+        rebased.cache_operation_epoch = cache_operation_epoch;
+        rebased.routing = self.system_file_routing_stamp();
+        Some(rebased)
     }
 
     pub(crate) fn library_routing_basis_is_current(
@@ -3036,6 +3167,7 @@ impl WorldState {
         lease: &PackageLibraryRoutingLease<'_>,
     ) -> bool {
         Arc::ptr_eq(&self.package_library, &basis.library)
+            && self.library_replacement_basis_is_current(basis)
             && basis.library.cache_operation_epoch(lease) == basis.cache_operation_epoch
             && self.system_file_routing_stamp() == basis.routing
             && self.package_library_ready == basis.ready
@@ -3058,6 +3190,7 @@ impl WorldState {
         cache_operation_epoch: u64,
     ) -> Option<LibraryRoutingBasis> {
         if !Arc::ptr_eq(&self.package_library, &basis.library)
+            || !self.library_replacement_basis_is_current(basis)
             || self.system_file_routing_stamp() != basis.routing
             || self.package_library_ready != basis.ready
             || self.package_input_generation() != basis.package_input_generation
@@ -3085,6 +3218,7 @@ impl WorldState {
         library: &PackageLibrary,
     ) -> Option<ProspectiveLibraryRouting> {
         if !Arc::ptr_eq(&self.package_library, &basis.library)
+            || !self.library_replacement_basis_is_current(basis)
             || self.system_file_routing_stamp() != basis.routing
             || self.package_input_generation() != basis.package_input_generation
             || self.package_config_generation != basis.package_config_generation
@@ -3111,7 +3245,8 @@ impl WorldState {
             LibraryRoutingMutation::Changed | LibraryRoutingMutation::Dropped => basis
                 .routing
                 .package_library_content_generation
-                .wrapping_add(1),
+                .checked_add(1)
+                .expect("package-library content generation exhausted"),
         };
         let routing_owner =
             SystemFileRoutingOwnerIdentity(Self::mint_system_file_routing_owner_generation());
@@ -3135,6 +3270,88 @@ impl WorldState {
             watcher_owner,
             routing,
         })
+    }
+
+    /// Capture the compact authority half of open-package warming. The caller
+    /// takes the scope snapshot under the same state read lock, then performs
+    /// collection and R/provider work after releasing it.
+    pub(crate) fn capture_open_package_warm_basis(
+        &self,
+        candidate_library: &Arc<PackageLibrary>,
+    ) -> OpenPackageWarmBasis {
+        let index = self.workspace_index.authority_snapshot();
+        OpenPackageWarmBasis {
+            candidate_library: Arc::clone(candidate_library),
+            workspace_index_version: index.version,
+            workspace_index_max_files: self.workspace_index.config().max_files,
+            workspace_index_max_file_size_bytes: self.workspace_index.config().max_file_size_bytes,
+            workspace_index_artifact_capacity: index.artifact_capacity_limit,
+            workspace_index_pinned: index.pinned,
+            graph_revision: self.cross_file_graph.edge_revision(),
+            graph_authority_generation: self.workspace_graph_authority_generation,
+            open_context_authority_generation: self.open_context_authority_generation,
+            editor_eligibility_generation: self.editor_eligibility_generation,
+            analysis_config_generation: self.analysis_config_generation,
+            chunk_override_generation: self.chunk_override_generation,
+            raw_cache_generation: self.cross_file_file_cache.content_generation(),
+            package_input_generation: self.package_input_generation(),
+            package_config_generation: self.package_config_generation,
+            package_state_record_generation: self.package_state_record_generation,
+            workspace_folders: self.workspace_folders.clone(),
+            exclusion_patterns: self.workspace_exclusions.patterns().to_vec(),
+            max_chain_depth: self.cross_file_config.max_chain_depth,
+            max_transitive_dependents_visited: self
+                .cross_file_config
+                .max_transitive_dependents_visited,
+            backward_dependencies: self.cross_file_config.backward_dependencies,
+            open_records: self
+                .documents
+                .keys()
+                .map(|uri| (uri.clone(), self.documents.record_token(uri)))
+                .collect(),
+            requested_packages: HashSet::new(),
+            successfully_warmed: HashSet::new(),
+        }
+    }
+
+    fn open_package_warm_basis_is_current(
+        &self,
+        basis: &OpenPackageWarmBasis,
+        candidate_library: &Arc<PackageLibrary>,
+    ) -> bool {
+        let index = self.workspace_index.authority_snapshot();
+        let current_open: std::collections::BTreeMap<_, _> = self
+            .documents
+            .keys()
+            .map(|uri| (uri.clone(), self.documents.record_token(uri)))
+            .collect();
+        Arc::ptr_eq(&basis.candidate_library, candidate_library)
+            && index.version == basis.workspace_index_version
+            && self.workspace_index.config().max_files == basis.workspace_index_max_files
+            && self.workspace_index.config().max_file_size_bytes
+                == basis.workspace_index_max_file_size_bytes
+            && index.artifact_capacity_limit == basis.workspace_index_artifact_capacity
+            && index.pinned == basis.workspace_index_pinned
+            && self.cross_file_graph.edge_revision() == basis.graph_revision
+            && self.workspace_graph_authority_generation == basis.graph_authority_generation
+            && self.open_context_authority_generation == basis.open_context_authority_generation
+            && self.editor_eligibility_generation == basis.editor_eligibility_generation
+            && self.analysis_config_generation == basis.analysis_config_generation
+            && self.chunk_override_generation == basis.chunk_override_generation
+            && self.cross_file_file_cache.content_generation() == basis.raw_cache_generation
+            && self.package_input_generation() == basis.package_input_generation
+            && self.package_config_generation == basis.package_config_generation
+            && self.package_state_record_generation == basis.package_state_record_generation
+            && self.workspace_folders == basis.workspace_folders
+            && self.workspace_exclusions.patterns() == basis.exclusion_patterns.as_slice()
+            && self.cross_file_config.max_chain_depth == basis.max_chain_depth
+            && self.cross_file_config.max_transitive_dependents_visited
+                == basis.max_transitive_dependents_visited
+            && self.cross_file_config.backward_dependencies == basis.backward_dependencies
+            && current_open == basis.open_records
+            && basis
+                .requested_packages
+                .is_subset(&basis.successfully_warmed)
     }
 
     pub(crate) fn workspace_scan_generation(&self) -> u64 {
@@ -4066,6 +4283,7 @@ impl WorldState {
             package_library: Arc::new(PackageLibrary::new_empty()),
             package_library_install_id: Self::mint_package_library_install_id(),
             package_library_content_generation: 0,
+            pending_library_replacement: None,
             package_seed_install_id: 0,
             pending_system_file_seed_retry: None,
             pending_post_seed_refresh_retry: None,
@@ -6096,9 +6314,19 @@ impl WorldState {
             prospective,
             library,
             ready,
+            warm_basis,
             system_file,
         } = prepared;
+        let warm_basis_is_valid = warm_basis
+            .as_ref()
+            .is_some_and(|basis| self.open_package_warm_basis_is_current(basis, &library));
+        let requires_full_warm = matches!(
+            basis.mutation,
+            LibraryRoutingMutation::Replacement | LibraryRoutingMutation::Dropped
+        );
         if !self.library_routing_basis_is_current(&basis, lease)
+            || (requires_full_warm && !warm_basis_is_valid)
+            || (!requires_full_warm && warm_basis.as_ref().is_some_and(|_| !warm_basis_is_valid))
             || system_file.basis.routing != prospective.routing
             || !self.system_file_analysis_non_routing_basis_is_current(&system_file.basis)
             || !system_file.external_observations_are_current()
@@ -6146,6 +6374,8 @@ impl WorldState {
             }
         };
         if basis.mutation == LibraryRoutingMutation::Replacement {
+            debug_assert_eq!(self.pending_library_replacement, basis.replacement_intent);
+            self.pending_library_replacement = None;
             self.bump_package_config_generation();
         }
 
@@ -6166,7 +6396,12 @@ impl WorldState {
         }
 
         let changed_uris = system_file.changed_uris;
-        let candidate_uris = self.system_file_republish_set(&changed_uris);
+        let candidate_uris = match basis.mutation {
+            LibraryRoutingMutation::Replacement | LibraryRoutingMutation::Dropped => {
+                self.documents.keys().cloned().collect()
+            }
+            LibraryRoutingMutation::Changed => self.system_file_republish_set(&changed_uris),
+        };
         let candidates = self.capture_analysis_transfer_candidates(
             candidate_uris
                 .into_iter()
@@ -7231,6 +7466,7 @@ impl WorldState {
         only_packages: Option<HashSet<String>>,
     ) -> Option<CapturedSystemFileAnalysis> {
         if !Arc::ptr_eq(&self.package_library, &basis.library)
+            || !self.library_replacement_basis_is_current(basis)
             || self.system_file_routing_stamp() != basis.routing
             || self.package_input_generation() != basis.package_input_generation
             || self.package_config_generation != basis.package_config_generation
@@ -11616,6 +11852,60 @@ mod tests {
             vec!["bbb".to_string()],
             "data_packages must follow the edit; got: {:?}",
             doc.data_packages
+        );
+    }
+
+    #[test]
+    fn open_package_warm_basis_rejects_a_new_open_record() {
+        let mut state = WorldState::new();
+        let candidate = Arc::new(PackageLibrary::new_empty());
+        let mut basis = state.capture_open_package_warm_basis(&candidate);
+        basis.record_successfully_warmed(HashSet::new());
+        assert!(state.open_package_warm_basis_is_current(&basis, &candidate));
+
+        let uri = Url::parse("file:///warm-basis-new-open.R").unwrap();
+        state.open_document(uri, "library(newpkg)\n", Some(1));
+        assert!(
+            !state.open_package_warm_basis_is_current(&basis, &candidate),
+            "an open installed after package collection must force clear + rewarm"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_intent_rebases_only_across_additive_content() {
+        let mut state = WorldState::new();
+        let library = state.package_library.clone();
+        let lease = library.routing_lease().await;
+        let epoch = library.cache_operation_epoch(&lease);
+        let basis = state
+            .capture_library_routing_basis(
+                &library,
+                epoch,
+                LibraryRoutingMutation::Replacement,
+                None,
+            )
+            .unwrap();
+        drop(lease);
+
+        state.record_package_library_content_change();
+        let lease = library.routing_lease().await;
+        let additive_epoch = library.cache_operation_epoch(&lease);
+        let rebased = state
+            .rebase_library_replacement_basis(&basis, &library, additive_epoch)
+            .expect("additive content must preserve and rebase the same replacement intent");
+        assert_eq!(rebased.replacement_intent, basis.replacement_intent);
+        drop(lease);
+
+        state.package_library_ready = !basis.ready;
+        assert!(
+            state
+                .rebase_library_replacement_basis(&basis, &library, additive_epoch)
+                .is_none(),
+            "readiness drift is a construction-key change, not an additive rebase"
+        );
+        assert_eq!(
+            state.pending_library_replacement, basis.replacement_intent,
+            "a failed old-intent rebase must not clear its still-current owner"
         );
     }
 }

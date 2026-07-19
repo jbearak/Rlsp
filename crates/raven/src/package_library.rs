@@ -568,7 +568,11 @@ impl PackageLibrary {
         if self.retired.load(Ordering::Acquire) {
             return None;
         }
-        self.cache_operation_epoch.fetch_add(1, Ordering::AcqRel);
+        self.cache_operation_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .expect("package-cache operation epoch exhausted");
         Some(PackageCacheOperationLease { _guard: guard })
     }
 

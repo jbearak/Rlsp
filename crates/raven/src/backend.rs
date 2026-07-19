@@ -1631,6 +1631,7 @@ struct PackageInitKey {
     packages_r_path: Option<std::path::PathBuf>,
     additional_paths: Vec<std::path::PathBuf>,
     workspace_root: Option<std::path::PathBuf>,
+    workspace_folders: Vec<Url>,
     package_input_generation: u64,
 }
 
@@ -1647,6 +1648,7 @@ impl PackageInitKey {
                 .workspace_folders
                 .first()
                 .and_then(|url| url.to_file_path().ok()),
+            workspace_folders: state.workspace_folders.clone(),
             package_input_generation: state.package_input_generation(),
         }
     }
@@ -1708,7 +1710,7 @@ impl Backend {
         if already_ready {
             return PackageInitAttempt::Ready;
         }
-        let routing_basis = capture_library_routing_basis(
+        let mut routing_basis = capture_library_routing_basis(
             &self.state,
             crate::state::LibraryRoutingMutation::Replacement,
             None,
@@ -1771,30 +1773,39 @@ impl Backend {
                 && state.package_config_generation == basis.package_config_generation
                 && PackageInitKey::capture(&state) == basis.key
         };
-        let routing_effects = if exact_init_intent
-            && let Some(routing_basis) = routing_basis
-            && let Some(driver) = prepare_library_routing_driver(
-                &self.state,
-                routing_basis,
-                library,
-                LibraryRoutingDriverOptions {
-                    ready,
-                    only_packages: None,
-                    warm_open_packages: false,
-                    refresh_cache_epoch: true,
-                    attempt_limit: 2,
-                },
-            )
-            .await
-        {
-            match complete_library_routing_driver(&self.state, driver).await {
-                LibraryRoutingTransactionOutcome::Committed(effects) => Some(effects),
-                LibraryRoutingTransactionOutcome::Superseded
-                | LibraryRoutingTransactionOutcome::RetryExhausted(_) => None,
+        let routing_effects = if exact_init_intent {
+            if let Some(routing_basis) = routing_basis.take()
+                && let Some(driver) = prepare_library_routing_driver(
+                    &self.state,
+                    routing_basis,
+                    library,
+                    LibraryRoutingDriverOptions {
+                        ready,
+                        only_packages: None,
+                        warm_open_packages: true,
+                        refresh_cache_epoch: true,
+                        attempt_limit: 2,
+                    },
+                )
+                .await
+            {
+                match complete_library_routing_driver(&self.state, driver).await {
+                    LibraryRoutingTransactionOutcome::Committed(effects) => Some(effects),
+                    LibraryRoutingTransactionOutcome::Superseded => None,
+                    LibraryRoutingTransactionOutcome::RetryExhausted(driver) => {
+                        abort_library_replacement_driver(&self.state, &driver).await;
+                        None
+                    }
+                }
+            } else {
+                None
             }
         } else {
             None
         };
+        if let Some(unused) = routing_basis.as_ref() {
+            self.state.write().await.abort_library_replacement(unused);
+        }
         let Some(routing_effects) = routing_effects else {
             log::trace!("Discarding stale on-demand PackageLibrary build");
             return PackageInitAttempt::Stale {
@@ -3964,7 +3975,7 @@ async fn capture_library_routing_basis(
     let lease = library.routing_lease().await;
     let epoch = library.cache_operation_epoch(&lease);
     state_arc
-        .read()
+        .write()
         .await
         .capture_library_routing_basis(&library, epoch, mutation, watcher_owner)
 }
@@ -3980,7 +3991,7 @@ async fn capture_library_content_successor(
     let library = state_arc.read().await.package_library.clone();
     let lease = library.routing_lease().await;
     let epoch = library.cache_operation_epoch(&lease);
-    let basis = state_arc.read().await.capture_library_routing_basis(
+    let basis = state_arc.write().await.capture_library_routing_basis(
         &library,
         epoch,
         mutation,
@@ -3990,14 +4001,66 @@ async fn capture_library_content_successor(
     Some((basis, successor))
 }
 
+async fn rebase_library_replacement_driver(
+    state_arc: &Arc<RwLock<WorldState>>,
+    deferred: &mut DeferredLibraryRouting,
+) -> bool {
+    if !deferred.basis.is_replacement() {
+        return false;
+    }
+    let library = state_arc.read().await.package_library.clone();
+    let lease = library.routing_lease().await;
+    let epoch = library.cache_operation_epoch(&lease);
+    let Some(rebased) =
+        state_arc
+            .read()
+            .await
+            .rebase_library_replacement_basis(&deferred.basis, &library, epoch)
+    else {
+        return false;
+    };
+    let Some(prospective) = state_arc
+        .read()
+        .await
+        .prospective_library_routing(&rebased, &deferred.library)
+    else {
+        return false;
+    };
+    deferred.basis = rebased;
+    deferred.prospective = prospective;
+    true
+}
+
+async fn abort_library_replacement_driver(
+    state_arc: &Arc<RwLock<WorldState>>,
+    deferred: &DeferredLibraryRouting,
+) {
+    state_arc
+        .write()
+        .await
+        .abort_library_replacement(&deferred.basis);
+}
+
 async fn run_library_routing_transaction(
     state_arc: &Arc<RwLock<WorldState>>,
     mut deferred: DeferredLibraryRouting,
 ) -> LibraryRoutingTransactionOutcome {
     for attempt in 0..deferred.attempt_limit {
-        if deferred.warm_open_packages {
-            prefetch_packages_for_open_documents_into(state_arc, &deferred.library, false).await;
-        }
+        let warm_basis = if deferred.warm_open_packages {
+            // Every retry starts from a cache whose successful-warm coverage is
+            // attributable solely to this exact open/scope authority basis.
+            // A stale round must not leave an old package name looking warm.
+            deferred.library.clear_cache().await;
+            let Some(basis) =
+                prefetch_packages_for_open_documents_into(state_arc, &deferred.library, false)
+                    .await
+            else {
+                return LibraryRoutingTransactionOutcome::RetryExhausted(Box::new(deferred));
+            };
+            Some(basis)
+        } else {
+            None
+        };
         let captured = {
             let state = state_arc.read().await;
             state.capture_library_routing_system_file_analysis(
@@ -4007,6 +4070,7 @@ async fn run_library_routing_transaction(
             )
         };
         let Some(captured) = captured else {
+            abort_library_replacement_driver(state_arc, &deferred).await;
             return LibraryRoutingTransactionOutcome::Superseded;
         };
         let draft = match tokio::task::spawn_blocking(move || {
@@ -4042,25 +4106,41 @@ async fn run_library_routing_transaction(
             prospective: deferred.prospective.clone(),
             library: deferred.library.clone(),
             ready: deferred.ready,
+            warm_basis,
             system_file,
         };
         match state.try_commit_library_routing(prepared, &lease) {
             Ok(effects) => return LibraryRoutingTransactionOutcome::Committed(effects),
             Err(_) => {
-                if epoch != deferred.basis.cache_operation_epoch() && !deferred.refresh_cache_epoch
-                {
-                    return LibraryRoutingTransactionOutcome::RetryExhausted(Box::new(deferred));
+                let same_library = Arc::ptr_eq(&state.package_library, &deferred.basis.library);
+                if same_library {
+                    if epoch != deferred.basis.cache_operation_epoch()
+                        && !deferred.refresh_cache_epoch
+                    {
+                        return LibraryRoutingTransactionOutcome::RetryExhausted(Box::new(
+                            deferred,
+                        ));
+                    }
+                    let Some(refreshed) =
+                        state.refresh_library_routing_cache_epoch(&deferred.basis, epoch)
+                    else {
+                        state.abort_library_replacement(&deferred.basis);
+                        return LibraryRoutingTransactionOutcome::Superseded;
+                    };
+                    deferred.basis = refreshed;
                 }
-                let Some(refreshed) =
-                    state.refresh_library_routing_cache_epoch(&deferred.basis, epoch)
-                else {
-                    return LibraryRoutingTransactionOutcome::Superseded;
-                };
-                deferred.basis = refreshed;
             }
         }
         drop(state);
         drop(lease);
+        if !Arc::ptr_eq(
+            &state_arc.read().await.package_library,
+            &deferred.basis.library,
+        ) && !rebase_library_replacement_driver(state_arc, &mut deferred).await
+        {
+            abort_library_replacement_driver(state_arc, &deferred).await;
+            return LibraryRoutingTransactionOutcome::Superseded;
+        }
         if attempt + 1 < deferred.attempt_limit {
             tokio::task::yield_now().await;
         }
@@ -4085,14 +4165,34 @@ struct LibraryRoutingDriverOptions {
 
 async fn prepare_library_routing_driver(
     state_arc: &Arc<RwLock<WorldState>>,
-    basis: crate::state::LibraryRoutingBasis,
+    mut basis: crate::state::LibraryRoutingBasis,
     library: Arc<crate::package_library::PackageLibrary>,
     options: LibraryRoutingDriverOptions,
 ) -> Option<DeferredLibraryRouting> {
-    let prospective = state_arc
+    let mut prospective = state_arc
         .read()
         .await
-        .prospective_library_routing(&basis, &library)?;
+        .prospective_library_routing(&basis, &library);
+    if prospective.is_none() && basis.is_replacement() {
+        let current = state_arc.read().await.package_library.clone();
+        let lease = current.routing_lease().await;
+        let epoch = current.cache_operation_epoch(&lease);
+        if let Some(rebased) = state_arc
+            .read()
+            .await
+            .rebase_library_replacement_basis(&basis, &current, epoch)
+        {
+            basis = rebased;
+            prospective = state_arc
+                .read()
+                .await
+                .prospective_library_routing(&basis, &library);
+        }
+    }
+    let Some(prospective) = prospective else {
+        state_arc.write().await.abort_library_replacement(&basis);
+        return None;
+    };
     Some(DeferredLibraryRouting {
         basis,
         prospective,
@@ -4126,6 +4226,9 @@ async fn settle_deferred_library_routing_escrow(
     let mut retry_delay = std::time::Duration::from_millis(10);
     let transfer = loop {
         if escrow.cancellation.is_cancelled() {
+            if let Some(driver) = escrow.driver.as_ref() {
+                abort_library_replacement_driver(&task_handles.state, driver).await;
+            }
             task_handles
                 .state
                 .read()
@@ -4180,6 +4283,9 @@ async fn settle_deferred_library_routing_escrow(
         }
         tokio::select! {
             _ = escrow.cancellation.cancelled() => {
+                if let Some(driver) = escrow.driver.as_ref() {
+                    abort_library_replacement_driver(&task_handles.state, driver).await;
+                }
                 task_handles
                     .state
                     .read()
@@ -7870,8 +7976,8 @@ struct CapturedOpenEditFallback {
     exclusions: crate::config_file::CompiledWorkspaceExclusions,
     subject_excluded: bool,
     graph_roots: Vec<Url>,
-    packages_enabled: bool,
     data_packages: Vec<String>,
+    packages_enabled: bool,
     plan: PreparedOpenCommitPlan,
 }
 
@@ -12498,7 +12604,6 @@ struct ReconciliationDecisions {
     diagnostics_enabled_changed: bool,
     old_diagnostics_enabled: bool,
     new_diagnostics_enabled: bool,
-    packages_enabled: bool,
     max_transitive_dependents_visited_changed: bool,
     trigger_on_open_paren_changed: bool,
     new_trigger_on_open_paren: bool,
@@ -13472,7 +13577,7 @@ impl LanguageServer for Backend {
 
         // Task B: Initialize PackageLibrary (await this - diagnostics need it)
         // This is fast (~100ms) due to batched R subprocess calls.
-        let startup_routing_basis = capture_library_routing_basis(
+        let mut startup_routing_basis = capture_library_routing_basis(
             &self.state,
             crate::state::LibraryRoutingMutation::Replacement,
             None,
@@ -13533,8 +13638,15 @@ impl LanguageServer for Backend {
         // ahead and already written a library with prefetched package caches.
         // Overwriting it would discard those caches and cause false-positive
         // "Package is not installed" diagnostics until the next prefetch.
-        let routing_effects = if let Some(basis) =
-            startup_routing_basis.filter(|basis| !basis.ready)
+        if startup_routing_basis
+            .as_ref()
+            .is_some_and(|basis| basis.ready)
+        {
+            if let Some(unused) = startup_routing_basis.take() {
+                self.state.write().await.abort_library_replacement(&unused);
+            }
+        }
+        let routing_effects = if let Some(basis) = startup_routing_basis.take()
             && let Some(driver) = prepare_library_routing_driver(
                 &self.state,
                 basis,
@@ -13551,8 +13663,11 @@ impl LanguageServer for Backend {
         {
             match complete_library_routing_driver(&self.state, driver).await {
                 LibraryRoutingTransactionOutcome::Committed(effects) => Some(effects),
-                LibraryRoutingTransactionOutcome::Superseded
-                | LibraryRoutingTransactionOutcome::RetryExhausted(_) => None,
+                LibraryRoutingTransactionOutcome::Superseded => None,
+                LibraryRoutingTransactionOutcome::RetryExhausted(driver) => {
+                    abort_library_replacement_driver(&self.state, &driver).await;
+                    None
+                }
             }
         } else {
             None
@@ -13762,7 +13877,8 @@ impl LanguageServer for Backend {
                         LibraryRoutingTransactionOutcome::Superseded => {
                             return Err(refresh_not_committed("routing commit superseded"));
                         }
-                        LibraryRoutingTransactionOutcome::RetryExhausted(_) => {
+                        LibraryRoutingTransactionOutcome::RetryExhausted(driver) => {
+                            abort_library_replacement_driver(&self.state, &driver).await;
                             return Err(refresh_not_committed("routing retry exhausted"));
                         }
                     };
@@ -15695,7 +15811,6 @@ impl Backend {
                     probe == prev.prev_cross_file
                 };
 
-            let packages_enabled = state.cross_file_config.packages_enabled;
             // If `package_mode` changed, apply the setting change via the
             // event-driven path. For Disabled: translate immediately
             // (derive yields no workspace). For Auto/Enabled: capture root
@@ -15758,7 +15873,6 @@ impl Backend {
                 diagnostics_enabled_changed,
                 old_diagnostics_enabled,
                 new_diagnostics_enabled,
-                packages_enabled,
                 max_transitive_dependents_visited_changed,
                 trigger_on_open_paren_changed,
                 new_trigger_on_open_paren,
@@ -15778,7 +15892,6 @@ impl Backend {
             diagnostics_enabled_changed,
             old_diagnostics_enabled,
             new_diagnostics_enabled,
-            packages_enabled,
             max_transitive_dependents_visited_changed,
             trigger_on_open_paren_changed,
             new_trigger_on_open_paren,
@@ -16103,7 +16216,7 @@ impl Backend {
                     LibraryRoutingDriverOptions {
                         ready: package_library_ready,
                         only_packages: None,
-                        warm_open_packages: packages_enabled,
+                        warm_open_packages: true,
                         refresh_cache_epoch: true,
                         attempt_limit: 2,
                     },
@@ -18280,19 +18393,23 @@ pub(crate) async fn prefetch_packages_for_open_documents(
     state_arc: &Arc<RwLock<WorldState>>,
     pkg_lib: &Arc<crate::package_library::PackageLibrary>,
 ) {
-    prefetch_packages_for_open_documents_into(state_arc, pkg_lib, true).await;
+    let _ = prefetch_packages_for_open_documents_into(state_arc, pkg_lib, true).await;
 }
 
 async fn prefetch_packages_for_open_documents_into(
     state_arc: &Arc<RwLock<WorldState>>,
     pkg_lib: &Arc<crate::package_library::PackageLibrary>,
     authoritative: bool,
-) {
-    let (doc_packages, probe) = {
+) -> Option<crate::state::OpenPackageWarmBasis> {
+    let (mut warm_basis, doc_packages, probe) = {
         let state = state_arc.read().await;
         let (doc_pkgs, docs) = collect_open_document_packages(&state);
         let snapshot = state.build_package_scope_snapshot(&docs);
-        (doc_pkgs, snapshot)
+        (
+            state.capture_open_package_warm_basis(pkg_lib),
+            doc_pkgs,
+            snapshot,
+        )
     }; // read lock released
 
     let mut all_pkgs = doc_packages;
@@ -18338,18 +18455,24 @@ async fn prefetch_packages_for_open_documents_into(
         .into_iter()
         .filter(|p| is_valid_package_name(p) && !crate::package_library::is_load_all_sentinel(p))
         .collect();
+    let requested: std::collections::HashSet<String> = packages.iter().cloned().collect();
     if !packages.is_empty() {
         log::trace!(
             "Prefetching {} packages for {} open documents",
             packages.len(),
             probe.docs.len()
         );
-        if authoritative {
-            let _ = prefetch_current_package_library(state_arc, &packages).await;
+        let warmed = if authoritative {
+            prefetch_current_package_library(state_arc, &packages).await
         } else {
-            let _ = pkg_lib.prefetch_packages(&packages).await;
+            pkg_lib.prefetch_packages(&packages).await
+        };
+        if !warmed {
+            return None;
         }
     }
+    warm_basis.record_successfully_warmed(requested);
+    Some(warm_basis)
 }
 
 /// Core logic of the old `raven.refreshPackages` inline path. Retained for
@@ -18594,8 +18717,9 @@ async fn commit_libpath_changed(
             .filter(|name| !removed.contains(*name))
             .cloned()
             .collect::<Vec<_>>();
-        if !warm.is_empty() {
-            successor.prefetch_packages(&warm).await;
+        if !warm.is_empty() && !successor.prefetch_packages(&warm).await {
+            attempts += 1;
+            continue;
         }
         let Some(driver) = prepare_library_routing_driver(
             state_arc,
@@ -18703,7 +18827,7 @@ async fn commit_libpath_dropped(
             LibraryRoutingDriverOptions {
                 ready,
                 only_packages: Some(std::collections::HashSet::new()),
-                warm_open_packages: false,
+                warm_open_packages: true,
                 refresh_cache_epoch: false,
                 attempt_limit: 1,
             },
@@ -19232,7 +19356,7 @@ mod tests {
             super::LibraryRoutingDriverOptions {
                 ready: false,
                 only_packages: None,
-                warm_open_packages: false,
+                warm_open_packages: true,
                 refresh_cache_epoch: true,
                 attempt_limit: 1,
             },
