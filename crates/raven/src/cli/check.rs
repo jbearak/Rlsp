@@ -420,7 +420,12 @@ fn materialize_cli_contextual_provider(
     state
         .cross_file_file_cache
         .insert(execution.uri.clone(), snapshot, content);
-    state.workspace_index.insert(execution.uri.clone(), entry);
+    let (_, evicted) = state.workspace_index.install_complete_with_eviction(
+        execution.uri.clone(),
+        entry,
+        crate::workspace_index::ClosedProvenance::Dynamic,
+    );
+    state.refresh_tar_source_watch_parents(std::iter::once(execution.uri.clone()).chain(evicted));
     let graph_metadata =
         state.metadata_for_dependency_graph(&execution.uri, &metadata, workspace_root);
     state.cross_file_graph.update_file(

@@ -9385,6 +9385,7 @@ fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<U
     // generation comes from the state-wide counter and cannot reuse the old
     // value.
     state.watched_file_resync_generations.remove(uri);
+    state.refresh_tar_source_watch_parents([uri.clone()]);
     neighbors
 }
 
@@ -19294,11 +19295,17 @@ impl Backend {
             }
         }
         let claim = {
-            let state = self.state.read().await;
-            match state.workspace_index.claim_enrichment(
+            let mut state = self.state.write().await;
+            let (claim, evicted) = state.workspace_index.claim_enrichment_with_eviction(
                 file_uri.clone(),
                 crate::workspace_index::ClosedProvenance::Dynamic,
-            ) {
+            );
+            if evicted.is_some() {
+                state.refresh_tar_source_watch_parents(
+                    std::iter::once(file_uri.clone()).chain(evicted),
+                );
+            }
+            match claim {
                 crate::workspace_index::ClaimEnrichment::AlreadyComplete(_) => {
                     return state.workspace_index.get_metadata(file_uri);
                 }
@@ -19788,11 +19795,17 @@ impl Backend {
             }
         }
         let (claim, refresh) = {
-            let state = self.state.read().await;
-            match state.workspace_index.claim_enrichment(
+            let mut state = self.state.write().await;
+            let (claim, evicted) = state.workspace_index.claim_enrichment_with_eviction(
                 file_uri.clone(),
                 crate::workspace_index::ClosedProvenance::Dynamic,
-            ) {
+            );
+            if evicted.is_some() {
+                state.refresh_tar_source_watch_parents(
+                    std::iter::once(file_uri.clone()).chain(evicted),
+                );
+            }
+            match claim {
                 crate::workspace_index::ClaimEnrichment::AlreadyComplete(refresh) => {
                     (None, Some(refresh))
                 }

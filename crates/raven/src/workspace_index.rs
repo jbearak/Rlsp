@@ -282,6 +282,14 @@ pub(crate) struct WorkspaceIndexTargetedChanges {
 pub(crate) struct PreparedWorkspaceIndexTargetedBatch {
     expected_version: u64,
     state: IndexState,
+    changed_uris: Vec<Url>,
+}
+
+impl PreparedWorkspaceIndexTargetedBatch {
+    /// URIs whose authoritative Complete records differ in this prepared swap.
+    pub(crate) fn changed_uris(&self) -> &[Url] {
+        &self.changed_uris
+    }
 }
 
 fn push_with_pins<V>(
@@ -888,11 +896,23 @@ impl WorkspaceIndex {
     pub fn install_complete(
         &self,
         uri: Url,
-        mut entry: IndexEntry,
+        entry: IndexEntry,
         provenance: ClosedProvenance,
     ) -> bool {
+        self.install_complete_with_eviction(uri, entry, provenance)
+            .0
+    }
+
+    /// Internal form of [`Self::install_complete`] that reports the
+    /// artifact-tier Complete record evicted by this install, if any.
+    pub(crate) fn install_complete_with_eviction(
+        &self,
+        uri: Url,
+        mut entry: IndexEntry,
+        provenance: ClosedProvenance,
+    ) -> (bool, Option<Url>) {
         let Ok(mut state) = self.inner.write() else {
-            return false;
+            return (false, None);
         };
         let next_version = state.version.wrapping_add(1);
         entry.indexed_at_version = next_version;
@@ -900,7 +920,7 @@ impl WorkspaceIndex {
         artifact.indexed_at_version = next_version;
         artifact.provenance = provenance;
 
-        Self::install_complete_locked(
+        let evicted = Self::install_complete_locked(
             &mut state,
             uri.clone(),
             artifact,
@@ -914,7 +934,7 @@ impl WorkspaceIndex {
         if let Ok(mut metrics) = self.metrics.write() {
             metrics.insertions += 1;
         }
-        full_resident
+        (full_resident, evicted)
     }
 
     /// Refresh a finalized record without changing who owns its lifecycle.
@@ -922,9 +942,9 @@ impl WorkspaceIndex {
         &self,
         uri: Url,
         entry: IndexEntry,
-    ) -> bool {
+    ) -> (bool, Option<Url>) {
         let provenance = self.provenance(&uri).unwrap_or(ClosedProvenance::Dynamic);
-        self.install_complete(uri, entry, provenance)
+        self.install_complete_with_eviction(uri, entry, provenance)
     }
 
     /// Replace metadata for one finalized record in both residency tiers.
@@ -965,7 +985,7 @@ impl WorkspaceIndex {
         mut artifact: ArtifactEntry,
         full: Option<IndexEntry>,
         max_file_size_bytes: usize,
-    ) {
+    ) -> Option<Url> {
         artifact.record_generation = Self::mint_record_generation();
         let mut protected = state.pinned.clone();
         protected.extend(
@@ -975,13 +995,14 @@ impl WorkspaceIndex {
                 .filter(|(_, slot)| matches!(slot, ArtifactSlot::Pending { .. }))
                 .map(|(pending_uri, _)| pending_uri.clone()),
         );
-        if let Some(evicted) = push_with_pins(
+        let evicted = push_with_pins(
             &mut state.artifacts,
             &protected,
             uri.clone(),
             ArtifactSlot::Complete(artifact),
-        ) {
-            state.full.pop(&evicted);
+        );
+        if let Some(evicted) = &evicted {
+            state.full.pop(evicted);
         }
 
         if let Some(full) = full {
@@ -991,21 +1012,37 @@ impl WorkspaceIndex {
                 push_with_pins(&mut state.full, &state.pinned, uri, full);
             }
         }
+        evicted
     }
 
     /// Atomically claim enrichment for an absent URI.
     pub fn claim_enrichment(&self, uri: Url, provenance: ClosedProvenance) -> ClaimEnrichment {
+        self.claim_enrichment_with_eviction(uri, provenance).0
+    }
+
+    /// Internal form of [`Self::claim_enrichment`] that reports a Complete
+    /// artifact evicted while reserving a new Pending slot.
+    pub(crate) fn claim_enrichment_with_eviction(
+        &self,
+        uri: Url,
+        provenance: ClosedProvenance,
+    ) -> (ClaimEnrichment, Option<Url>) {
         let Ok(mut state) = self.inner.write() else {
-            return ClaimEnrichment::AlreadyPending;
+            return (ClaimEnrichment::AlreadyPending, None);
         };
         match state.artifacts.peek(&uri) {
             Some(ArtifactSlot::Complete(entry)) => {
-                return ClaimEnrichment::AlreadyComplete(CompleteRefreshToken {
-                    uri,
-                    record_generation: entry.record_generation,
-                });
+                return (
+                    ClaimEnrichment::AlreadyComplete(CompleteRefreshToken {
+                        uri,
+                        record_generation: entry.record_generation,
+                    }),
+                    None,
+                );
             }
-            Some(ArtifactSlot::Pending { .. }) => return ClaimEnrichment::AlreadyPending,
+            Some(ArtifactSlot::Pending { .. }) => {
+                return (ClaimEnrichment::AlreadyPending, None);
+            }
             None => {}
         }
 
@@ -1019,7 +1056,7 @@ impl WorkspaceIndex {
                 .filter(|(_, slot)| matches!(slot, ArtifactSlot::Pending { .. }))
                 .map(|(pending_uri, _)| pending_uri.clone()),
         );
-        if let Some(evicted) = push_with_pins(
+        let evicted = push_with_pins(
             &mut state.artifacts,
             &protected,
             uri.clone(),
@@ -1027,19 +1064,32 @@ impl WorkspaceIndex {
                 claim_generation: generation,
                 provenance,
             },
-        ) {
-            state.full.pop(&evicted);
+        );
+        if let Some(evicted) = &evicted {
+            state.full.pop(evicted);
         }
         state.version = state.version.wrapping_add(1);
-        ClaimEnrichment::Claimed(EnrichmentClaim { uri, generation })
+        (
+            ClaimEnrichment::Claimed(EnrichmentClaim { uri, generation }),
+            evicted,
+        )
     }
 
     /// Commit a claimed Pending record atomically into both projections.
     pub fn commit_enrichment(
         &self,
         claim: &EnrichmentClaim,
-        mut entry: IndexEntry,
+        entry: IndexEntry,
     ) -> Result<bool, EnrichmentCommitError> {
+        self.commit_enrichment_with_eviction(claim, entry)
+            .map(|(full_resident, _)| full_resident)
+    }
+
+    pub(crate) fn commit_enrichment_with_eviction(
+        &self,
+        claim: &EnrichmentClaim,
+        mut entry: IndexEntry,
+    ) -> Result<(bool, Option<Url>), EnrichmentCommitError> {
         let mut state = self
             .inner
             .write()
@@ -1056,7 +1106,7 @@ impl WorkspaceIndex {
         let mut artifact = ArtifactEntry::from(&entry);
         artifact.indexed_at_version = next_version;
         artifact.provenance = provenance;
-        Self::install_complete_locked(
+        let evicted = Self::install_complete_locked(
             &mut state,
             claim.uri.clone(),
             artifact,
@@ -1064,7 +1114,7 @@ impl WorkspaceIndex {
             self.config.max_file_size_bytes,
         );
         state.version = next_version;
-        Ok(state.full.contains(&claim.uri))
+        Ok((state.full.contains(&claim.uri), evicted))
     }
 
     pub(crate) fn enrichment_claim_is_current(&self, claim: &EnrichmentClaim) -> bool {
@@ -1127,8 +1177,17 @@ impl WorkspaceIndex {
     pub fn commit_complete_refresh(
         &self,
         token: &CompleteRefreshToken,
-        mut entry: IndexEntry,
+        entry: IndexEntry,
     ) -> Result<bool, EnrichmentCommitError> {
+        self.commit_complete_refresh_with_eviction(token, entry)
+            .map(|(full_resident, _)| full_resident)
+    }
+
+    pub(crate) fn commit_complete_refresh_with_eviction(
+        &self,
+        token: &CompleteRefreshToken,
+        mut entry: IndexEntry,
+    ) -> Result<(bool, Option<Url>), EnrichmentCommitError> {
         let mut state = self
             .inner
             .write()
@@ -1146,7 +1205,7 @@ impl WorkspaceIndex {
         let mut artifact = ArtifactEntry::from(&entry);
         artifact.indexed_at_version = next_version;
         artifact.provenance = provenance;
-        Self::install_complete_locked(
+        let evicted = Self::install_complete_locked(
             &mut state,
             token.uri.clone(),
             artifact,
@@ -1154,7 +1213,7 @@ impl WorkspaceIndex {
             self.config.max_file_size_bytes,
         );
         state.version = next_version;
-        Ok(state.full.contains(&token.uri))
+        Ok((state.full.contains(&token.uri), evicted))
     }
 
     /// Abort a Pending claim; stale claims cannot remove a newer generation.
@@ -1265,6 +1324,13 @@ impl WorkspaceIndex {
         {
             return Ok(None);
         }
+        let mut changed_uris: Vec<_> = changes
+            .metadata
+            .iter()
+            .map(|(uri, _)| uri.clone())
+            .chain(changes.installs.iter().map(|(uri, ..)| uri.clone()))
+            .chain(changes.removals.iter().cloned())
+            .collect();
         if changes.metadata.iter().any(|(uri, _)| {
             !matches!(
                 candidate.artifacts.peek(uri),
@@ -1302,13 +1368,15 @@ impl WorkspaceIndex {
             let mut artifact = ArtifactEntry::from(&entry);
             artifact.indexed_at_version = next_version;
             artifact.provenance = provenance;
-            Self::install_complete_locked(
+            if let Some(evicted) = Self::install_complete_locked(
                 &mut candidate,
                 uri,
                 artifact,
                 Some(entry),
                 self.config.max_file_size_bytes,
-            );
+            ) {
+                changed_uris.push(evicted);
+            }
         }
         let user_cap_nz = Self::effective_cap_for(&self.config);
         let user_cap = user_cap_nz.get();
@@ -1322,10 +1390,13 @@ impl WorkspaceIndex {
         {
             candidate.artifacts.resize(cap);
         }
+        changed_uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        changed_uris.dedup();
         candidate.version = next_version;
         Ok(Some(PreparedWorkspaceIndexTargetedBatch {
             expected_version,
             state: candidate,
+            changed_uris,
         }))
     }
 
@@ -1478,7 +1549,14 @@ impl WorkspaceIndex {
 
     /// Resize the artifact-only tier.
     pub fn resize_artifacts(&self, cap: usize) {
+        self.resize_artifacts_with_evictions(cap);
+    }
+
+    /// Internal form of [`Self::resize_artifacts`] that reports every
+    /// Complete record removed while enforcing the smaller artifact cap.
+    pub(crate) fn resize_artifacts_with_evictions(&self, cap: usize) -> Vec<Url> {
         let cap = crate::cross_file::cache::non_zero_or(cap, DEFAULT_ARTIFACT_CAPACITY);
+        let mut evicted = Vec::new();
         if let Ok(mut state) = self.inner.write() {
             state.artifact_user_cap = cap.get();
             while state.artifacts.len() > cap.get() {
@@ -1496,6 +1574,7 @@ impl WorkspaceIndex {
                 };
                 state.artifacts.pop(&victim);
                 state.full.pop(&victim);
+                evicted.push(victim);
             }
             let runtime_cap = cap.get().max(state.artifacts.len());
             if let Some(runtime_cap) = NonZeroUsize::new(runtime_cap)
@@ -1513,6 +1592,7 @@ impl WorkspaceIndex {
             }
             state.version = state.version.wrapping_add(1);
         }
+        evicted
     }
 
     // ========================================================================
@@ -2338,6 +2418,42 @@ mod tests {
         assert!(index.contains(&uri2));
         assert!(index.contains(&uri3));
         assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn targeted_batch_reports_implicit_complete_eviction_victims() {
+        let index = WorkspaceIndex::new(WorkspaceIndexConfig {
+            max_files: 1,
+            ..make_test_config()
+        });
+        index.resize_artifacts(1);
+        let victim = test_uri("victim.R");
+        let replacement = test_uri("replacement.R");
+        index.insert(victim.clone(), make_test_entry(0));
+
+        let prepared = index
+            .prepare_targeted_batch_if_current(
+                index.version(),
+                WorkspaceIndexTargetedChanges {
+                    metadata: Vec::new(),
+                    installs: vec![(
+                        replacement.clone(),
+                        make_test_entry(0),
+                        ClosedProvenance::Dynamic,
+                    )],
+                    removals: Vec::new(),
+                    pins: HashSet::new(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let mut expected = vec![victim.clone(), replacement.clone()];
+        expected.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(prepared.changed_uris(), expected);
+        assert!(index.commit_prepared_targeted_batch(prepared).unwrap());
+        assert!(!index.is_complete(&victim));
+        assert!(index.is_complete(&replacement));
     }
 
     #[test]

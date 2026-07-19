@@ -1286,6 +1286,12 @@ pub struct WorldState {
     pub(crate) watched_batch_test_commit_attempts: usize,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) analysis_revalidation_reservation_count: usize,
+    /// Instrumentation for keeping ordinary analysis commits off the
+    /// workspace-wide tar watch-registry sweep.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) tar_source_watch_full_rebuild_count: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) tar_source_watch_parent_check_count: usize,
     /// Whether the background workspace scan has completed and the dependency
     /// graph has been populated from workspace entries. In `Auto` backward
     /// dependency mode, undefined variable diagnostics are deferred for files
@@ -1880,6 +1886,26 @@ pub(crate) enum PreparedAnalysisCommit {
     OpenAliasReconcile(Box<PreparedOpenAliasReconcileAnalysis>),
     OpenInstall(Box<PreparedOpenInstallAnalysis>),
     OpenClose(Box<PreparedOpenCloseAnalysis>),
+}
+
+/// Bounded post-commit check for whether authoritative tar watch topology may
+/// have changed.
+///
+/// Ordinary commits name only the parents whose open/closed authority changed.
+/// A full workspace replacement skips the gate because every parent may have
+/// changed. The existing full rebuild remains the single writer of both
+/// registry directions and the root-generation tombstones.
+enum TarSourceWatchRegistryRefresh {
+    Full,
+    Parents(Vec<Url>),
+}
+
+impl TarSourceWatchRegistryRefresh {
+    fn push_parent(&mut self, parent: Option<Url>) {
+        if let (Self::Parents(parents), Some(parent)) = (self, parent) {
+            parents.push(parent);
+        }
+    }
 }
 
 /// One all-or-none watched-file transaction spanning closed-file and package
@@ -5537,7 +5563,32 @@ impl WorldState {
     /// holding the WorldState write lock, so rejected preparations cannot
     /// leak registry mutations.
     fn rebuild_tar_source_watch_registry(&mut self) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.tar_source_watch_full_rebuild_count += 1;
+        }
         let previous_by_path = self.tar_source_parents_by_watch_path.clone();
+        let (by_parent, by_path) = self.collect_authoritative_tar_source_watch_registry();
+        let mut changed_paths: HashSet<PathBuf> = previous_by_path.keys().cloned().collect();
+        changed_paths.extend(by_path.keys().cloned());
+        let mut changed_paths: Vec<_> = changed_paths
+            .into_iter()
+            .filter(|path| previous_by_path.get(path) != by_path.get(path))
+            .collect();
+        changed_paths.sort();
+        for path in changed_paths {
+            self.bump_tar_source_watch_path_generation(&path);
+        }
+        self.tar_source_watch_paths_by_parent = by_parent;
+        self.tar_source_parents_by_watch_path = by_path;
+    }
+
+    /// Compute the authoritative bidirectional registry without mutating
+    /// generations. Tests use this as an explicit full-sweep oracle for the
+    /// bounded post-commit gate.
+    fn collect_authoritative_tar_source_watch_registry(
+        &self,
+    ) -> (HashMap<Url, Vec<PathBuf>>, HashMap<PathBuf, HashSet<Url>>) {
         let mut by_parent: HashMap<Url, Vec<PathBuf>> = HashMap::new();
 
         for uri in self.workspace_index.artifact_uris() {
@@ -5576,18 +5627,68 @@ impl WorldState {
                     .insert(parent.clone());
             }
         }
-        let mut changed_paths: HashSet<PathBuf> = previous_by_path.keys().cloned().collect();
-        changed_paths.extend(by_path.keys().cloned());
-        let mut changed_paths: Vec<_> = changed_paths
-            .into_iter()
-            .filter(|path| previous_by_path.get(path) != by_path.get(path))
-            .collect();
-        changed_paths.sort();
-        for path in changed_paths {
-            self.bump_tar_source_watch_path_generation(&path);
+        (by_parent, by_path)
+    }
+
+    /// Read one parent's effective post-commit watch roots using the same
+    /// authority precedence as [`Self::rebuild_tar_source_watch_registry`].
+    fn authoritative_tar_source_watch_paths(&self, parent: &Url) -> Vec<PathBuf> {
+        let metadata = if let Some(record) = self.documents.get_record(parent) {
+            Some(Arc::clone(record.metadata()))
+        } else if self.is_document_open_or_alias(parent) {
+            None
+        } else {
+            self.workspace_index.get_metadata(parent)
+        };
+        let mut paths = metadata
+            .map(|metadata| metadata.tar_source_expansion_watch_paths.clone())
+            .unwrap_or_default();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Gate the rare full rebuild behind bounded authoritative parent checks.
+    ///
+    /// The common edit path names one parent. If its normalized roots still
+    /// match the installed parent map, the check is O(1) in workspace size and
+    /// performs no per-artifact index reads. A topology change deliberately
+    /// falls back to the full rebuild so bidirectional ownership, net
+    /// owner-set generation bumps, and tombstone retention keep one writer.
+    fn refresh_tar_source_watch_registry(&mut self, refresh: TarSourceWatchRegistryRefresh) {
+        let needs_rebuild = match refresh {
+            TarSourceWatchRegistryRefresh::Full => true,
+            TarSourceWatchRegistryRefresh::Parents(mut parents) => {
+                parents.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+                parents.dedup();
+                parents.into_iter().any(|parent| {
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        self.tar_source_watch_parent_check_count += 1;
+                    }
+                    let authoritative = self.authoritative_tar_source_watch_paths(&parent);
+                    self.tar_source_watch_paths_by_parent
+                        .get(&parent)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        != authoritative.as_slice()
+                })
+            }
+        };
+        if needs_rebuild {
+            self.rebuild_tar_source_watch_registry();
         }
-        self.tar_source_watch_paths_by_parent = by_parent;
-        self.tar_source_parents_by_watch_path = by_path;
+    }
+
+    /// Reconcile a bounded set of parents after an authoritative mutation that
+    /// intentionally bypasses [`Self::try_commit_analysis`].
+    pub(crate) fn refresh_tar_source_watch_parents(
+        &mut self,
+        parents: impl IntoIterator<Item = Url>,
+    ) {
+        self.refresh_tar_source_watch_registry(TarSourceWatchRegistryRefresh::Parents(
+            parents.into_iter().collect(),
+        ));
     }
 
     /// Current operational generation of raw package inputs.
@@ -6327,6 +6428,10 @@ impl WorldState {
             watched_batch_test_commit_attempts: 0,
             #[cfg(any(test, feature = "test-support"))]
             analysis_revalidation_reservation_count: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            tar_source_watch_full_rebuild_count: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            tar_source_watch_parent_check_count: 0,
             workspace_scan_complete: false,
             package_state: crate::package_state::PackageState::new(),
             package_state_record_generation: 0,
@@ -7144,20 +7249,27 @@ impl WorldState {
 
     /// Resize all LRU caches based on configuration.
     /// Called after parsing initialization options.
-    pub fn resize_caches(&self, config: &crate::cross_file::config::CrossFileConfig) {
+    pub fn resize_caches(&mut self, config: &crate::cross_file::config::CrossFileConfig) {
         self.cross_file_meta
             .resize(config.cache_metadata_max_entries);
         self.cross_file_file_cache.resize(
             config.cache_file_content_max_entries,
             config.cache_existence_max_entries,
         );
-        self.workspace_index
-            .resize_artifacts(config.cache_workspace_index_max_entries);
+        let evicted = self
+            .workspace_index
+            .resize_artifacts_with_evictions(config.cache_workspace_index_max_entries);
+        if !evicted.is_empty() {
+            self.refresh_tar_source_watch_parents(evicted);
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_document(&mut self, uri: Url, text: &str, version: Option<i32>) {
+        let mut tar_watch_parents = vec![uri.clone()];
+        tar_watch_parents.extend(self.canonical_uris_for_open_document(&uri));
         let aliases = self.register_open_document_aliases(&uri);
+        tar_watch_parents.extend(aliases.iter().cloned());
         self.cross_file_file_cache.invalidate(&uri);
         for alias in aliases {
             self.cross_file_file_cache.invalidate(&alias);
@@ -7165,6 +7277,9 @@ impl WorldState {
         self.documents
             .insert(uri.clone(), Document::new_with_uri(text, version, &uri));
         self.advance_open_context_authority_generation();
+        self.refresh_tar_source_watch_registry(TarSourceWatchRegistryRefresh::Parents(
+            tar_watch_parents,
+        ));
     }
 
     /// Open one document authority with its already-enriched metadata.
@@ -7194,7 +7309,10 @@ impl WorldState {
         metadata: Arc<crate::cross_file::CrossFileMetadata>,
         lifecycle_epoch: Option<DiagnosticsEpoch>,
     ) -> Arc<OpenDocumentRecord> {
+        let mut tar_watch_parents = vec![uri.clone()];
+        tar_watch_parents.extend(self.canonical_uris_for_open_document(&uri));
         let aliases = self.register_open_document_aliases(&uri);
+        tar_watch_parents.extend(aliases.iter().cloned());
         self.cross_file_file_cache.invalidate(&uri);
         self.record_editor_chunk_kind_override(&uri, document.chunk_kind);
         for alias in aliases {
@@ -7204,6 +7322,9 @@ impl WorldState {
             .documents
             .open(uri, document, metadata, lifecycle_epoch);
         self.advance_open_context_authority_generation();
+        self.refresh_tar_source_watch_registry(TarSourceWatchRegistryRefresh::Parents(
+            tar_watch_parents,
+        ));
         record
     }
 
@@ -7230,6 +7351,8 @@ impl WorldState {
     pub fn close_document(&mut self, uri: &Url) -> Vec<Url> {
         self.cancel_open_install_intent(uri);
         let aliases = self.open_document_aliases.close(uri);
+        let mut tar_watch_parents = vec![uri.clone()];
+        tar_watch_parents.extend(aliases.iter().cloned());
         let removed_record = self.documents.close(uri).is_some();
         if removed_record || !aliases.is_empty() {
             self.advance_open_context_authority_generation();
@@ -7237,6 +7360,9 @@ impl WorldState {
         if let Ok(mut cache) = self.effective_lint_config_cache.lock() {
             cache.remove(uri.as_str());
         }
+        self.refresh_tar_source_watch_registry(TarSourceWatchRegistryRefresh::Parents(
+            tar_watch_parents,
+        ));
         aliases
     }
 
@@ -7970,6 +8096,91 @@ impl WorldState {
         }
     }
 
+    fn extend_tar_watch_open_plan_parents(parents: &mut Vec<Url>, plan: &PreparedOpenCommitPlan) {
+        parents.extend(plan.reset_closed_roots.iter().cloned());
+        parents.extend(plan.retire_closed_roots.iter().cloned());
+        parents.extend(
+            plan.close_disk_installs
+                .iter()
+                .map(|install| install.uri.clone()),
+        );
+    }
+
+    fn tar_watch_refresh_for_system_file(
+        prepared: &PreparedSystemFileAnalysis,
+    ) -> TarSourceWatchRegistryRefresh {
+        let mut parents = prepared
+            .index
+            .as_ref()
+            .into_iter()
+            .flat_map(|index| index.changed_uris().iter().cloned())
+            .collect::<Vec<_>>();
+        parents.extend(
+            prepared
+                .open_metadata
+                .iter()
+                .map(|replacement| replacement.uri.clone()),
+        );
+        TarSourceWatchRegistryRefresh::Parents(parents)
+    }
+
+    /// Capture every parent whose authoritative open/closed record may change
+    /// before a prepared commit consumes or rewrites its transition inputs.
+    fn tar_watch_refresh_for_prepared(
+        &self,
+        prepared: &PreparedAnalysisCommit,
+    ) -> TarSourceWatchRegistryRefresh {
+        let mut parents = Vec::new();
+        match prepared {
+            PreparedAnalysisCommit::WorkspaceScan(_) => {
+                return TarSourceWatchRegistryRefresh::Full;
+            }
+            PreparedAnalysisCommit::SystemFile(prepared) => {
+                return Self::tar_watch_refresh_for_system_file(prepared);
+            }
+            PreparedAnalysisCommit::Upsert(prepared) => {
+                parents.push(prepared.uri.clone());
+            }
+            PreparedAnalysisCommit::Remove { uri, .. } => {
+                parents.push(uri.clone());
+            }
+            PreparedAnalysisCommit::WatchedBatch(prepared) => {
+                parents.extend(prepared.mutations.iter().map(|mutation| match mutation {
+                    PreparedClosedMutation::Upsert(prepared) => prepared.uri.clone(),
+                    PreparedClosedMutation::Remove { uri, .. } => uri.clone(),
+                }));
+            }
+            PreparedAnalysisCommit::OpenInstall(prepared) => {
+                parents.push(prepared.uri.clone());
+                parents.extend(self.canonical_uris_for_open_document(&prepared.uri));
+                parents.extend(prepared.aliases.iter().cloned());
+                Self::extend_tar_watch_open_plan_parents(&mut parents, &prepared.plan);
+            }
+            PreparedAnalysisCommit::OpenEdit(prepared) => {
+                parents.push(prepared.uri.clone());
+                Self::extend_tar_watch_open_plan_parents(&mut parents, &prepared.plan);
+            }
+            PreparedAnalysisCommit::OpenMetadata(prepared) => {
+                parents.push(prepared.uri.clone());
+                Self::extend_tar_watch_open_plan_parents(&mut parents, &prepared.plan);
+            }
+            PreparedAnalysisCommit::OpenAliasReconcile(prepared) => {
+                parents.push(prepared.uri.clone());
+                // Capture the old aliases before registration replaces them.
+                parents.extend(self.canonical_uris_for_open_document(&prepared.uri));
+                parents.extend(prepared.aliases.iter().cloned());
+                Self::extend_tar_watch_open_plan_parents(&mut parents, &prepared.plan);
+            }
+            PreparedAnalysisCommit::OpenClose(prepared) => {
+                parents.push(prepared.uri.clone());
+                parents.extend(self.canonical_uris_for_open_document(&prepared.uri));
+                parents.extend(prepared.expected_aliases.iter().cloned());
+                Self::extend_tar_watch_open_plan_parents(&mut parents, &prepared.plan);
+            }
+        }
+        TarSourceWatchRegistryRefresh::Parents(parents)
+    }
+
     /// Validate and commit one prepared analysis transaction while the caller
     /// holds the sole `WorldState` write lock.
     ///
@@ -7982,12 +8193,15 @@ impl WorldState {
         &mut self,
         prepared: PreparedAnalysisCommit,
     ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
+        let mut tar_watch_refresh = self.tar_watch_refresh_for_prepared(&prepared);
         let result = match prepared {
             PreparedAnalysisCommit::WorkspaceScan(prepared) => {
                 self.try_commit_workspace_scan(*prepared)
             }
             PreparedAnalysisCommit::SystemFile(prepared) => self.try_commit_system_file(*prepared),
-            PreparedAnalysisCommit::OpenClose(prepared) => self.try_commit_open_close(*prepared),
+            PreparedAnalysisCommit::OpenClose(prepared) => {
+                self.try_commit_open_close(*prepared, &mut tar_watch_refresh)
+            }
             PreparedAnalysisCommit::OpenInstall(prepared) => {
                 self.try_commit_open_install(*prepared)
             }
@@ -8003,19 +8217,21 @@ impl WorldState {
                 None,
                 true,
                 false,
+                &mut tar_watch_refresh,
             ),
             PreparedAnalysisCommit::Remove { basis, uri } => self.try_commit_closed_batch(
                 vec![PreparedClosedMutation::Remove { basis, uri }],
                 None,
                 true,
                 false,
+                &mut tar_watch_refresh,
             ),
             PreparedAnalysisCommit::WatchedBatch(prepared) => {
-                self.try_commit_watched_batch(*prepared)
+                self.try_commit_watched_batch(*prepared, &mut tar_watch_refresh)
             }
         };
         if result.is_ok() {
-            self.rebuild_tar_source_watch_registry();
+            self.refresh_tar_source_watch_registry(tar_watch_refresh);
         }
         result
     }
@@ -8023,6 +8239,7 @@ impl WorldState {
     fn try_commit_watched_batch(
         &mut self,
         prepared: PreparedWatchedBatchAnalysis,
+        tar_watch_refresh: &mut TarSourceWatchRegistryRefresh,
     ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
         if prepared
             .watched_generations
@@ -8048,6 +8265,7 @@ impl WorldState {
             prepared.package,
             false,
             prepared.durable_package_handoff,
+            tar_watch_refresh,
         )
     }
 
@@ -8316,6 +8534,7 @@ impl WorldState {
         ),
         AnalysisCommitRejected,
     > {
+        let tar_watch_refresh = Self::tar_watch_refresh_for_system_file(&prepared.system_file);
         let PreparedLibraryRoutingAnalysis {
             basis,
             prospective,
@@ -8586,7 +8805,7 @@ impl WorldState {
                 &self.library_routing_reconcile_wake_generation,
             );
         }
-        self.rebuild_tar_source_watch_registry();
+        self.refresh_tar_source_watch_registry(tar_watch_refresh);
 
         Ok((
             LibraryRoutingTransferredEffects {
@@ -8601,6 +8820,7 @@ impl WorldState {
     fn try_commit_open_close(
         &mut self,
         mut prepared: PreparedOpenCloseAnalysis,
+        tar_watch_refresh: &mut TarSourceWatchRegistryRefresh,
     ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
         let targets = HashSet::from([prepared.uri.clone()]);
         if !self.analysis_basis_is_current(&prepared.basis, &prepared.uri, &targets)
@@ -8631,8 +8851,10 @@ impl WorldState {
             .and_then(|package| self.install_prepared_package_projection(package));
 
         for install in prepared.plan.close_disk_installs.drain(..) {
-            self.workspace_index
+            let (_, evicted) = self
+                .workspace_index
                 .install_complete_preserving_provenance(install.uri.clone(), install.entry);
+            tar_watch_refresh.push_parent(evicted);
             self.cross_file_file_cache
                 .insert(install.uri, install.snapshot, install.content);
         }
@@ -9139,6 +9361,7 @@ impl WorldState {
         package: Option<(PackageProjectionBasis, PreparedPackageProjection)>,
         reserve_closed_fanout: bool,
         durable_package_handoff: bool,
+        tar_watch_refresh: &mut TarSourceWatchRegistryRefresh,
     ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
         let mut targets = HashSet::with_capacity(mutations.len());
         let no_duplicates = mutations.iter().all(|mutation| {
@@ -9219,21 +9442,24 @@ impl WorldState {
                         && matches!(&prepared.basis.subject, AnalysisSubjectBasis::Observed(_));
                     let report_unmarked_fanout = !reserve_closed_fanout
                         || matches!(&prepared.basis.subject, AnalysisSubjectBasis::Pending(_));
-                    let committed = match &prepared.basis.subject {
+                    let (committed, evicted) = match &prepared.basis.subject {
                         AnalysisSubjectBasis::Pending(claim) => self
                             .workspace_index
-                            .commit_enrichment(claim, prepared.entry)
-                            .is_ok(),
+                            .commit_enrichment_with_eviction(claim, prepared.entry)
+                            .map(|(_, evicted)| (true, evicted))
+                            .unwrap_or((false, None)),
                         AnalysisSubjectBasis::Complete(token) => self
                             .workspace_index
-                            .commit_complete_refresh(token, prepared.entry)
-                            .is_ok(),
+                            .commit_complete_refresh_with_eviction(token, prepared.entry)
+                            .map(|(_, evicted)| (true, evicted))
+                            .unwrap_or((false, None)),
                         AnalysisSubjectBasis::Observed(_) => {
-                            self.workspace_index.install_complete_preserving_provenance(
-                                prepared.uri.clone(),
-                                prepared.entry,
-                            );
-                            true
+                            let (_, evicted) =
+                                self.workspace_index.install_complete_preserving_provenance(
+                                    prepared.uri.clone(),
+                                    prepared.entry,
+                                );
+                            (true, evicted)
                         }
                         AnalysisSubjectBasis::Open(_)
                         | AnalysisSubjectBasis::OpenInstall(_)
@@ -9241,6 +9467,7 @@ impl WorldState {
                             unreachable!("open subjects never enter the closed commit path")
                         }
                     };
+                    tar_watch_refresh.push_parent(evicted);
                     debug_assert!(committed, "prevalidated closed CAS remains current");
 
                     let result = self.cross_file_graph.update_file(
@@ -9563,7 +9790,14 @@ impl WorldState {
             content_hash: None,
         };
         let processed = processed_workspace_document(uri.clone(), document, snapshot);
-        self.workspace_index.insert(uri, processed.entry);
+        let (_, evicted) = self.workspace_index.install_complete_with_eviction(
+            uri.clone(),
+            processed.entry,
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        );
+        let mut parents = vec![uri];
+        parents.extend(evicted);
+        self.refresh_tar_source_watch_registry(TarSourceWatchRegistryRefresh::Parents(parents));
     }
 
     /// Build the dependency graph from all entries in the workspace index.
@@ -10144,6 +10378,7 @@ impl WorldState {
 
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok();
+        let mut tar_watch_parents = Vec::new();
 
         for uri in external_uris {
             if self.workspace_index.enrichment_status(&uri).is_some() {
@@ -10187,7 +10422,16 @@ impl WorldState {
                 artifacts,
                 indexed_at_version: 0,
             };
-            self.workspace_index.insert(uri, entry);
+            let (_, evicted) = self.workspace_index.install_complete_with_eviction(
+                uri.clone(),
+                entry,
+                crate::workspace_index::ClosedProvenance::Dynamic,
+            );
+            tar_watch_parents.push(uri);
+            tar_watch_parents.extend(evicted);
+        }
+        if !tar_watch_parents.is_empty() {
+            self.refresh_tar_source_watch_parents(tar_watch_parents);
         }
     }
 }
@@ -11612,6 +11856,31 @@ mod tests {
             mtime: std::time::SystemTime::UNIX_EPOCH,
             size,
             content_hash: Some(content_hash),
+        }
+    }
+
+    fn assert_tar_watch_registry_matches_full_oracle(state: &WorldState) {
+        let (by_parent, by_path) = state.collect_authoritative_tar_source_watch_registry();
+        assert_eq!(state.tar_source_watch_paths_by_parent, by_parent);
+        assert_eq!(state.tar_source_parents_by_watch_path, by_path);
+    }
+
+    fn tar_watch_test_entry(
+        metadata: crate::cross_file::CrossFileMetadata,
+    ) -> crate::workspace_index::IndexEntry {
+        crate::workspace_index::IndexEntry {
+            contents: Rope::from_str("x <- 1\n"),
+            tree: None,
+            loaded_packages: Vec::new(),
+            data_packages: Vec::new(),
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: None,
+            },
+            metadata: Arc::new(metadata),
+            artifacts: Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+            indexed_at_version: 0,
         }
     }
 
@@ -14967,6 +15236,392 @@ mod tests {
     }
 
     #[test]
+    fn plain_open_edit_checks_one_parent_without_full_registry_sweep() {
+        let mut state = WorldState::new();
+        for index in 0..256 {
+            let uri = Url::parse(&format!("file:///workspace/closed-{index}.R")).unwrap();
+            state.insert_workspace_document_for_test(
+                uri.clone(),
+                Document::new_with_uri("closed <- 1\n", None, &uri),
+            );
+        }
+        let uri = Url::parse("file:///workspace/open.R").unwrap();
+        state.open_document(uri.clone(), "before <- 1\n", Some(1));
+        let rebuilds_before = state.tar_source_watch_full_rebuild_count;
+        let checks_before = state.tar_source_watch_parent_check_count;
+
+        commit_test_edit(
+            &mut state,
+            &uri,
+            "after <- 2\n",
+            crate::cross_file::CrossFileMetadata::default(),
+            PreparedOpenCommitPlan::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.tar_source_watch_full_rebuild_count, rebuilds_before,
+            "ordinary typing must not scan the workspace-wide tar watch registry"
+        );
+        assert_eq!(
+            state.tar_source_watch_parent_check_count,
+            checks_before + 1,
+            "the OpenEdit gate must inspect only its subject parent"
+        );
+        assert_tar_watch_registry_matches_full_oracle(&state);
+    }
+
+    #[test]
+    fn gated_tar_watch_refresh_matches_full_oracle_across_root_transitions() {
+        let parent = Url::parse("file:///workspace/_targets.R").unwrap();
+        let old_root = PathBuf::from("/workspace/R");
+        let new_root = PathBuf::from("/workspace/src");
+        let mut state = WorldState::new();
+        state.open_document(parent.clone(), "targets::tar_source(\"R\")\n", Some(1));
+
+        let generation = state.documents.get_record(&parent).unwrap().generation();
+        state
+            .documents
+            .replace_metadata_if_current(
+                &parent,
+                generation,
+                Arc::new(crate::cross_file::CrossFileMetadata {
+                    tar_source_expansion_watch_paths: vec![old_root.clone()],
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let rebuilds_before = state.tar_source_watch_full_rebuild_count;
+        state.refresh_tar_source_watch_registry(TarSourceWatchRegistryRefresh::Parents(vec![
+            parent.clone(),
+        ]));
+        assert_eq!(
+            state.tar_source_watch_full_rebuild_count,
+            rebuilds_before + 1
+        );
+        assert_tar_watch_registry_matches_full_oracle(&state);
+        let old_generation = state.tar_source_watch_path_generations[&old_root];
+
+        let rebuilds_before = state.tar_source_watch_full_rebuild_count;
+        state.refresh_tar_source_watch_registry(TarSourceWatchRegistryRefresh::Parents(vec![
+            parent.clone(),
+        ]));
+        assert_eq!(
+            state.tar_source_watch_full_rebuild_count, rebuilds_before,
+            "an identical root set must stay on the bounded gate"
+        );
+        assert_eq!(
+            state.tar_source_watch_path_generations[&old_root], old_generation,
+            "an identical owner set must not bump its generation"
+        );
+
+        let generation = state.documents.get_record(&parent).unwrap().generation();
+        state
+            .documents
+            .replace_metadata_if_current(
+                &parent,
+                generation,
+                Arc::new(crate::cross_file::CrossFileMetadata {
+                    tar_source_expansion_watch_paths: vec![new_root.clone()],
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        state.refresh_tar_source_watch_registry(TarSourceWatchRegistryRefresh::Parents(vec![
+            parent.clone(),
+        ]));
+        assert_tar_watch_registry_matches_full_oracle(&state);
+        assert!(
+            !state
+                .tar_source_parents_by_watch_path
+                .contains_key(&old_root)
+        );
+        assert!(state.tar_source_watch_path_generations[&old_root] > old_generation);
+        let retired_generation = state.tar_source_watch_path_generations[&old_root];
+        let new_generation = state.tar_source_watch_path_generations[&new_root];
+
+        state.close_document(&parent);
+        assert_tar_watch_registry_matches_full_oracle(&state);
+        assert!(state.tar_source_watch_paths_by_parent.is_empty());
+        assert!(state.tar_source_parents_by_watch_path.is_empty());
+        assert_eq!(
+            state.tar_source_watch_path_generations[&old_root], retired_generation,
+            "an unrelated later transition must preserve the old root tombstone"
+        );
+        assert!(state.tar_source_watch_path_generations[&new_root] > new_generation);
+    }
+
+    #[test]
+    fn targeted_eviction_retires_tar_watch_root_and_rejected_swap_is_inert() {
+        use crate::cross_file::file_cache::FileSnapshot;
+        use crate::workspace_index::{
+            ClosedProvenance, IndexEntry, WorkspaceIndexConfig, WorkspaceIndexTargetedChanges,
+        };
+
+        let victim = Url::parse("file:///workspace/_targets.R").unwrap();
+        let replacement = Url::parse("file:///workspace/replacement.R").unwrap();
+        let stale_replacement = Url::parse("file:///workspace/stale-replacement.R").unwrap();
+        let root = PathBuf::from("/workspace/R");
+        let make_entry = |metadata| IndexEntry {
+            contents: Rope::from_str("x <- 1\n"),
+            tree: None,
+            loaded_packages: Vec::new(),
+            data_packages: Vec::new(),
+            snapshot: FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: None,
+            },
+            metadata: Arc::new(metadata),
+            artifacts: Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+            indexed_at_version: 0,
+        };
+
+        let mut state = WorldState::new();
+        state.workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig {
+            max_files: 1,
+            ..Default::default()
+        });
+        state.workspace_index.resize_artifacts(1);
+        state.workspace_index.install_complete(
+            victim.clone(),
+            make_entry(crate::cross_file::CrossFileMetadata {
+                tar_source_expansion_watch_paths: vec![root.clone()],
+                ..Default::default()
+            }),
+            ClosedProvenance::Dynamic,
+        );
+        state.rebuild_tar_source_watch_registry();
+        let root_generation = state.tar_source_watch_path_generations[&root];
+        let rebuilds_before = state.tar_source_watch_full_rebuild_count;
+
+        let prepared = state
+            .workspace_index
+            .prepare_targeted_batch_if_current(
+                state.workspace_index.version(),
+                WorkspaceIndexTargetedChanges {
+                    metadata: Vec::new(),
+                    installs: vec![(
+                        replacement.clone(),
+                        make_entry(crate::cross_file::CrossFileMetadata::default()),
+                        ClosedProvenance::Dynamic,
+                    )],
+                    removals: Vec::new(),
+                    pins: HashSet::new(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            prepared.changed_uris().contains(&victim),
+            "the prepared swap must carry its implicit Complete eviction victim"
+        );
+        let refresh = TarSourceWatchRegistryRefresh::Parents(prepared.changed_uris().to_vec());
+        assert!(
+            state
+                .workspace_index
+                .commit_prepared_targeted_batch(prepared)
+                .unwrap()
+        );
+        state.refresh_tar_source_watch_registry(refresh);
+
+        assert_eq!(
+            state.tar_source_watch_full_rebuild_count,
+            rebuilds_before + 1,
+            "one successful ownership change needs exactly one full rebuild"
+        );
+        assert_eq!(
+            state.tar_source_watch_path_generations[&root],
+            root_generation.wrapping_add(1),
+            "retiring the last owner bumps the root tombstone exactly once"
+        );
+        assert_tar_watch_registry_matches_full_oracle(&state);
+
+        let prepared = state
+            .workspace_index
+            .prepare_targeted_batch_if_current(
+                state.workspace_index.version(),
+                WorkspaceIndexTargetedChanges {
+                    metadata: Vec::new(),
+                    installs: vec![(
+                        stale_replacement,
+                        make_entry(crate::cross_file::CrossFileMetadata::default()),
+                        ClosedProvenance::Dynamic,
+                    )],
+                    removals: Vec::new(),
+                    pins: HashSet::new(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let owners_before = state.tar_source_watch_paths_by_parent.clone();
+        let reverse_before = state.tar_source_parents_by_watch_path.clone();
+        let generations_before = state.tar_source_watch_path_generations.clone();
+        let rebuilds_before = state.tar_source_watch_full_rebuild_count;
+        assert!(state.workspace_index.replace_complete_metadata(
+            &replacement,
+            Arc::new(crate::cross_file::CrossFileMetadata::default())
+        ));
+        assert!(
+            !state
+                .workspace_index
+                .commit_prepared_targeted_batch(prepared)
+                .unwrap()
+        );
+        assert_eq!(state.tar_source_watch_paths_by_parent, owners_before);
+        assert_eq!(state.tar_source_parents_by_watch_path, reverse_before);
+        assert_eq!(state.tar_source_watch_path_generations, generations_before);
+        assert_eq!(
+            state.tar_source_watch_full_rebuild_count, rebuilds_before,
+            "a rejected targeted CAS must not reach the registry gate"
+        );
+    }
+
+    #[test]
+    fn closed_upsert_reconciles_implicit_tar_watch_eviction() {
+        use crate::workspace_index::{ClosedProvenance, WorkspaceIndexConfig};
+
+        let victim = Url::parse("file:///workspace/_targets.R").unwrap();
+        let subject = Url::parse("file:///workspace/new.R").unwrap();
+        let root = PathBuf::from("/workspace/R");
+        let mut state = WorldState::new();
+        state.workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig {
+            max_files: 1,
+            ..Default::default()
+        });
+        state.workspace_index.resize_artifacts(1);
+        state.workspace_index.install_complete(
+            victim.clone(),
+            tar_watch_test_entry(crate::cross_file::CrossFileMetadata {
+                tar_source_expansion_watch_paths: vec![root.clone()],
+                ..Default::default()
+            }),
+            ClosedProvenance::Dynamic,
+        );
+        state.rebuild_tar_source_watch_registry();
+        let root_generation = state.tar_source_watch_path_generations[&root];
+        let rebuilds_before = state.tar_source_watch_full_rebuild_count;
+
+        let basis = state.capture_closed_removal_analysis_basis(&subject);
+        let entry = tar_watch_test_entry(crate::cross_file::CrossFileMetadata::default());
+        let prepared = PreparedClosedAnalysis::new(
+            basis,
+            subject.clone(),
+            entry.clone(),
+            entry.snapshot.clone(),
+            entry.contents.to_string(),
+            entry.metadata.clone(),
+            None,
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        state
+            .try_commit_analysis(PreparedAnalysisCommit::Upsert(Box::new(prepared)))
+            .unwrap();
+
+        assert!(!state.workspace_index.is_complete(&victim));
+        assert!(state.workspace_index.is_complete(&subject));
+        assert_eq!(
+            state.tar_source_watch_full_rebuild_count,
+            rebuilds_before + 1
+        );
+        assert_eq!(
+            state.tar_source_watch_path_generations[&root],
+            root_generation.wrapping_add(1)
+        );
+        assert_tar_watch_registry_matches_full_oracle(&state);
+    }
+
+    #[test]
+    fn pending_claim_reconciles_eviction_before_enrichment_finishes() {
+        use crate::workspace_index::{ClaimEnrichment, ClosedProvenance, WorkspaceIndexConfig};
+
+        let victim = Url::parse("file:///workspace/_targets.R").unwrap();
+        let pending = Url::parse("file:///workspace/pending.R").unwrap();
+        let root = PathBuf::from("/workspace/R");
+        let mut state = WorldState::new();
+        state.workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig {
+            max_files: 1,
+            ..Default::default()
+        });
+        state.workspace_index.resize_artifacts(1);
+        state.workspace_index.install_complete(
+            victim.clone(),
+            tar_watch_test_entry(crate::cross_file::CrossFileMetadata {
+                tar_source_expansion_watch_paths: vec![root.clone()],
+                ..Default::default()
+            }),
+            ClosedProvenance::Dynamic,
+        );
+        state.rebuild_tar_source_watch_registry();
+        let root_generation = state.tar_source_watch_path_generations[&root];
+
+        let (claim, evicted) = state
+            .workspace_index
+            .claim_enrichment_with_eviction(pending.clone(), ClosedProvenance::Dynamic);
+        assert_eq!(evicted.as_ref(), Some(&victim));
+        state.refresh_tar_source_watch_parents(std::iter::once(pending).chain(evicted));
+
+        assert_eq!(
+            state.tar_source_watch_path_generations[&root],
+            root_generation.wrapping_add(1),
+            "claim admission retires the evicted owner before detached enrichment"
+        );
+        assert_tar_watch_registry_matches_full_oracle(&state);
+        let ClaimEnrichment::Claimed(claim) = claim else {
+            panic!("expected a fresh Pending claim");
+        };
+        state.workspace_index.abort_enrichment(&claim).unwrap();
+        assert_tar_watch_registry_matches_full_oracle(&state);
+    }
+
+    #[test]
+    fn live_cache_shrink_reconciles_evicted_tar_watch_owner() {
+        use crate::workspace_index::ClosedProvenance;
+
+        let victim = Url::parse("file:///workspace/_targets.R").unwrap();
+        let survivor = Url::parse("file:///workspace/survivor.R").unwrap();
+        let root = PathBuf::from("/workspace/R");
+        let mut state = WorldState::new();
+        state.workspace_index.resize_artifacts(2);
+        state.workspace_index.install_complete(
+            victim.clone(),
+            tar_watch_test_entry(crate::cross_file::CrossFileMetadata {
+                tar_source_expansion_watch_paths: vec![root.clone()],
+                ..Default::default()
+            }),
+            ClosedProvenance::Dynamic,
+        );
+        state.workspace_index.install_complete(
+            survivor.clone(),
+            tar_watch_test_entry(crate::cross_file::CrossFileMetadata::default()),
+            ClosedProvenance::Dynamic,
+        );
+        state.rebuild_tar_source_watch_registry();
+        let root_generation = state.tar_source_watch_path_generations[&root];
+        let rebuilds_before = state.tar_source_watch_full_rebuild_count;
+
+        let config = crate::cross_file::config::CrossFileConfig {
+            cache_workspace_index_max_entries: 1,
+            ..Default::default()
+        };
+        state.resize_caches(&config);
+
+        assert!(!state.workspace_index.is_complete(&victim));
+        assert!(state.workspace_index.is_complete(&survivor));
+        assert_eq!(
+            state.tar_source_watch_full_rebuild_count,
+            rebuilds_before + 1
+        );
+        assert_eq!(
+            state.tar_source_watch_path_generations[&root],
+            root_generation.wrapping_add(1)
+        );
+        assert_tar_watch_registry_matches_full_oracle(&state);
+    }
+
+    #[test]
     fn tar_watch_root_replacement_bumps_tombstone_and_stales_basis() {
         let parent = Url::parse("file:///workspace/_targets.R").unwrap();
         let old_root = PathBuf::from("/workspace/R");
@@ -15060,6 +15715,7 @@ mod tests {
             .unwrap();
         let owners_before = state.tar_source_watch_paths_by_parent.clone();
         let reverse_before = state.tar_source_parents_by_watch_path.clone();
+        let rebuilds_before = state.tar_source_watch_full_rebuild_count;
 
         // The detached derivation performs its filesystem walk and observes
         // the new member before attempting to commit.
@@ -15114,6 +15770,10 @@ mod tests {
         );
         assert_eq!(state.tar_source_watch_paths_by_parent, owners_before);
         assert_eq!(state.tar_source_parents_by_watch_path, reverse_before);
+        assert_eq!(
+            state.tar_source_watch_full_rebuild_count, rebuilds_before,
+            "a rejected CAS must not reach the post-commit registry gate"
+        );
         assert!(
             state
                 .cross_file_graph

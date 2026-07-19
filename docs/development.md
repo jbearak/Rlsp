@@ -175,7 +175,18 @@ Rough pipeline:
 `tar_source()` expansion is caller-owned and filesystem-backed; it has no
 process-global cache. A finalized record stores its ordered ordinal sources and
 every existing or potential watch root. `WorldState` derives a bidirectional
-parent/root registry only after successful analysis commits. Watcher delivery
+parent/root registry only after successful analysis commits. Ordinary commits
+do not rebuild that registry eagerly: after the commit CAS succeeds, a bounded
+gate re-reads only the parents whose open/closed authority changed and compares
+their normalized roots with the installed parent map. The common `OpenEdit`
+checks one parent and is therefore O(1) in workspace size. Only an actual
+topology mismatch falls back to the full registry sweep, which remains the
+single writer of both map directions, net owner-set generation bumps, and
+removed-root tombstones. Artifact-cache installs and Pending admission include
+any implicit LRU eviction victim in that bounded parent set; a claim-time
+eviction is reconciled immediately because enrichment may later abort. Full
+workspace replacements rebuild directly. Rejected commits never reach either
+path. Watcher delivery
 first advances a global monotonic event generation, closing the new-request /
 pre-registry race, then advances the monotonic identities of overlapping roots
 and looks up their parents. An affected open parent receives a per-URI
