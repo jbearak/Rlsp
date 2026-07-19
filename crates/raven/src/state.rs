@@ -955,6 +955,8 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) watched_final_handoff_test_capture: FinalHandoffCapture<WatchedFinalHandoffForTest>,
     #[cfg(test)]
+    pub(crate) config_reload_publish_test_capture: FinalHandoffCapture<ConfigReloadPublishForTest>,
+    #[cfg(test)]
     pub(crate) did_close_final_handoff_test_capture:
         FinalHandoffCapture<Vec<AnalysisRevalidationTicketFingerprint>>,
     #[cfg(test)]
@@ -3175,6 +3177,13 @@ impl From<&AnalysisRevalidationTicket> for AnalysisRevalidationTicketFingerprint
 pub(crate) struct WatchedFinalHandoffForTest {
     pub(crate) reserved: Vec<AnalysisRevalidationTicketFingerprint>,
     pub(crate) transferred: Vec<AnalysisRevalidationTicketFingerprint>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigReloadPublishForTest {
+    pub(crate) scheduled: Vec<Url>,
+    pub(crate) completed: Vec<Url>,
 }
 
 #[cfg(test)]
@@ -6441,6 +6450,8 @@ impl WorldState {
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
             watched_final_handoff_test_capture: FinalHandoffCapture::default(),
+            #[cfg(test)]
+            config_reload_publish_test_capture: FinalHandoffCapture::default(),
             #[cfg(test)]
             did_close_final_handoff_test_capture: FinalHandoffCapture::default(),
             #[cfg(test)]

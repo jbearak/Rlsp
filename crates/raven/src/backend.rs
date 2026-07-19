@@ -17129,12 +17129,13 @@ impl LanguageServer for Backend {
             params.changes.len()
         );
         #[cfg(test)]
-        let final_handoff_test_capture = self
-            .state
-            .read()
-            .await
-            .watched_final_handoff_test_capture
-            .claim();
+        let (final_handoff_test_capture, config_reload_publish_test_capture) = {
+            let state = self.state.read().await;
+            (
+                state.watched_final_handoff_test_capture.claim(),
+                state.config_reload_publish_test_capture.claim(),
+            )
+        };
         let tar_source_parents = if params.changes.is_empty() {
             Vec::new()
         } else {
@@ -17254,17 +17255,45 @@ impl LanguageServer for Backend {
             // can't race a still-running reload publish.
             const MAX_CONCURRENT_PUBLISHES: usize = 8;
             let mut join_set = tokio::task::JoinSet::new();
+            #[cfg(test)]
+            let mut completed = Vec::with_capacity(to_publish.len());
+            #[cfg(test)]
+            let mut scheduled = to_publish.clone();
             for uri in to_publish {
                 while join_set.len() >= MAX_CONCURRENT_PUBLISHES {
-                    join_set.join_next().await;
+                    let _joined = join_set.join_next().await;
+                    #[cfg(test)]
+                    if let Some(Ok(uri)) = _joined {
+                        completed.push(uri);
+                    }
                 }
                 let state_arc = self.state.clone();
                 let client = self.client.clone();
                 join_set.spawn(async move {
                     publish_diagnostics_inner(&state_arc, &client, &uri).await;
+                    #[cfg(test)]
+                    {
+                        uri
+                    }
                 });
             }
-            while join_set.join_next().await.is_some() {}
+            while let Some(_joined) = join_set.join_next().await {
+                #[cfg(test)]
+                if let Ok(uri) = _joined {
+                    completed.push(uri);
+                }
+            }
+            #[cfg(test)]
+            if let Some(capture) = &config_reload_publish_test_capture {
+                scheduled.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+                completed.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+                capture
+                    .record_and_pause(crate::state::ConfigReloadPublishForTest {
+                        scheduled,
+                        completed,
+                    })
+                    .await;
+            }
         }
 
         // If every change was a config file, the source-file flow below has
@@ -42179,15 +42208,11 @@ mod project_config_initialize_tests {
     /// ordering.
     ///
     /// We exercise 12 open `.R` files (above the concurrency cap of 8).
-    /// The reload's reconciliation helper marks every open URI for
-    /// force-republish (counter increment); a successful publish
-    /// decrements that counter via `try_consume_publish`. Asserting that
-    /// every URI's `force_republish_count_for_test == 0` after the
-    /// handler returns is a stronger signal than checking
-    /// `last_published_version` — the gate's prior-publish state from
-    /// `did_open` would already make `can_publish(uri, 1)` return
-    /// false, so that observable could pass without the reload doing
-    /// anything.
+    /// An invocation-scoped capture records both the scheduled URI set and
+    /// every successfully joined task. This avoids attributing shared
+    /// force-republish counters that may still be draining from `did_open`
+    /// setup while still proving the reload joined work above and below the
+    /// concurrency cap.
     #[tokio::test]
     async fn watched_files_reload_publishes_all_open_documents_in_parallel() {
         use tower_lsp::lsp_types::{
@@ -42210,6 +42235,10 @@ mod project_config_initialize_tests {
                     uri: Url::from_file_path(tmp.path()).unwrap(),
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -42234,47 +42263,40 @@ mod project_config_initialize_tests {
             uris.push(uri);
         }
 
-        // Sanity: pre-reload, no outstanding force-republish markers — the
-        // reload is the only path under test that will mark and then
-        // consume them.
-        {
-            let state = backend.state.read().await;
-            for uri in &uris {
-                assert_eq!(
-                    state.diagnostics_gate.force_republish_count_for_test(uri),
-                    0,
-                    "unexpected pre-reload force-republish marker for {uri}"
-                );
-            }
-        }
-
         // Edit raven.toml and trigger a reload.
         fs::write(
             tmp.path().join("raven.toml"),
             "[linting]\nenabled = true\nlineLength = 140\n",
         )
         .unwrap();
-        backend
-            .did_change_watched_files(DidChangeWatchedFilesParams {
-                changes: vec![FileEvent {
-                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
-                    typ: FileChangeType::CHANGED,
-                }],
-            })
-            .await;
-
-        // After the handler returns, every URI's force-republish marker
-        // (set by the reconciliation helper) must have been consumed by
-        // a successful `try_consume_publish` — a stuck or un-awaited
-        // task would leave its URI's counter at 1.
-        let state = backend.state.read().await;
-        for uri in &uris {
-            assert_eq!(
-                state.diagnostics_gate.force_republish_count_for_test(uri),
-                0,
-                "reload's parallel publish driver left an outstanding force-republish marker for {uri}",
-            );
-        }
+        let capture = backend
+            .state
+            .read()
+            .await
+            .config_reload_publish_test_capture
+            .arm();
+        let task_backend = backend.clone();
+        let config_uri = Url::from_file_path(tmp.path().join("raven.toml")).unwrap();
+        let reload = tokio::spawn(async move {
+            task_backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent {
+                        uri: config_uri,
+                        typ: FileChangeType::CHANGED,
+                    }],
+                })
+                .await;
+        });
+        let handoff =
+            tokio::time::timeout(std::time::Duration::from_secs(5), capture.wait_payload())
+                .await
+                .expect("config reload must join every scheduled diagnostics publish");
+        let mut expected = uris;
+        expected.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(handoff.scheduled, expected);
+        assert_eq!(handoff.completed, expected);
+        capture.release();
+        reload.await.unwrap();
     }
 
     /// Characterization test for the watched-files CREATED/CHANGED async
@@ -50408,8 +50430,6 @@ infixContinuationStyle = "aligned"
         watched: HashMap<Url, u64>,
         chunk_overrides: HashMap<Url, crate::chunks::ChunkKind>,
         pins: std::collections::HashSet<Url>,
-        reservations: usize,
-        force: u32,
     }
 
     fn close_central_snapshot(state: &WorldState, uri: &Url) -> CloseCentralSnapshot {
@@ -50448,15 +50468,14 @@ infixContinuationStyle = "aligned"
             watched: state.watched_file_resync_generations.clone(),
             chunk_overrides: state.editor_chunk_kind_overrides.clone(),
             pins: state.workspace_index.pinned_uris_for_test(),
-            reservations: state.analysis_revalidation_reservation_count,
-            force: state.diagnostics_gate.force_republish_count_for_test(uri),
         }
     }
 
     #[tokio::test]
     async fn did_close_target_edit_is_terminal_and_never_rebases() {
         let tmp = TempDir::new().unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "close-edit-owner.R", "r", "before <- 1\n").await;
+        let (svc, uri) =
+            open_in_quiescent_workspace(&tmp, "close-edit-owner.R", "r", "before <- 1\n").await;
         let backend = svc.inner();
         let pause = backend
             .state
@@ -50894,6 +50913,10 @@ infixContinuationStyle = "aligned"
                     uri: Url::from_file_path(tmp.path()).unwrap(),
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
