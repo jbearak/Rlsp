@@ -1708,6 +1708,12 @@ impl Backend {
         if already_ready {
             return PackageInitAttempt::Ready;
         }
+        let routing_basis = capture_library_routing_basis(
+            &self.state,
+            crate::state::LibraryRoutingMutation::Replacement,
+            None,
+        )
+        .await;
 
         let (library, ready, load_notes, init_error) = if force_not_ready {
             (
@@ -1759,29 +1765,64 @@ impl Backend {
         // The build owns no state until this exact compare-and-swap. A
         // concurrent settings/workspace/package-input change or another
         // readiness transition rejects it without replacing newer state.
-        let committed = {
-            let mut state = self.state.write().await;
-            if !state.package_library_ready
+        let exact_init_intent = {
+            let state = self.state.read().await;
+            !state.package_library_ready
                 && state.package_config_generation == basis.package_config_generation
                 && PackageInitKey::capture(&state) == basis.key
-            {
-                state.install_package_library(library, ready);
-                #[cfg(test)]
-                self.package_library_install_keys_for_test
-                    .lock()
-                    .unwrap()
-                    .push(basis.key.clone());
-                true
-            } else {
-                false
-            }
         };
-        if !committed {
+        let routing_effects = if exact_init_intent
+            && let Some(routing_basis) = routing_basis
+            && let Some(driver) = prepare_library_routing_driver(
+                &self.state,
+                routing_basis,
+                library,
+                LibraryRoutingDriverOptions {
+                    ready,
+                    only_packages: None,
+                    warm_open_packages: false,
+                    refresh_cache_epoch: true,
+                    attempt_limit: 2,
+                },
+            )
+            .await
+        {
+            match complete_library_routing_driver(&self.state, driver).await {
+                LibraryRoutingTransactionOutcome::Committed(effects) => Some(effects),
+                LibraryRoutingTransactionOutcome::Superseded
+                | LibraryRoutingTransactionOutcome::RetryExhausted(_) => None,
+            }
+        } else {
+            None
+        };
+        let Some(routing_effects) = routing_effects else {
             log::trace!("Discarding stale on-demand PackageLibrary build");
             return PackageInitAttempt::Stale {
                 attempted_key: basis.key,
             };
-        }
+        };
+        #[cfg(test)]
+        self.package_library_install_keys_for_test
+            .lock()
+            .unwrap()
+            .push(basis.key.clone());
+
+        let tickets = {
+            let mut state = self.state.write().await;
+            let fallback: Vec<_> = state.documents.keys().cloned().collect();
+            finalize_analysis_handoff_or_fallback(
+                &mut state,
+                vec![routing_effects.handle],
+                Vec::new(),
+                fallback,
+            )
+        };
+        tokio::spawn(Backend::publish_diagnostics_for_tickets_bounded(
+            self.state.clone(),
+            self.client.clone(),
+            tickets,
+            Some(self.traversal_truncation.clone()),
+        ));
 
         // Only the winning build surfaces its provider-load notes.
         self.surface_load_notes(&load_notes).await;
@@ -3879,6 +3920,321 @@ async fn run_system_file_convergence_transaction_owned(
         tokio::task::yield_now().await;
     }
     unreachable!("the fixed two-attempt system.file loop always returns")
+}
+
+struct DeferredLibraryRouting {
+    basis: crate::state::LibraryRoutingBasis,
+    prospective: crate::state::ProspectiveLibraryRouting,
+    library: Arc<crate::package_library::PackageLibrary>,
+    ready: bool,
+    only_packages: Option<std::collections::HashSet<String>>,
+    warm_open_packages: bool,
+    refresh_cache_epoch: bool,
+    attempt_limit: usize,
+}
+
+struct DeferredLibraryRoutingEscrow {
+    driver: Option<DeferredLibraryRouting>,
+    handles: Vec<crate::state::AnalysisTransferHandle>,
+    candidates: Vec<crate::state::AnalysisTransferCandidate>,
+    fallback: Vec<Url>,
+    post_seed: Option<(
+        DeferredCombinedPostSeedOwner,
+        Option<crate::state::PackageSeedInstalledIdentity>,
+    )>,
+    retry_generation: u64,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(test)]
+const LIBRARY_ROUTING_DEFERRED_PAUSE_URI: &str = "raven-test://library-routing-deferred";
+
+enum LibraryRoutingTransactionOutcome {
+    Committed(crate::state::LibraryRoutingTransferredEffects),
+    Superseded,
+    RetryExhausted(Box<DeferredLibraryRouting>),
+}
+
+async fn capture_library_routing_basis(
+    state_arc: &Arc<RwLock<WorldState>>,
+    mutation: crate::state::LibraryRoutingMutation,
+    watcher_owner: Option<crate::state::LibpathWatcherOwner>,
+) -> Option<crate::state::LibraryRoutingBasis> {
+    let library = state_arc.read().await.package_library.clone();
+    let lease = library.routing_lease().await;
+    let epoch = library.cache_operation_epoch(&lease);
+    state_arc
+        .read()
+        .await
+        .capture_library_routing_basis(&library, epoch, mutation, watcher_owner)
+}
+
+async fn capture_library_content_successor(
+    state_arc: &Arc<RwLock<WorldState>>,
+    mutation: crate::state::LibraryRoutingMutation,
+    watcher_owner: crate::state::LibpathWatcherOwner,
+) -> Option<(
+    crate::state::LibraryRoutingBasis,
+    Arc<crate::package_library::PackageLibrary>,
+)> {
+    let library = state_arc.read().await.package_library.clone();
+    let lease = library.routing_lease().await;
+    let epoch = library.cache_operation_epoch(&lease);
+    let basis = state_arc.read().await.capture_library_routing_basis(
+        &library,
+        epoch,
+        mutation,
+        Some(watcher_owner),
+    )?;
+    let successor = Arc::new(library.fork_cache_snapshot(&lease));
+    Some((basis, successor))
+}
+
+async fn run_library_routing_transaction(
+    state_arc: &Arc<RwLock<WorldState>>,
+    mut deferred: DeferredLibraryRouting,
+) -> LibraryRoutingTransactionOutcome {
+    for attempt in 0..deferred.attempt_limit {
+        if deferred.warm_open_packages {
+            prefetch_packages_for_open_documents_into(state_arc, &deferred.library, false).await;
+        }
+        let captured = {
+            let state = state_arc.read().await;
+            state.capture_library_routing_system_file_analysis(
+                &deferred.basis,
+                &deferred.prospective,
+                deferred.only_packages.clone(),
+            )
+        };
+        let Some(captured) = captured else {
+            return LibraryRoutingTransactionOutcome::Superseded;
+        };
+        let draft = match tokio::task::spawn_blocking(move || {
+            crate::state::prepare_system_file_analysis(captured)
+        })
+        .await
+        {
+            Ok(draft) => draft,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => {
+                log::warn!("library-routing system.file worker was cancelled: {error}");
+                return LibraryRoutingTransactionOutcome::RetryExhausted(Box::new(deferred));
+            }
+        };
+        let prepared = {
+            let state = state_arc.read().await;
+            state.finish_system_file_analysis(draft)
+        };
+        let Some(system_file) = prepared else {
+            if attempt + 1 == deferred.attempt_limit {
+                return LibraryRoutingTransactionOutcome::RetryExhausted(Box::new(deferred));
+            }
+            tokio::task::yield_now().await;
+            continue;
+        };
+
+        let old_library = deferred.basis.library.clone();
+        let lease = old_library.routing_lease().await;
+        let epoch = old_library.cache_operation_epoch(&lease);
+        let mut state = state_arc.write().await;
+        let prepared = crate::state::PreparedLibraryRoutingAnalysis {
+            basis: deferred.basis.clone(),
+            prospective: deferred.prospective.clone(),
+            library: deferred.library.clone(),
+            ready: deferred.ready,
+            system_file,
+        };
+        match state.try_commit_library_routing(prepared, &lease) {
+            Ok(effects) => return LibraryRoutingTransactionOutcome::Committed(effects),
+            Err(_) => {
+                if epoch != deferred.basis.cache_operation_epoch() && !deferred.refresh_cache_epoch
+                {
+                    return LibraryRoutingTransactionOutcome::RetryExhausted(Box::new(deferred));
+                }
+                let Some(refreshed) =
+                    state.refresh_library_routing_cache_epoch(&deferred.basis, epoch)
+                else {
+                    return LibraryRoutingTransactionOutcome::Superseded;
+                };
+                deferred.basis = refreshed;
+            }
+        }
+        drop(state);
+        drop(lease);
+        if attempt + 1 < deferred.attempt_limit {
+            tokio::task::yield_now().await;
+        }
+    }
+    LibraryRoutingTransactionOutcome::RetryExhausted(Box::new(deferred))
+}
+
+async fn run_deferred_library_routing_once(
+    state_arc: &Arc<RwLock<WorldState>>,
+    deferred: DeferredLibraryRouting,
+) -> LibraryRoutingTransactionOutcome {
+    run_library_routing_transaction(state_arc, deferred).await
+}
+
+struct LibraryRoutingDriverOptions {
+    ready: bool,
+    only_packages: Option<std::collections::HashSet<String>>,
+    warm_open_packages: bool,
+    refresh_cache_epoch: bool,
+    attempt_limit: usize,
+}
+
+async fn prepare_library_routing_driver(
+    state_arc: &Arc<RwLock<WorldState>>,
+    basis: crate::state::LibraryRoutingBasis,
+    library: Arc<crate::package_library::PackageLibrary>,
+    options: LibraryRoutingDriverOptions,
+) -> Option<DeferredLibraryRouting> {
+    let prospective = state_arc
+        .read()
+        .await
+        .prospective_library_routing(&basis, &library)?;
+    Some(DeferredLibraryRouting {
+        basis,
+        prospective,
+        library,
+        ready: options.ready,
+        only_packages: options.only_packages,
+        warm_open_packages: options.warm_open_packages,
+        refresh_cache_epoch: options.refresh_cache_epoch,
+        attempt_limit: options.attempt_limit,
+    })
+}
+
+async fn complete_library_routing_driver(
+    state_arc: &Arc<RwLock<WorldState>>,
+    driver: DeferredLibraryRouting,
+) -> LibraryRoutingTransactionOutcome {
+    match run_library_routing_transaction(state_arc, driver).await {
+        LibraryRoutingTransactionOutcome::RetryExhausted(deferred)
+            if deferred.refresh_cache_epoch =>
+        {
+            run_deferred_library_routing_once(state_arc, *deferred).await
+        }
+        outcome => outcome,
+    }
+}
+
+async fn settle_deferred_library_routing_escrow(
+    task_handles: PackageSeedTaskHandles,
+    mut escrow: DeferredLibraryRoutingEscrow,
+) {
+    let mut retry_delay = std::time::Duration::from_millis(10);
+    let transfer = loop {
+        if escrow.cancellation.is_cancelled() {
+            task_handles
+                .state
+                .read()
+                .await
+                .library_routing_retry
+                .complete(escrow.retry_generation);
+            return;
+        }
+        let mut superseded = escrow.driver.is_none();
+        if let Some(driver) = escrow.driver.take() {
+            match run_deferred_library_routing_once(&task_handles.state, driver).await {
+                LibraryRoutingTransactionOutcome::Committed(effects) => break effects,
+                LibraryRoutingTransactionOutcome::RetryExhausted(driver) => {
+                    escrow.driver = Some(*driver);
+                    #[cfg(test)]
+                    {
+                        let pause = {
+                            let mut state = task_handles.state.write().await;
+                            state.library_routing_deferred_handles_for_test =
+                                escrow.handles.clone();
+                            state.library_routing_deferred_candidates_for_test =
+                                escrow.candidates.clone();
+                            state.library_routing_deferred_post_seed_for_test =
+                                escrow.post_seed.as_ref().map(|(owner, _)| owner.identity);
+                            state.library_routing_deferred_test_pause.take_armed(
+                                &Url::parse(LIBRARY_ROUTING_DEFERRED_PAUSE_URI).unwrap(),
+                            )
+                        };
+                        if let Some(pause) = pause {
+                            pause.pause().await;
+                        }
+                    }
+                }
+                LibraryRoutingTransactionOutcome::Superseded => {
+                    superseded = true;
+                }
+            }
+        }
+        // The immutable config/library intent lost to a successor. Explicitly
+        // acquire a transfer owned by the current routing lifecycle before
+        // releasing this caller's ledger; never finalize against an ownerless
+        // gap between the two top-level intents.
+        if superseded
+            && let Some(transfer) =
+                run_system_file_convergence_transfer(&task_handles.state, None).await
+        {
+            break crate::state::LibraryRoutingTransferredEffects {
+                handle: transfer.handle,
+                changed_uris: transfer.changed_uris,
+                restart_owner: None,
+            };
+        }
+        tokio::select! {
+            _ = escrow.cancellation.cancelled() => {
+                task_handles
+                    .state
+                    .read()
+                    .await
+                    .library_routing_retry
+                    .complete(escrow.retry_generation);
+                return;
+            }
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
+        retry_delay = std::cmp::min(
+            retry_delay.saturating_mul(2),
+            std::time::Duration::from_millis(250),
+        );
+    };
+
+    if let Some(owner) = transfer.restart_owner {
+        restart_libpath_watcher_for_owner(&task_handles.state, &task_handles.client, true, owner)
+            .await;
+        task_handles.state.read().await.clear_help_caches();
+    }
+    escrow.handles.push(transfer.handle);
+    let tickets = if let Some((owner, deferred_system_file)) = escrow.post_seed {
+        finish_deferred_post_seed_refresh(
+            task_handles.clone(),
+            owner,
+            DeferredPostSeedFinalization {
+                handles: escrow.handles,
+                candidates: escrow.candidates,
+                deferred_system_file,
+            },
+        )
+        .await
+    } else {
+        let mut state = task_handles.state.write().await;
+        finalize_analysis_handoff_candidates_or_fallback(
+            &mut state,
+            escrow.handles,
+            escrow.candidates,
+            escrow.fallback,
+        )
+    };
+    Backend::publish_diagnostics_for_tickets_bounded(
+        task_handles.state.clone(),
+        task_handles.client.clone(),
+        tickets,
+        Some(task_handles.traversal_truncation.clone()),
+    )
+    .await;
+    task_handles
+        .state
+        .read()
+        .await
+        .library_routing_retry
+        .complete(escrow.retry_generation);
 }
 
 async fn try_finalize_open_package_routing(
@@ -13116,6 +13472,12 @@ impl LanguageServer for Backend {
 
         // Task B: Initialize PackageLibrary (await this - diagnostics need it)
         // This is fast (~100ms) due to batched R subprocess calls.
+        let startup_routing_basis = capture_library_routing_basis(
+            &self.state,
+            crate::state::LibraryRoutingMutation::Replacement,
+            None,
+        )
+        .await;
         let (new_package_library, package_library_ready, load_notes) = {
             let pkg_start = std::time::Instant::now();
             let r_calls_before = crate::perf::get_r_subprocess_calls();
@@ -13171,18 +13533,31 @@ impl LanguageServer for Backend {
         // ahead and already written a library with prefetched package caches.
         // Overwriting it would discard those caches and cause false-positive
         // "Package is not installed" diagnostics until the next prefetch.
-        let committed = {
-            let mut state = self.state.write().await;
-            if !state.package_library_ready {
-                state.install_package_library(new_package_library, package_library_ready);
-                true
-            } else {
-                log::info!(
-                    "PackageLibrary already initialized (from did_open), skipping overwrite"
-                );
-                false
+        let routing_effects = if let Some(basis) =
+            startup_routing_basis.filter(|basis| !basis.ready)
+            && let Some(driver) = prepare_library_routing_driver(
+                &self.state,
+                basis,
+                new_package_library,
+                LibraryRoutingDriverOptions {
+                    ready: package_library_ready,
+                    only_packages: None,
+                    warm_open_packages: true,
+                    refresh_cache_epoch: true,
+                    attempt_limit: 2,
+                },
+            )
+            .await
+        {
+            match complete_library_routing_driver(&self.state, driver).await {
+                LibraryRoutingTransactionOutcome::Committed(effects) => Some(effects),
+                LibraryRoutingTransactionOutcome::Superseded
+                | LibraryRoutingTransactionOutcome::RetryExhausted(_) => None,
             }
+        } else {
+            None
         };
+        let committed = routing_effects.is_some();
         // Surface Tier 2/3 load notes only if this path committed the library,
         // so the did_open race (`ensure_package_library_initialized`) doesn't
         // double-toast the same notes.
@@ -13194,9 +13569,7 @@ impl LanguageServer for Backend {
         // The workspace scan (Task A) may have completed before the library
         // was ready, leaving branch-2 (installed-package) targets unresolved.
         // This detached convergence pass picks them up.
-        if package_library_ready
-            && let Some(transfer) = run_system_file_convergence_transfer(&self.state, None).await
-        {
+        if let Some(ref transfer) = routing_effects {
             let tickets = {
                 let mut state = self.state.write().await;
                 let fallback: Vec<_> = state.documents.keys().cloned().collect();
@@ -13226,7 +13599,14 @@ impl LanguageServer for Backend {
         // documented workaround is the `raven.refreshPackages` command, which
         // rebuilds `PackageLibrary` (re-running `.libPaths()`) and restarts the
         // watcher over the newly-discovered paths. See `docs/packages.md`.
-        restart_libpath_watcher(&self.state, &self.client, true).await;
+        if let Some(owner) = routing_effects.and_then(|effects| effects.restart_owner) {
+            restart_libpath_watcher_for_owner(&self.state, &self.client, true, owner).await;
+        } else {
+            // A didOpen initialization may have won while Task B was building.
+            // Start a watcher for that current owner without reviving Task B's
+            // superseded routing intent.
+            restart_libpath_watcher(&self.state, &self.client, true).await;
+        }
 
         // R fallback for sysdata: when the AST scan found nothing AND
         // R/sysdata.rda exists, try loading via an R subprocess.
@@ -13300,6 +13680,17 @@ impl LanguageServer for Backend {
         &self,
         params: tower_lsp::lsp_types::ExecuteCommandParams,
     ) -> tower_lsp::jsonrpc::Result<Option<serde_json::Value>> {
+        fn refresh_not_committed(reason: &'static str) -> tower_lsp::jsonrpc::Error {
+            log::warn!("raven.refreshPackages did not commit: {reason}");
+            tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+                message: std::borrow::Cow::Borrowed(
+                    "Package refresh was superseded before it could commit; please retry",
+                ),
+                data: Some(serde_json::json!({ "reason": reason })),
+            }
+        }
+
         match params.command.as_str() {
             "raven.refreshPackages" => {
                 // refreshPackages is meaningless when package awareness is
@@ -13331,6 +13722,12 @@ impl LanguageServer for Backend {
                 // empty library whose `cached_count()` starts at 0. We compute
                 // the user-visible delta against the pre-rebuild count instead.
                 let before_count = self.state.read().await.package_library.cached_count().await;
+                let routing_basis = capture_library_routing_basis(
+                    &self.state,
+                    crate::state::LibraryRoutingMutation::Replacement,
+                    None,
+                )
+                .await;
 
                 // Rebuild the PackageLibrary first — this re-runs `.libPaths()`
                 // so mid-session libpath changes (renv switched projects,
@@ -13339,43 +13736,59 @@ impl LanguageServer for Backend {
                 // snapshot in place and the refresh would re-populate with the
                 // same wrong paths.
                 let (new_lib, ready) = rebuild_package_library(&self.state).await;
-                {
-                    let mut state = self.state.write().await;
-                    state.install_package_library(new_lib, ready);
-                }
-                let system_file_transfer = if ready {
-                    run_system_file_convergence_transfer(&self.state, None).await
-                } else {
-                    None
+                new_lib.clear_cache().await;
+                let Some(routing_basis) = routing_basis else {
+                    return Err(refresh_not_committed("routing basis superseded"));
                 };
+                let Some(driver) = prepare_library_routing_driver(
+                    &self.state,
+                    routing_basis,
+                    new_lib.clone(),
+                    LibraryRoutingDriverOptions {
+                        ready,
+                        only_packages: None,
+                        warm_open_packages: true,
+                        refresh_cache_epoch: true,
+                        attempt_limit: 2,
+                    },
+                )
+                .await
+                else {
+                    return Err(refresh_not_committed("routing preparation superseded"));
+                };
+                let routing_effects =
+                    match complete_library_routing_driver(&self.state, driver).await {
+                        LibraryRoutingTransactionOutcome::Committed(effects) => effects,
+                        LibraryRoutingTransactionOutcome::Superseded => {
+                            return Err(refresh_not_committed("routing commit superseded"));
+                        }
+                        LibraryRoutingTransactionOutcome::RetryExhausted(_) => {
+                            return Err(refresh_not_committed("routing retry exhausted"));
+                        }
+                    };
 
                 // Restart the watcher over the freshly-discovered libpaths so
                 // subsequent installs in the new libpaths are observed. A
                 // no-op if watching is disabled or the library is not ready.
-                restart_libpath_watcher(&self.state, &self.client, true).await;
+                if let Some(owner) = routing_effects.restart_owner {
+                    restart_libpath_watcher_for_owner(&self.state, &self.client, true, owner).await;
+                }
 
                 // Clear the cache then compute the eviction count before
                 // warm-prefetching, so prefetched entries don't reduce the
                 // reported cleared count.
-                let pkg_lib = self.state.read().await.package_library.clone();
-                pkg_lib.clear_cache().await;
                 // Help and HTML help caches reference package-export content
                 // that just got invalidated; flush them too so subsequent
                 // hover/help-panel requests re-fetch from R.
                 self.state.read().await.clear_help_caches();
-                let after_count = pkg_lib.cached_count().await;
-                let cleared = before_count.saturating_sub(after_count);
-                prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
+                let cleared = before_count;
                 log::info!("raven.refreshPackages: cleared {cleared} cache entries");
 
                 let tickets = {
                     let mut state = self.state.write().await;
-                    let handles = system_file_transfer
-                        .map(|transfer| vec![transfer.handle])
-                        .unwrap_or_default();
                     finalize_analysis_handoff_or_fallback(
                         &mut state,
-                        handles,
+                        vec![routing_effects.handle],
                         open_uris.clone(),
                         open_uris,
                     )
@@ -13598,209 +14011,208 @@ impl LanguageServer for Backend {
         };
 
         // Compute affected files and debounce config while holding write lock
-        let (
-            mut work_items,
-            packages_to_prefetch,
-            packages_enabled,
-            package_library,
-            package_routing,
-        ) = if let Some(mut effects) = detached_live_effects {
-            let state = self.state.read().await;
-            let packages_enabled = state.cross_file_config.packages_enabled;
-            let package_library = state.package_library.clone();
-            let packages_to_prefetch = effects
-                .open
-                .as_ref()
-                .expect("open edit returns its immutable outcome")
-                .packages_to_prefetch
-                .clone();
-            let package_routing = effects.package_routing.take();
-            (
-                effects.revalidations,
-                packages_to_prefetch,
-                packages_enabled,
-                package_library,
-                package_routing,
-            )
-        } else {
-            let mut state = self.state.write().await;
-
-            if state.is_project_excluded_uri(&uri) {
-                let workspace_root = state.workspace_folders.first().cloned();
-                let old_meta = state.get_enriched_metadata(&uri);
-                let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
-                let max_forward_depth = state.cross_file_config.max_forward_depth;
+        let (mut work_items, packages_to_prefetch, packages_enabled, package_routing) =
+            if let Some(mut effects) = detached_live_effects {
+                let state = self.state.read().await;
                 let packages_enabled = state.cross_file_config.packages_enabled;
+                let packages_to_prefetch = effects
+                    .open
+                    .as_ref()
+                    .expect("open edit returns its immutable outcome")
+                    .packages_to_prefetch
+                    .clone();
+                let package_routing = effects.package_routing.take();
+                (
+                    effects.revalidations,
+                    packages_to_prefetch,
+                    packages_enabled,
+                    package_routing,
+                )
+            } else {
+                let mut state = self.state.write().await;
+
+                if state.is_project_excluded_uri(&uri) {
+                    let workspace_root = state.workspace_folders.first().cloned();
+                    let old_meta = state.get_enriched_metadata(&uri);
+                    let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
+                    let max_forward_depth = state.cross_file_config.max_forward_depth;
+                    let packages_enabled = state.cross_file_config.packages_enabled;
+                    let Some(prepared) =
+                        state.prepare_document_changes(&uri, changes.clone(), version)
+                    else {
+                        log::warn!("Ignoring didChange for unopened document {uri}");
+                        return;
+                    };
+                    let analysis_text = prepared.document().analysis_text();
+                    let (meta, mut attempted_contexts) =
+                        extract_enriched_live_metadata_with_contexts(&state, &uri, &analysis_text);
+                    let mut files_to_index = if on_demand_enabled {
+                        source_targets_to_index_for_live_diagnostics(
+                            &state,
+                            &uri,
+                            &meta,
+                            workspace_root.as_ref(),
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    let packages_to_prefetch = if packages_enabled {
+                        let mut packages =
+                            extract_loaded_packages_from_library_calls(&meta.library_calls);
+                        packages.extend(namespace_warm_packages(&meta));
+                        packages
+                    } else {
+                        Vec::new()
+                    };
+                    let (graph, graph_roots, graph_contexts) = prepare_open_graph_plan(
+                        &state,
+                        &uri,
+                        old_meta.as_deref(),
+                        &meta,
+                        workspace_root.as_ref(),
+                        true,
+                    );
+                    attempted_contexts.extend(graph_contexts);
+                    let plan = PreparedOpenCommitPlan {
+                        graph,
+                        reset_closed_roots: graph_roots,
+                        packages_to_prefetch: packages_to_prefetch.clone(),
+                        refresh_pins: true,
+                        ..PreparedOpenCommitPlan::default()
+                    };
+                    let effects = match state
+                        .attach_open_edit_context_authorities(prepared, attempted_contexts)
+                    {
+                        Ok(prepared) => {
+                            let effects = state
+                                .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+                                    PreparedOpenEditAnalysis::new(
+                                        prepared,
+                                        Arc::new(meta.clone()),
+                                        plan,
+                                    ),
+                                )))
+                                .expect(
+                                    "didChange basis cannot change under the WorldState write lock",
+                                );
+                            state.cross_file_activity.record_recent(uri.clone());
+                            drop(state);
+                            effects
+                        }
+                        Err(prepared) => {
+                            let prepared = *prepared;
+                            log::warn!(
+                                "didChange for {uri} exceeded the open-analysis authority ceiling; \
+                                 committing the local buffer with cross-file facts disabled"
+                            );
+                            files_to_index.clear();
+                            drop(state);
+                            let Some(effects) =
+                                commit_detached_open_edit_fallback(&self.state, &uri, prepared)
+                                    .await
+                            else {
+                                log::trace!(
+                                    "discarding superseded didChange overflow fallback for {uri}"
+                                );
+                                return;
+                            };
+                            effects
+                        }
+                    };
+                    let mut revalidations = effects.revalidations;
+                    let packages_to_prefetch = effects
+                        .open
+                        .expect("open edit returns its immutable outcome")
+                        .packages_to_prefetch;
+                    if packages_enabled && !packages_to_prefetch.is_empty() {
+                        let _ = self.ensure_package_library_initialized().await;
+                        let _ =
+                            prefetch_current_package_library(&self.state, &packages_to_prefetch)
+                                .await;
+                    }
+                    if on_demand_enabled {
+                        for file_uri in files_to_index {
+                            self.index_file_on_demand(&file_uri).await;
+                        }
+                        if max_forward_depth > 0 {
+                            self.index_forward_chain(
+                                &uri,
+                                max_forward_depth,
+                                workspace_root.as_ref(),
+                            )
+                            .await;
+                        }
+                    }
+                    // The excluded path publishes the edited subject immediately,
+                    // but every dependent ticket reserved by the commit seam must
+                    // still get a consumer so its force-republish marker drains.
+                    revalidations.retain(|ticket| ticket.uri != uri);
+                    for ticket in revalidations {
+                        let state_arc = self.state.clone();
+                        let client = self.client.clone();
+                        let traversal_truncation = self.traversal_truncation.clone();
+                        tokio::spawn(run_debounced_diagnostics(
+                            state_arc,
+                            client,
+                            ticket.uri,
+                            ticket.debounce_ms,
+                            ticket.trigger,
+                            Some(traversal_truncation),
+                        ));
+                    }
+                    self.publish_diagnostics(&uri).await;
+                    return;
+                }
+
+                // Capture old metadata before recomputing (for WD change detection)
+                let old_meta = state.get_enriched_metadata(&uri);
+
                 let Some(prepared) = state.prepare_document_changes(&uri, changes.clone(), version)
                 else {
                     log::warn!("Ignoring didChange for unopened document {uri}");
                     return;
                 };
-                let analysis_text = prepared.document().analysis_text();
+                // Capture package settings for background prefetch
+                let packages_enabled = state.cross_file_config.packages_enabled;
+
+                // Extract and enrich metadata from the prepared document's exact
+                // analysis view, then atomically install one coherent record.
+                let text = prepared.document().analysis_text();
                 let (meta, mut attempted_contexts) =
-                    extract_enriched_live_metadata_with_contexts(&state, &uri, &analysis_text);
-                let mut files_to_index = if on_demand_enabled {
-                    source_targets_to_index_for_live_diagnostics(
-                        &state,
-                        &uri,
-                        &meta,
-                        workspace_root.as_ref(),
-                    )
-                } else {
-                    Vec::new()
-                };
-                let packages_to_prefetch = if packages_enabled {
+                    extract_enriched_live_metadata_with_contexts(&state, &uri, &text);
+                let workspace_root = state.workspace_folders.first().cloned();
+                let packages_to_prefetch: Vec<String> = if packages_enabled {
                     let mut packages =
-                        extract_loaded_packages_from_library_calls(&meta.library_calls);
+                        edited_document_warm_packages(&meta.library_calls, prepared.document());
                     packages.extend(namespace_warm_packages(&meta));
                     packages
                 } else {
                     Vec::new()
                 };
-                let (graph, graph_roots, graph_contexts) = prepare_open_graph_plan(
+                let (graph, _graph_roots, graph_contexts) = prepare_open_graph_plan(
                     &state,
                     &uri,
                     old_meta.as_deref(),
                     &meta,
                     workspace_root.as_ref(),
-                    true,
+                    false,
                 );
                 attempted_contexts.extend(graph_contexts);
-                let plan = PreparedOpenCommitPlan {
-                    graph,
-                    reset_closed_roots: graph_roots,
-                    packages_to_prefetch: packages_to_prefetch.clone(),
-                    refresh_pins: true,
-                    ..PreparedOpenCommitPlan::default()
-                };
-                let effects = match state
-                    .attach_open_edit_context_authorities(prepared, attempted_contexts)
+                let package_event_uri =
+                    state
+                        .package_inputs
+                        .workspace_root
+                        .as_ref()
+                        .and_then(|root| {
+                            authoritative_package_input_uri_for_open_document(&state, &uri, root)
+                                .map(|package_input| package_input.uri().clone())
+                        });
+                let package_text = package_event_uri
+                    .as_ref()
+                    .map(|_| Arc::<str>::from(prepared.document().text()));
+                let (package_fanout_uris, package_source_interface_fanout) = if let Some(pkg) =
+                    state.package_workspace()
                 {
-                    Ok(prepared) => {
-                        let effects = state
-                            .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
-                                PreparedOpenEditAnalysis::new(
-                                    prepared,
-                                    Arc::new(meta.clone()),
-                                    plan,
-                                ),
-                            )))
-                            .expect(
-                                "didChange basis cannot change under the WorldState write lock",
-                            );
-                        state.cross_file_activity.record_recent(uri.clone());
-                        drop(state);
-                        effects
-                    }
-                    Err(prepared) => {
-                        let prepared = *prepared;
-                        log::warn!(
-                            "didChange for {uri} exceeded the open-analysis authority ceiling; \
-                                 committing the local buffer with cross-file facts disabled"
-                        );
-                        files_to_index.clear();
-                        drop(state);
-                        let Some(effects) =
-                            commit_detached_open_edit_fallback(&self.state, &uri, prepared).await
-                        else {
-                            log::trace!(
-                                "discarding superseded didChange overflow fallback for {uri}"
-                            );
-                            return;
-                        };
-                        effects
-                    }
-                };
-                let mut revalidations = effects.revalidations;
-                let packages_to_prefetch = effects
-                    .open
-                    .expect("open edit returns its immutable outcome")
-                    .packages_to_prefetch;
-                if packages_enabled && !packages_to_prefetch.is_empty() {
-                    let _ = self.ensure_package_library_initialized().await;
-                    let package_library = self.state.read().await.package_library.clone();
-                    package_library
-                        .prefetch_packages(&packages_to_prefetch)
-                        .await;
-                }
-                if on_demand_enabled {
-                    for file_uri in files_to_index {
-                        self.index_file_on_demand(&file_uri).await;
-                    }
-                    if max_forward_depth > 0 {
-                        self.index_forward_chain(&uri, max_forward_depth, workspace_root.as_ref())
-                            .await;
-                    }
-                }
-                // The excluded path publishes the edited subject immediately,
-                // but every dependent ticket reserved by the commit seam must
-                // still get a consumer so its force-republish marker drains.
-                revalidations.retain(|ticket| ticket.uri != uri);
-                for ticket in revalidations {
-                    let state_arc = self.state.clone();
-                    let client = self.client.clone();
-                    let traversal_truncation = self.traversal_truncation.clone();
-                    tokio::spawn(run_debounced_diagnostics(
-                        state_arc,
-                        client,
-                        ticket.uri,
-                        ticket.debounce_ms,
-                        ticket.trigger,
-                        Some(traversal_truncation),
-                    ));
-                }
-                self.publish_diagnostics(&uri).await;
-                return;
-            }
-
-            // Capture old metadata before recomputing (for WD change detection)
-            let old_meta = state.get_enriched_metadata(&uri);
-
-            let Some(prepared) = state.prepare_document_changes(&uri, changes.clone(), version)
-            else {
-                log::warn!("Ignoring didChange for unopened document {uri}");
-                return;
-            };
-            // Capture package settings for background prefetch
-            let packages_enabled = state.cross_file_config.packages_enabled;
-            let package_library = state.package_library.clone();
-
-            // Extract and enrich metadata from the prepared document's exact
-            // analysis view, then atomically install one coherent record.
-            let text = prepared.document().analysis_text();
-            let (meta, mut attempted_contexts) =
-                extract_enriched_live_metadata_with_contexts(&state, &uri, &text);
-            let workspace_root = state.workspace_folders.first().cloned();
-            let packages_to_prefetch: Vec<String> = if packages_enabled {
-                let mut packages =
-                    edited_document_warm_packages(&meta.library_calls, prepared.document());
-                packages.extend(namespace_warm_packages(&meta));
-                packages
-            } else {
-                Vec::new()
-            };
-            let (graph, _graph_roots, graph_contexts) = prepare_open_graph_plan(
-                &state,
-                &uri,
-                old_meta.as_deref(),
-                &meta,
-                workspace_root.as_ref(),
-                false,
-            );
-            attempted_contexts.extend(graph_contexts);
-            let package_event_uri = state
-                .package_inputs
-                .workspace_root
-                .as_ref()
-                .and_then(|root| {
-                    authoritative_package_input_uri_for_open_document(&state, &uri, root)
-                        .map(|package_input| package_input.uri().clone())
-                });
-            let package_text = package_event_uri
-                .as_ref()
-                .map(|_| Arc::<str>::from(prepared.document().text()));
-            let (package_fanout_uris, package_source_interface_fanout) =
-                if let Some(pkg) = state.package_workspace() {
                     let fanout = state
                         .documents
                         .keys()
@@ -13816,57 +14228,64 @@ impl LanguageServer for Backend {
                 } else {
                     (Vec::new(), false)
                 };
-            let plan = PreparedOpenCommitPlan {
-                graph,
-                package_event: package_event_uri.zip(package_text),
-                package_fanout_uris,
-                package_source_interface_fanout,
-                packages_to_prefetch: packages_to_prefetch.clone(),
-                ..PreparedOpenCommitPlan::default()
-            };
-            let mut effects = match state
-                .attach_open_edit_context_authorities(prepared, attempted_contexts)
-            {
-                Ok(prepared) => {
-                    let effects = state
-                        .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
-                            PreparedOpenEditAnalysis::new(prepared, Arc::new(meta.clone()), plan),
-                        )))
-                        .expect("didChange basis cannot change under the WorldState write lock");
-                    state.cross_file_activity.record_recent(uri.clone());
-                    effects
-                }
-                Err(prepared) => {
-                    let prepared = *prepared;
-                    log::warn!(
-                        "didChange for {uri} exceeded the open-analysis authority ceiling; \
+                let plan = PreparedOpenCommitPlan {
+                    graph,
+                    package_event: package_event_uri.zip(package_text),
+                    package_fanout_uris,
+                    package_source_interface_fanout,
+                    packages_to_prefetch: packages_to_prefetch.clone(),
+                    ..PreparedOpenCommitPlan::default()
+                };
+                let mut effects = match state
+                    .attach_open_edit_context_authorities(prepared, attempted_contexts)
+                {
+                    Ok(prepared) => {
+                        let effects = state
+                            .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(
+                                PreparedOpenEditAnalysis::new(
+                                    prepared,
+                                    Arc::new(meta.clone()),
+                                    plan,
+                                ),
+                            )))
+                            .expect(
+                                "didChange basis cannot change under the WorldState write lock",
+                            );
+                        state.cross_file_activity.record_recent(uri.clone());
+                        effects
+                    }
+                    Err(prepared) => {
+                        let prepared = *prepared;
+                        log::warn!(
+                            "didChange for {uri} exceeded the open-analysis authority ceiling; \
                              committing the local buffer with cross-file facts disabled"
-                    );
-                    drop(state);
-                    let Some(effects) =
-                        commit_detached_open_edit_fallback(&self.state, &uri, prepared).await
-                    else {
-                        log::trace!("discarding superseded didChange overflow fallback for {uri}");
-                        return;
-                    };
-                    effects
-                }
+                        );
+                        drop(state);
+                        let Some(effects) =
+                            commit_detached_open_edit_fallback(&self.state, &uri, prepared).await
+                        else {
+                            log::trace!(
+                                "discarding superseded didChange overflow fallback for {uri}"
+                            );
+                            return;
+                        };
+                        effects
+                    }
+                };
+                let packages_to_prefetch = effects
+                    .open
+                    .as_ref()
+                    .expect("open edit returns its immutable outcome")
+                    .packages_to_prefetch
+                    .clone();
+                let package_routing = effects.package_routing.take();
+                (
+                    effects.revalidations,
+                    packages_to_prefetch,
+                    packages_enabled,
+                    package_routing,
+                )
             };
-            let packages_to_prefetch = effects
-                .open
-                .as_ref()
-                .expect("open edit returns its immutable outcome")
-                .packages_to_prefetch
-                .clone();
-            let package_routing = effects.package_routing.take();
-            (
-                effects.revalidations,
-                packages_to_prefetch,
-                packages_enabled,
-                package_library,
-                package_routing,
-            )
-        };
 
         let mut deferred_package_routing = None;
         if let Some(routing) = package_routing {
@@ -13893,7 +14312,6 @@ impl LanguageServer for Backend {
         // After prefetch completes, schedule diagnostic revalidation so newly
         // cached exports clear false-positive "undefined variable" diagnostics.
         if packages_enabled {
-            let pkg_lib = package_library;
             let state_arc = self.state.clone();
             let client = self.client.clone();
             let revalidation_uri = uri.clone();
@@ -13976,7 +14394,7 @@ impl LanguageServer for Backend {
                     return;
                 }
                 log::trace!("Background prefetching {} packages", packages_vec.len());
-                pkg_lib.prefetch_packages(&packages_vec).await;
+                let _ = prefetch_current_package_library(&state_arc, &packages_vec).await;
 
                 // Warming a package can change `pkg::member` / missing-package
                 // diagnostics in OTHER open documents that reference it but do
@@ -15378,6 +15796,9 @@ impl Backend {
         let mut package_inputs_initialized_by_exclusion_reload = false;
         let mut workspace_scan_transfer = None;
         let mut system_file_transfer = None;
+        let mut library_restart_owner = None;
+        let mut library_routing_committed = false;
+        let mut deferred_library_routing: Option<Option<DeferredLibraryRouting>> = None;
         let mut workspace_scan_fallback_affected = Vec::new();
         let mut post_seed_candidates: Vec<AnalysisTransferCandidate> = Vec::new();
         let mut deferred_post_seed = None;
@@ -15660,6 +16081,12 @@ impl Backend {
         // paths).
         if package_settings_changed {
             log::info!("Package settings changed, reinitializing PackageLibrary");
+            let routing_basis = capture_library_routing_basis(
+                &self.state,
+                crate::state::LibraryRoutingMutation::Replacement,
+                None,
+            )
+            .await;
 
             // No `packages_enabled` gate here: `rebuild_package_library`
             // self-gates and returns `(new_empty(), false)` when packages are
@@ -15668,23 +16095,48 @@ impl Backend {
             // neutral and keeps the disabled→empty decision in one place.
             let (new_package_library, package_library_ready) =
                 rebuild_package_library(&self.state).await;
-
-            // Replace under brief write lock.
+            let routing_outcome = if let Some(routing_basis) = routing_basis
+                && let Some(driver) = prepare_library_routing_driver(
+                    &self.state,
+                    routing_basis,
+                    new_package_library,
+                    LibraryRoutingDriverOptions {
+                        ready: package_library_ready,
+                        only_packages: None,
+                        warm_open_packages: packages_enabled,
+                        refresh_cache_epoch: true,
+                        attempt_limit: 2,
+                    },
+                )
+                .await
             {
-                let mut state = self.state.write().await;
-                state.install_package_library(new_package_library, package_library_ready);
-            }
-            if package_library_ready
-                && let Some(transfer) =
-                    run_system_file_convergence_transfer(&self.state, None).await
-            {
-                system_file_transfer = Some(transfer);
+                complete_library_routing_driver(&self.state, driver).await
+            } else {
+                LibraryRoutingTransactionOutcome::Superseded
+            };
+            match routing_outcome {
+                LibraryRoutingTransactionOutcome::Committed(effects) => {
+                    library_routing_committed = true;
+                    system_file_transfer = Some(crate::state::SystemFileTransferredEffects {
+                        handle: effects.handle,
+                        changed_uris: effects.changed_uris,
+                    });
+                    library_restart_owner = effects.restart_owner;
+                }
+                LibraryRoutingTransactionOutcome::Superseded => {
+                    deferred_library_routing = Some(None);
+                }
+                LibraryRoutingTransactionOutcome::RetryExhausted(driver) => {
+                    deferred_library_routing = Some(Some(*driver));
+                }
             }
 
             // Help/HTML help caches index by (topic, package); the package
             // set just changed, so flush them to match watcher and refresh
             // paths.
-            self.state.read().await.clear_help_caches();
+            if library_routing_committed {
+                self.state.read().await.clear_help_caches();
+            }
         }
 
         // Restart the libpath watcher if any setting that affects it
@@ -15693,23 +16145,60 @@ impl Backend {
         // user flipped `watchLibraryPaths` or adjusted the debounce
         // slider) — the helper handles the teardown + respawn atomically
         // and does NOT re-run the R subprocess.
-        if package_settings_changed || watch_settings_changed {
+        if let Some(owner) = library_restart_owner {
+            restart_libpath_watcher_for_owner(&self.state, &self.client, true, owner).await;
+        } else if watch_settings_changed && deferred_library_routing.is_none() {
             restart_libpath_watcher(&self.state, &self.client, true).await;
         }
 
         // Warm the package export cache before republishing diagnostics so
         // the fresh (empty) library doesn't cause transient false-positive
         // "unknown function" diagnostics for package exports.
-        if package_settings_changed && packages_enabled {
-            let pkg_lib = self.state.read().await.package_library.clone();
-            prefetch_packages_for_open_documents(&self.state, &pkg_lib).await;
-        }
+        // Replacement candidates are warmed before the atomic routing commit.
 
         if scope_changed {
             log::trace!(
                 "Scope-affecting settings changed, revalidating {} open documents",
                 open_uris.len()
             );
+        }
+
+        if let Some(driver) = deferred_library_routing {
+            let (retry_generation, cancellation) = self
+                .state
+                .read()
+                .await
+                .library_routing_retry
+                .schedule_additive();
+            let (handles, candidates) = {
+                let state = self.state.read().await;
+                let mut handles = Vec::new();
+                if let Some(transfer) = workspace_scan_transfer.take() {
+                    handles.push(transfer.handle);
+                }
+                if let Some(transfer) = system_file_transfer.take() {
+                    handles.push(transfer.handle);
+                }
+                let mut additional = open_uris.clone();
+                additional.extend(workspace_scan_fallback_affected.clone());
+                let mut candidates = state.capture_analysis_transfer_candidates(additional);
+                candidates.extend(std::mem::take(&mut post_seed_candidates));
+                (handles, candidates)
+            };
+            let escrow = DeferredLibraryRoutingEscrow {
+                driver,
+                handles,
+                candidates,
+                fallback: open_uris,
+                post_seed: deferred_post_seed
+                    .take()
+                    .map(|owner| (owner, deferred_system_file.take())),
+                retry_generation,
+                cancellation,
+            };
+            let task_handles = PackageSeedTaskHandles::from_backend(self);
+            tokio::spawn(settle_deferred_library_routing_escrow(task_handles, escrow));
+            return Vec::new();
         }
 
         if only_watch_changed && deferred_post_seed.is_none() {
@@ -15882,7 +16371,7 @@ impl Backend {
         // convergence attempt. Prefetch must consume that committed result,
         // never start a third post-commit initialization that can defeat the
         // retry ceiling (especially when a degraded build remains not-ready).
-        let (probe, package_library) = {
+        let probe = {
             let state = self.state.read().await;
             if !state.cross_file_config.packages_enabled || !state.package_library_ready {
                 return;
@@ -15891,10 +16380,7 @@ impl Backend {
                 return;
             };
             let last_line = document.text().lines().count().saturating_sub(1) as u32;
-            (
-                state.build_package_scope_snapshot(&[(uri.clone(), last_line)]),
-                state.package_library.clone(),
-            )
+            state.build_package_scope_snapshot(&[(uri.clone(), last_line)])
         };
 
         let empty_base_exports = std::collections::HashSet::new();
@@ -15927,7 +16413,7 @@ impl Backend {
         packages.sort_unstable();
         packages.dedup();
         if !packages.is_empty() {
-            package_library.prefetch_packages(&packages).await;
+            let _ = prefetch_current_package_library(&self.state, &packages).await;
         }
     }
 
@@ -16276,8 +16762,7 @@ impl Backend {
                     file_uri,
                     packages_to_prefetch
                 );
-                let pkg_lib = self.state.read().await.package_library.clone();
-                pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+                let _ = prefetch_current_package_library(&self.state, &packages_to_prefetch).await;
             }
         }
 
@@ -16765,8 +17250,7 @@ impl Backend {
                     file_uri,
                     packages_to_prefetch
                 );
-                let pkg_lib = self.state.read().await.package_library.clone();
-                pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+                let _ = prefetch_current_package_library(&self.state, &packages_to_prefetch).await;
             }
         }
 
@@ -17768,9 +18252,41 @@ fn open_docs_referencing_packages(
 /// and prefetch their exports into `pkg_lib`. Snapshots state under the read
 /// lock, releases it before running scope resolution (per AGENTS.md lock-hold
 /// invariant).
+async fn prefetch_current_package_library(
+    state_arc: &Arc<RwLock<WorldState>>,
+    packages: &[String],
+) -> bool {
+    if packages.is_empty() {
+        return true;
+    }
+    for _ in 0..2 {
+        // The state guard is gone before the logical cache-operation lease is
+        // awaited. The final routing commit takes the inverse
+        // old-library-exclusive -> WorldState order.
+        let library = state_arc.read().await.package_library.clone();
+        if !library.prefetch_packages(packages).await {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        if Arc::ptr_eq(&state_arc.read().await.package_library, &library) {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    false
+}
+
 pub(crate) async fn prefetch_packages_for_open_documents(
     state_arc: &Arc<RwLock<WorldState>>,
     pkg_lib: &Arc<crate::package_library::PackageLibrary>,
+) {
+    prefetch_packages_for_open_documents_into(state_arc, pkg_lib, true).await;
+}
+
+async fn prefetch_packages_for_open_documents_into(
+    state_arc: &Arc<RwLock<WorldState>>,
+    pkg_lib: &Arc<crate::package_library::PackageLibrary>,
+    authoritative: bool,
 ) {
     let (doc_packages, probe) = {
         let state = state_arc.read().await;
@@ -17828,7 +18344,11 @@ pub(crate) async fn prefetch_packages_for_open_documents(
             packages.len(),
             probe.docs.len()
         );
-        pkg_lib.prefetch_packages(&packages).await;
+        if authoritative {
+            let _ = prefetch_current_package_library(state_arc, &packages).await;
+        } else {
+            let _ = pkg_lib.prefetch_packages(&packages).await;
+        }
     }
 }
 
@@ -17918,13 +18438,34 @@ pub(crate) fn restart_libpath_watcher<'a>(
     allow_recovery: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
     Box::pin(async move {
-        {
+        let owner = {
             let mut state = state_arc.write().await;
-            state.libpath_watcher_handle = None;
+            state.begin_libpath_watcher_restart()
+        };
+        restart_libpath_watcher_for_owner(state_arc, client, allow_recovery, owner).await
+    })
+}
+
+fn restart_libpath_watcher_for_owner<'a>(
+    state_arc: &'a Arc<RwLock<WorldState>>,
+    client: &'a Client,
+    allow_recovery: bool,
+    owner: crate::state::LibpathWatcherOwner,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    Box::pin(async move {
+        if !state_arc
+            .read()
+            .await
+            .libpath_watcher_owner_is_current(owner)
+        {
+            return false;
         }
 
         let (should_start, lib_paths, debounce) = {
             let state = state_arc.read().await;
+            if !state.libpath_watcher_owner_is_current(owner) {
+                return false;
+            }
             let lib_paths = state.package_library.lib_paths().to_vec();
             let should = state.cross_file_config.packages_enabled
                 && state.cross_file_config.packages_watch_library_paths
@@ -17956,6 +18497,7 @@ pub(crate) fn restart_libpath_watcher<'a>(
             client_for_consumer,
             rx,
             allow_recovery,
+            owner,
         ));
 
         let Some(handle) = crate::libpath_watcher::spawn_watcher(lib_paths, debounce, tx) else {
@@ -17964,6 +18506,9 @@ pub(crate) fn restart_libpath_watcher<'a>(
 
         {
             let mut state = state_arc.write().await;
+            if !state.libpath_watcher_owner_is_current(owner) {
+                return false;
+            }
             state.libpath_watcher_handle = Some(Arc::new(handle));
         }
         true
@@ -17994,29 +18539,224 @@ pub(crate) struct ScopeProbeSnapshot {
     pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
 }
 
-/// State-side preparation for a `LibpathEvent::Dropped`: clears the package
-/// cache so stale entries can't leak into subsequent lookups, and marks every
-/// open document for force-republish so the scheduled diagnostic pass can
-/// overwrite the last publish at the same document version. Returns the list
-/// of open URIs so the caller can schedule the actual publishing.
-///
-/// Split out of the consumer body to keep the state invariants unit-testable
-/// without needing a tower-lsp `Client`.
-pub(crate) async fn prepare_dropped_recovery(state_arc: &Arc<RwLock<WorldState>>) -> Vec<Url> {
-    let pkg_lib = { state_arc.read().await.package_library.clone() };
-    pkg_lib.clear_cache().await;
-
-    let open_uris: Vec<Url> = {
-        let state = state_arc.read().await;
-        state.documents.keys().cloned().collect()
-    };
-    {
-        let state = state_arc.read().await;
-        state
-            .diagnostics_gate
-            .mark_force_republish_many(open_uris.iter());
+async fn commit_libpath_changed(
+    state_arc: &Arc<RwLock<WorldState>>,
+    owner: crate::state::LibpathWatcherOwner,
+    affected: &std::collections::HashSet<String>,
+    added: &std::collections::HashSet<String>,
+    removed: &std::collections::HashSet<String>,
+    touched: &std::collections::HashSet<String>,
+) -> Option<(
+    crate::state::LibraryRoutingTransferredEffects,
+    std::collections::HashSet<String>,
+)> {
+    let (retry_generation, cancellation) = state_arc
+        .read()
+        .await
+        .library_routing_retry
+        .schedule_additive();
+    let mut attempts = 0usize;
+    let mut retry_delay = std::time::Duration::from_millis(10);
+    loop {
+        if cancellation.is_cancelled() {
+            state_arc
+                .read()
+                .await
+                .library_routing_retry
+                .complete(retry_generation);
+            return None;
+        }
+        let Some((basis, successor)) = capture_library_content_successor(
+            state_arc,
+            crate::state::LibraryRoutingMutation::Changed,
+            owner,
+        )
+        .await
+        else {
+            state_arc
+                .read()
+                .await
+                .library_routing_retry
+                .complete(retry_generation);
+            return None;
+        };
+        let ready = basis.ready;
+        let invalidated_combined = successor.invalidate_many(affected).await;
+        let trigger_set = affected
+            .iter()
+            .chain(invalidated_combined.iter())
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let warm = touched
+            .iter()
+            .chain(added.iter())
+            .chain(invalidated_combined.iter())
+            .filter(|name| !removed.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !warm.is_empty() {
+            successor.prefetch_packages(&warm).await;
+        }
+        let Some(driver) = prepare_library_routing_driver(
+            state_arc,
+            basis,
+            successor,
+            LibraryRoutingDriverOptions {
+                ready,
+                only_packages: Some(affected.clone()),
+                warm_open_packages: false,
+                refresh_cache_epoch: false,
+                attempt_limit: 1,
+            },
+        )
+        .await
+        else {
+            state_arc
+                .read()
+                .await
+                .library_routing_retry
+                .complete(retry_generation);
+            return None;
+        };
+        match run_library_routing_transaction(state_arc, driver).await {
+            LibraryRoutingTransactionOutcome::Committed(effects) => {
+                state_arc
+                    .read()
+                    .await
+                    .library_routing_retry
+                    .complete(retry_generation);
+                return Some((effects, trigger_set));
+            }
+            LibraryRoutingTransactionOutcome::Superseded => {
+                state_arc
+                    .read()
+                    .await
+                    .library_routing_retry
+                    .complete(retry_generation);
+                return None;
+            }
+            LibraryRoutingTransactionOutcome::RetryExhausted(_) => {}
+        }
+        attempts += 1;
+        if attempts < 2 {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                state_arc
+                    .read()
+                    .await
+                    .library_routing_retry
+                    .complete(retry_generation);
+                return None;
+            }
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
+        retry_delay = std::cmp::min(
+            retry_delay.saturating_mul(2),
+            std::time::Duration::from_millis(250),
+        );
     }
-    open_uris
+}
+
+async fn commit_libpath_dropped(
+    state_arc: &Arc<RwLock<WorldState>>,
+    owner: crate::state::LibpathWatcherOwner,
+) -> Option<crate::state::LibraryRoutingTransferredEffects> {
+    let (retry_generation, cancellation) = state_arc
+        .read()
+        .await
+        .library_routing_retry
+        .schedule_additive();
+    let mut attempts = 0usize;
+    let mut retry_delay = std::time::Duration::from_millis(10);
+    loop {
+        if cancellation.is_cancelled() {
+            state_arc
+                .read()
+                .await
+                .library_routing_retry
+                .complete(retry_generation);
+            return None;
+        }
+        let Some((basis, successor)) = capture_library_content_successor(
+            state_arc,
+            crate::state::LibraryRoutingMutation::Dropped,
+            owner,
+        )
+        .await
+        else {
+            state_arc
+                .read()
+                .await
+                .library_routing_retry
+                .complete(retry_generation);
+            return None;
+        };
+        let ready = basis.ready;
+        successor.clear_cache().await;
+        let Some(driver) = prepare_library_routing_driver(
+            state_arc,
+            basis,
+            successor,
+            LibraryRoutingDriverOptions {
+                ready,
+                only_packages: Some(std::collections::HashSet::new()),
+                warm_open_packages: false,
+                refresh_cache_epoch: false,
+                attempt_limit: 1,
+            },
+        )
+        .await
+        else {
+            state_arc
+                .read()
+                .await
+                .library_routing_retry
+                .complete(retry_generation);
+            return None;
+        };
+        match run_library_routing_transaction(state_arc, driver).await {
+            LibraryRoutingTransactionOutcome::Committed(effects) => {
+                state_arc
+                    .read()
+                    .await
+                    .library_routing_retry
+                    .complete(retry_generation);
+                return Some(effects);
+            }
+            LibraryRoutingTransactionOutcome::Superseded => {
+                state_arc
+                    .read()
+                    .await
+                    .library_routing_retry
+                    .complete(retry_generation);
+                return None;
+            }
+            LibraryRoutingTransactionOutcome::RetryExhausted(_) => {}
+        }
+        attempts += 1;
+        if attempts < 2 {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                state_arc
+                    .read()
+                    .await
+                    .library_routing_retry
+                    .complete(retry_generation);
+                return None;
+            }
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
+        retry_delay = std::cmp::min(
+            retry_delay.saturating_mul(2),
+            std::time::Duration::from_millis(250),
+        );
+    }
 }
 
 /// Consumer for libpath change events. Invalidates the package cache for
@@ -18034,10 +18774,18 @@ async fn run_libpath_consumer(
     client: Client,
     mut rx: tokio::sync::mpsc::Receiver<crate::libpath_watcher::LibpathEvent>,
     allow_recovery: bool,
+    owner: crate::state::LibpathWatcherOwner,
 ) {
     use crate::libpath_watcher::LibpathEvent;
 
     while let Some(evt) = rx.recv().await {
+        if !state_arc
+            .read()
+            .await
+            .libpath_watcher_owner_is_current(owner)
+        {
+            return;
+        }
         match evt {
             LibpathEvent::Changed {
                 added,
@@ -18060,86 +18808,16 @@ async fn run_libpath_consumer(
                     touched.len()
                 );
 
-                // Bust help caches before invalidating the package library so
-                // any concurrent hover/completion requests see a clean slate and
-                // re-fetch from R rather than returning stale HTML or text help.
+                let Some((routing_effects, trigger_set)) = commit_libpath_changed(
+                    &state_arc, owner, &affected, &added, &removed, &touched,
+                )
+                .await
+                else {
+                    continue;
+                };
+                // Help entries become stale at the same winner-only boundary as
+                // the new package cache and routing projection.
                 state_arc.read().await.clear_help_caches();
-
-                // Invalidate the package cache and learn which combined
-                // aggregate entries were dropped as a side effect. A document loading
-                // a meta-package like `tidyverse` needs revalidation when
-                // `dplyr` changes — `tidyverse` is not in `affected` but its
-                // aggregate was invalidated, so it's in `invalidated_combined`.
-                let pkg_lib = { state_arc.read().await.package_library.clone() };
-                let invalidated_combined = pkg_lib.invalidate_many(&affected).await;
-
-                // Union of names that mark a document as affected: either the
-                // direct disk-level change (`affected`) or a dropped aggregate
-                // (`invalidated_combined`). Documents whose `loaded_packages`
-                // intersect this union need diagnostic revalidation.
-                let trigger_set: std::collections::HashSet<String> = affected
-                    .iter()
-                    .chain(invalidated_combined.iter())
-                    .cloned()
-                    .collect();
-
-                // Await the warmup prefetch BEFORE republishing diagnostics so
-                // the next diagnostic pass sees a warmed cache; otherwise a
-                // raced prefetch can land just after diagnostics compute and
-                // leave the user looking at stale results.
-                let non_removed_trigger_set: std::collections::HashSet<String> = touched
-                    .iter()
-                    .chain(added.iter())
-                    .chain(invalidated_combined.iter())
-                    .filter(|name| !removed.contains(*name))
-                    .cloned()
-                    .collect();
-                if !non_removed_trigger_set.is_empty() {
-                    let prefetch_vec: Vec<String> = non_removed_trigger_set.into_iter().collect();
-                    pkg_lib.prefetch_packages(&prefetch_vec).await;
-                }
-                // Cache invalidation and warmup above establish the new
-                // package-library contents. Publish their routing ownership at
-                // one state seam before detached system.file convergence
-                // captures its basis.
-                state_arc
-                    .write()
-                    .await
-                    .record_package_library_content_change();
-
-                // A package install/removal under a watched libpath can create
-                // or destroy `source(system.file(...))` resolution targets even
-                // though the set of lib_paths is unchanged. Pre-check under the
-                // read lock so workspaces without a matching system.file source
-                // (the common case) never pay for the write lock. Otherwise
-                // re-resolve just the entries referencing changed packages so
-                // edges form for a newly-installed package and stale edges drop
-                // for a removed one. The write-lock section does bounded disk
-                // work — stat probes per selected entry plus reading/parsing
-                // newly resolved external files in
-                // `index_cross_package_resolved_files` — the same work every
-                // library-swap site performs under this lock.
-                let touches_system_file = {
-                    let state = state_arc.read().await;
-                    let selected = |s: &crate::cross_file::ForwardSource| {
-                        s.system_file
-                            .as_ref()
-                            .is_some_and(|sf| affected.contains(&sf.package))
-                    };
-                    state
-                        .workspace_index
-                        .any_artifact(|entry| entry.metadata.sources.iter().any(selected))
-                        || state.documents.uris().iter().any(|uri| {
-                            state.documents.get_record(uri).is_some_and(|record| {
-                                record.metadata().sources.iter().any(selected)
-                            })
-                        })
-                };
-                let system_file_transfer = if touches_system_file {
-                    run_system_file_convergence_transfer(&state_arc, Some(affected.clone())).await
-                } else {
-                    None
-                };
 
                 // Collect URIs whose effective package scope intersects
                 // `trigger_set`.
@@ -18228,12 +18906,9 @@ async fn run_libpath_consumer(
                 let tickets = {
                     let mut state = state_arc.write().await;
                     let fallback: Vec<_> = state.documents.keys().cloned().collect();
-                    let handles = system_file_transfer
-                        .map(|transfer| vec![transfer.handle])
-                        .unwrap_or_default();
                     finalize_analysis_handoff_or_fallback(
                         &mut state,
-                        handles,
+                        vec![routing_effects.handle],
                         affected_uris,
                         fallback,
                     )
@@ -18253,15 +18928,24 @@ async fn run_libpath_consumer(
                     allow_recovery
                 );
 
-                // The watcher is gone so we can no longer track installs or
-                // upgrades; any cached help content may now be stale.
+                let Some(routing_effects) = commit_libpath_dropped(&state_arc, owner).await else {
+                    return;
+                };
                 state_arc.read().await.clear_help_caches();
-
-                let open_uris = prepare_dropped_recovery(&state_arc).await;
-                Backend::publish_diagnostics_for_uris_bounded(
+                let tickets = {
+                    let mut state = state_arc.write().await;
+                    let open_uris: Vec<_> = state.documents.keys().cloned().collect();
+                    finalize_analysis_handoff_or_fallback(
+                        &mut state,
+                        vec![routing_effects.handle],
+                        open_uris.clone(),
+                        open_uris,
+                    )
+                };
+                Backend::publish_diagnostics_for_tickets_bounded(
                     Arc::clone(&state_arc),
                     client.clone(),
-                    open_uris,
+                    tickets,
                     None,
                 )
                 .await;
@@ -18272,7 +18956,17 @@ async fn run_libpath_consumer(
                 // `raven.refreshPackages`, which additionally rebuilds the
                 // PackageLibrary (picking up `.libPaths()` changes).
                 if allow_recovery {
-                    let attached = restart_libpath_watcher(&state_arc, &client, false).await;
+                    let attached = if let Some(recovery_owner) = routing_effects.restart_owner {
+                        restart_libpath_watcher_for_owner(
+                            &state_arc,
+                            &client,
+                            false,
+                            recovery_owner,
+                        )
+                        .await
+                    } else {
+                        false
+                    };
                     log::info!(
                         "LibpathWatcher: recovery attempted, new watcher attached = {}",
                         attached
@@ -18287,6 +18981,453 @@ async fn run_libpath_consumer(
 
 #[cfg(test)]
 mod tests {
+    async fn initialized_library_routing_service() -> (
+        tower_lsp::LspService<super::Backend>,
+        tower_lsp::ClientSocket,
+    ) {
+        use tower::{Service, ServiceExt};
+
+        let (mut service, socket) = tower_lsp::LspService::new(super::Backend::new);
+        let request = tower_lsp::jsonrpc::Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(tower_lsp::lsp_types::InitializeParams::default()).unwrap(),
+            )
+            .finish();
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+        (service, socket)
+    }
+
+    #[tokio::test]
+    async fn retired_prefetch_retries_the_current_library() {
+        use std::sync::Arc;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let package = temp.path().join("retryPkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("DESCRIPTION"),
+            "Package: retryPkg\nVersion: 1.0\n",
+        )
+        .unwrap();
+        std::fs::write(package.join("NAMESPACE"), "export(retry_export)\n").unwrap();
+
+        let mut old = crate::package_library::PackageLibrary::new_empty();
+        old.set_lib_paths(vec![temp.path().to_path_buf()]);
+        let old = Arc::new(old);
+        let mut successor = crate::package_library::PackageLibrary::new_empty();
+        successor.set_lib_paths(vec![temp.path().to_path_buf()]);
+        let successor = Arc::new(successor);
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorldState::new()));
+        {
+            let mut world = state.write().await;
+            world.package_library = old.clone();
+            world.package_library_ready = true;
+        }
+
+        let lease = old.routing_lease().await;
+        old.retire(&lease);
+        state.write().await.package_library = successor.clone();
+        drop(lease);
+
+        assert!(super::prefetch_current_package_library(&state, &["retryPkg".to_string()]).await);
+        assert!(successor.cached_package_names().await.contains("retryPkg"));
+        assert!(old.cached_package_names().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retired_prefetch_has_a_bounded_terminal_outcome() {
+        use std::sync::Arc;
+
+        let library = Arc::new(crate::package_library::PackageLibrary::new_empty());
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorldState::new()));
+        state.write().await.package_library = library.clone();
+        let lease = library.routing_lease().await;
+        library.retire(&lease);
+        drop(lease);
+
+        assert!(!super::prefetch_current_package_library(&state, &["never".to_string()]).await);
+    }
+
+    #[tokio::test]
+    async fn dropped_content_owns_deferred_retry_after_exact_two_foreground_attempts() {
+        use std::sync::Arc;
+
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorldState::new()));
+        let owner = {
+            let mut world = state.write().await;
+            world.library_routing_test_reject_remaining = 2;
+            world.libpath_watcher_owner()
+        };
+
+        let effects = super::commit_libpath_dropped(&state, owner)
+            .await
+            .expect("the awaited deferred owner must eventually commit");
+        let world = state.read().await;
+        assert_eq!(world.library_routing_test_commit_attempts, 3);
+        assert_eq!(world.package_library_content_generation_for_test(), 1);
+        assert!(effects.restart_owner.is_some());
+    }
+
+    #[tokio::test]
+    async fn changed_content_reforks_for_deferred_retry_without_dropping_event() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorldState::new()));
+        let owner = {
+            let mut world = state.write().await;
+            world.library_routing_test_reject_remaining = 2;
+            world.libpath_watcher_owner()
+        };
+        let affected = HashSet::from(["changedPkg".to_string()]);
+        let (effects, trigger) = super::commit_libpath_changed(
+            &state,
+            owner,
+            &affected,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .await
+        .expect("the exact watcher event must survive foreground exhaustion");
+        let world = state.read().await;
+        assert_eq!(world.library_routing_test_commit_attempts, 3);
+        assert!(trigger.contains("changedPkg"));
+        assert!(effects.restart_owner.is_none());
+        assert!(world.libpath_watcher_owner_is_current(owner));
+    }
+
+    #[tokio::test]
+    async fn persistent_content_rejection_backs_off_and_shutdown_cancels_owner() {
+        use std::sync::Arc;
+
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorldState::new()));
+        let owner = {
+            let mut world = state.write().await;
+            world.library_routing_test_reject_remaining = usize::MAX;
+            world.libpath_watcher_owner()
+        };
+        let task_state = state.clone();
+        let task =
+            tokio::spawn(async move { super::commit_libpath_dropped(&task_state, owner).await });
+
+        loop {
+            if state.read().await.library_routing_test_commit_attempts >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let before = state.read().await.library_routing_test_commit_attempts;
+        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+        let after = state.read().await.library_routing_test_commit_attempts;
+        assert!(
+            after <= before + 3,
+            "deferred owner must back off instead of hot-spinning: {before} -> {after}"
+        );
+
+        state.read().await.library_routing_retry.cancel();
+        assert!(task.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unrelated_additive_retry_does_not_cancel_watcher_content_owner() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorldState::new()));
+        let owner = {
+            let mut world = state.write().await;
+            world.library_routing_test_reject_remaining = usize::MAX;
+            world.libpath_watcher_owner()
+        };
+        let task_state = state.clone();
+        let mut task =
+            tokio::spawn(async move { super::commit_libpath_dropped(&task_state, owner).await });
+        loop {
+            if state.read().await.library_routing_test_commit_attempts >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let (unrelated_generation, unrelated_cancellation) =
+            state.read().await.library_routing_retry.schedule_additive();
+        assert!(
+            !unrelated_cancellation.is_cancelled(),
+            "an additive config owner must not cancel an existing watcher owner"
+        );
+        state
+            .read()
+            .await
+            .library_routing_retry
+            .complete(unrelated_generation);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "unrelated config retry scheduling must not terminate the watcher event"
+        );
+
+        state.write().await.begin_libpath_watcher_restart();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .expect("watcher supersession must terminate its old content owner")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!state.read().await.library_routing_retry.has_pending());
+    }
+
+    #[tokio::test]
+    async fn deferred_library_routing_retains_exact_ledger_until_one_finalization() {
+        use futures_util::StreamExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (service, mut socket) = initialized_library_routing_service().await;
+        let backend = service.inner();
+        let root = tempfile::TempDir::new().unwrap();
+        let uri = tower_lsp::lsp_types::Url::parse("file:///escrow-consumer.R").unwrap();
+        let post_seed_identity = {
+            let mut state = backend.state.write().await;
+            state.open_document(uri.clone(), "consumer <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+            state.package_inputs.workspace_root = Some(root.path().to_path_buf());
+            state.record_package_input_mutation();
+            state.record_package_seed_installed()
+        };
+        let existing = super::run_system_file_convergence_transfer(&backend.state, None)
+            .await
+            .expect("the current routing must install an initial exact transfer");
+        let (candidate, reservations_before, finalizations_before, pause) = {
+            let mut state = backend.state.write().await;
+            let candidate = state.capture_analysis_transfer_candidates([uri.clone()]);
+            state.library_routing_test_reject_remaining = usize::MAX;
+            let pause = state.library_routing_deferred_test_pause.arm(
+                tower_lsp::lsp_types::Url::parse(super::LIBRARY_ROUTING_DEFERRED_PAUSE_URI)
+                    .unwrap(),
+            );
+            (
+                candidate,
+                state.analysis_revalidation_reservation_count,
+                state.analysis_transfer_finalization_count_for_test(),
+                pause,
+            )
+        };
+        let basis = super::capture_library_routing_basis(
+            &backend.state,
+            crate::state::LibraryRoutingMutation::Replacement,
+            None,
+        )
+        .await
+        .unwrap();
+        let driver = super::prepare_library_routing_driver(
+            &backend.state,
+            basis,
+            Arc::new(crate::package_library::PackageLibrary::new_empty()),
+            super::LibraryRoutingDriverOptions {
+                ready: false,
+                only_packages: None,
+                warm_open_packages: false,
+                refresh_cache_epoch: true,
+                attempt_limit: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let (retry_generation, cancellation) = backend
+            .state
+            .read()
+            .await
+            .library_routing_retry
+            .schedule_additive();
+        let escrow = super::DeferredLibraryRoutingEscrow {
+            driver: Some(driver),
+            handles: vec![existing.handle],
+            candidates: candidate.clone(),
+            fallback: vec![uri.clone()],
+            post_seed: Some((
+                super::DeferredCombinedPostSeedOwner {
+                    root: root.path().to_path_buf(),
+                    identity: post_seed_identity,
+                },
+                None,
+            )),
+            retry_generation,
+            cancellation,
+        };
+        let worker = tokio::spawn(super::settle_deferred_library_routing_escrow(
+            super::PackageSeedTaskHandles::from_backend(backend),
+            escrow,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), pause.wait_arrived())
+            .await
+            .expect("forced exhaustion must retain the exact escrow before backoff");
+        {
+            let mut state = backend.state.write().await;
+            assert_eq!(
+                state.library_routing_deferred_handles_for_test,
+                vec![existing.handle]
+            );
+            assert_eq!(
+                state.library_routing_deferred_candidates_for_test,
+                candidate
+            );
+            assert_eq!(
+                state.library_routing_deferred_post_seed_for_test,
+                Some(post_seed_identity),
+                "the deferred replacement must retain its exact post-seed owner"
+            );
+            assert!(state.analysis_transfer_is_pending_for_test(existing.handle));
+            assert_eq!(
+                state.analysis_revalidation_reservation_count,
+                reservations_before
+            );
+            assert_eq!(
+                state.analysis_transfer_finalization_count_for_test(),
+                finalizations_before
+            );
+            assert_eq!(
+                state.diagnostics_gate.force_republish_count_for_test(&uri),
+                0,
+                "a retained escrow must not leak a publish marker"
+            );
+            assert!(state.library_routing_retry.has_pending());
+            state.library_routing_test_reject_remaining = 0;
+        }
+        pause.release();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("the retained exact driver must converge")
+            .unwrap();
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.analysis_transfer_finalization_count_for_test(),
+            finalizations_before + 1
+        );
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservations_before + 1
+        );
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            0,
+            "the one completed publish consumes its force marker"
+        );
+        assert!(!state.library_routing_retry.has_pending());
+        assert!(
+            !state.post_seed_refresh_retry_is_current(post_seed_identity),
+            "the preserved post-seed owner must complete its retained ledger"
+        );
+        drop(state);
+        let published = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("the one escrow publication must arrive")
+            .expect("client socket remains open");
+        assert_eq!(published.method(), "textDocument/publishDiagnostics");
+        let params: tower_lsp::lsp_types::PublishDiagnosticsParams =
+            serde_json::from_value(published.params().unwrap().clone()).unwrap();
+        assert_eq!(params.uri, uri);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), socket.next())
+                .await
+                .is_err(),
+            "one escrow finalization must publish the candidate exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_library_routing_acquires_current_transfer_before_finalizing_ledger() {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+
+        let (service, mut socket) = initialized_library_routing_service().await;
+        let backend = service.inner();
+        let uri = tower_lsp::lsp_types::Url::parse("file:///superseded-consumer.R").unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.open_document(uri.clone(), "consumer <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+        }
+        let previous = super::run_system_file_convergence_transfer(&backend.state, None)
+            .await
+            .expect("the old current routing must own a transfer");
+        let (candidate, reservations_before, finalizations_before) = {
+            let state = backend.state.read().await;
+            (
+                state.capture_analysis_transfer_candidates([uri.clone()]),
+                state.analysis_revalidation_reservation_count,
+                state.analysis_transfer_finalization_count_for_test(),
+            )
+        };
+        let (retry_generation, cancellation) = backend
+            .state
+            .read()
+            .await
+            .library_routing_retry
+            .schedule_additive();
+        let escrow = super::DeferredLibraryRoutingEscrow {
+            driver: None,
+            handles: vec![previous.handle],
+            candidates: candidate,
+            fallback: vec![uri.clone()],
+            post_seed: None,
+            retry_generation,
+            cancellation,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            super::settle_deferred_library_routing_escrow(
+                super::PackageSeedTaskHandles::from_backend(backend),
+                escrow,
+            ),
+        )
+        .await
+        .expect("a superseded intent must converge through current routing");
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.analysis_transfer_is_pending_for_test(previous.handle),
+            "the current-routing successor must inherit and consume the old transfer"
+        );
+        assert_eq!(
+            state.analysis_transfer_finalization_count_for_test(),
+            finalizations_before + 1
+        );
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservations_before + 1
+        );
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            0,
+            "the current-transfer finalizer's publish consumes its marker"
+        );
+        assert!(!state.library_routing_retry.has_pending());
+        drop(state);
+        let published = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("the current-transfer publication must arrive")
+            .expect("client socket remains open");
+        assert_eq!(published.method(), "textDocument/publishDiagnostics");
+        let params: tower_lsp::lsp_types::PublishDiagnosticsParams =
+            serde_json::from_value(published.params().unwrap().clone()).unwrap();
+        assert_eq!(params.uri, uri);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), socket.next())
+                .await
+                .is_err(),
+            "the superseded ledger must publish exactly once"
+        );
+    }
+
     mod diagnostic_lifecycle {
         use futures_util::StreamExt;
         use std::sync::Arc;
@@ -23529,62 +24670,6 @@ mod refresh_packages_tests {
         assert!(lib.lib_paths().is_empty());
     }
 
-    /// Regression for review finding #3: a `Dropped` event must leave open
-    /// documents in a state where the next diagnostic run can republish at
-    /// the same document version (force-republish bypasses the monotonic
-    /// gate) and must clear the package cache.
-    #[tokio::test]
-    async fn prepare_dropped_recovery_clears_cache_and_marks_open_docs() {
-        use crate::package_library::{PackageInfo, PackageLibrary};
-        use crate::state::{Document, WorldState};
-        use tokio::sync::RwLock;
-
-        let mut world = WorldState::new();
-        let uri_a = Url::parse("file:///workspace/a.R").unwrap();
-        let uri_b = Url::parse("file:///workspace/b.R").unwrap();
-        world
-            .documents
-            .insert(uri_a.clone(), Document::new("x <- 1", Some(1)));
-        world
-            .documents
-            .insert(uri_b.clone(), Document::new("y <- 2", Some(1)));
-
-        // Simulate prior publishes at version 1 for both docs.
-        world.diagnostics_gate.record_publish(&uri_a, 1);
-        world.diagnostics_gate.record_publish(&uri_b, 1);
-        // Without force-republish, the gate blocks same-version republishes.
-        assert!(!world.diagnostics_gate.can_publish(&uri_a, 1));
-        assert!(!world.diagnostics_gate.can_publish(&uri_b, 1));
-
-        // Seed the package cache so we can observe it being cleared.
-        let lib = Arc::new(PackageLibrary::new_empty());
-        lib.insert_package(PackageInfo::new("foo".into(), HashSet::new()))
-            .await;
-        world.package_library = lib.clone();
-
-        let state = Arc::new(RwLock::new(world));
-        let open = prepare_dropped_recovery(&state).await;
-
-        // Cache cleared.
-        assert_eq!(lib.cached_count().await, 0);
-
-        // All open URIs returned.
-        let open_set: HashSet<Url> = open.into_iter().collect();
-        assert!(open_set.contains(&uri_a));
-        assert!(open_set.contains(&uri_b));
-
-        // Same-version republish is now allowed for both documents.
-        let state_guard = state.read().await;
-        assert!(
-            state_guard.diagnostics_gate.can_publish(&uri_a, 1),
-            "force-republish must allow the same-version republish for uri_a"
-        );
-        assert!(
-            state_guard.diagnostics_gate.can_publish(&uri_b, 1),
-            "force-republish must allow the same-version republish for uri_b"
-        );
-    }
-
     /// Regression for issue #107: `build_package_scope_snapshot` must include
     /// closed parent files (reachable via the dependency graph) in the
     /// artifacts/metadata maps, not just open documents. Otherwise inherited
@@ -24631,6 +25716,79 @@ mod refresh_packages_tests {
             assert!(
                 state.package_library.is_cached("dplyr").await,
                 "refresh while disabled must not clear the existing library's cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn refresh_packages_retry_exhaustion_is_an_error_without_winner_effects() {
+            let backend = make_test_backend();
+            let original = ready_library(std::path::PathBuf::from("/tmp/libs"));
+            original
+                .insert_package(crate::package_library::PackageInfo::new(
+                    "dplyr".to_string(),
+                    std::collections::HashSet::new(),
+                ))
+                .await;
+            let uri = tower_lsp::lsp_types::Url::parse("file:///refresh-consumer.R").unwrap();
+            let (owner, finalizations_before, reservations_before) = {
+                let mut state = backend.state.write().await;
+                state.package_library = Arc::clone(&original);
+                state.package_library_ready = true;
+                state.cross_file_config.packages_r_path =
+                    Some(std::path::PathBuf::from("/definitely/missing/R"));
+                state.open_document(uri.clone(), "consumer <- 1\n", Some(1));
+                state
+                    .begin_open_document_diagnostic_lifecycle(&uri)
+                    .unwrap();
+                state.help_cache.insert(
+                    "retained-topic",
+                    Some("dplyr"),
+                    Some("retained help".to_string()),
+                );
+                state.library_routing_test_reject_remaining = usize::MAX;
+                (
+                    state.libpath_watcher_owner(),
+                    state.analysis_transfer_finalization_count_for_test(),
+                    state.analysis_revalidation_reservation_count,
+                )
+            };
+
+            let error = backend
+                .execute_command(ExecuteCommandParams {
+                    command: "raven.refreshPackages".into(),
+                    arguments: vec![],
+                    work_done_progress_params: Default::default(),
+                })
+                .await
+                .expect_err("retry exhaustion must not be reported as a successful refresh");
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({ "reason": "routing retry exhausted" }))
+            );
+
+            let state = backend.state.read().await;
+            assert!(Arc::ptr_eq(&state.package_library, &original));
+            assert!(state.package_library.is_cached("dplyr").await);
+            assert_eq!(
+                state.help_cache.get("retained-topic", Some("dplyr")),
+                Some(Some("retained help".to_string()))
+            );
+            assert!(state.libpath_watcher_owner_is_current(owner));
+            assert_eq!(
+                state.analysis_transfer_finalization_count_for_test(),
+                finalizations_before
+            );
+            assert_eq!(
+                state.analysis_revalidation_reservation_count,
+                reservations_before
+            );
+            assert_eq!(
+                state.diagnostics_gate.force_republish_count_for_test(&uri),
+                0
+            );
+            assert_eq!(
+                state.library_routing_test_commit_attempts, 4,
+                "refresh owns two foreground attempts and one retained two-attempt lifecycle"
             );
         }
     }

@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::namespace_parser::{parse_data_symbols, parse_description_depends, parse_index_exports};
 use crate::package_db::PackageMetadataProvider;
@@ -442,11 +443,30 @@ pub struct PackageLibrary {
     /// DB), consulted only when the installed (Tier 1) path does not resolve a
     /// package. Empty by default; populated by `build_package_library`. These
     /// feed export resolution only — never `package_exists()` (install status).
-    providers: Vec<Box<dyn PackageMetadataProvider>>,
+    providers: Vec<Arc<dyn PackageMetadataProvider>>,
     /// Local-dev overlay: sentinel -> workspace-local internal symbols.
     /// Consulted by the three resolution chokepoints before the installed caches.
     /// Refreshed by the shared derived-package installer.
     local_dev_overlay: ArcSwap<Option<Arc<LocalDevPackage>>>,
+    /// Operation-level ownership for cache mutations.
+    ///
+    /// A shared lease spans one complete logical load, including every
+    /// per-package and aggregate publication. Library-routing transactions
+    /// briefly take the exclusive side to clone a coherent successor and again
+    /// at the central commit. `cache_operation_epoch` changes when a logical
+    /// mutation starts, so a successor prepared from an older cache is rejected
+    /// instead of overwriting an in-flight warm.
+    cache_operation_gate: tokio::sync::RwLock<()>,
+    cache_operation_epoch: AtomicU64,
+    retired: AtomicBool,
+}
+
+pub(crate) struct PackageCacheOperationLease<'a> {
+    _guard: tokio::sync::RwLockReadGuard<'a, ()>,
+}
+
+pub(crate) struct PackageLibraryRoutingLease<'a> {
+    _guard: tokio::sync::RwLockWriteGuard<'a, ()>,
 }
 
 impl PackageLibrary {
@@ -469,6 +489,9 @@ impl PackageLibrary {
             r_subprocess: None,
             providers: Vec::new(),
             local_dev_overlay: ArcSwap::from_pointee(None),
+            cache_operation_gate: tokio::sync::RwLock::new(()),
+            cache_operation_epoch: AtomicU64::new(0),
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -493,6 +516,9 @@ impl PackageLibrary {
             r_subprocess,
             providers: Vec::new(),
             local_dev_overlay: ArcSwap::from_pointee(None),
+            cache_operation_gate: tokio::sync::RwLock::new(()),
+            cache_operation_epoch: AtomicU64::new(0),
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -534,7 +560,52 @@ impl PackageLibrary {
 
     /// Replace the ordered fallback providers (tier order: index 0 first).
     pub fn set_providers(&mut self, providers: Vec<Box<dyn PackageMetadataProvider>>) {
-        self.providers = providers;
+        self.providers = providers.into_iter().map(Arc::from).collect();
+    }
+
+    async fn begin_cache_operation(&self) -> Option<PackageCacheOperationLease<'_>> {
+        let guard = self.cache_operation_gate.read().await;
+        if self.retired.load(Ordering::Acquire) {
+            return None;
+        }
+        self.cache_operation_epoch.fetch_add(1, Ordering::AcqRel);
+        Some(PackageCacheOperationLease { _guard: guard })
+    }
+
+    pub(crate) async fn routing_lease(&self) -> PackageLibraryRoutingLease<'_> {
+        PackageLibraryRoutingLease {
+            _guard: self.cache_operation_gate.write().await,
+        }
+    }
+
+    pub(crate) fn cache_operation_epoch(&self, _lease: &PackageLibraryRoutingLease<'_>) -> u64 {
+        self.cache_operation_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn retire(&self, _lease: &PackageLibraryRoutingLease<'_>) {
+        self.retired.store(true, Ordering::Release);
+    }
+
+    /// Clone the complete cache/runtime view while the caller holds exclusive
+    /// routing ownership. The returned library is unpublished and may be
+    /// invalidated or warmed without changing the authoritative library.
+    pub(crate) fn fork_cache_snapshot(&self, _lease: &PackageLibraryRoutingLease<'_>) -> Self {
+        Self {
+            lib_paths: self.lib_paths.clone(),
+            packages: ArcSwap::new(self.packages.load_full()),
+            packages_write: Mutex::new(()),
+            combined_entries: ArcSwap::new(self.combined_entries.load_full()),
+            combined_entries_write: Mutex::new(()),
+            base_packages: self.base_packages.clone(),
+            base_exports: Arc::clone(&self.base_exports),
+            default_attached_owners: Arc::clone(&self.default_attached_owners),
+            r_subprocess: self.r_subprocess.clone(),
+            providers: self.providers.clone(),
+            local_dev_overlay: ArcSwap::new(self.local_dev_overlay.load_full()),
+            cache_operation_gate: tokio::sync::RwLock::new(()),
+            cache_operation_epoch: AtomicU64::new(0),
+            retired: AtomicBool::new(false),
+        }
     }
 
     /// True when fallback providers are configured (Tier 2/3 present beyond the
@@ -573,7 +644,11 @@ impl PackageLibrary {
 
     /// Publish a new per-package cache snapshot after applying `f` to a clone of
     /// the current map.
-    fn update_packages<R>(&self, f: impl FnOnce(&mut PackageCache) -> R) -> R {
+    fn update_packages<R>(
+        &self,
+        _lease: &PackageCacheOperationLease<'_>,
+        f: impl FnOnce(&mut PackageCache) -> R,
+    ) -> R {
         let _guard = self.packages_write.lock();
         let mut next = self.packages.load_full().as_ref().clone();
         let result = f(&mut next);
@@ -583,7 +658,11 @@ impl PackageLibrary {
 
     /// Publish a new combined-entry cache snapshot after applying `f` to a clone
     /// of the current map.
-    fn update_combined_entries<R>(&self, f: impl FnOnce(&mut CombinedCache) -> R) -> R {
+    fn update_combined_entries<R>(
+        &self,
+        _lease: &PackageCacheOperationLease<'_>,
+        f: impl FnOnce(&mut CombinedCache) -> R,
+    ) -> R {
         let _guard = self.combined_entries_write.lock();
         let mut next = self.combined_entries.load_full().as_ref().clone();
         let result = f(&mut next);
@@ -1073,8 +1152,19 @@ impl PackageLibrary {
     /// Insert a package into the cache
     ///
     /// This is primarily used for testing and initialization.
-    pub async fn insert_package(&self, mut info: PackageInfo) {
-        self.update_packages(|cache| {
+    pub async fn insert_package(&self, info: PackageInfo) {
+        let Some(lease) = self.begin_cache_operation().await else {
+            return;
+        };
+        self.insert_package_under_lease(info, &lease);
+    }
+
+    fn insert_package_under_lease(
+        &self,
+        mut info: PackageInfo,
+        lease: &PackageCacheOperationLease<'_>,
+    ) {
+        self.update_packages(lease, |cache| {
             // Monotonic member authority: never let a weaker entry shadow a
             // `Complete` exports set. Upgrades (Unknown/Partial -> Complete) and
             // equal-or-stronger replacements publish as-is; a weaker incoming
@@ -1135,6 +1225,17 @@ impl PackageLibrary {
     /// name itself is not in `names` (e.g. a document using `library(tidyverse)`
     /// when `dplyr` is installed).
     pub async fn invalidate_many(&self, names: &HashSet<String>) -> HashSet<String> {
+        let Some(lease) = self.begin_cache_operation().await else {
+            return HashSet::new();
+        };
+        self.invalidate_many_under_lease(names, &lease)
+    }
+
+    fn invalidate_many_under_lease(
+        &self,
+        names: &HashSet<String>,
+        lease: &PackageCacheOperationLease<'_>,
+    ) -> HashSet<String> {
         if names.is_empty() {
             return HashSet::new();
         }
@@ -1170,13 +1271,13 @@ impl PackageLibrary {
             }
             dependents
         };
-        self.update_packages(|cache| {
+        self.update_packages(lease, |cache| {
             for n in names {
                 cache.remove(n);
             }
         });
         let mut invalidated_combined: HashSet<String> = HashSet::new();
-        self.update_combined_entries(|combined| {
+        self.update_combined_entries(lease, |combined| {
             // Drop direct hits; record only the ones that were actually present.
             for n in names {
                 if combined.remove(n).is_some() {
@@ -1216,10 +1317,17 @@ impl PackageLibrary {
 
     /// Clear all cached packages, including aggregate `combined_entries`.
     pub async fn clear_cache(&self) {
-        self.update_packages(|cache| {
+        let Some(lease) = self.begin_cache_operation().await else {
+            return;
+        };
+        self.clear_cache_under_lease(&lease);
+    }
+
+    fn clear_cache_under_lease(&self, lease: &PackageCacheOperationLease<'_>) {
+        self.update_packages(lease, |cache| {
             cache.clear();
         });
-        self.update_combined_entries(|combined| {
+        self.update_combined_entries(lease, |combined| {
             combined.clear();
         });
     }
@@ -1240,6 +1348,7 @@ impl PackageLibrary {
         &self,
         pattern_packages: &[String],
         datasets_map: &mut HashMap<String, Vec<crate::r_subprocess::DataObject>>,
+        lease: &PackageCacheOperationLease<'_>,
     ) {
         for pkg_name in pattern_packages {
             if let Some(pkg_dir) = self.find_package_directory(pkg_name)
@@ -1257,7 +1366,7 @@ impl PackageLibrary {
                 info.exports_completeness = MemberCompleteness::Partial;
                 // Preserve any pre-fetched dataset enumeration for this package.
                 apply_enumeration_from(datasets_map, pkg_name, &pkg_dir, &mut info);
-                self.insert_package(info).await;
+                self.insert_package_under_lease(info, lease);
             }
         }
     }
@@ -1278,11 +1387,22 @@ impl PackageLibrary {
     ///
     /// # Arguments
     /// * `packages` - List of package names to prefetch
-    pub async fn prefetch_packages(&self, packages: &[String]) {
+    pub async fn prefetch_packages(&self, packages: &[String]) -> bool {
         if packages.is_empty() {
-            return;
+            return true;
         }
+        let Some(lease) = self.begin_cache_operation().await else {
+            return false;
+        };
+        self.prefetch_packages_under_lease(packages, &lease).await;
+        true
+    }
 
+    async fn prefetch_packages_under_lease(
+        &self,
+        packages: &[String],
+        lease: &PackageCacheOperationLease<'_>,
+    ) {
         // Filter out packages we've already cached, and de-duplicate the
         // request. De-duplication is REQUIRED for correctness, not just
         // efficiency: a package appearing twice (e.g. two `library(dplyr)`
@@ -1322,7 +1442,7 @@ impl PackageLibrary {
         let mut scheduled: HashSet<String> = uncached_packages.iter().cloned().collect();
         let mut frontier: Vec<String> = uncached_packages.clone();
         while !frontier.is_empty() {
-            self.prefetch_uncached_level(&frontier).await;
+            self.prefetch_uncached_level(&frontier, lease).await;
 
             let mut next: Vec<String> = Vec::new();
             {
@@ -1349,7 +1469,7 @@ impl PackageLibrary {
         // packages. Everything the recursive warm touches is already cached by
         // the level loop above, so this performs no further R subprocess spawns.
         for pkg_name in &uncached_packages {
-            let _ = self.warm_all_exports(pkg_name).await;
+            let _ = self.warm_all_exports_under_lease(pkg_name, lease).await;
         }
     }
 
@@ -1359,7 +1479,11 @@ impl PackageLibrary {
     /// `data()` objects in one batched R call (issue #429). Does NOT recurse
     /// into dependencies or populate `combined_entries` — [`Self::prefetch_packages`]
     /// drives the transitive closure and the combined warm-up.
-    async fn prefetch_uncached_level(&self, uncached_packages: &[String]) {
+    async fn prefetch_uncached_level(
+        &self,
+        uncached_packages: &[String],
+        lease: &PackageCacheOperationLease<'_>,
+    ) {
         // Categorize packages: static (no exportPattern) vs pattern (needs R)
         let mut static_packages: Vec<(String, PathBuf, NamespaceParseResult)> = Vec::new();
         let mut pattern_packages: Vec<String> = Vec::new();
@@ -1459,7 +1583,7 @@ impl PackageLibrary {
                 name
             );
 
-            self.insert_package(info).await;
+            self.insert_package_under_lease(info, lease);
         }
 
         // Step 2: Batch R subprocess call only for pattern packages
@@ -1543,7 +1667,7 @@ impl PackageLibrary {
                                 info.lazy_data.len(),
                                 pkg_name
                             );
-                            self.insert_package(info).await;
+                            self.insert_package_under_lease(info, lease);
                         }
                     }
                     Err(e) => {
@@ -1558,6 +1682,7 @@ impl PackageLibrary {
                         self.prefetch_pattern_packages_via_index(
                             &pattern_packages,
                             &mut datasets_map,
+                            lease,
                         )
                         .await;
                     }
@@ -1569,8 +1694,12 @@ impl PackageLibrary {
                     pattern_packages.len()
                 );
 
-                self.prefetch_pattern_packages_via_index(&pattern_packages, &mut datasets_map)
-                    .await;
+                self.prefetch_pattern_packages_via_index(
+                    &pattern_packages,
+                    &mut datasets_map,
+                    lease,
+                )
+                .await;
             }
         }
     }
@@ -2184,6 +2313,15 @@ impl PackageLibrary {
     /// Requirement 4.4: WHEN the package is `tidymodels`, THE Package_Resolver SHALL also load
     /// exports from the tidymodels packages
     pub async fn get_package(&self, name: &str) -> Option<Arc<PackageInfo>> {
+        let lease = self.begin_cache_operation().await?;
+        self.get_package_under_lease(name, &lease).await
+    }
+
+    async fn get_package_under_lease(
+        &self,
+        name: &str,
+        lease: &PackageCacheOperationLease<'_>,
+    ) -> Option<Arc<PackageInfo>> {
         // Step 1: Check cache first
         if let Some(cached) = self.get_cached_package(name).await {
             log::trace!("Package '{}' found in cache", name);
@@ -2203,7 +2341,7 @@ impl PackageLibrary {
                 // provider knows is left uncached so `package_exists()` still
                 // reports it missing (install status stays Tier-1-only).
                 if let Some(info) = self.resolve_from_providers(name) {
-                    self.insert_package(info).await;
+                    self.insert_package_under_lease(info, lease);
                     return self.get_cached_package(name).await;
                 }
                 log::trace!(
@@ -2229,7 +2367,7 @@ impl PackageLibrary {
                     Vec::new(),
                     Vec::new(),
                 );
-                self.insert_package(info).await;
+                self.insert_package_under_lease(info, lease);
                 return self.get_cached_package(name).await;
             }
         };
@@ -2346,7 +2484,7 @@ impl PackageLibrary {
         );
 
         // Insert into cache
-        self.insert_package(info).await;
+        self.insert_package_under_lease(info, lease);
 
         // Return the cached version
         self.get_cached_package(name).await
@@ -2474,7 +2612,13 @@ impl PackageLibrary {
     /// Requirement 4.5: THE Package_Resolver SHALL handle circular dependencies in the
     /// `Depends` chain by tracking visited packages
     pub async fn get_all_exports(&self, name: &str) -> HashSet<String> {
-        self.warm_all_exports(name).await.as_ref().clone()
+        let Some(lease) = self.begin_cache_operation().await else {
+            return HashSet::new();
+        };
+        self.warm_all_exports_under_lease(name, &lease)
+            .await
+            .as_ref()
+            .clone()
     }
 
     /// Build and cache the combined export set for `name`, returning the shared
@@ -2484,7 +2628,19 @@ impl PackageLibrary {
     /// owned `HashSet`. It is the cache-warming path used by
     /// [`PackageLibrary::prefetch_packages`], where callers only need the
     /// aggregate to become available to synchronous cache probes.
+    #[cfg(test)]
     async fn warm_all_exports(&self, name: &str) -> Arc<HashSet<String>> {
+        let Some(lease) = self.begin_cache_operation().await else {
+            return Arc::new(HashSet::new());
+        };
+        self.warm_all_exports_under_lease(name, &lease).await
+    }
+
+    async fn warm_all_exports_under_lease(
+        &self,
+        name: &str,
+        lease: &PackageCacheOperationLease<'_>,
+    ) -> Arc<HashSet<String>> {
         // Check cache first
         {
             let cache = self.combined_entries.load();
@@ -2501,13 +2657,13 @@ impl PackageLibrary {
         let mut visited = HashSet::new();
         let mut all_exports = HashSet::new();
         let mut owners: HashMap<String, String> = HashMap::new();
-        self.collect_exports_recursive(name, &mut visited, &mut all_exports, &mut owners)
+        self.collect_exports_recursive(name, &mut visited, &mut all_exports, &mut owners, lease)
             .await;
 
         // Publish availability and owner attribution as one immutable entry, so
         // hot-path readers can never observe a combined export without the
         // matching owner attribution.
-        self.update_combined_entries(|cache| {
+        self.update_combined_entries(lease, |cache| {
             let cached = Arc::new(CombinedEntry::new(all_exports, owners));
             cache.insert(name.to_string(), Arc::clone(&cached));
             log::trace!(
@@ -2545,6 +2701,7 @@ impl PackageLibrary {
         visited: &mut HashSet<String>,
         all_exports: &mut HashSet<String>,
         owners: &mut HashMap<String, String>,
+        lease: &PackageCacheOperationLease<'_>,
     ) {
         // Check if we've already visited this package (circular dependency detection)
         if visited.contains(name) {
@@ -2559,7 +2716,7 @@ impl PackageLibrary {
         visited.insert(name.to_string());
 
         // Load the package
-        let package_info = match self.get_package(name).await {
+        let package_info = match self.get_package_under_lease(name, lease).await {
             Some(info) => info,
             None => {
                 log::trace!(
@@ -2619,7 +2776,14 @@ impl PackageLibrary {
         // Recursively process all dependency packages
         // Use Box::pin for recursive async calls
         for dep_name in packages_to_process {
-            Box::pin(self.collect_exports_recursive(&dep_name, visited, all_exports, owners)).await;
+            Box::pin(self.collect_exports_recursive(
+                &dep_name,
+                visited,
+                all_exports,
+                owners,
+                lease,
+            ))
+            .await;
         }
     }
 }
@@ -2912,7 +3076,8 @@ mod tests {
         exports: HashSet<String>,
         owners: HashMap<String, String>,
     ) {
-        lib.update_combined_entries(|combined| {
+        let lease = lib.begin_cache_operation().await.unwrap();
+        lib.update_combined_entries(&lease, |combined| {
             combined.insert(
                 name.to_string(),
                 Arc::new(CombinedEntry::new(exports, owners)),
@@ -3552,20 +3717,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sync_reader_uses_published_snapshot_while_package_writer_gate_is_held() {
+    #[tokio::test]
+    async fn sync_reader_uses_published_snapshot_while_package_writer_gate_is_held() {
         let lib = Arc::new(PackageLibrary::new_empty());
         let package = "ravencontentionpkg".to_string();
         let symbol = "raven_contention_symbol".to_string();
         {
             let mut exports = HashSet::new();
             exports.insert(symbol.clone());
-            lib.update_packages(|packages| {
-                packages.insert(
-                    package.clone(),
-                    Arc::new(PackageInfo::new(package.clone(), exports)),
-                );
-            });
+            lib.insert_package(PackageInfo::new(package.clone(), exports))
+                .await;
         }
 
         let publish_gate = lib.packages_write.lock();

@@ -75,6 +75,7 @@ fn semaphore_permits(parallelism: usize) -> usize {
 }
 
 /// R subprocess interface for package queries
+#[derive(Clone)]
 pub struct RSubprocess {
     /// Path to R executable
     r_path: PathBuf,

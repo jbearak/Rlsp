@@ -644,6 +644,43 @@ Key ideas:
 
 `PackageLibrary` owns two in-memory side caches: `packages` for direct per-package metadata and `combined_entries` for aggregate availability/ownership snapshots. Both are atomic read-copy snapshots (`arc_swap::ArcSwap<HashMap<...>>`) with a small writer mutex per map to serialize copy-on-write publication. Synchronous cache readers load an immutable snapshot and do normal `HashMap` lookups, so an in-progress writer publication is never semantic absence and cannot produce transient diagnostics. Writers clone the current map, mutate the clone, and publish a new `Arc<HashMap<...>>`; keep those publication sections small and never hold a writer mutex across `.await`, R subprocess calls, disk/provider reads, or recursive package expansion. Multi-map operations such as invalidation publish the two maps sequentially rather than nesting writer gates. Completion readers should clone only the relevant `Arc<PackageInfo>` / `Arc<CombinedEntry>` handles from snapshots before doing string iteration/dedupe.
 
+Logical cache operations also hold one shared library-operation lease from their
+first load through every direct and aggregate publication. Library replacement,
+explicit refresh, and libpath Changed/Dropped events take the exclusive side to
+fork a coherent unpublished successor and again at the final routing commit.
+Every started logical mutation advances an operation epoch; a candidate derived
+from an earlier epoch cannot retire the current cache. Retiring a library makes
+late cache writers return a typed retry signal, and authoritative warm callers
+reacquire the current `WorldState.package_library` with a bounded retry. Never
+wait on a library lease while holding `WorldState`: the only finalization order
+is old-library exclusive lease, then `WorldState` write.
+
+`WorldState::try_commit_library_routing` is the production commit seam for LSP
+library replacements and content successors. Its typed basis binds the exact
+old `Arc`, operation epoch, install/content/routing identities, readiness,
+package configuration and inputs, workspace folders, and (for watcher events)
+the never-reused watcher owner. Detached work derives the complete future
+`system.file()` projection against a prospective routing stamp; the commit
+revalidates external file observations and atomically publishes the new
+library, identities, readiness/overlay, index/open metadata, graph/pins, watcher
+owner, and one analysis-transfer handle. Help-cache clearing, watcher restart,
+user-visible cleared counts, and diagnostic finalization are winner-only
+effects after that commit.
+
+Replacement drivers run two foreground attempts and one retained two-attempt
+lifecycle, so their maximum is four complete attempts, not an open-ended loop.
+Configuration reconciliation escrows every preexisting handle and exact
+candidate while a replacement is deferred; repeated exhaustion retains the
+same ledger with capped cancellation-aware backoff. Only typed `Superseded`
+work may acquire a transfer from the current routing before finalizing that
+ledger. `refreshPackages` returns a JSON-RPC error on either supersession or
+exhaustion so the extension cannot report an uncommitted refresh as
+“refreshed 0”. Libpath Changed/Dropped instead refork the exact watcher event:
+two foreground attempts are followed by an awaited owned retry with capped
+backoff until commit, shutdown cancellation, or watcher-owner supersession.
+Scheduling unrelated configuration work is additive and cannot cancel that
+event.
+
 ### Availability vs. ownership: unified aggregate entries (#407)
 
 `combined_entries[pkg]` is the aggregate cache built by `get_all_exports` / `collect_exports_recursive`. Each `CombinedEntry` stores two projections from the same traversal:

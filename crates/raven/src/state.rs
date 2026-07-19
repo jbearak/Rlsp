@@ -24,6 +24,7 @@ static NEXT_WORKSPACE_SCAN_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_WORKSPACE_SCAN_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_PACKAGE_LIBRARY_INSTALL_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SYSTEM_FILE_ROUTING_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_LIBPATH_WATCHER_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_ANALYSIS_TRANSFER_FINALIZATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SYSTEM_FILE_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_PACKAGE_SEED_INSTALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -193,7 +194,7 @@ use crate::open_document_store::{
     AnalysisGeneration, OpenDocumentRecord, OpenDocumentStore, OpenRecordToken,
     PreparedOpenDocument, PreparedOpenMetadataReplacement,
 };
-use crate::package_library::PackageLibrary;
+use crate::package_library::{PackageLibrary, PackageLibraryRoutingLease};
 use crate::parameter_resolver::SignatureCache;
 use crate::workspace_index::{
     ClosedProvenance, ClosedRecordToken, CompleteRefreshToken, EnrichmentClaim, IndexEntry,
@@ -935,6 +936,21 @@ pub struct WorldState {
     pub(crate) system_file_test_reject_remaining: usize,
     #[cfg(test)]
     pub(crate) system_file_test_commit_attempts: usize,
+    #[cfg(test)]
+    pub(crate) library_routing_test_reject_remaining: usize,
+    #[cfg(test)]
+    pub(crate) library_routing_test_commit_attempts: usize,
+    /// Deterministic barrier after a deferred library-routing attempt retains
+    /// its exact transfer ledger and before the retry backoff.
+    #[cfg(test)]
+    pub(crate) library_routing_deferred_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) library_routing_deferred_handles_for_test: Vec<AnalysisTransferHandle>,
+    #[cfg(test)]
+    pub(crate) library_routing_deferred_candidates_for_test: Vec<AnalysisTransferCandidate>,
+    #[cfg(test)]
+    pub(crate) library_routing_deferred_post_seed_for_test: Option<PackageSeedInstalledIdentity>,
     /// Deterministic barrier between detached overflow derivation and CAS.
     #[cfg(test)]
     pub(crate) open_edit_fallback_test_pause:
@@ -1116,6 +1132,12 @@ pub struct WorldState {
     /// Handle to the running libpath watcher, if any. Dropping it stops watching.
     pub libpath_watcher_handle:
         Option<std::sync::Arc<super::libpath_watcher::LibpathWatcherHandle>>,
+    /// Never-reused provenance for the active libpath watcher/consumer.
+    ///
+    /// Library replacement advances this in the same commit that publishes the
+    /// successor library, so queued events from the retired watcher can never
+    /// capture and mutate that successor during a post-commit restart gap.
+    libpath_watcher_owner_generation: u64,
     pub package_library_ready: bool,
     /// ABA-safe ownership token for detached full-workspace scans.
     ///
@@ -1189,6 +1211,8 @@ pub struct WorldState {
     pub(crate) package_input_lifecycle: crate::package_state::PackageInputLifecycle,
     /// Coalescing lifecycle for the one delayed package-seed convergence task.
     pub(crate) package_seed_retry: crate::package_state::PackageSeedRetryLifecycle,
+    /// Additive lifecycle for deferred package-library routing ledgers.
+    pub(crate) library_routing_retry: crate::package_state::PackageSeedRetryLifecycle,
     pub(crate) watched_package_retry: crate::package_state::PackageSeedRetryLifecycle,
     pub(crate) sysdata_fallback_retry: crate::package_state::PackageSeedRetryLifecycle,
 }
@@ -1801,6 +1825,66 @@ struct SystemFileAnalysisBasis {
     open_records: std::collections::BTreeMap<Url, OpenRecordToken>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LibraryRoutingMutation {
+    Replacement,
+    Changed,
+    Dropped,
+}
+
+/// Exact old authority owned by one package-library routing driver.
+///
+/// The library `Arc` and operation epoch cover cache work that deliberately
+/// does not advance `WorldState` generations. Package/config/routing fields
+/// prevent a detached build or watcher event from rebasing onto a successor
+/// intent.
+#[derive(Clone)]
+pub(crate) struct LibraryRoutingBasis {
+    pub(crate) library: Arc<PackageLibrary>,
+    cache_operation_epoch: u64,
+    routing: SystemFileRoutingStamp,
+    pub(crate) ready: bool,
+    package_input_generation: u64,
+    package_config_generation: u64,
+    package_state_record_generation: u64,
+    packages_enabled: bool,
+    packages_r_path: Option<PathBuf>,
+    packages_additional_library_paths: Vec<PathBuf>,
+    workspace_folders: Vec<Url>,
+    watcher_owner: Option<LibpathWatcherOwner>,
+    mutation: LibraryRoutingMutation,
+}
+
+impl LibraryRoutingBasis {
+    pub(crate) fn cache_operation_epoch(&self) -> u64 {
+        self.cache_operation_epoch
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProspectiveLibraryRouting {
+    install_id: u64,
+    content_generation: u64,
+    routing_owner: SystemFileRoutingOwnerIdentity,
+    watcher_owner: LibpathWatcherOwner,
+    routing: SystemFileRoutingStamp,
+}
+
+pub(crate) struct PreparedLibraryRoutingAnalysis {
+    pub(crate) basis: LibraryRoutingBasis,
+    pub(crate) prospective: ProspectiveLibraryRouting,
+    pub(crate) library: Arc<PackageLibrary>,
+    pub(crate) ready: bool,
+    pub(crate) system_file: PreparedSystemFileAnalysis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LibraryRoutingTransferredEffects {
+    pub(crate) handle: AnalysisTransferHandle,
+    pub(crate) changed_uris: Vec<Url>,
+    pub(crate) restart_owner: Option<LibpathWatcherOwner>,
+}
+
 struct CapturedSystemFileOpen {
     uri: Url,
     token: OpenRecordToken,
@@ -2390,6 +2474,10 @@ pub(crate) struct PackageSeedInstalledIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SystemFileRoutingOwnerIdentity(u64);
 
+/// Exact provenance of one libpath watcher/consumer lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LibpathWatcherOwner(u64);
+
 impl WorldState {
     /// Whether the complete package seed/library/routing record installed by a
     /// seed transaction is still the current owner.
@@ -2802,9 +2890,37 @@ impl WorldState {
             .expect("system.file routing owner generation counter exhausted")
     }
 
+    fn mint_libpath_watcher_owner_generation() -> u64 {
+        NEXT_LIBPATH_WATCHER_OWNER_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("libpath watcher owner generation counter exhausted")
+    }
+
+    pub(crate) fn libpath_watcher_owner(&self) -> LibpathWatcherOwner {
+        LibpathWatcherOwner(self.libpath_watcher_owner_generation)
+    }
+
+    /// Retire the current watcher before any asynchronous teardown/spawn work.
+    pub(crate) fn begin_libpath_watcher_restart(&mut self) -> LibpathWatcherOwner {
+        self.libpath_watcher_owner_generation = Self::mint_libpath_watcher_owner_generation();
+        self.libpath_watcher_handle = None;
+        self.libpath_watcher_owner()
+    }
+
+    pub(crate) fn libpath_watcher_owner_is_current(&self, owner: LibpathWatcherOwner) -> bool {
+        self.libpath_watcher_owner() == owner
+    }
+
     /// Install a newly built package library and mint every authority identity
     /// consumed by detached package and `system.file()` work.
-    pub(crate) fn install_package_library(&mut self, library: Arc<PackageLibrary>, ready: bool) {
+    #[cfg(test)]
+    pub(crate) fn install_package_library(
+        &mut self,
+        library: Arc<PackageLibrary>,
+        ready: bool,
+    ) -> LibpathWatcherOwner {
         self.package_library = library;
         self.package_library_install_id = Self::mint_package_library_install_id();
         self.package_library_content_generation = 0;
@@ -2813,10 +2929,12 @@ impl WorldState {
         self.refresh_local_dev_overlay();
         self.package_library_ready = ready;
         self.bump_package_config_generation();
+        self.begin_libpath_watcher_restart()
     }
 
     /// Record an in-place package-library content change after cache
     /// invalidation and warmup have completed.
+    #[cfg(test)]
     pub(crate) fn record_package_library_content_change(&mut self) {
         self.package_library_content_generation =
             self.package_library_content_generation.wrapping_add(1);
@@ -2839,6 +2957,11 @@ impl WorldState {
     #[cfg(test)]
     pub(crate) fn package_state_record_generation_for_test(&self) -> u64 {
         self.package_state_record_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn package_library_content_generation_for_test(&self) -> u64 {
+        self.package_library_content_generation
     }
 
     pub(crate) fn system_file_routing_owner_identity(&self) -> SystemFileRoutingOwnerIdentity {
@@ -2873,6 +2996,145 @@ impl WorldState {
             workspace_root,
             library_paths,
         }
+    }
+
+    pub(crate) fn capture_library_routing_basis(
+        &self,
+        expected_library: &Arc<PackageLibrary>,
+        cache_operation_epoch: u64,
+        mutation: LibraryRoutingMutation,
+        watcher_owner: Option<LibpathWatcherOwner>,
+    ) -> Option<LibraryRoutingBasis> {
+        if !Arc::ptr_eq(&self.package_library, expected_library)
+            || watcher_owner.is_some_and(|owner| !self.libpath_watcher_owner_is_current(owner))
+        {
+            return None;
+        }
+        Some(LibraryRoutingBasis {
+            library: Arc::clone(&self.package_library),
+            cache_operation_epoch,
+            routing: self.system_file_routing_stamp(),
+            ready: self.package_library_ready,
+            package_input_generation: self.package_input_generation(),
+            package_config_generation: self.package_config_generation,
+            package_state_record_generation: self.package_state_record_generation,
+            packages_enabled: self.cross_file_config.packages_enabled,
+            packages_r_path: self.cross_file_config.packages_r_path.clone(),
+            packages_additional_library_paths: self
+                .cross_file_config
+                .packages_additional_library_paths
+                .clone(),
+            workspace_folders: self.workspace_folders.clone(),
+            watcher_owner,
+            mutation,
+        })
+    }
+
+    pub(crate) fn library_routing_basis_is_current(
+        &self,
+        basis: &LibraryRoutingBasis,
+        lease: &PackageLibraryRoutingLease<'_>,
+    ) -> bool {
+        Arc::ptr_eq(&self.package_library, &basis.library)
+            && basis.library.cache_operation_epoch(lease) == basis.cache_operation_epoch
+            && self.system_file_routing_stamp() == basis.routing
+            && self.package_library_ready == basis.ready
+            && self.package_input_generation() == basis.package_input_generation
+            && self.package_config_generation == basis.package_config_generation
+            && self.package_state_record_generation == basis.package_state_record_generation
+            && self.cross_file_config.packages_enabled == basis.packages_enabled
+            && self.cross_file_config.packages_r_path == basis.packages_r_path
+            && self.cross_file_config.packages_additional_library_paths
+                == basis.packages_additional_library_paths
+            && self.workspace_folders == basis.workspace_folders
+            && basis
+                .watcher_owner
+                .is_none_or(|owner| self.libpath_watcher_owner_is_current(owner))
+    }
+
+    pub(crate) fn refresh_library_routing_cache_epoch(
+        &self,
+        basis: &LibraryRoutingBasis,
+        cache_operation_epoch: u64,
+    ) -> Option<LibraryRoutingBasis> {
+        if !Arc::ptr_eq(&self.package_library, &basis.library)
+            || self.system_file_routing_stamp() != basis.routing
+            || self.package_library_ready != basis.ready
+            || self.package_input_generation() != basis.package_input_generation
+            || self.package_config_generation != basis.package_config_generation
+            || self.package_state_record_generation != basis.package_state_record_generation
+            || self.cross_file_config.packages_enabled != basis.packages_enabled
+            || self.cross_file_config.packages_r_path != basis.packages_r_path
+            || self.cross_file_config.packages_additional_library_paths
+                != basis.packages_additional_library_paths
+            || self.workspace_folders != basis.workspace_folders
+            || basis
+                .watcher_owner
+                .is_some_and(|owner| !self.libpath_watcher_owner_is_current(owner))
+        {
+            return None;
+        }
+        let mut refreshed = basis.clone();
+        refreshed.cache_operation_epoch = cache_operation_epoch;
+        Some(refreshed)
+    }
+
+    pub(crate) fn prospective_library_routing(
+        &self,
+        basis: &LibraryRoutingBasis,
+        library: &PackageLibrary,
+    ) -> Option<ProspectiveLibraryRouting> {
+        if !Arc::ptr_eq(&self.package_library, &basis.library)
+            || self.system_file_routing_stamp() != basis.routing
+            || self.package_input_generation() != basis.package_input_generation
+            || self.package_config_generation != basis.package_config_generation
+            || self.package_state_record_generation != basis.package_state_record_generation
+            || self.cross_file_config.packages_enabled != basis.packages_enabled
+            || self.cross_file_config.packages_r_path != basis.packages_r_path
+            || self.cross_file_config.packages_additional_library_paths
+                != basis.packages_additional_library_paths
+            || self.workspace_folders != basis.workspace_folders
+            || basis
+                .watcher_owner
+                .is_some_and(|owner| !self.libpath_watcher_owner_is_current(owner))
+        {
+            return None;
+        }
+        let install_id = match basis.mutation {
+            LibraryRoutingMutation::Replacement => Self::mint_package_library_install_id(),
+            LibraryRoutingMutation::Changed | LibraryRoutingMutation::Dropped => {
+                basis.routing.package_library_install_id
+            }
+        };
+        let content_generation = match basis.mutation {
+            LibraryRoutingMutation::Replacement => 0,
+            LibraryRoutingMutation::Changed | LibraryRoutingMutation::Dropped => basis
+                .routing
+                .package_library_content_generation
+                .wrapping_add(1),
+        };
+        let routing_owner =
+            SystemFileRoutingOwnerIdentity(Self::mint_system_file_routing_owner_generation());
+        let watcher_owner = match basis.mutation {
+            LibraryRoutingMutation::Changed => basis
+                .watcher_owner
+                .expect("Changed routing must retain its watcher provenance"),
+            LibraryRoutingMutation::Replacement | LibraryRoutingMutation::Dropped => {
+                LibpathWatcherOwner(Self::mint_libpath_watcher_owner_generation())
+            }
+        };
+        let mut routing = basis.routing.clone();
+        routing.owner = routing_owner;
+        routing.package_library_install_id = install_id;
+        routing.package_library_content_generation = content_generation;
+        routing.library_paths = library.lib_paths().to_vec();
+        Some(ProspectiveLibraryRouting {
+            install_id,
+            content_generation,
+            routing_owner,
+            watcher_owner,
+            routing,
+        })
     }
 
     pub(crate) fn workspace_scan_generation(&self) -> u64 {
@@ -3047,6 +3309,19 @@ impl WorldState {
             .filter(|(uri, trigger)| !trigger.is_stale(self, uri))
             .map(|(uri, _trigger)| uri.clone())
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn analysis_transfer_is_pending_for_test(
+        &self,
+        handle: AnalysisTransferHandle,
+    ) -> bool {
+        self.analysis_transfers.contains_key(&handle.identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn analysis_transfer_finalization_count_for_test(&self) -> usize {
+        self.analysis_transfer_finalizations.len()
     }
 
     /// Complete a rejected handoff from current exact candidates exactly once.
@@ -3875,6 +4150,19 @@ impl WorldState {
             #[cfg(test)]
             system_file_test_commit_attempts: 0,
             #[cfg(test)]
+            library_routing_test_reject_remaining: 0,
+            #[cfg(test)]
+            library_routing_test_commit_attempts: 0,
+            #[cfg(test)]
+            library_routing_deferred_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            library_routing_deferred_handles_for_test: Vec::new(),
+            #[cfg(test)]
+            library_routing_deferred_candidates_for_test: Vec::new(),
+            #[cfg(test)]
+            library_routing_deferred_post_seed_for_test: None,
+            #[cfg(test)]
             open_edit_fallback_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
@@ -3931,6 +4219,7 @@ impl WorldState {
             watched_file_resync_generation_counter: 0,
             watched_file_resync_generations: HashMap::new(),
             libpath_watcher_handle: None,
+            libpath_watcher_owner_generation: Self::mint_libpath_watcher_owner_generation(),
             package_library_ready: false,
             workspace_scan_generation: 0,
             workspace_scan_intent: None,
@@ -3963,6 +4252,7 @@ impl WorldState {
             package_inputs: crate::package_state::PackageInputs::default(),
             package_input_lifecycle: crate::package_state::PackageInputLifecycle::default(),
             package_seed_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
+            library_routing_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
             watched_package_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
             sysdata_fallback_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
         }
@@ -4305,6 +4595,7 @@ impl WorldState {
     /// Cancel delayed package convergence tasks during server shutdown.
     pub(crate) fn cancel_package_seed_retry(&self) {
         self.package_seed_retry.cancel();
+        self.library_routing_retry.cancel();
         self.watched_package_retry.cancel();
         self.sysdata_fallback_retry.cancel();
     }
@@ -5685,14 +5976,21 @@ impl WorldState {
     }
 
     fn system_file_analysis_basis_is_current(&self, basis: &SystemFileAnalysisBasis) -> bool {
+        basis.routing == self.system_file_routing_stamp()
+            && self.system_file_analysis_non_routing_basis_is_current(basis)
+    }
+
+    fn system_file_analysis_non_routing_basis_is_current(
+        &self,
+        basis: &SystemFileAnalysisBasis,
+    ) -> bool {
         let index = self.workspace_index.authority_snapshot();
         let open_records: std::collections::BTreeMap<_, _> = self
             .documents
             .keys()
             .map(|uri| (uri.clone(), self.documents.record_token(uri)))
             .collect();
-        basis.routing == self.system_file_routing_stamp()
-            && index.version == basis.workspace_index_version
+        index.version == basis.workspace_index_version
             && self.workspace_index.config().max_files == basis.workspace_index_max_files
             && self.workspace_index.config().max_file_size_bytes
                 == basis.workspace_index_max_file_size_bytes
@@ -5777,6 +6075,115 @@ impl WorldState {
                 changed_uris,
             }),
             package_routing: None,
+        })
+    }
+
+    /// Atomically publish one package-library successor with the complete
+    /// `system.file()` index/open/graph projection derived for its prospective
+    /// routing identity.
+    ///
+    /// The caller holds the old library's exclusive routing lease. Production
+    /// cache helpers never wait on that lease while holding `WorldState`, so
+    /// acquiring this state write lock after the lease is the single fair,
+    /// deadlock-free finalization order.
+    pub(crate) fn try_commit_library_routing(
+        &mut self,
+        prepared: PreparedLibraryRoutingAnalysis,
+        lease: &PackageLibraryRoutingLease<'_>,
+    ) -> Result<LibraryRoutingTransferredEffects, AnalysisCommitRejected> {
+        let PreparedLibraryRoutingAnalysis {
+            basis,
+            prospective,
+            library,
+            ready,
+            system_file,
+        } = prepared;
+        if !self.library_routing_basis_is_current(&basis, lease)
+            || system_file.basis.routing != prospective.routing
+            || !self.system_file_analysis_non_routing_basis_is_current(&system_file.basis)
+            || !system_file.external_observations_are_current()
+            || system_file.open_metadata.iter().any(|replacement| {
+                system_file.basis.open_records.get(&replacement.uri) != Some(&replacement.token)
+                    || !self.documents.record_token_is_current(&replacement.token)
+                    || !self.documents.generation_is_current(
+                        &replacement.uri,
+                        replacement.prepared.base_generation(),
+                    )
+            })
+        {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+        #[cfg(test)]
+        {
+            self.library_routing_test_commit_attempts += 1;
+            if self.library_routing_test_reject_remaining > 0 {
+                self.library_routing_test_reject_remaining -= 1;
+                return Err(AnalysisCommitRejected::StaleBasis);
+            }
+        }
+        if let Some(index) = system_file.index
+            && !self
+                .workspace_index
+                .commit_prepared_targeted_batch(index)
+                .map_err(|_| AnalysisCommitRejected::StaleBasis)?
+        {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+
+        basis.library.retire(lease);
+        self.package_library = library;
+        self.package_library_install_id = prospective.install_id;
+        self.package_library_content_generation = prospective.content_generation;
+        self.system_file_routing_owner_generation = prospective.routing_owner.0;
+        self.package_library_ready = ready;
+        self.refresh_local_dev_overlay();
+        let restart_owner = match basis.mutation {
+            LibraryRoutingMutation::Changed => None,
+            LibraryRoutingMutation::Replacement | LibraryRoutingMutation::Dropped => {
+                self.libpath_watcher_owner_generation = prospective.watcher_owner.0;
+                self.libpath_watcher_handle = None;
+                Some(prospective.watcher_owner)
+            }
+        };
+        if basis.mutation == LibraryRoutingMutation::Replacement {
+            self.bump_package_config_generation();
+        }
+
+        let open_changed = !system_file.open_metadata.is_empty();
+        for replacement in system_file.open_metadata {
+            self.documents
+                .commit_prepared_metadata_if_current(&replacement.uri, replacement.prepared)
+                .expect("all library-routing open targets were prevalidated");
+        }
+        if open_changed {
+            self.advance_open_context_authority_generation();
+        }
+        if !system_file.changed_uris.is_empty() {
+            self.cross_file_graph = system_file.graph;
+            self.advance_workspace_graph_authority_generation();
+            self.advance_workspace_scan_generation();
+            self.recompute_open_neighborhood_pins();
+        }
+
+        let changed_uris = system_file.changed_uris;
+        let candidate_uris = self.system_file_republish_set(&changed_uris);
+        let candidates = self.capture_analysis_transfer_candidates(
+            candidate_uris
+                .into_iter()
+                .filter(|uri| self.diagnostics_publish_allowed(uri)),
+        );
+        let identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+            routing_owner: prospective.routing_owner,
+            commit_generation: Self::mint_system_file_commit_generation(),
+        });
+        let handle =
+            self.install_analysis_transfer(identity, self.latest_system_file_transfer, candidates);
+        self.latest_system_file_transfer = Some(identity);
+
+        Ok(LibraryRoutingTransferredEffects {
+            handle,
+            changed_uris,
+            restart_owner,
         })
     }
 
@@ -6811,6 +7218,47 @@ impl WorldState {
         &self,
         only_packages: Option<HashSet<String>>,
     ) -> CapturedSystemFileAnalysis {
+        self.capture_system_file_analysis_with_routing(
+            only_packages,
+            self.system_file_routing_stamp(),
+        )
+    }
+
+    pub(crate) fn capture_library_routing_system_file_analysis(
+        &self,
+        basis: &LibraryRoutingBasis,
+        prospective: &ProspectiveLibraryRouting,
+        only_packages: Option<HashSet<String>>,
+    ) -> Option<CapturedSystemFileAnalysis> {
+        if !Arc::ptr_eq(&self.package_library, &basis.library)
+            || self.system_file_routing_stamp() != basis.routing
+            || self.package_input_generation() != basis.package_input_generation
+            || self.package_config_generation != basis.package_config_generation
+            || self.package_state_record_generation != basis.package_state_record_generation
+            || self.cross_file_config.packages_enabled != basis.packages_enabled
+            || self.cross_file_config.packages_r_path != basis.packages_r_path
+            || self.cross_file_config.packages_additional_library_paths
+                != basis.packages_additional_library_paths
+            || self.workspace_folders != basis.workspace_folders
+            || basis
+                .watcher_owner
+                .is_some_and(|owner| !self.libpath_watcher_owner_is_current(owner))
+        {
+            return None;
+        }
+        Some(
+            self.capture_system_file_analysis_with_routing(
+                only_packages,
+                prospective.routing.clone(),
+            ),
+        )
+    }
+
+    fn capture_system_file_analysis_with_routing(
+        &self,
+        only_packages: Option<HashSet<String>>,
+        routing: SystemFileRoutingStamp,
+    ) -> CapturedSystemFileAnalysis {
         let index = self.workspace_index.authority_snapshot();
         let source_selected = |source: &crate::cross_file::ForwardSource| {
             source.system_file.as_ref().is_some_and(|call| {
@@ -6849,7 +7297,7 @@ impl WorldState {
             .collect();
         CapturedSystemFileAnalysis {
             basis: SystemFileAnalysisBasis {
-                routing: self.system_file_routing_stamp(),
+                routing,
                 workspace_index_version: index.version,
                 workspace_index_max_files: self.workspace_index.config().max_files,
                 workspace_index_max_file_size_bytes: self
