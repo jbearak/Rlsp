@@ -78,7 +78,12 @@ pub(crate) struct PackageSeedRetryLifecycle {
 
 impl PackageSeedRetryLifecycle {
     pub(crate) fn schedule(&self) -> (u64, CancellationToken) {
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let generation = self
+            .next_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("package-seed retry generation exhausted");
         let mut pending = self.pending.write().unwrap();
         for (_, token) in std::mem::take(&mut *pending) {
             token.cancel();
@@ -89,7 +94,12 @@ impl PackageSeedRetryLifecycle {
     }
 
     pub(crate) fn schedule_additive(&self) -> (u64, CancellationToken) {
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let generation = self
+            .next_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("package-seed additive retry generation exhausted");
         let token = CancellationToken::new();
         self.pending
             .write()

@@ -563,6 +563,14 @@ impl PackageLibrary {
         self.providers = providers.into_iter().map(Arc::from).collect();
     }
 
+    /// Replace the ordered fallback providers with already-shared providers.
+    ///
+    /// Same-key provider discovery is coalesced across library builds, so its
+    /// immutable result must be cheaply reusable by every waiter.
+    fn set_shared_providers(&mut self, providers: Vec<Arc<dyn PackageMetadataProvider>>) {
+        self.providers = providers;
+    }
+
     async fn begin_cache_operation(&self) -> Option<PackageCacheOperationLease<'_>> {
         let guard = self.cache_operation_gate.read().await;
         if self.retired.load(Ordering::Acquire) {
@@ -2022,7 +2030,7 @@ impl PackageLibrary {
         // tests, or future explicit configuration), respect that and skip
         // rediscovery — overwriting their choice would be surprising.
         if self.lib_paths.is_empty() {
-            self.lib_paths = self.get_lib_paths_with_fallback().await;
+            self.lib_paths = self.get_lib_paths_with_fallback().await?;
         }
 
         if self.lib_paths.is_empty() {
@@ -2177,6 +2185,11 @@ impl PackageLibrary {
                     }
                 }
                 Err(e) => {
+                    if e.downcast_ref::<crate::r_subprocess::OuterDeadlineExpired>()
+                        .is_some()
+                    {
+                        return Err(e);
+                    }
                     log::trace!(
                         "R batch query for base packages failed: {}, using INDEX fallback",
                         e
@@ -2268,18 +2281,23 @@ impl PackageLibrary {
     }
 
     /// Get library paths with fallback strategy
-    async fn get_lib_paths_with_fallback(&self) -> Vec<PathBuf> {
+    async fn get_lib_paths_with_fallback(&self) -> anyhow::Result<Vec<PathBuf>> {
         // Try R subprocess first (most accurate)
         if let Some(ref r_subprocess) = self.r_subprocess {
             match r_subprocess.get_lib_paths().await {
                 Ok(paths) if !paths.is_empty() => {
                     log::trace!("Got {} library paths from R", paths.len());
-                    return paths;
+                    return Ok(paths);
                 }
                 Ok(_) => {
                     log::trace!("R returned empty lib_paths, using fallback");
                 }
                 Err(e) => {
+                    if e.downcast_ref::<crate::r_subprocess::OuterDeadlineExpired>()
+                        .is_some()
+                    {
+                        return Err(e);
+                    }
                     log::trace!("Failed to get lib_paths from R: {}, using fallback", e);
                 }
             }
@@ -2288,7 +2306,7 @@ impl PackageLibrary {
         // Use platform-specific fallback
         let fallback = crate::r_subprocess::get_fallback_lib_paths();
         log::trace!("Using fallback library paths: {:?}", fallback);
-        fallback
+        Ok(fallback)
     }
     /// Get package info using tiered loading strategy
     ///
@@ -2881,11 +2899,11 @@ pub enum PackageLibraryStatus {
     Disabled,
     /// Initialized with >= 1 library path — the only ready state.
     Ready,
-    /// No R subprocess located (incl. `spawn_blocking` join failure).
+    /// No usable R subprocess located.
     RNotFound,
-    /// `initialize()` errored — currently unreachable end-to-end (it has a
-    /// single `Ok(())` return and swallows R failures), kept for the CLI's
-    /// degradation-note contract and `initialize()`'s fallible signature.
+    /// Library construction failed. Tier-1 `initialize()` currently swallows R
+    /// failures, but provider admission, deadline, thread-spawn, or physical
+    /// load failures can reach this status through the public builder.
     InitFailed(String),
     /// R found, init ok, but zero lib paths discovered/configured.
     NoLibraryPaths,
@@ -2921,26 +2939,415 @@ impl PackageLibraryStatus {
 /// post-scan startup init), so editor and CI can't drift.
 ///
 /// Lock-free by design: takes owned/cloned inputs and no `WorldState`, so it
-/// adds no logging/perf/state dependency to this module. R discovery does
-/// synchronous IO, so it runs in `spawn_blocking`; a join failure collapses to
-/// "R not found" (matching the existing builders' `.unwrap_or(None)`), never
-/// `InitFailed`. The helper never logs or prints — each caller surfaces
-/// `status` its own way. Configured `additional_paths` are applied *after* R
-/// discovery so they augment (never suppress) R-reported paths and count toward
-/// readiness.
+/// adds no state or performance-accounting dependency to this module. R
+/// discovery is async, deadline-aware, and kill-on-drop; Tier 2/3 provider
+/// opening and checksum work runs on a capacity-bounded, runtime-independent OS
+/// thread. Provider load notes are logged here and returned so a winning caller
+/// can also surface them through its UI contract. Configured `additional_paths`
+/// are applied *after* R discovery so they augment (never suppress) R-reported
+/// paths and count toward readiness.
 pub async fn build_package_library(
     r_path: Option<PathBuf>,
     additional_paths: &[PathBuf],
     workspace_root: Option<PathBuf>,
     packages_enabled: bool,
 ) -> PackageLibraryOutcome {
+    match try_build_package_library(
+        r_path,
+        additional_paths,
+        workspace_root,
+        packages_enabled,
+        ProviderLoadPolicy::Share,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => PackageLibraryOutcome {
+            library: Arc::new(PackageLibrary::new_empty()),
+            status: PackageLibraryStatus::InitFailed(error.to_string()),
+            load_notes: Vec::new(),
+            shipped_db_load: ShippedDbLoad::Absent,
+        },
+    }
+}
+
+struct ProviderLoadArtifact {
+    providers: Vec<Arc<dyn crate::package_db::PackageMetadataProvider>>,
+    notes: Vec<String>,
+    shipped_db_load: ShippedDbLoad,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderLoadFailure(String);
+
+impl std::fmt::Display for ProviderLoadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProviderLoadFailure {}
+
+type ProviderLoadResult = Result<Arc<ProviderLoadArtifact>, Arc<ProviderLoadFailure>>;
+
+#[derive(Clone)]
+enum ProviderLoadState {
+    Running,
+    Complete(ProviderLoadResult),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderLoadKey {
+    repo_db_path: Option<PathBuf>,
+    shipped_db_inputs: crate::package_db::ShippedDbCandidateInputs,
+}
+
+#[derive(Default)]
+struct ProviderLoadRegistry {
+    active: std::collections::HashMap<ProviderLoadKey, ActiveProviderLoad>,
+}
+
+struct ActiveProviderLoad {
+    generation: u64,
+    completion: tokio::sync::watch::Receiver<ProviderLoadState>,
+    #[cfg(test)]
+    followers: usize,
+}
+
+/// Authority policy for a fallback-provider build.
+///
+/// Passive consumers share any same-key physical generation already in
+/// progress. An explicit replacement authority supersedes the generation that
+/// was active when it arrived and installs the next generation under the
+/// registry lock. The old physical job may finish concurrently, but its exact
+/// generation cleanup cannot remove the fresh entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderLoadPolicy {
+    Share,
+    FreshAfterActive,
+}
+
+#[cfg(test)]
+struct ProviderLoadTestPause {
+    arrived: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+fn provider_load_test_pauses()
+-> &'static parking_lot::Mutex<std::collections::HashMap<ProviderLoadKey, ProviderLoadTestPause>> {
+    static PAUSES: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<ProviderLoadKey, ProviderLoadTestPause>>,
+    > = std::sync::OnceLock::new();
+    PAUSES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn pause_provider_load_for_test(key: &ProviderLoadKey) {
+    if let Some(pause) = provider_load_test_pauses().lock().remove(key) {
+        let _ = pause.arrived.send(());
+        let _ = pause.release.recv();
+    }
+}
+
+const PROVIDER_LOAD_HARD_CAP: usize = 4;
+static NEXT_PROVIDER_LOAD_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn provider_load_registry() -> &'static Arc<parking_lot::Mutex<ProviderLoadRegistry>> {
+    static REGISTRY: std::sync::OnceLock<Arc<parking_lot::Mutex<ProviderLoadRegistry>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default())))
+}
+
+fn provider_load_gate() -> &'static Arc<tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(PROVIDER_LOAD_HARD_CAP)))
+}
+
+#[derive(Clone)]
+struct ProviderLoadCompletion {
+    inner: Arc<ProviderLoadCompletionInner>,
+}
+
+struct ProviderLoadCompletionInner {
+    parts: Mutex<Option<ProviderLoadCompletionParts>>,
+}
+
+struct ProviderLoadCompletionParts {
+    registry: Arc<parking_lot::Mutex<ProviderLoadRegistry>>,
+    key: ProviderLoadKey,
+    generation: u64,
+    sender: tokio::sync::watch::Sender<ProviderLoadState>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl ProviderLoadCompletion {
+    fn new(
+        registry: Arc<parking_lot::Mutex<ProviderLoadRegistry>>,
+        key: ProviderLoadKey,
+        generation: u64,
+        sender: tokio::sync::watch::Sender<ProviderLoadState>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ProviderLoadCompletionInner {
+                parts: Mutex::new(Some(ProviderLoadCompletionParts {
+                    registry,
+                    key,
+                    generation,
+                    sender,
+                    permit,
+                })),
+            }),
+        }
+    }
+
+    /// Publish and retire this generation exactly once. The permit remains
+    /// owned through terminal publication and generation-checked cleanup.
+    fn finish(&self, result: ProviderLoadResult) {
+        let Some(parts) = self.inner.parts.lock().take() else {
+            return;
+        };
+        complete_provider_load(
+            parts.registry,
+            parts.key,
+            parts.generation,
+            parts.sender,
+            result,
+        );
+        drop(parts.permit);
+    }
+}
+
+struct ProviderThreadCompletionGuard {
+    completion: ProviderLoadCompletion,
+    result: Option<ProviderLoadResult>,
+}
+
+impl Drop for ProviderThreadCompletionGuard {
+    fn drop(&mut self) {
+        let result = self.result.take().unwrap_or_else(|| {
+            Err(Arc::new(ProviderLoadFailure(
+                "package metadata provider thread stopped without a result".to_string(),
+            )))
+        });
+        self.completion.finish(result);
+    }
+}
+
+fn provider_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn spawn_provider_load_thread(
+    completion: ProviderLoadCompletion,
+    job: impl FnOnce() -> ProviderLoadResult + Send + 'static,
+) -> Result<(), ProviderLoadFailure> {
+    let thread_completion = completion.clone();
+    std::thread::Builder::new()
+        .name("raven-package-provider".to_string())
+        .spawn(move || {
+            let mut guard = ProviderThreadCompletionGuard {
+                completion: thread_completion,
+                result: None,
+            };
+            guard.result = Some(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).unwrap_or_else(
+                    |payload| {
+                        Err(Arc::new(ProviderLoadFailure(format!(
+                            "package metadata provider thread panicked: {}",
+                            provider_panic_message(payload)
+                        ))))
+                    },
+                ),
+            );
+        })
+        .map(drop)
+        .map_err(|error| {
+            ProviderLoadFailure(format!(
+                "failed to spawn package metadata provider thread: {error}"
+            ))
+        })
+}
+
+async fn subscribe_or_spawn_provider_load_from<F>(
+    registry: &Arc<parking_lot::Mutex<ProviderLoadRegistry>>,
+    gate: &Arc<tokio::sync::Semaphore>,
+    provider_key: &ProviderLoadKey,
+    policy: ProviderLoadPolicy,
+    spawn: F,
+) -> anyhow::Result<tokio::sync::watch::Receiver<ProviderLoadState>>
+where
+    F: FnOnce(ProviderLoadCompletion) -> Result<(), ProviderLoadFailure>,
+{
+    let deadline = crate::r_subprocess::current_outer_r_deadline();
+    let excluded_generation = {
+        let mut registry = registry.lock();
+        if let Some(active) = registry.active.get_mut(provider_key) {
+            if policy == ProviderLoadPolicy::Share {
+                #[cfg(test)]
+                {
+                    active.followers = active.followers.saturating_add(1);
+                }
+                return Ok(active.completion.clone());
+            }
+            Some(active.generation)
+        } else {
+            None
+        }
+    };
+
+    // Tokio's semaphore queue is FIFO. The caller's outer deadline is captured
+    // once so capacity admission and later completion observe one stable
+    // budget. A fresh generation can overlap the excluded physical job and
+    // therefore consumes its own permit.
+    let acquire = Arc::clone(gate).acquire_owned();
+    let permit = if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, acquire)
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(crate::r_subprocess::OuterDeadlineExpired {
+                    phase: "package metadata provider capacity",
+                })
+            })?
+    } else {
+        acquire.await
+    }
+    .map_err(|_| anyhow::anyhow!("package metadata provider capacity gate closed"))?;
+
+    let mut registry_guard = registry.lock();
+    if let Some(active) = registry_guard.active.get_mut(provider_key)
+        && Some(active.generation) != excluded_generation
+    {
+        #[cfg(test)]
+        {
+            active.followers = active.followers.saturating_add(1);
+        }
+        let receiver = active.completion.clone();
+        drop(registry_guard);
+        drop(permit);
+        return Ok(receiver);
+    }
+
+    let generation = NEXT_PROVIDER_LOAD_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("provider-load generation exhausted");
+    let (sender, receiver) = tokio::sync::watch::channel(ProviderLoadState::Running);
+    registry_guard.active.insert(
+        provider_key.clone(),
+        ActiveProviderLoad {
+            generation,
+            completion: receiver.clone(),
+            #[cfg(test)]
+            followers: 0,
+        },
+    );
+    let completion = ProviderLoadCompletion::new(
+        Arc::clone(registry),
+        provider_key.clone(),
+        generation,
+        sender,
+        permit,
+    );
+    // Installation and physical detachment share one synchronous critical
+    // section. Spawn failure is published immediately after releasing the
+    // registry lock so no receiver, entry, or permit can be stranded.
+    let spawn_result = spawn(completion.clone());
+    drop(registry_guard);
+    if let Err(error) = spawn_result {
+        completion.finish(Err(Arc::new(error.clone())));
+        return Err(anyhow::Error::new(error));
+    }
+    Ok(receiver)
+}
+
+fn complete_provider_load(
+    registry: Arc<parking_lot::Mutex<ProviderLoadRegistry>>,
+    key: ProviderLoadKey,
+    generation: u64,
+    sender: tokio::sync::watch::Sender<ProviderLoadState>,
+    result: ProviderLoadResult,
+) {
+    // Publish before generation-checked cleanup. Existing followers retain
+    // their receiver even after the registry admits a later generation.
+    sender.send_replace(ProviderLoadState::Complete(result));
+    let mut registry = registry.lock();
+    if registry
+        .active
+        .get(&key)
+        .is_some_and(|active| active.generation == generation)
+    {
+        registry.active.remove(&key);
+    }
+}
+
+async fn await_provider_load(
+    receiver: tokio::sync::watch::Receiver<ProviderLoadState>,
+) -> anyhow::Result<Arc<ProviderLoadArtifact>> {
+    match await_provider_load_result(receiver, crate::r_subprocess::current_outer_r_deadline())
+        .await?
+    {
+        Ok(artifact) => Ok(artifact),
+        Err(error) => Err(anyhow::anyhow!("{error}")),
+    }
+}
+
+async fn await_provider_load_result(
+    mut receiver: tokio::sync::watch::Receiver<ProviderLoadState>,
+    deadline: Option<tokio::time::Instant>,
+) -> anyhow::Result<ProviderLoadResult> {
+    loop {
+        match receiver.borrow_and_update().clone() {
+            ProviderLoadState::Complete(result) => return Ok(result),
+            ProviderLoadState::Running => {}
+        }
+
+        let changed = receiver.changed();
+        if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, changed)
+                .await
+                .map_err(|_| {
+                    anyhow::Error::new(crate::r_subprocess::OuterDeadlineExpired {
+                        phase: "package metadata provider load",
+                    })
+                })?
+                .map_err(|_| anyhow::anyhow!("package metadata provider thread stopped"))?;
+        } else {
+            changed
+                .await
+                .map_err(|_| anyhow::anyhow!("package metadata provider thread stopped"))?;
+        }
+    }
+}
+
+/// Typed package-routing builder. `provider_load_policy` is call-site authority:
+/// passive startup/on-demand paths use [`ProviderLoadPolicy::Share`], while the
+/// explicit replacement helper used by refresh/config/libpath changes uses
+/// [`ProviderLoadPolicy::FreshAfterActive`]. Deadline expiry remains an error so
+/// callers cannot accidentally commit an empty/degraded library as a successful
+/// replacement.
+pub(crate) async fn try_build_package_library(
+    r_path: Option<PathBuf>,
+    additional_paths: &[PathBuf],
+    workspace_root: Option<PathBuf>,
+    packages_enabled: bool,
+    provider_load_policy: ProviderLoadPolicy,
+) -> anyhow::Result<PackageLibraryOutcome> {
     if !packages_enabled {
-        return PackageLibraryOutcome {
+        return Ok(PackageLibraryOutcome {
             library: Arc::new(PackageLibrary::new_empty()),
             status: PackageLibraryStatus::Disabled,
             load_notes: Vec::new(),
             shipped_db_load: ShippedDbLoad::Absent,
-        };
+        });
     }
 
     // Tier 2 (repo DB) path is derived from the workspace root, so clone it
@@ -2949,70 +3356,123 @@ pub async fn build_package_library(
         .as_ref()
         .map(|r| r.join(".raven").join("packages.json"));
 
-    let (mut lib, status) = build_library_inner(r_path, additional_paths, workspace_root).await;
+    let (mut lib, status) = build_library_inner(r_path, additional_paths, workspace_root).await?;
 
     // Open the fallback DBs off the async runtime (mmap + ~10-20 ms blake3).
-    let shipped_db_candidates = crate::package_db::locate_shipped_db_candidates();
-    let (providers, notes, shipped_db_load) = tokio::task::spawn_blocking(move || {
-        let mut providers: Vec<Box<dyn crate::package_db::PackageMetadataProvider>> = Vec::new();
-        let mut notes: Vec<String> = Vec::new();
-        // Tier 2 first (repo DB), then Tier 3 (shipped DB).
-        //
-        // A valid-but-empty DB (zero packages) resolves nothing, so it is NOT
-        // wired as a provider: `has_providers()` must mean "real package
-        // coverage exists" (the degraded-environment note in `cli::check` gates
-        // on it), and an empty provider would also cost futile lookups. An empty
-        // Tier-2 file is thus treated exactly like an absent one.
-        if let Some(path) = repo_db_path {
-            match crate::package_db::json_db::RepoDbProvider::from_file(&path) {
-                Ok(Some(p)) if !p.is_empty() => providers.push(Box::new(p)),
-                Ok(_) => {}                          // Absent or empty -> silent
-                Err(e) => notes.push(e.to_string()), // explain-and-continue
-            }
-        }
-        // Track the Tier 3 verdict alongside the provider: `Absent` until a
-        // candidate proves otherwise. A non-empty load wins, is wired, and stops
-        // the scan; a failed candidate records `Failed` but keeps looking, so a
-        // later working candidate still upgrades the verdict to `Loaded`.
-        //
-        // An empty DB (zero packages) is treated as no coverage: it is neither
-        // wired (see the Tier-2 note above) nor recorded as `Loaded`, and the
-        // scan continues to lower-precedence candidates. Leaving the verdict
-        // `Absent` is deliberate — the missing-export footer then points at
-        // `raven packages update` (download a real DB), the correct remedy,
-        // rather than the `Loaded` branch's "the package is likely private / not
-        // on CRAN", which would misdescribe an empty database.
-        let mut shipped_db_load = ShippedDbLoad::Absent;
-        for path in shipped_db_candidates {
-            match crate::package_db::binary_db::ShippedDbProvider::from_file(&path) {
-                Ok(Some(p)) if !p.is_empty() => {
-                    providers.push(Box::new(p));
-                    shipped_db_load = ShippedDbLoad::Loaded;
-                    break;
+    let shipped_db_inputs = crate::package_db::capture_shipped_db_candidate_inputs();
+    let provider_key = ProviderLoadKey {
+        repo_db_path: repo_db_path.clone(),
+        shipped_db_inputs: shipped_db_inputs.clone(),
+    };
+    if crate::r_subprocess::current_outer_r_deadline()
+        .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    {
+        return Err(anyhow::Error::new(
+            crate::r_subprocess::OuterDeadlineExpired {
+                phase: "package metadata provider pre-spawn",
+            },
+        ));
+    }
+    #[cfg(test)]
+    let physical_key = provider_key.clone();
+    let physical_deadline =
+        crate::r_subprocess::current_outer_r_deadline().map(tokio::time::Instant::into_std);
+    let receiver = subscribe_or_spawn_provider_load_from(
+        provider_load_registry(),
+        provider_load_gate(),
+        &provider_key,
+        provider_load_policy,
+        move |completion| {
+            spawn_provider_load_thread(completion, move || {
+                let shipped_db_candidates =
+                    crate::package_db::locate_shipped_db_candidates_from(&shipped_db_inputs);
+                let mut providers: Vec<Arc<dyn crate::package_db::PackageMetadataProvider>> =
+                    Vec::new();
+                let mut notes: Vec<String> = Vec::new();
+                // Tier 2 first (repo DB), then Tier 3 (shipped DB).
+                //
+                // A valid-but-empty DB (zero packages) resolves nothing, so it is NOT
+                // wired as a provider: `has_providers()` must mean "real package
+                // coverage exists" (the degraded-environment note in `cli::check` gates
+                // on it), and an empty provider would also cost futile lookups. An empty
+                // Tier-2 file is thus treated exactly like an absent one.
+                if let Some(path) = repo_db_path {
+                    match crate::package_db::json_db::RepoDbProvider::from_file_with_deadline(
+                        &path,
+                        physical_deadline,
+                    ) {
+                        Ok(Some(p)) if !p.is_empty() => providers.push(Arc::new(p)),
+                        Ok(_) => {}                          // Absent or empty -> silent
+                        Err(crate::package_db::json_db::RepoDbError::DeadlineExpired) => {
+                            return Err(Arc::new(ProviderLoadFailure(
+                                "package metadata provider load exceeded the original routing deadline"
+                                    .to_string(),
+                            )));
+                        }
+                        Err(e) => notes.push(e.to_string()), // explain-and-continue
+                    }
                 }
-                Ok(_) => {} // Absent (None) or empty -> not usable coverage; keep scanning
-                Err(e) => {
-                    notes.push(format!("{}: {e}", path.display()));
-                    shipped_db_load = ShippedDbLoad::Failed;
+                // Track the Tier 3 verdict alongside the provider: `Absent` until a
+                // candidate proves otherwise. A non-empty load wins, is wired, and stops
+                // the scan; a failed candidate records `Failed` but keeps looking, so a
+                // later working candidate still upgrades the verdict to `Loaded`.
+                //
+                // An empty DB (zero packages) is treated as no coverage: it is neither
+                // wired (see the Tier-2 note above) nor recorded as `Loaded`, and the
+                // scan continues to lower-precedence candidates. Leaving the verdict
+                // `Absent` is deliberate — the missing-export footer then points at
+                // `raven packages update` (download a real DB), the correct remedy,
+                // rather than the `Loaded` branch's "the package is likely private / not
+                // on CRAN", which would misdescribe an empty database.
+                let mut shipped_db_load = ShippedDbLoad::Absent;
+                for path in shipped_db_candidates {
+                    match crate::package_db::binary_db::ShippedDbProvider::from_file_with_deadline(
+                        &path,
+                        physical_deadline,
+                    ) {
+                        Ok(Some(p)) if !p.is_empty() => {
+                            providers.push(Arc::new(p));
+                            shipped_db_load = ShippedDbLoad::Loaded;
+                            break;
+                        }
+                        Ok(_) => {} // Absent (None) or empty -> not usable coverage; keep scanning
+                        Err(crate::package_db::binary_db::ShippedDbError::DeadlineExpired) => {
+                            return Err(Arc::new(ProviderLoadFailure(
+                                "package metadata provider load exceeded the original routing deadline"
+                                    .to_string(),
+                            )));
+                        }
+                        Err(e) => {
+                            notes.push(format!("{}: {e}", path.display()));
+                            shipped_db_load = ShippedDbLoad::Failed;
+                        }
+                    }
                 }
-            }
-        }
-        (providers, notes, shipped_db_load)
-    })
-    .await
-    .unwrap_or_else(|_| (Vec::new(), Vec::new(), ShippedDbLoad::Absent));
+                let artifact = Arc::new(ProviderLoadArtifact {
+                    providers,
+                    notes,
+                    shipped_db_load,
+                });
+                #[cfg(test)]
+                pause_provider_load_for_test(&physical_key);
+                Ok(artifact)
+            })
+        },
+    )
+    .await?;
+    let artifact = await_provider_load(receiver).await?;
 
-    for note in &notes {
+    for note in &artifact.notes {
         log::warn!("{note}");
     }
-    lib.set_providers(providers);
+    lib.set_shared_providers(artifact.providers.clone());
 
-    PackageLibraryOutcome {
+    Ok(PackageLibraryOutcome {
         library: Arc::new(lib),
         status,
-        load_notes: notes,
-        shipped_db_load,
-    }
+        load_notes: artifact.notes.clone(),
+        shipped_db_load: artifact.shipped_db_load,
+    })
 }
 
 /// Shared construction core for both the runtime ([`build_package_library`]) and
@@ -3024,23 +3484,30 @@ async fn build_library_inner(
     r_path: Option<PathBuf>,
     additional_paths: &[PathBuf],
     workspace_root: Option<PathBuf>,
-) -> (PackageLibrary, PackageLibraryStatus) {
-    let subprocess =
-        tokio::task::spawn_blocking(move || match (RSubprocess::new(r_path), workspace_root) {
-            (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
-            (sub, _) => sub,
-        })
-        .await
-        .unwrap_or(None);
+) -> anyhow::Result<(PackageLibrary, PackageLibraryStatus)> {
+    let subprocess = match (RSubprocess::new_for_routing(r_path).await?, workspace_root) {
+        (Some(subprocess), Some(root)) => Some(subprocess.with_working_dir(root)),
+        (subprocess, _) => subprocess,
+    };
 
     let r_found = subprocess.is_some();
     let mut lib = PackageLibrary::with_subprocess(subprocess);
-    let init_error = lib.initialize().await.err().map(|e| e.to_string());
+    let init_error = match lib.initialize().await {
+        Ok(()) => None,
+        Err(error)
+            if error
+                .downcast_ref::<crate::r_subprocess::OuterDeadlineExpired>()
+                .is_some() =>
+        {
+            return Err(error);
+        }
+        Err(error) => Some(error.to_string()),
+    };
     lib.add_library_paths(additional_paths);
     let has_lib_paths = !lib.lib_paths().is_empty();
 
     let status = PackageLibraryStatus::classify(init_error, r_found, has_lib_paths);
-    (lib, status)
+    Ok((lib, status))
 }
 
 /// Build a Tier-1-only library with **no** fallback providers wired. This is the
@@ -3052,7 +3519,9 @@ pub async fn build_package_library_tier1_only(
     additional_paths: &[PathBuf],
     workspace_root: Option<PathBuf>,
 ) -> PackageLibraryOutcome {
-    let (lib, status) = build_library_inner(r_path, additional_paths, workspace_root).await;
+    let (lib, status) = build_library_inner(r_path, additional_paths, workspace_root)
+        .await
+        .unwrap_or_else(|_| (PackageLibrary::new_empty(), PackageLibraryStatus::RNotFound));
     PackageLibraryOutcome {
         library: Arc::new(lib),
         status,
@@ -3069,6 +3538,575 @@ mod tests {
     /// (defined in `package_db` so every lib-test that touches the var shares one
     /// instance / one audited `unsafe` mutation site).
     use crate::package_db::{NamesDbEnvGuard, RAVEN_NAMES_DB_ENV_LOCK};
+
+    fn provider_load_key_for_test(name: &str) -> ProviderLoadKey {
+        ProviderLoadKey {
+            repo_db_path: Some(PathBuf::from(name)),
+            shipped_db_inputs: crate::package_db::capture_shipped_db_candidate_inputs(),
+        }
+    }
+
+    fn empty_provider_load_artifact() -> Arc<ProviderLoadArtifact> {
+        Arc::new(ProviderLoadArtifact {
+            providers: Vec::new(),
+            notes: Vec::new(),
+            shipped_db_load: ShippedDbLoad::Absent,
+        })
+    }
+
+    fn replace_provider_file_for_test(path: &Path, contents: &str) {
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, contents).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_file(path).unwrap();
+        std::fs::rename(replacement, path).unwrap();
+    }
+
+    struct CapturedProviderSpawn {
+        completion: ProviderLoadCompletion,
+    }
+
+    async fn test_subscribe(
+        registry: &Arc<parking_lot::Mutex<ProviderLoadRegistry>>,
+        gate: &Arc<tokio::sync::Semaphore>,
+        key: &ProviderLoadKey,
+    ) -> anyhow::Result<(
+        tokio::sync::watch::Receiver<ProviderLoadState>,
+        Option<CapturedProviderSpawn>,
+    )> {
+        test_subscribe_with_policy(registry, gate, key, ProviderLoadPolicy::Share).await
+    }
+
+    async fn test_subscribe_with_policy(
+        registry: &Arc<parking_lot::Mutex<ProviderLoadRegistry>>,
+        gate: &Arc<tokio::sync::Semaphore>,
+        key: &ProviderLoadKey,
+        policy: ProviderLoadPolicy,
+    ) -> anyhow::Result<(
+        tokio::sync::watch::Receiver<ProviderLoadState>,
+        Option<CapturedProviderSpawn>,
+    )> {
+        let captured = Arc::new(parking_lot::Mutex::new(None));
+        let spawn_capture = Arc::clone(&captured);
+        let receiver =
+            subscribe_or_spawn_provider_load_from(registry, gate, key, policy, move |completion| {
+                *spawn_capture.lock() = Some(CapturedProviderSpawn { completion });
+                Ok(())
+            })
+            .await?;
+        let spawn = captured.lock().take();
+        Ok((receiver, spawn))
+    }
+
+    fn finish_test_spawn(
+        registry: &Arc<parking_lot::Mutex<ProviderLoadRegistry>>,
+        key: &ProviderLoadKey,
+        spawn: CapturedProviderSpawn,
+        result: ProviderLoadResult,
+    ) {
+        let _ = (registry, key);
+        spawn.completion.finish(result);
+    }
+
+    fn wait_for_provider_cleanup(
+        registry: &Arc<parking_lot::Mutex<ProviderLoadRegistry>>,
+        gate: &Arc<tokio::sync::Semaphore>,
+        key: &ProviderLoadKey,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.lock().active.contains_key(key)
+            || gate.available_permits() != PROVIDER_LOAD_HARD_CAP
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "provider generation did not clean up"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_load_capacity_queues_fifth_then_succeeds() {
+        let registry = Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(PROVIDER_LOAD_HARD_CAP));
+        let keys = (0..=PROVIDER_LOAD_HARD_CAP)
+            .map(|index| provider_load_key_for_test(&format!("provider-{index}")))
+            .collect::<Vec<_>>();
+
+        let mut spawns = Vec::new();
+        for key in &keys[..PROVIDER_LOAD_HARD_CAP] {
+            let (_, spawn) = test_subscribe(&registry, &gate, key).await.unwrap();
+            spawns.push(spawn.expect("distinct key starts one physical supervisor"));
+        }
+        assert_eq!(registry.lock().active.len(), PROVIDER_LOAD_HARD_CAP);
+        assert_eq!(gate.available_permits(), 0);
+        let (_, duplicate) = test_subscribe(&registry, &gate, &keys[1]).await.unwrap();
+        assert!(duplicate.is_none());
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "same-key fast path bypasses a full physical cap"
+        );
+
+        let fifth = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            let gate = Arc::clone(&gate);
+            let key = keys[PROVIDER_LOAD_HARD_CAP].clone();
+            async move { test_subscribe(&registry, &gate, &key).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !fifth.is_finished(),
+            "the fifth distinct key waits for capacity"
+        );
+
+        let first = spawns.remove(0);
+        finish_test_spawn(
+            &registry,
+            &keys[0],
+            first,
+            Ok(empty_provider_load_artifact()),
+        );
+        let (_, fifth_spawn) = tokio::time::timeout(std::time::Duration::from_secs(1), fifth)
+            .await
+            .expect("released capacity wakes the FIFO waiter")
+            .unwrap()
+            .unwrap();
+        assert!(fifth_spawn.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_provider_deadline_leaves_no_entry_or_permit_leak() {
+        let registry = Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(PROVIDER_LOAD_HARD_CAP));
+        let full_keys = (0..PROVIDER_LOAD_HARD_CAP)
+            .map(|index| provider_load_key_for_test(&format!("timeout-full-{index}")))
+            .collect::<Vec<_>>();
+        let mut full_spawns = Vec::new();
+        for key in &full_keys {
+            let (_, spawn) = test_subscribe(&registry, &gate, key).await.unwrap();
+            full_spawns.push(spawn.unwrap());
+        }
+        let queued_key = provider_load_key_for_test("timeout-queued");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let queued = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            let gate = Arc::clone(&gate);
+            let key = queued_key.clone();
+            crate::r_subprocess::with_outer_r_deadline(deadline, async move {
+                test_subscribe(&registry, &gate, &key).await
+            })
+        });
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        let result = queued.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(ref error)
+                if error.is::<crate::r_subprocess::OuterDeadlineExpired>()
+        ));
+        assert!(!registry.lock().active.contains_key(&queued_key));
+        assert_eq!(gate.available_permits(), 0);
+
+        for (key, spawn) in full_keys.iter().zip(full_spawns) {
+            finish_test_spawn(&registry, key, spawn, Ok(empty_provider_load_artifact()));
+        }
+        assert_eq!(gate.available_permits(), PROVIDER_LOAD_HARD_CAP);
+    }
+
+    #[tokio::test]
+    async fn racing_same_key_admission_spawns_one_physical_generation() {
+        let registry = Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(PROVIDER_LOAD_HARD_CAP));
+        let key = provider_load_key_for_test("racing-same-key");
+        let (left, right) = tokio::join!(
+            test_subscribe(&registry, &gate, &key),
+            test_subscribe(&registry, &gate, &key),
+        );
+        let (left_receiver, left_spawn) = left.unwrap();
+        let (right_receiver, right_spawn) = right.unwrap();
+        assert_eq!(
+            usize::from(left_spawn.is_some()) + usize::from(right_spawn.is_some()),
+            1
+        );
+        let spawn = left_spawn.or(right_spawn).unwrap();
+        let artifact = empty_provider_load_artifact();
+        finish_test_spawn(&registry, &key, spawn, Ok(Arc::clone(&artifact)));
+        assert!(Arc::ptr_eq(
+            &await_provider_load(left_receiver).await.unwrap(),
+            &artifact
+        ));
+        assert!(Arc::ptr_eq(
+            &await_provider_load(right_receiver).await.unwrap(),
+            &artifact
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_policy_supersedes_paused_old_generation_and_share_follows_new() {
+        let registry = Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(PROVIDER_LOAD_HARD_CAP));
+        let key = provider_load_key_for_test("paused-old-new");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider-version");
+        std::fs::write(&path, "old").unwrap();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let old_path = path.clone();
+        let old_receiver = subscribe_or_spawn_provider_load_from(
+            &registry,
+            &gate,
+            &key,
+            ProviderLoadPolicy::Share,
+            move |completion| {
+                spawn_provider_load_thread(completion, move || {
+                    let version = std::fs::read_to_string(old_path).unwrap();
+                    arrived_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(Arc::new(ProviderLoadArtifact {
+                        providers: Vec::new(),
+                        notes: vec![version],
+                        shipped_db_load: ShippedDbLoad::Absent,
+                    }))
+                })
+            },
+        )
+        .await
+        .unwrap();
+        arrived_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // Same-path atomic replacement on Unix exercises the opened-old-handle
+        // versus newly-addressable-path case. Windows' std API requires the
+        // destination removal in the helper, but still changes file identity.
+        replace_provider_file_for_test(&path, "new");
+
+        let fresh_path = path.clone();
+        let (fresh_arrived_tx, fresh_arrived_rx) = std::sync::mpsc::channel();
+        let (fresh_release_tx, fresh_release_rx) = std::sync::mpsc::channel();
+        let fresh_receiver = subscribe_or_spawn_provider_load_from(
+            &registry,
+            &gate,
+            &key,
+            ProviderLoadPolicy::FreshAfterActive,
+            move |completion| {
+                spawn_provider_load_thread(completion, move || {
+                    let version = std::fs::read_to_string(fresh_path).unwrap();
+                    fresh_arrived_tx.send(()).unwrap();
+                    fresh_release_rx.recv().unwrap();
+                    Ok(Arc::new(ProviderLoadArtifact {
+                        providers: Vec::new(),
+                        notes: vec![version],
+                        shipped_db_load: ShippedDbLoad::Absent,
+                    }))
+                })
+            },
+        )
+        .await
+        .unwrap();
+        fresh_arrived_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            gate.available_permits(),
+            PROVIDER_LOAD_HARD_CAP - 2,
+            "old and fresh physical generations overlap"
+        );
+        let (new_follower, duplicate) = test_subscribe(&registry, &gate, &key).await.unwrap();
+        assert!(
+            duplicate.is_none(),
+            "a later Share caller follows the fresh generation"
+        );
+
+        let fresh_generation = registry.lock().active.get(&key).unwrap().generation;
+        release_tx.send(()).unwrap();
+        let old = await_provider_load(old_receiver).await.unwrap();
+        assert_eq!(old.notes, ["old"]);
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gate.available_permits() != PROVIDER_LOAD_HARD_CAP - 1 {
+            assert!(
+                std::time::Instant::now() < cleanup_deadline,
+                "superseded old generation did not release its permit"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            registry.lock().active.get(&key).unwrap().generation,
+            fresh_generation,
+            "old exact cleanup cannot remove the fresh registry entry"
+        );
+
+        fresh_release_tx.send(()).unwrap();
+        let fresh = await_provider_load(fresh_receiver).await.unwrap();
+        let followed = await_provider_load(new_follower).await.unwrap();
+        assert_eq!(fresh.notes, ["new"]);
+        assert!(Arc::ptr_eq(&fresh, &followed));
+        wait_for_provider_cleanup(&registry, &gate, &key);
+    }
+
+    #[test]
+    fn physical_provider_completion_crosses_tokio_runtime_shutdown() {
+        let registry = Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(PROVIDER_LOAD_HARD_CAP));
+        let key = provider_load_key_for_test("cross-runtime");
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let receiver = first_runtime
+            .block_on(subscribe_or_spawn_provider_load_from(
+                &registry,
+                &gate,
+                &key,
+                ProviderLoadPolicy::Share,
+                move |completion| {
+                    spawn_provider_load_thread(completion, move || {
+                        arrived_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(empty_provider_load_artifact())
+                    })
+                },
+            ))
+            .unwrap();
+        arrived_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(first_runtime);
+
+        release_tx.send(()).unwrap();
+        let second_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        second_runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                await_provider_load(receiver),
+            )
+            .await
+            .expect("a new runtime observes the std-thread completion")
+            .unwrap()
+        });
+        wait_for_provider_cleanup(&registry, &gate, &key);
+    }
+
+    #[tokio::test]
+    async fn panicking_physical_provider_load_publishes_failure_and_cleans_capacity() {
+        let registry = Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(PROVIDER_LOAD_HARD_CAP));
+        let key = provider_load_key_for_test("panicking-provider");
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let leader = subscribe_or_spawn_provider_load_from(
+            &registry,
+            &gate,
+            &key,
+            ProviderLoadPolicy::Share,
+            move |completion| {
+                spawn_provider_load_thread(completion, move || -> ProviderLoadResult {
+                    arrived_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    panic!("synthetic provider panic");
+                })
+            },
+        )
+        .await
+        .unwrap();
+        arrived_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (follower, duplicate) = test_subscribe(&registry, &gate, &key).await.unwrap();
+        assert!(duplicate.is_none());
+        release_tx.send(()).unwrap();
+        assert!(await_provider_load(leader).await.is_err());
+        assert!(await_provider_load(follower).await.is_err());
+        wait_for_provider_cleanup(&registry, &gate, &key);
+    }
+
+    #[tokio::test]
+    async fn provider_thread_spawn_failure_publishes_and_cleans_capacity() {
+        let registry = Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(PROVIDER_LOAD_HARD_CAP));
+        let key = provider_load_key_for_test("spawn-failure-provider");
+        let result = subscribe_or_spawn_provider_load_from(
+            &registry,
+            &gate,
+            &key,
+            ProviderLoadPolicy::Share,
+            |_completion| Err(ProviderLoadFailure("synthetic spawn failure".to_string())),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("synthetic spawn failure must reject admission"),
+            Err(error) => error,
+        };
+        assert!(error.is::<ProviderLoadFailure>());
+        assert!(error.to_string().contains("synthetic spawn failure"));
+        assert!(!registry.lock().active.contains_key(&key));
+        assert_eq!(gate.available_permits(), PROVIDER_LOAD_HARD_CAP);
+    }
+
+    #[tokio::test]
+    async fn provider_load_completion_wakes_all_same_key_followers_and_self_cleans() {
+        let registry = Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(PROVIDER_LOAD_HARD_CAP));
+        let key = provider_load_key_for_test("coalesced-provider");
+        let (leader, spawn) = test_subscribe(&registry, &gate, &key).await.unwrap();
+        let spawn = spawn.expect("first claimant starts the physical load");
+        let (follower, duplicate) = test_subscribe(&registry, &gate, &key).await.unwrap();
+        assert!(
+            duplicate.is_none(),
+            "same-key claimant follows without capacity"
+        );
+        drop(leader);
+        assert!(registry.lock().active.contains_key(&key));
+        assert_eq!(gate.available_permits(), PROVIDER_LOAD_HARD_CAP - 1);
+
+        let completion_registry = Arc::clone(&registry);
+        let completion_key = key.clone();
+        let artifact = empty_provider_load_artifact();
+        finish_test_spawn(
+            &completion_registry,
+            &completion_key,
+            spawn,
+            Ok(Arc::clone(&artifact)),
+        );
+        assert!(Arc::ptr_eq(
+            &await_provider_load(follower).await.unwrap(),
+            &artifact
+        ));
+        assert!(!registry.lock().active.contains_key(&key));
+        assert_eq!(gate.available_permits(), PROVIDER_LOAD_HARD_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_follower_deadline_does_not_cancel_physical_generation() {
+        let registry = Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(PROVIDER_LOAD_HARD_CAP));
+        let key = provider_load_key_for_test("deadline-provider");
+        let (leader, spawn) = test_subscribe(&registry, &gate, &key).await.unwrap();
+        let spawn = spawn.expect("first claimant starts the physical load");
+        let (follower, duplicate) = test_subscribe(&registry, &gate, &key).await.unwrap();
+        assert!(duplicate.is_none());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let timed_out = tokio::spawn(crate::r_subprocess::with_outer_r_deadline(
+            deadline,
+            await_provider_load(follower),
+        ));
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        let result = timed_out.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(ref error)
+                if error.is::<crate::r_subprocess::OuterDeadlineExpired>()
+        ));
+        assert!(registry.lock().active.contains_key(&key));
+
+        let artifact = empty_provider_load_artifact();
+        finish_test_spawn(&registry, &key, spawn, Ok(Arc::clone(&artifact)));
+        assert!(Arc::ptr_eq(
+            &await_provider_load(leader).await.unwrap(),
+            &artifact
+        ));
+        assert!(!registry.lock().active.contains_key(&key));
+        assert_eq!(gate.available_permits(), PROVIDER_LOAD_HARD_CAP);
+    }
+
+    #[tokio::test]
+    async fn stale_provider_completion_cannot_remove_new_generation() {
+        let registry = Arc::new(parking_lot::Mutex::new(ProviderLoadRegistry::default()));
+        let key = provider_load_key_for_test("stale-completion");
+        let (_new_sender, new_receiver) = tokio::sync::watch::channel(ProviderLoadState::Running);
+        registry.lock().active.insert(
+            key.clone(),
+            ActiveProviderLoad {
+                generation: 22,
+                completion: new_receiver,
+                followers: 0,
+            },
+        );
+        let (stale_sender, _stale_receiver) =
+            tokio::sync::watch::channel(ProviderLoadState::Running);
+        complete_provider_load(
+            Arc::clone(&registry),
+            key.clone(),
+            11,
+            stale_sender,
+            Ok(empty_provider_load_artifact()),
+        );
+        assert_eq!(registry.lock().active.get(&key).unwrap().generation, 22);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_real_builds_share_one_global_provider_load() {
+        let _env_guard = RAVEN_NAMES_DB_ENV_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let workspace_root = root.path().to_path_buf();
+        let r_path = workspace_root.join("definitely-not-an-R-executable");
+        let key = ProviderLoadKey {
+            repo_db_path: Some(workspace_root.join(".raven").join("packages.json")),
+            shipped_db_inputs: crate::package_db::capture_shipped_db_candidate_inputs(),
+        };
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        provider_load_test_pauses().lock().insert(
+            key.clone(),
+            ProviderLoadTestPause {
+                arrived: arrived_tx,
+                release: release_rx,
+            },
+        );
+
+        let first = tokio::spawn(try_build_package_library(
+            Some(r_path.clone()),
+            &[],
+            Some(workspace_root.clone()),
+            true,
+            ProviderLoadPolicy::Share,
+        ));
+        tokio::task::spawn_blocking(move || {
+            arrived_rx.recv_timeout(std::time::Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let second = tokio::spawn(try_build_package_library(
+            Some(r_path),
+            &[],
+            Some(workspace_root),
+            true,
+            ProviderLoadPolicy::Share,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if provider_load_registry()
+                    .lock()
+                    .active
+                    .get(&key)
+                    .is_some_and(|active| active.followers == 1)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second real build follows the first physical load");
+
+        first.abort();
+        let leader = first.await;
+        assert!(
+            matches!(leader, Err(ref error) if error.is_cancelled()),
+            "dropping the leader cannot own the physical generation"
+        );
+        release_tx.send(()).unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("the follower survives leader cancellation");
+        assert!(second.unwrap().is_ok());
+        assert!(!provider_load_registry().lock().active.contains_key(&key));
+    }
 
     /// Seed a `combined_entries` cache entry directly, bypassing `get_all_exports`.
     /// Lets tests construct specific aggregate snapshots — including the
@@ -3220,9 +4258,9 @@ mod tests {
     }
 
     /// Pins the readiness predicate and degradation precedence
-    /// platform-independently. The `Some(_)` rows exercise classification
-    /// *logic* only — `initialize()` never returns `Err` end-to-end, so those
-    /// statuses are unreachable via the real pipeline.
+    /// platform-independently. The `Some(_)` rows exercise Tier-1
+    /// classification directly; the public builder can also produce
+    /// `InitFailed` for provider admission, deadline, spawn, or load failures.
     #[test]
     fn classify_truth_table() {
         use PackageLibraryStatus::*;

@@ -597,6 +597,14 @@ Key properties (details in the function and commit-seam doc comments):
 - `old_meta` (for working-directory-change child invalidation) is caller-supplied: the close path must capture it **before** the document stores are wiped, because the unsaved buffer's metadata lives only there.
 - Ordinary single-file commits reserve mutation-side fanout at the commit seam. `WatchedBatch` instead reports removal dependents from the pre-commit graph and upsert dependents from the post-commit graph as collect-only candidates; the outer watched finalizer merges them with package and system-file candidates, then deduplicates, activity-caps, force-marks, and assigns tickets exactly once.
 
+If a watched overlay exceeds the traversal budget, Raven preserves arrival
+order with immediate per-file commits. A package-only CAS runs first and
+installs its analysis handoff durably before any sequential file commit can mint
+a `system.file()` successor. Convergence is attempted only while that exact
+package-routing owner remains current; a foreign or ABA-style successor
+inherits the handoff and the stale batch stops without deriving or committing
+against it.
+
 Watched-file invalid UTF-8 is treated as potentially transient on the immediate pass: the resync preserves existing state and schedules a delayed retry. The retry carries the exact watched generation, so a newer CREATE/CHANGE/DELETE or close supersedes it. A still-invalid final read becomes a removal inside the same outer watched transaction; a recovered read becomes an upsert. Each arrival gets at most three complete inline attempts (initial plus two fresh recaptures). Exhaustion preclaims an additive `PackageSeedRetryLifecycle` owner: unrelated batches remain independently pending, while a same-URI successor makes the stale owner terminate without reseeding itself.
 
 After a successful outer commit, package-wide exact open candidates, closed-file candidates, and any immediate routing/system-file transfer are merged through one activity-capped finalizer. If routing must continue asynchronously, that worker retains the entire untouched finalization bundle until the exact routing owner or a validated successor converges; package/closed candidates are never finalized early or recaptured by URI. CREATED/CHANGED handlers keep their asynchronous acknowledgement contract by spawning the batch, while DELETED-only handlers await commit and finalization before returning.
@@ -699,7 +707,7 @@ All R subprocess calls must:
 - use timeouts to avoid hangs
 - route through `RSubprocess::execute_r_code{,_with_timeout}` rather than spawning `R` directly
 
-Each `R` spawn is CPU-heavy — loading the base packages alone is 6–11s and pins a core. A global semaphore (`r_subprocess_semaphore` in `r_subprocess.rs`, sized to the available parallelism clamped to the range 2–8) caps how many R processes run at once, so a burst of callers (a 16-way test run, or many documents warming packages at once) cannot oversubscribe every core and starve the latency-sensitive 5s `formals()` queries past their timeout. The permit is taken outside the per-call timeout, so queue-wait never counts against a query's budget. If you see R-gated tests time out only under heavy machine load, suspect spawn volume, not the timeout value.
+Each `R` spawn is CPU-heavy — loading the base packages alone is 6–11s and pins a core. A global semaphore (`r_subprocess_semaphore` in `r_subprocess.rs`, sized to the available parallelism clamped to the range 2–8) caps how many R processes run at once, so a burst of callers (a 16-way test run, or many documents warming packages at once) cannot oversubscribe every core and starve the latency-sensitive 5s `formals()` queries past their timeout. For ordinary calls the permit is taken outside the per-call timeout, so queue-wait does not consume that child-execution budget. Package-routing calls additionally carry one outer wall deadline across semaphore queueing and child execution. `get_lib_paths()` may degrade ordinary R execution or semantic failures to fallback paths, but it must propagate a typed `OuterDeadlineExpired` unchanged; caching fallback paths after an expired routing authority would let stale work look successfully initialized. If you see ordinary R-gated tests time out only under heavy machine load, suspect spawn volume, not the child timeout value.
 
 See `crates/raven/src/package_library.rs` and `crates/raven/src/r_subprocess.rs`.
 
@@ -775,7 +783,7 @@ pub trait PackageMetadataProvider: Send + Sync {
 }
 ```
 
-`PackageLibrary` gains an ordered `providers: Vec<Box<dyn PackageMetadataProvider>>`
+`PackageLibrary` gains an ordered `providers: Vec<Arc<dyn PackageMetadataProvider>>`
 (Tier 2 repo DB at index 0, Tier 3 shipped DB next), empty by default. The **one**
 hook is in `get_package`: when `find_package_directory` misses (Tier 1 has no
 directory), it consults the providers in order; the first hit is cached like any
@@ -796,6 +804,35 @@ contaminated by Tier 2/3 guesses. Construction is split into
 (runtime: inner + provider wiring). Existing 4-arg callers of
 `build_package_library` are unchanged.
 
+Runtime Tier 2/3 opening is globally coalesced by the exact repo/shipped-input
+key. Each physical generation runs on one dedicated standard thread, independent
+of any caller's Tokio runtime, under a process-wide cap of four. `Share`
+callers—startup, didOpen/on-demand initialization, and ordinary builders—follow
+the newest same-key watch generation and reuse its immutable `Arc` providers,
+even while the physical cap is full. Explicit replacement authorities
+(`refreshPackages`, configuration rebuilds, and libpath watcher rebuilds) use
+`FreshAfterActive`: after FIFO capacity admission they replace the generation
+that was active when they arrived, and every later `Share` caller follows the
+successor. Old waiters retain the old terminal result; the two physical
+same-key generations may temporarily consume two permits.
+
+Registry installation and standard-thread spawn occur in one synchronous
+critical section with no await. The thread-owned completion guard catches
+unwind, publishes exactly one terminal watch state, compare-removes only its
+exact `(key, generation)`, and drops the capacity permit last. Spawn failure
+performs the same terminal publication/cleanup and returns a typed error. A
+caller deadline or complete runtime shutdown can discard a receiver, but cannot
+cancel the physical generation, release its permit early, or let an old
+completion erase a newer generation.
+
+Each Tier 2 or Tier 3 file is parsed from an already-open handle. The loader
+captures that handle's stable identity (platform file ID plus size/timestamps),
+then compares both the handle and the path after parsing. An atomic replacement
+or in-place mutation retries once under the original load deadline; a second
+identity mismatch returns typed `ConcurrentModification` instead of publishing
+stale or mixed metadata. Tier 3 maps the same verified handle—it never stats one
+path and mmaps a separately reopened file.
+
 ### Performance discipline (§12)
 
 The LSP hot path (diagnostic collection) reads the in-memory package caches from
@@ -808,9 +845,9 @@ already-published snapshots and must not take a disk/page-fault stall. So:
   lookup — one syscall, eliminating even the first index page fault. A cheap
   nicety, not required for correctness, and a no-op on platforms without
   `madvise`;
-- the `blake3` payload checksum is verified **at open, in `spawn_blocking`**
-  (decision #13) — ~10–20 ms once during library init, off the async runtime —
-  catching truncation/corruption/tampering;
+- the `blake3` payload checksum is verified **at open on the dedicated provider
+  thread** (decision #13) — ~10–20 ms once during library init, off the async
+  runtime — catching truncation/corruption/tampering;
 - provider results feed the existing per-package cache, so steady-state lookups
   stay in-memory and make no provider call.
 
@@ -1201,9 +1238,75 @@ change list through both strict folds.
 
 **Lifecycle:** Resolution is deferred until `lib_paths` are ready — the workspace scan may run before the package library is initialized. Startup, library replacement, every `LibpathEvent::Changed` (package install/removal under a watched libpath), and DESCRIPTION/NAMESPACE manifest changes run one detached convergence transaction (`backend.rs`). Each exact routing owner gets at most two complete attempts; a newer routing/library owner supersedes old work immediately. Package-seed callers additionally carry the exact installed-seed identity (raw-input, derived package-state, routing, and library generations plus a unique install ID) through capture and commit. Once a seed installs, cancellation cannot abandon its owner: contention returns a typed deferred result and schedules one coalesced exact-seed retry, while supersession returns a transfer owned by an explicitly validated current successor. Routing-changing open/close commits likewise retain their exact outer candidates until the required owner or a validated successor converges, then combine both ownership domains in one finalization; delayed retries never recapture candidates by URI.
 
+Package-library replacement also has a synchronous pre-seal ledger in
+`WorldState`'s replacement lifecycle. Cancellation may deposit transfer
+handles, exact candidates, fallback URIs, post-seed ownership, and build notes
+there without reacquiring the async state lock. A successful replacement CAS
+adopts that ledger and collapses it with predecessor transfers into one fresh
+`SystemFile` transfer; post-seed tails remain on the pending transfer until a
+state-locked finalizer registers the existing retry owner. They are not carried
+in caller-local commit effects. Routing-owned detached tasks are registered
+through a shutdown-linearized task gate: shutdown retires diagnostic epochs,
+fences new routing registrations, drains tails/retry owners without publishing,
+closes the spawn gate, releases all locks, and only then waits for tracked
+tasks. Do not introduce a raw `tokio::spawn` for work that owns or consumes
+these ledgers. Watched-file retries and deferred routing finalizers inherit a
+tracked parent token or register as a root at an untracked handler boundary;
+their sleeps select the task owner's shutdown token, and spawn refusal retires
+exact retry currency synchronously. A `packageMode = "disabled"` transition
+likewise preserves the exact routing owner minted while removing the workspace
+package and completes its tracked `system.file()` convergence before config
+diagnostics are republished. That worker is exact-owner only: a re-enable or
+newer routing writer supersedes it without letting the stale Disabled task
+derive, commit, or finalize the successor. If its config caller is cancelled
+after a commit, an acknowledged two-phase handoff keeps an exact fallback copy
+with the surviving tracked root until the caller has finalized the transfer or
+placed it in durable escrow; a dropped acknowledgement makes the root consume
+that copy itself through the same one-shot transfer gate.
+
+Libpath watching uses a state-owned lifecycle rather than a loose task and
+handle. A prospective watcher journals events while buffering and becomes
+active only in the same validated CAS that installs its exact owner; every
+active install starts with a full rescan. Journal deliveries are RAII claims
+acked only by the winning routing CAS, so cancellation remerges them with newer
+events. Prearm owns close guards on both sides of the blocking setup boundary,
+and setup pauses are journal-local in tests; cancellation or shutdown closes
+the buffering journal immediately, while a late OS handle is torn down instead
+of reactivating it. Consumers claim against the routing-task shutdown token.
+`Changed` is a durable targeted invalidation, `Rescan` is a sticky full-scan
+obligation used for bounded overflow, and `Dropped` is terminal for that
+attachment. Retry delays select only their timer, journal closure, or shutdown,
+so an event storm cannot collapse backoff. One primary attachment failure
+may install one exact recovery watcher. If that recovery also fails, the
+watcher-only CAS records an exact terminal-degradation reconcile obligation;
+its tracked worker clears and fully warms the current library without a third
+watcher attachment, retries in a bounded paced batch, then parks on routing
+edges with a heartbeat. The shared `Notify` is paired with a monotonic wake
+generation advanced before every notification, so another consumer cannot
+drain the only edge while degraded repair is between its final attempt and
+park; notifications are still consulted only at that boundary, preserving
+retry pacing. Publishing a successor watcher owner and server shutdown are
+both wake-generation edges, so an already parked degraded root exits promptly
+instead of remaining tracked until the heartbeat. Routing-CAS attachment
+failure does not create this
+extra obligation because its clear/warm/derive transaction has already
+committed.
+
 **Retention:** `resolve_system_file_sources()` never clears `ForwardSource.system_file` and never drops unresolved entries — resolution state (`path`, `resolved_uri`) is recomputed from scratch on every pass. This is what makes the lifecycle events above recoverable without re-extracting metadata: an edge to a not-yet-installed package forms once the package appears, a stale edge to a removed package is cleared, and a workspace `Package:` rename re-targets self-package (branch 1) references. An unresolved entry is inert (empty `path`, no `resolved_uri`): the dependency graph and scope resolution produce no edge for it and the missing-file collectors skip it (`ForwardSource::exempt_from_missing_file_diagnostics` is the single predicate). Convergence covers both metadata stores — the workspace index (closed files) and the authoritative document store (open buffers) — and commits metadata, external installs/removals, graph edges, pins, and open metadata as one validated unit. The libpath consumer supplies a package filter, so unrelated sources are neither resolved nor disk-probed.
 
-**Ownership and locking:** Capture clones the exact routing/library/package, index, graph, configuration, and open-record authorities under a short read lock. Resolution, external reads/parsing, and graph derivation run on owned data in a blocking worker with no `WorldState` guard. Every external candidate is opened and read once; its valid/missing/invalid identity and any parsed artifacts come from those same bytes. Immediately before the central CAS, Raven rereads and compares every identity, then validates all central authorities and final open targets before mutating any tier. Index admission receives the pin set derived from the prepared graph, not the pre-transaction graph, so a tight LRU cap cannot evict newly reachable external targets before their graph edges commit. Raw file-cache contents are inputs only, never freshness authority. `raven check` retains one explicitly named CLI compatibility writer until CLI index installation is migrated as a separate ownership family; LSP callers and lifecycle tests do not use it.
+**Ownership and locking:** Capture clones the exact routing/library/package, index, graph, configuration, and open-record authorities under a short read lock. Resolution, external reads/parsing, and graph derivation run on owned data in a blocking worker with no `WorldState` guard. Every external candidate is opened and read once; its valid/missing/invalid identity and any parsed artifacts come from those same bytes. Existing dynamically indexed targets are refreshed in the same atomic transaction when a still-referenced URI has a different valid snapshot; open-authoritative, workspace-owned, pending, missing, invalid, and unchanged targets retain their current owner/content. A refreshed target replaces its full record, artifacts, outgoing graph node, and interface-change fanout even when the resolved URI itself is unchanged. Immediately before the central CAS, Raven rereads and compares every identity, then validates all central authorities and final open targets before mutating any tier. Index admission receives the pin set derived from the prepared graph, not the pre-transaction graph, so a tight LRU cap cannot evict newly reachable external targets before their graph edges commit. Raw file-cache contents are inputs only, never freshness authority. `raven check` retains one explicitly named CLI compatibility writer until CLI index installation is migrated as a separate ownership family; LSP callers and lifecycle tests do not use it.
+
+`system.file()` graph derivation has one process-wide physical slot. After
+deadline-bounded semaphore admission, Raven installs an exact `(worker id,
+derivation key)` slot and starts a dedicated standard thread. The waiter owns a
+shared result/notification object independent of the global slot. The thread's
+completion guard stores and notifies the result (including caught unwind),
+compare-clears only its exact slot, then releases the sole permit last; a stale
+completion token therefore cannot clear a successor, and immediate back-to-back
+work never depends on asynchronous `JoinHandle::is_finished()` bookkeeping.
+Thread-spawn failure synchronously clears the exact slot and releases capacity.
+
+Watched closed-file batches normally rederive every prepared peer against one whole-workspace overlay and commit atomically. If that overlay exceeds the configured traversal budget, the narrow fallback first commits any paired package projection under its exact watched CAS, then replays the prepared closed mutations in deterministic event order through the existing single-item immediate transaction. The fallback never acknowledges a watched generation by returning without a commit or durable retry.
 
 **Re-resolution:** If a `system.file()` source edge resolves to a path that was previously reported as an error (`unresolved-source-path`), the diagnostic is retracted once resolution succeeds.
 

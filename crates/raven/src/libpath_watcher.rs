@@ -23,7 +23,7 @@
 //! older distros capped at 8192 who install CRAN snapshots may want to raise
 //! the limit via `sysctl -w fs.inotify.max_user_watches=524288`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Aggregated notification about changes under one or more libpath directories.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,9 @@ pub enum LibpathEvent {
     /// Watcher attach failed or events were dropped; consumer should fall back
     /// to a full cache clear + re-init.
     Dropped,
+    /// A bounded journal overflowed. The active watcher remains valid, but the
+    /// consumer must clear and rebuild package cache/routing from current disk.
+    Rescan,
 }
 
 impl LibpathEvent {
@@ -62,12 +65,381 @@ impl LibpathEvent {
                 out.extend(touched.iter().cloned());
                 out
             }
-            LibpathEvent::Dropped => HashSet::new(),
+            LibpathEvent::Dropped | LibpathEvent::Rescan => HashSet::new(),
         }
     }
 }
 
-use std::collections::HashMap;
+const LIBPATH_JOURNAL_NAME_CAPACITY: usize = 1024;
+const LIBPATH_RAW_PATH_CAPACITY: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibpathJournalPhase {
+    Buffering,
+    Active,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibpathPackageChange {
+    Added,
+    Removed,
+    Touched,
+}
+
+#[derive(Default)]
+struct LibpathJournalPending {
+    changes: HashMap<String, LibpathPackageChange>,
+    rescan_required: bool,
+    dropped: bool,
+}
+
+impl LibpathJournalPending {
+    fn is_empty(&self) -> bool {
+        !self.dropped && !self.rescan_required && self.changes.is_empty()
+    }
+
+    fn record(&mut self, event: LibpathEvent) {
+        match event {
+            LibpathEvent::Dropped => {
+                self.changes.clear();
+                self.rescan_required = false;
+                self.dropped = true;
+            }
+            LibpathEvent::Rescan => {
+                if self.dropped {
+                    return;
+                }
+                self.changes.clear();
+                self.rescan_required = true;
+            }
+            LibpathEvent::Changed {
+                added,
+                removed,
+                touched,
+            } => {
+                if self.dropped || self.rescan_required {
+                    return;
+                }
+                for (names, change) in [
+                    (added, LibpathPackageChange::Added),
+                    (removed, LibpathPackageChange::Removed),
+                    (touched, LibpathPackageChange::Touched),
+                ] {
+                    for name in names {
+                        if !self.changes.contains_key(&name)
+                            && self.changes.len() == LIBPATH_JOURNAL_NAME_CAPACITY
+                        {
+                            self.changes.clear();
+                            self.rescan_required = true;
+                            return;
+                        }
+                        self.changes.insert(name, change);
+                    }
+                }
+            }
+        }
+    }
+
+    fn take_highest_priority(&mut self) -> Option<LibpathEvent> {
+        if self.dropped {
+            self.dropped = false;
+            return Some(LibpathEvent::Dropped);
+        }
+        if self.rescan_required {
+            self.rescan_required = false;
+            return Some(LibpathEvent::Rescan);
+        }
+        if self.changes.is_empty() {
+            return None;
+        }
+        let mut added = HashSet::new();
+        let mut removed = HashSet::new();
+        let mut touched = HashSet::new();
+        for (name, change) in std::mem::take(&mut self.changes) {
+            match change {
+                LibpathPackageChange::Added => {
+                    added.insert(name);
+                }
+                LibpathPackageChange::Removed => {
+                    removed.insert(name);
+                }
+                LibpathPackageChange::Touched => {
+                    touched.insert(name);
+                }
+            }
+        }
+        Some(LibpathEvent::Changed {
+            added,
+            removed,
+            touched,
+        })
+    }
+}
+
+struct LibpathJournalState {
+    phase: LibpathJournalPhase,
+    pending: LibpathJournalPending,
+    claimed_generation: Option<u64>,
+    next_claim_generation: u64,
+}
+
+/// Bounded state-owned handoff between a prospective watcher and its consumer.
+///
+/// Watch callbacks and debounce work record while `Buffering`; the central
+/// package-library CAS is the sole transition to `Active`. Overflow never
+/// relies on another bounded send: it clears the bounded per-package
+/// last-write-wins map and sets a sticky `Rescan` bit that the consumer pulls
+/// directly.
+pub(crate) struct LibpathWatchJournal {
+    state: parking_lot::Mutex<LibpathJournalState>,
+    wake: tokio::sync::Notify,
+    closed: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    prearm_setup_pause: parking_lot::Mutex<Option<PrearmSetupTestPause>>,
+}
+
+impl LibpathWatchJournal {
+    pub(crate) fn new_buffering() -> Arc<Self> {
+        Arc::new(Self {
+            state: parking_lot::Mutex::new(LibpathJournalState {
+                phase: LibpathJournalPhase::Buffering,
+                pending: LibpathJournalPending::default(),
+                claimed_generation: None,
+                next_claim_generation: 0,
+            }),
+            wake: tokio::sync::Notify::new(),
+            closed: tokio_util::sync::CancellationToken::new(),
+            #[cfg(test)]
+            prearm_setup_pause: parking_lot::Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn record(&self, event: LibpathEvent) {
+        let mut state = self.state.lock();
+        if state.phase == LibpathJournalPhase::Closed {
+            return;
+        }
+        state.pending.record(event);
+        let active = state.phase == LibpathJournalPhase::Active
+            && state.claimed_generation.is_none()
+            && !state.pending.is_empty();
+        drop(state);
+        if active {
+            self.wake.notify_one();
+        }
+    }
+
+    pub(crate) fn require_rescan(&self) {
+        self.record(LibpathEvent::Rescan);
+    }
+
+    pub(crate) fn is_buffering(&self) -> bool {
+        self.state.lock().phase == LibpathJournalPhase::Buffering
+    }
+
+    /// Activate synchronously inside the winning `WorldState` CAS.
+    ///
+    /// A false result is a stale/invalid prepared watcher, never a benign
+    /// no-op: publishing its owner would strand a consumer behind a closed or
+    /// already-active journal.
+    pub(crate) fn try_activate(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.phase != LibpathJournalPhase::Buffering {
+            return false;
+        }
+        state.phase = LibpathJournalPhase::Active;
+        drop(state);
+        self.wake.notify_waiters();
+        true
+    }
+
+    pub(crate) fn close(&self) {
+        let mut state = self.state.lock();
+        state.phase = LibpathJournalPhase::Closed;
+        state.pending = LibpathJournalPending::default();
+        drop(state);
+        self.closed.cancel();
+        self.wake.notify_waiters();
+    }
+
+    /// Pace a durable redelivery while allowing retirement/shutdown to
+    /// interrupt immediately.
+    pub(crate) async fn wait_retry(
+        &self,
+        delay: Duration,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => true,
+            _ = self.closed.cancelled() => false,
+            _ = shutdown.cancelled() => false,
+        }
+    }
+
+    /// Claim the highest-priority durable event.
+    ///
+    /// Exactly one delivery may be in flight. Dropping the returned claim
+    /// without calling [`LibpathJournalDelivery::ack`] re-merges its older
+    /// payload ahead of any newer pending input, so cancellation and rejected
+    /// routing CASes cannot lose invalidation work.
+    pub(crate) async fn claim(self: &Arc<Self>) -> Option<LibpathJournalDelivery> {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        self.claim_until_shutdown(&shutdown).await
+    }
+
+    /// Claim a durable event, or stop promptly when the routing task owner
+    /// closes its shutdown gate.
+    pub(crate) async fn claim_until_shutdown(
+        self: &Arc<Self>,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> Option<LibpathJournalDelivery> {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.state.lock();
+                if shutdown.is_cancelled() {
+                    return None;
+                }
+                match state.phase {
+                    LibpathJournalPhase::Closed => return None,
+                    LibpathJournalPhase::Buffering => {}
+                    LibpathJournalPhase::Active => {
+                        if state.claimed_generation.is_none()
+                            && let Some(event) = state.pending.take_highest_priority()
+                        {
+                            let generation = state.next_claim_generation;
+                            state.next_claim_generation = state
+                                .next_claim_generation
+                                .checked_add(1)
+                                .expect("libpath journal claim generation exhausted");
+                            state.claimed_generation = Some(generation);
+                            return Some(LibpathJournalDelivery {
+                                journal: Arc::clone(self),
+                                generation,
+                                event: Some(event),
+                            });
+                        }
+                    }
+                }
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = shutdown.cancelled() => return None,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_closed_for_test(&self) -> bool {
+        self.state.lock().phase == LibpathJournalPhase::Closed
+    }
+
+    #[cfg(test)]
+    fn arm_prearm_setup_pause_for_test(&self, pause: PrearmSetupTestPause) {
+        *self.prearm_setup_pause.lock() = Some(pause);
+    }
+
+    #[cfg(test)]
+    fn pause_prearm_setup_for_test(&self) {
+        let pause = self.prearm_setup_pause.lock().take();
+        if let Some(pause) = pause {
+            let _ = pause.arrived.send(());
+            let _ = pause.release.recv();
+        }
+    }
+}
+
+/// One exact in-flight journal delivery.
+///
+/// The event is acknowledged only by the central routing winner. Every other
+/// drop path restores it with lower temporal precedence than input recorded
+/// after the claim.
+pub(crate) struct LibpathJournalDelivery {
+    journal: Arc<LibpathWatchJournal>,
+    generation: u64,
+    event: Option<LibpathEvent>,
+}
+
+impl LibpathJournalDelivery {
+    pub(crate) fn event(&self) -> &LibpathEvent {
+        self.event
+            .as_ref()
+            .expect("an acknowledged libpath delivery has no event")
+    }
+
+    pub(crate) fn journal(&self) -> &Arc<LibpathWatchJournal> {
+        &self.journal
+    }
+
+    pub(crate) fn ack(&mut self) {
+        let mut state = self.journal.state.lock();
+        assert_eq!(
+            state.claimed_generation,
+            Some(self.generation),
+            "libpath journal ack must consume the exact in-flight generation"
+        );
+        state.claimed_generation = None;
+        self.event = None;
+        let wake = state.phase == LibpathJournalPhase::Active && !state.pending.is_empty();
+        drop(state);
+        if wake {
+            self.journal.wake.notify_one();
+        }
+    }
+}
+
+impl Drop for LibpathJournalDelivery {
+    fn drop(&mut self) {
+        let Some(event) = self.event.take() else {
+            return;
+        };
+        let mut state = self.journal.state.lock();
+        if state.claimed_generation != Some(self.generation) {
+            return;
+        }
+        state.claimed_generation = None;
+        if state.phase != LibpathJournalPhase::Closed {
+            let newer = std::mem::take(&mut state.pending);
+            state.pending.record(event);
+            if newer.dropped {
+                state.pending.record(LibpathEvent::Dropped);
+            } else if newer.rescan_required {
+                state.pending.record(LibpathEvent::Rescan);
+            } else if !newer.changes.is_empty() {
+                let mut added = HashSet::new();
+                let mut removed = HashSet::new();
+                let mut touched = HashSet::new();
+                for (name, change) in newer.changes {
+                    match change {
+                        LibpathPackageChange::Added => {
+                            added.insert(name);
+                        }
+                        LibpathPackageChange::Removed => {
+                            removed.insert(name);
+                        }
+                        LibpathPackageChange::Touched => {
+                            touched.insert(name);
+                        }
+                    }
+                }
+                state.pending.record(LibpathEvent::Changed {
+                    added,
+                    removed,
+                    touched,
+                });
+            }
+        }
+        let wake = state.phase == LibpathJournalPhase::Active && !state.pending.is_empty();
+        drop(state);
+        if wake {
+            self.journal.wake.notify_one();
+        }
+    }
+}
+
 use std::path::{Path, PathBuf};
 
 /// A snapshot of which package subdirectories exist under each libpath.
@@ -112,6 +484,7 @@ impl LibpathSnapshot {
     ///   effective on-disk package differs even though the name persists.
     ///
     /// Consumers should treat all three as invalidation triggers.
+    #[cfg(test)]
     pub(crate) fn diff(&self, other: &Self) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
         let prev = self.winning_roots();
         let next = other.winning_roots();
@@ -133,6 +506,35 @@ impl LibpathSnapshot {
             }
         }
         (added, removed, moved)
+    }
+
+    fn diff_bounded(
+        &self,
+        other: &Self,
+    ) -> Option<(HashSet<String>, HashSet<String>, HashSet<String>)> {
+        let prev = self.winning_roots();
+        let next = other.winning_roots();
+        let mut added = HashSet::new();
+        let mut removed = HashSet::new();
+        let mut moved = HashSet::new();
+        let mut changed = HashSet::new();
+        for name in prev.keys().chain(next.keys()) {
+            let target = match (prev.get(name), next.get(name)) {
+                (None, Some(_)) => Some(&mut added),
+                (Some(_), None) => Some(&mut removed),
+                (Some(previous), Some(current)) if previous != current => Some(&mut moved),
+                _ => None,
+            };
+            if let Some(target) = target
+                && changed.insert(name.clone())
+            {
+                if changed.len() > LIBPATH_JOURNAL_NAME_CAPACITY {
+                    return None;
+                }
+                target.insert(name.clone());
+            }
+        }
+        Some((added, removed, moved))
     }
 
     /// True if any watched root currently contains a package with this name.
@@ -340,23 +742,78 @@ pub struct LibpathWatcherHandle {
     _watcher: notify::RecommendedWatcher,
     /// Abort handle for the debounce/diff task.
     task: tokio::task::JoinHandle<()>,
+    /// Prospective journals are closed explicitly so a blocked consumer exits
+    /// even while callback-side Arcs still exist.
+    journal: Option<Arc<LibpathWatchJournal>>,
+    /// Compatibility bridge for the public mpsc API.
+    bridge: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(test)]
+    drop_probe: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(test)]
+impl LibpathWatcherHandle {
+    pub(crate) fn set_drop_probe(&mut self, probe: impl Fn() + Send + Sync + 'static) {
+        self.drop_probe = Some(Box::new(probe));
+    }
 }
 
 impl Drop for LibpathWatcherHandle {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(probe) = self.drop_probe.as_ref() {
+            probe();
+        }
+        if let Some(journal) = self.journal.as_ref() {
+            journal.close();
+        }
         self.task.abort();
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.abort();
+        }
     }
 }
 
 /// Start watching `paths`. Events are debounced by `debounce` and delivered on `tx`.
 ///
-/// On fatal setup failure (all paths unwatchable), emits a single
-/// `LibpathEvent::Dropped` and returns `None`. On partial failure (some paths
-/// attached), proceeds with the paths that succeeded.
+/// Setup is all-or-nothing. If any requested path cannot be watched, emits a
+/// single `LibpathEvent::Dropped`, tears down every attachment, and returns
+/// `None`; reporting full coverage while silently omitting a library path
+/// would make cache invalidation unsound.
 pub fn spawn_watcher(
     paths: Vec<PathBuf>,
     debounce: Duration,
     tx: mpsc::Sender<LibpathEvent>,
+) -> Option<LibpathWatcherHandle> {
+    let journal = LibpathWatchJournal::new_buffering();
+    let mut handle = match spawn_watcher_into_journal(paths, debounce, Arc::clone(&journal)) {
+        Some(handle) => handle,
+        None => {
+            let _ = tx.try_send(LibpathEvent::Dropped);
+            return None;
+        }
+    };
+    assert!(
+        journal.try_activate(),
+        "a newly created compatibility journal must be buffering"
+    );
+    let bridge_journal = Arc::clone(&journal);
+    handle.bridge = Some(tokio::spawn(async move {
+        while let Some(mut delivery) = bridge_journal.claim().await {
+            if tx.send(delivery.event().clone()).await.is_err() {
+                bridge_journal.close();
+                return;
+            }
+            delivery.ack();
+        }
+    }));
+    Some(handle)
+}
+
+fn spawn_watcher_into_journal(
+    paths: Vec<PathBuf>,
+    debounce: Duration,
+    journal: Arc<LibpathWatchJournal>,
 ) -> Option<LibpathWatcherHandle> {
     use notify::{RecursiveMode, Watcher};
 
@@ -367,20 +824,27 @@ pub fn spawn_watcher(
 
     // Internal channel: notify -> debounce task. Use a std::sync::mpsc because
     // notify v6 only accepts a synchronous EventHandler closure.
-    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    // Bounded pre-activation journal: a watcher can receive a burst while its
+    // baseline snapshot is still scanning a large library. Raw-channel
+    // overflow deposits a sticky full-rescan obligation instead of growing
+    // memory without bound or silently losing invalidation work.
+    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<notify::Result<notify::Event>>(1024);
     let raw_tx_cloned = raw_tx.clone();
+    let overflow_journal = Arc::clone(&journal);
 
-    let mut watcher = match notify::recommended_watcher(move |res| {
-        // Best-effort send; receiver may have gone away on shutdown.
-        let _ = raw_tx_cloned.send(res);
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            log::warn!("LibpathWatcher: failed to construct watcher: {e}");
-            let _ = tx.try_send(LibpathEvent::Dropped);
-            return None;
-        }
-    };
+    let mut watcher =
+        match notify::recommended_watcher(move |res| match raw_tx_cloned.try_send(res) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                overflow_journal.require_rescan();
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                log::warn!("LibpathWatcher: failed to construct watcher: {e}");
+                return None;
+            }
+        };
 
     let mut attached: Vec<PathBuf> = Vec::new();
     for p in &paths {
@@ -409,26 +873,124 @@ pub fn spawn_watcher(
 
     if attached.is_empty() {
         log::warn!("LibpathWatcher: no libpath directories could be attached");
-        let _ = tx.try_send(LibpathEvent::Dropped);
+        return None;
+    }
+    if attached.len() != paths.len() {
+        log::warn!(
+            "LibpathWatcher: attached only {}/{} requested library paths; refusing partial coverage",
+            attached.len(),
+            paths.len()
+        );
         return None;
     }
 
-    // Capture the initial snapshot before returning so that any filesystem
-    // events queued between watcher.watch() and task startup are correctly
-    // detected as deltas. block_in_place signals tokio that this thread is
-    // about to block, allowing it to move other tasks off this worker.
-    let initial_snap = tokio::task::block_in_place(|| LibpathSnapshot::capture(&attached));
+    // The watcher is pre-armed before snapshot capture. Events that race the
+    // detached filesystem scan queue in `raw_rx`, so the debounce task journals
+    // them against this baseline instead of leaving a snapshot/attach gap.
+    let initial_snap = LibpathSnapshot::capture(&attached);
 
     let raw_rx = Arc::new(StdMutex::new(raw_rx));
+    let task_journal = Arc::clone(&journal);
     let task = tokio::spawn(async move {
         let snapshot = Arc::new(tokio::sync::Mutex::new(initial_snap));
-        debounce_loop(raw_rx, snapshot, Arc::new(attached), debounce, tx).await;
+        debounce_loop(raw_rx, snapshot, Arc::new(attached), debounce, task_journal).await;
     });
 
     Some(LibpathWatcherHandle {
         _watcher: watcher,
         task,
+        // Install the close owner before returning from synchronous setup.
+        // If the surrounding async `prearm_watcher` future is cancelled after
+        // its blocking worker finishes, dropping this handle still closes the
+        // consumer's buffering journal.
+        journal: Some(journal),
+        bridge: None,
+        #[cfg(test)]
+        drop_probe: None,
     })
+}
+
+/// Prepare a watcher into a caller-owned buffering journal while keeping
+/// synchronous attach/baseline work off the async executor.
+pub(crate) async fn prearm_watcher(
+    paths: Vec<PathBuf>,
+    debounce: Duration,
+    journal: Arc<LibpathWatchJournal>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Option<LibpathWatcherHandle> {
+    // This async-side guard covers cancellation while `spawn_blocking` is
+    // still running. The blocking worker has its own guard for panic/failure.
+    let mut close_guard = LibpathJournalSetupCloseGuard::new(Arc::clone(&journal));
+    let setup_journal = Arc::clone(&journal);
+    let mut worker = tokio::task::spawn_blocking(move || {
+        let mut close_guard = LibpathJournalSetupCloseGuard::new(Arc::clone(&setup_journal));
+        #[cfg(test)]
+        setup_journal.pause_prearm_setup_for_test();
+        if !setup_journal.is_buffering() {
+            return None;
+        }
+        let handle = spawn_watcher_into_journal(paths, debounce, setup_journal);
+        if handle.as_ref().is_some_and(|handle| {
+            handle
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.is_buffering())
+        }) {
+            close_guard.disarm();
+        }
+        handle
+    });
+    let result = tokio::select! {
+        result = &mut worker => result,
+        _ = shutdown.cancelled() => return None,
+    };
+    match result {
+        Ok(Some(handle)) if journal.is_buffering() => {
+            close_guard.disarm();
+            Some(handle)
+        }
+        Ok(Some(handle)) => {
+            drop(handle);
+            None
+        }
+        Ok(None) => None,
+        Err(error) => {
+            log::warn!("LibpathWatcher: prearmed setup worker failed: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+struct PrearmSetupTestPause {
+    arrived: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+struct LibpathJournalSetupCloseGuard {
+    journal: Arc<LibpathWatchJournal>,
+    armed: bool,
+}
+
+impl LibpathJournalSetupCloseGuard {
+    fn new(journal: Arc<LibpathWatchJournal>) -> Self {
+        Self {
+            journal,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LibpathJournalSetupCloseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.journal.close();
+        }
+    }
 }
 
 async fn debounce_loop(
@@ -436,7 +998,7 @@ async fn debounce_loop(
     snapshot: Arc<tokio::sync::Mutex<LibpathSnapshot>>,
     paths: Arc<Vec<PathBuf>>,
     debounce: Duration,
-    tx: mpsc::Sender<LibpathEvent>,
+    journal: Arc<LibpathWatchJournal>,
 ) {
     loop {
         // Block on the next raw event. We move raw_rx across an await using
@@ -457,37 +1019,66 @@ async fn debounce_loop(
                 // An `Err` notify result at the head of the stream means notify
                 // surfaced an error for this callback — log and proceed with an
                 // empty starting path list so we still run the diff.
+                let mut raw_paths_overflowed = false;
                 let mut event_paths: Vec<PathBuf> = match notify_result {
-                    Ok(evt) => evt.paths,
+                    Ok(mut evt) => {
+                        if evt.paths.len() > LIBPATH_RAW_PATH_CAPACITY {
+                            evt.paths.truncate(LIBPATH_RAW_PATH_CAPACITY);
+                            raw_paths_overflowed = true;
+                        }
+                        evt.paths
+                    }
                     Err(e) => {
                         log::warn!("LibpathWatcher: notify error event: {e}");
+                        journal.require_rescan();
                         Vec::new()
                     }
                 };
                 tokio::time::sleep(debounce).await;
                 let rx_arc = Arc::clone(&raw_rx);
-                let drained_paths: Vec<PathBuf> = match tokio::task::spawn_blocking(move || {
-                    let mut paths = Vec::new();
-                    let guard = rx_arc.lock().unwrap();
-                    while let Ok(res) = guard.try_recv() {
-                        match res {
-                            Ok(evt) => paths.extend(evt.paths),
-                            Err(e) => {
-                                log::warn!("LibpathWatcher: notify error during drain: {e}")
+                let (drained_paths, drained_error, drained_overflow): (Vec<PathBuf>, bool, bool) =
+                    match tokio::task::spawn_blocking(move || {
+                        let mut paths = Vec::new();
+                        let mut saw_error = false;
+                        let mut overflowed = false;
+                        let guard = rx_arc.lock().unwrap();
+                        while let Ok(res) = guard.try_recv() {
+                            match res {
+                                Ok(evt) => {
+                                    let remaining =
+                                        LIBPATH_RAW_PATH_CAPACITY.saturating_sub(paths.len());
+                                    if evt.paths.len() > remaining {
+                                        overflowed = true;
+                                    }
+                                    paths.extend(evt.paths.into_iter().take(remaining));
+                                }
+                                Err(e) => {
+                                    log::warn!("LibpathWatcher: notify error during drain: {e}");
+                                    saw_error = true;
+                                }
                             }
                         }
-                    }
-                    paths
-                })
-                .await
-                {
-                    Ok(paths) => paths,
-                    Err(e) => {
-                        log::warn!("LibpathWatcher: drain task failed: {e}");
-                        Vec::new()
-                    }
-                };
-                event_paths.extend(drained_paths);
+                        (paths, saw_error, overflowed)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            log::warn!("LibpathWatcher: drain task failed: {e}");
+                            (Vec::new(), true, false)
+                        }
+                    };
+                if drained_error {
+                    journal.require_rescan();
+                }
+                let remaining = LIBPATH_RAW_PATH_CAPACITY.saturating_sub(event_paths.len());
+                if drained_paths.len() > remaining {
+                    raw_paths_overflowed = true;
+                }
+                event_paths.extend(drained_paths.into_iter().take(remaining));
+                if raw_paths_overflowed || drained_overflow {
+                    journal.require_rescan();
+                }
 
                 // Diff and derive touched under a single snapshot-lock acquisition.
                 let paths_for_capture = paths.clone();
@@ -499,13 +1090,17 @@ async fn debounce_loop(
                     Ok(snap) => snap,
                     Err(e) => {
                         log::warn!("LibpathWatcher: capture task failed: {e}");
-                        let _ = tx.send(LibpathEvent::Dropped).await;
+                        journal.record(LibpathEvent::Dropped);
                         return;
                     }
                 };
                 let (added, removed, touched) = {
                     let mut snap_guard = snapshot.lock().await;
-                    let (added, removed, moved) = snap_guard.diff(&next_snap);
+                    let Some((added, removed, moved)) = snap_guard.diff_bounded(&next_snap) else {
+                        *snap_guard = next_snap;
+                        journal.require_rescan();
+                        continue;
+                    };
                     let mut touched =
                         touched_from_events(&event_paths, &paths, &snap_guard, &next_snap);
                     // Packages whose winning libpath changed are also "touched"
@@ -517,25 +1112,34 @@ async fn debounce_loop(
                 };
 
                 if !added.is_empty() || !removed.is_empty() || !touched.is_empty() {
-                    let _ = tx
-                        .send(LibpathEvent::Changed {
-                            added,
-                            removed,
-                            touched,
-                        })
-                        .await;
+                    if added
+                        .iter()
+                        .chain(removed.iter())
+                        .chain(touched.iter())
+                        .collect::<HashSet<_>>()
+                        .len()
+                        > LIBPATH_JOURNAL_NAME_CAPACITY
+                    {
+                        journal.require_rescan();
+                        continue;
+                    }
+                    journal.record(LibpathEvent::Changed {
+                        added,
+                        removed,
+                        touched,
+                    });
                 }
             }
             Ok(Err(_disconnect)) => {
                 log::warn!("LibpathWatcher: raw channel disconnected, exiting");
                 // Notify consumer so the fallback (full cache clear) path runs;
                 // otherwise package invalidation silently stops for this session.
-                let _ = tx.send(LibpathEvent::Dropped).await;
+                journal.record(LibpathEvent::Dropped);
                 return;
             }
             Err(join_err) => {
                 log::warn!("LibpathWatcher: blocking task failed: {join_err}");
-                let _ = tx.send(LibpathEvent::Dropped).await;
+                journal.record(LibpathEvent::Dropped);
                 return;
             }
         }
@@ -578,7 +1182,9 @@ mod watcher_tests {
                 assert_eq!(added, ["foo".to_string()].into_iter().collect());
                 assert!(removed.is_empty());
             }
-            LibpathEvent::Dropped => panic!("expected Changed, got Dropped"),
+            LibpathEvent::Dropped | LibpathEvent::Rescan => {
+                panic!("expected Changed, got terminal/rescan")
+            }
         }
     }
 
@@ -612,7 +1218,9 @@ mod watcher_tests {
             LibpathEvent::Changed { added, .. } => {
                 assert!(added.contains("foo"), "expected foo in added: {:?}", added);
             }
-            LibpathEvent::Dropped => panic!("expected Changed for add, got Dropped"),
+            LibpathEvent::Dropped | LibpathEvent::Rescan => {
+                panic!("expected Changed for add, got terminal/rescan")
+            }
         }
 
         // Rewrite files inside the existing package directory — no listing
@@ -643,7 +1251,9 @@ mod watcher_tests {
                     touched
                 );
             }
-            LibpathEvent::Dropped => panic!("expected Changed, got Dropped"),
+            LibpathEvent::Dropped | LibpathEvent::Rescan => {
+                panic!("expected Changed, got terminal/rescan")
+            }
         }
     }
 
@@ -671,7 +1281,9 @@ mod watcher_tests {
                 assert_eq!(removed, ["foo".to_string()].into_iter().collect());
                 assert!(added.is_empty());
             }
-            LibpathEvent::Dropped => panic!("expected Changed, got Dropped"),
+            LibpathEvent::Dropped | LibpathEvent::Rescan => {
+                panic!("expected Changed, got terminal/rescan")
+            }
         }
     }
 
@@ -695,11 +1307,339 @@ mod watcher_tests {
             .expect("channel still open");
         assert!(matches!(evt, LibpathEvent::Dropped));
     }
+
+    #[tokio::test]
+    async fn prospective_watcher_refuses_partial_coverage_and_closes_journal() {
+        let valid = tempdir().unwrap();
+        let journal = LibpathWatchJournal::new_buffering();
+        let handle = prearm_watcher(
+            vec![
+                valid.path().to_path_buf(),
+                valid.path().join("missing-library"),
+            ],
+            Duration::from_millis(50),
+            Arc::clone(&journal),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(handle.is_none());
+        assert!(journal.is_closed_for_test());
+        assert!(journal.claim().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_prearm_after_setup_starts_closes_buffering_journal() {
+        let valid = tempdir().unwrap();
+        let journal = LibpathWatchJournal::new_buffering();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        journal.arm_prearm_setup_pause_for_test(PrearmSetupTestPause {
+            arrived: arrived_tx,
+            release: release_rx,
+        });
+
+        let task = tokio::spawn(prearm_watcher(
+            vec![valid.path().to_path_buf()],
+            Duration::from_millis(50),
+            Arc::clone(&journal),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        tokio::task::spawn_blocking(move || arrived_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The pause belongs only to this journal. An unrelated prearm must
+        // complete instead of stealing or waiting on its setup hook.
+        let unrelated = tempdir().unwrap();
+        let unrelated_journal = LibpathWatchJournal::new_buffering();
+        let unrelated_handle = tokio::time::timeout(
+            Duration::from_secs(10),
+            prearm_watcher(
+                vec![unrelated.path().to_path_buf()],
+                Duration::from_millis(50),
+                Arc::clone(&unrelated_journal),
+                tokio_util::sync::CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("unrelated journal has no prearm pause")
+        .expect("unrelated path attaches");
+        drop(unrelated_handle);
+
+        task.abort();
+        match task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("prearm task must observe cancellation"),
+        }
+        assert!(
+            journal.is_closed_for_test(),
+            "async-side guard closes before detached setup is released"
+        );
+        release_tx.send(()).unwrap();
+        assert!(journal.claim().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cancels_paused_prospective_prearm_and_closes_journal() {
+        let valid = tempdir().unwrap();
+        let journal = LibpathWatchJournal::new_buffering();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        journal.arm_prearm_setup_pause_for_test(PrearmSetupTestPause {
+            arrived: arrived_tx,
+            release: release_rx,
+        });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(prearm_watcher(
+            vec![valid.path().to_path_buf()],
+            Duration::from_millis(50),
+            Arc::clone(&journal),
+            shutdown.clone(),
+        ));
+        tokio::task::spawn_blocking(move || arrived_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("shutdown wins while blocking setup remains paused")
+                .unwrap()
+                .is_none()
+        );
+        assert!(journal.is_closed_for_test());
+        release_tx.send(()).unwrap();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn changed(added: &[&str], removed: &[&str], touched: &[&str]) -> LibpathEvent {
+        LibpathEvent::Changed {
+            added: added.iter().map(|name| (*name).to_string()).collect(),
+            removed: removed.iter().map(|name| (*name).to_string()).collect(),
+            touched: touched.iter().map(|name| (*name).to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn journal_buffers_until_one_checked_activation() {
+        let journal = LibpathWatchJournal::new_buffering();
+        journal.record(changed(&["alpha"], &[], &[]));
+        let waiter = tokio::spawn({
+            let journal = Arc::clone(&journal);
+            async move { journal.claim().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        assert!(journal.is_buffering());
+        assert!(journal.try_activate());
+        assert!(!journal.try_activate());
+        let mut delivery = waiter.await.unwrap().unwrap();
+        assert_eq!(delivery.event(), &changed(&["alpha"], &[], &[]));
+        delivery.ack();
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_cannot_claim_ready_journal_currency() {
+        let journal = LibpathWatchJournal::new_buffering();
+        journal.record(changed(&["alpha"], &[], &[]));
+        assert!(journal.try_activate());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+        assert!(
+            journal.claim_until_shutdown(&shutdown).await.is_none(),
+            "already-cancelled shutdown wins before ready currency is removed"
+        );
+        let mut delivery = journal.claim().await.unwrap();
+        assert_eq!(delivery.event(), &changed(&["alpha"], &[], &[]));
+        delivery.ack();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn journal_retry_delay_is_not_shortened_by_event_storm() {
+        let journal = LibpathWatchJournal::new_buffering();
+        assert!(journal.try_activate());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let retry = tokio::spawn({
+            let journal = Arc::clone(&journal);
+            let shutdown = shutdown.clone();
+            async move { journal.wait_retry(Duration::from_secs(10), &shutdown).await }
+        });
+        tokio::task::yield_now().await;
+        for index in 0..100 {
+            journal.record(changed(&[&format!("package-{index}")], &[], &[]));
+        }
+        tokio::task::yield_now().await;
+        assert!(!retry.is_finished());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert!(!retry.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(retry.await.unwrap());
+    }
+
+    #[test]
+    fn journal_activation_rejects_closed_phase() {
+        let journal = LibpathWatchJournal::new_buffering();
+        journal.close();
+        assert!(journal.is_closed_for_test());
+        assert!(!journal.try_activate());
+    }
+
+    #[tokio::test]
+    async fn journal_coalesces_package_changes_last_write_wins() {
+        let journal = LibpathWatchJournal::new_buffering();
+        journal.record(changed(&["add_remove", "add_touch"], &[], &[]));
+        journal.record(changed(&["remove_add"], &["add_remove"], &["add_touch"]));
+        journal.record(changed(&[], &["remove_add"], &[]));
+        journal.record(changed(&["remove_add"], &[], &[]));
+        assert!(journal.try_activate());
+
+        let mut delivery = journal.claim().await.unwrap();
+        assert_eq!(
+            delivery.event(),
+            &changed(&["remove_add"], &["add_remove"], &["add_touch"])
+        );
+        delivery.ack();
+    }
+
+    #[tokio::test]
+    async fn journal_huge_change_promotes_to_rescan_and_dropped_dominates() {
+        let journal = LibpathWatchJournal::new_buffering();
+        let touched = (0..=LIBPATH_JOURNAL_NAME_CAPACITY)
+            .map(|index| format!("pkg_{index}"))
+            .collect();
+        journal.record(LibpathEvent::Changed {
+            added: HashSet::new(),
+            removed: HashSet::new(),
+            touched,
+        });
+        journal.record(changed(&["subsumed"], &[], &[]));
+        journal.record(LibpathEvent::Dropped);
+        journal.record(LibpathEvent::Rescan);
+        assert!(journal.try_activate());
+
+        let mut delivery = journal.claim().await.unwrap();
+        assert_eq!(delivery.event(), &LibpathEvent::Dropped);
+        delivery.ack();
+    }
+
+    #[tokio::test]
+    async fn journal_capacity_counts_distinct_names_and_repeated_keys_do_not_overflow() {
+        let journal = LibpathWatchJournal::new_buffering();
+        for index in 0..LIBPATH_JOURNAL_NAME_CAPACITY {
+            journal.record(changed(&[], &[], &[&format!("pkg_{index}")]));
+        }
+        for _ in 0..LIBPATH_JOURNAL_NAME_CAPACITY {
+            journal.record(changed(&["pkg_0"], &[], &[]));
+        }
+        assert!(journal.try_activate());
+        let mut delivery = journal.claim().await.unwrap();
+        let LibpathEvent::Changed {
+            added,
+            removed,
+            touched,
+        } = delivery.event()
+        else {
+            panic!("exact capacity remains targeted")
+        };
+        assert_eq!(added, &HashSet::from(["pkg_0".to_string()]));
+        assert!(removed.is_empty());
+        assert_eq!(added.len() + touched.len(), LIBPATH_JOURNAL_NAME_CAPACITY);
+        delivery.ack();
+
+        let overflow = LibpathWatchJournal::new_buffering();
+        for index in 0..=LIBPATH_JOURNAL_NAME_CAPACITY {
+            overflow.record(changed(&[], &[], &[&format!("pkg_{index}")]));
+        }
+        assert!(overflow.try_activate());
+        let delivery = overflow.claim().await.unwrap();
+        assert_eq!(delivery.event(), &LibpathEvent::Rescan);
+    }
+
+    #[tokio::test]
+    async fn journal_rescan_ack_preserves_newer_changed_and_nack_subsumes_it() {
+        let journal = LibpathWatchJournal::new_buffering();
+        journal.record(LibpathEvent::Rescan);
+        assert!(journal.try_activate());
+        let mut rescan = journal.claim().await.unwrap();
+        journal.record(changed(&["newer"], &[], &[]));
+        rescan.ack();
+        let mut changed_delivery = journal.claim().await.unwrap();
+        assert_eq!(changed_delivery.event(), &changed(&["newer"], &[], &[]));
+        changed_delivery.ack();
+
+        journal.record(LibpathEvent::Rescan);
+        let rescan = journal.claim().await.unwrap();
+        journal.record(changed(&["subsumed"], &[], &[]));
+        drop(rescan);
+        let mut restored = journal.claim().await.unwrap();
+        assert_eq!(restored.event(), &LibpathEvent::Rescan);
+        restored.ack();
+    }
+
+    #[tokio::test]
+    async fn journal_close_during_claim_prevents_requeue_and_wakes_waiter() {
+        let journal = LibpathWatchJournal::new_buffering();
+        journal.record(changed(&["claimed"], &[], &[]));
+        assert!(journal.try_activate());
+        let delivery = journal.claim().await.unwrap();
+        let blocked = tokio::spawn({
+            let journal = Arc::clone(&journal);
+            async move { journal.claim().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        journal.close();
+        drop(delivery);
+        assert!(blocked.await.unwrap().is_none());
+        assert!(journal.is_closed_for_test());
+    }
+
+    #[tokio::test]
+    async fn journal_nack_remerges_older_claim_before_newer_changes() {
+        let journal = LibpathWatchJournal::new_buffering();
+        journal.record(changed(&["alpha"], &[], &[]));
+        assert!(journal.try_activate());
+        let delivery = journal.claim().await.unwrap();
+        journal.record(changed(&["beta"], &["alpha"], &[]));
+        drop(delivery);
+
+        let mut redelivery = journal.claim().await.unwrap();
+        assert_eq!(redelivery.event(), &changed(&["beta"], &["alpha"], &[]));
+        redelivery.ack();
+    }
+
+    #[tokio::test]
+    async fn journal_ack_preserves_newer_dropped() {
+        let journal = LibpathWatchJournal::new_buffering();
+        journal.record(LibpathEvent::Rescan);
+        assert!(journal.try_activate());
+        let mut delivery = journal.claim().await.unwrap();
+        journal.record(LibpathEvent::Dropped);
+        delivery.ack();
+
+        let mut terminal = journal.claim().await.unwrap();
+        assert_eq!(terminal.event(), &LibpathEvent::Dropped);
+        terminal.ack();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "exact in-flight generation")]
+    async fn journal_ack_rejects_an_already_consumed_generation() {
+        let journal = LibpathWatchJournal::new_buffering();
+        journal.record(LibpathEvent::Rescan);
+        assert!(journal.try_activate());
+        let mut delivery = journal.claim().await.unwrap();
+        delivery.ack();
+        delivery.ack();
+    }
 
     #[test]
     fn affected_packages_unions_all_three_sets() {

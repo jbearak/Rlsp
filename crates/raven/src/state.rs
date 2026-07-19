@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::content_provider::ContentProvider;
 use crate::indentation::IndentationStyle;
@@ -24,6 +24,7 @@ static NEXT_WORKSPACE_SCAN_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_WORKSPACE_SCAN_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_PACKAGE_LIBRARY_INSTALL_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_LIBRARY_REPLACEMENT_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_LIBRARY_ROUTING_RECONCILE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SYSTEM_FILE_ROUTING_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_LIBPATH_WATCHER_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_ANALYSIS_TRANSFER_FINALIZATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -825,7 +826,28 @@ pub struct WorldState {
     /// they preserve this intent. The replacement driver must then rebase the
     /// same intent onto the additive winner and repeat its unpublished
     /// clear/warm/derive round; it must never mint a replacement retry intent.
-    pending_library_replacement: Option<LibraryReplacementIntent>,
+    library_replacement_lifecycle: Arc<parking_lot::Mutex<LibraryReplacementLifecycle>>,
+    /// Synchronous shutdown fence shared with pre-seal Drop owners.
+    routing_shutdown: Arc<AtomicBool>,
+    /// Edge-triggered pickup signal for durable routing reconcile requests.
+    ///
+    /// Requests remain resident in `library_replacement_lifecycle`; this
+    /// notification is only a wakeup hint, so a coalesced notification cannot
+    /// lose work.
+    library_routing_reconcile_wake: Arc<tokio::sync::Notify>,
+    /// Monotonic durable edge paired with `library_routing_reconcile_wake`.
+    ///
+    /// Every producer advances this before notifying. Parked degraded repair
+    /// therefore distinguishes a real edge from a consumed/coalesced Notify
+    /// permit without changing its paced-attempt behavior.
+    library_routing_reconcile_wake_generation: Arc<AtomicU64>,
+    /// Durable token for eligibility changes that deliberately retain the
+    /// same reconcile request identity.
+    ///
+    /// Ordinary request producers mint a fresh request ID and must not advance
+    /// this generation. It exists solely so the pickup coordinator can
+    /// distinguish an external eligibility edge from its own redeposit wake.
+    library_routing_reconcile_eligibility_generation: Arc<AtomicU64>,
     /// Never-reused identity of the most recently installed package seed.
     package_seed_install_id: u64,
     /// Exact seed owner currently assigned to the coalesced deferred
@@ -845,6 +867,9 @@ pub struct WorldState {
     /// any post-seed or system worker is allowed to run.
     pending_post_seed_outer_handles: Vec<AnalysisTransferHandle>,
     pending_post_seed_outer_candidates: Vec<AnalysisTransferCandidate>,
+    /// Warning notes detached from a routing transfer only after its durable
+    /// post-seed/finalization owner has been registered.
+    deferred_library_routing_build_notes: Vec<String>,
     /// Dedicated latest-owner identity for all `system.file()` routing inputs.
     ///
     /// This is deliberately narrower than `package_input_generation`: unrelated
@@ -922,6 +947,16 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) watched_batch_pre_finalize_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic barrier between ordered update and deletion commits in
+    /// the over-budget watched-batch fallback.
+    #[cfg(test)]
+    pub(crate) watched_batch_fallback_after_updates_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic barrier after a config routing handoff is queued and
+    /// before its tracked root waits for receiver acknowledgement.
+    #[cfg(test)]
+    pub(crate) config_system_file_post_send_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
     #[cfg(test)]
     pub(crate) diagnostics_post_publish_lock_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
@@ -935,6 +970,25 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) package_init_pre_commit_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic cancellation barrier after reconcile request claim and
+    /// before any replacement guard/pre-seal ownership is armed.
+    #[cfg(test)]
+    pub(crate) package_init_post_claim_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Terminal reconcile-attempt barrier immediately before self-wake drain.
+    #[cfg(test)]
+    pub(crate) library_routing_reconcile_pre_drain_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Terminal reconcile-attempt barrier after the final eligibility reload
+    /// and before parking.
+    #[cfg(test)]
+    pub(crate) library_routing_reconcile_post_reload_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Barrier after degraded repair's final attempt snapshots the durable
+    /// wake edge and immediately before its park-boundary recheck.
+    #[cfg(test)]
+    pub(crate) degraded_reconcile_pre_park_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
     #[cfg(test)]
     pub(crate) system_file_pre_commit_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
@@ -945,6 +999,10 @@ pub struct WorldState {
     pub(crate) system_file_test_reject_remaining: usize,
     #[cfg(test)]
     pub(crate) system_file_test_commit_attempts: usize,
+    /// Instance-scoped executor seam for paused-time routing tests. Production
+    /// and the dedicated physical-lifetime tests leave this disabled.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) library_routing_derivation_on_tokio_for_test: bool,
     #[cfg(test)]
     pub(crate) library_routing_test_reject_remaining: usize,
     #[cfg(test)]
@@ -990,6 +1048,8 @@ pub struct WorldState {
     /// degraded/not-ready state without consulting the host R installation.
     #[cfg(test)]
     pub(crate) force_package_library_not_ready_for_test: bool,
+    #[cfg(test)]
+    pub(crate) force_package_init_stale_for_test: bool,
 
     // Cross-file state
     pub cross_file_config: CrossFileConfig,
@@ -1138,9 +1198,9 @@ pub struct WorldState {
     /// events or closes recreate the entry from the state-wide counter, so old
     /// generations are never reused.
     pub watched_file_resync_generations: HashMap<Url, u64>,
-    /// Handle to the running libpath watcher, if any. Dropping it stops watching.
-    pub libpath_watcher_handle:
-        Option<std::sync::Arc<super::libpath_watcher::LibpathWatcherHandle>>,
+    /// Exact applied watcher lifecycle; handle ownership is never exposed for
+    /// cloning outside the central watcher CAS paths.
+    libpath_watcher: LibpathWatcherState,
     /// Never-reused provenance for the active libpath watcher/consumer.
     ///
     /// Library replacement advances this in the same commit that publishes the
@@ -1221,8 +1281,8 @@ pub struct WorldState {
     /// Coalescing lifecycle for the one delayed package-seed convergence task.
     pub(crate) package_seed_retry: crate::package_state::PackageSeedRetryLifecycle,
     /// Additive lifecycle for deferred package-library routing ledgers.
-    pub(crate) library_routing_retry: crate::package_state::PackageSeedRetryLifecycle,
-    pub(crate) watched_package_retry: crate::package_state::PackageSeedRetryLifecycle,
+    pub(crate) library_routing_retry: Arc<crate::package_state::PackageSeedRetryLifecycle>,
+    pub(crate) watched_package_retry: Arc<crate::package_state::PackageSeedRetryLifecycle>,
     pub(crate) sysdata_fallback_retry: crate::package_state::PackageSeedRetryLifecycle,
 }
 
@@ -1801,6 +1861,9 @@ pub(crate) struct PreparedWatchedBatchAnalysis {
     pub(crate) package: Option<(PackageProjectionBasis, PreparedPackageProjection)>,
     pub(crate) package_open_records: std::collections::BTreeMap<Url, OpenRecordToken>,
     pub(crate) watched_generations: Vec<(Url, u64)>,
+    /// Install an exact transfer ledger with the package-only CAS before an
+    /// over-budget caller performs ordered closed-file commits.
+    pub(crate) durable_package_handoff: bool,
 }
 
 #[cfg(test)]
@@ -1811,6 +1874,7 @@ impl PreparedWatchedBatchAnalysis {
             package: None,
             package_open_records: Default::default(),
             watched_generations: Vec::new(),
+            durable_package_handoff: false,
         }
     }
 }
@@ -1838,12 +1902,476 @@ struct SystemFileAnalysisBasis {
 pub(crate) enum LibraryRoutingMutation {
     Replacement,
     Changed,
+    /// Unknown watcher loss while retaining the exact active watcher lineage.
+    ///
+    /// Unlike targeted `Changed`, this clears and fully warms the cache,
+    /// re-derives every `system.file()` source, and republishes all open
+    /// documents. Unlike `Dropped`, it does not replace the watcher.
+    FullRescan,
+    /// One exact watcher-independent repair after a watcher-only primary and
+    /// recovery attach both failed.
+    DegradedReconcile,
     Dropped,
 }
 
 /// Never-reused owner of one package-library replacement request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LibraryReplacementIntent(u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LibraryRoutingReconcileTelemetry {
+    pub(crate) package_config_generation: u64,
+    pub(crate) package_input_generation: u64,
+    pub(crate) packages_enabled: bool,
+    pub(crate) packages_r_path: Option<PathBuf>,
+    pub(crate) packages_additional_library_paths: Vec<PathBuf>,
+    pub(crate) workspace_folders: Vec<Url>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LibraryRoutingReconcileRequest {
+    pub(crate) id: u64,
+    pub(crate) telemetry: LibraryRoutingReconcileTelemetry,
+}
+
+#[derive(Default)]
+struct LibraryReplacementLifecycle {
+    pending: Option<LibraryReplacementIntent>,
+    reconcile_required: Option<LibraryRoutingReconcileRequest>,
+    pre_seal: Option<LibraryRoutingPreSealDeposit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LibraryReplacementAbortPolicy {
+    Reconcile,
+    NoReconcile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LibraryRoutingPreSealPostSeed {
+    pub(crate) root: PathBuf,
+    pub(crate) identity: PackageSeedInstalledIdentity,
+    pub(crate) deferred_system_file: Option<PackageSeedInstalledIdentity>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LibraryRoutingPreSealDeposit {
+    pub(crate) id: u64,
+    replacement_intent: Option<LibraryReplacementIntent>,
+    pub(crate) telemetry: LibraryRoutingReconcileTelemetry,
+    pub(crate) handles: Vec<AnalysisTransferHandle>,
+    pub(crate) candidates: Vec<AnalysisTransferCandidate>,
+    pub(crate) fallback: Vec<Url>,
+    pub(crate) post_seed: Option<LibraryRoutingPreSealPostSeed>,
+    pub(crate) retired_post_seed_owners: Vec<PackageSeedInstalledIdentity>,
+    pub(crate) build_notes: Vec<String>,
+}
+
+impl LibraryRoutingPreSealDeposit {
+    fn from_basis(basis: &LibraryRoutingBasis) -> Self {
+        Self {
+            id: Self::mint_id(),
+            replacement_intent: basis.replacement_intent,
+            telemetry: LibraryRoutingReconcileTelemetry {
+                package_config_generation: basis.package_config_generation,
+                package_input_generation: basis.package_input_generation,
+                packages_enabled: basis.packages_enabled,
+                packages_r_path: basis.packages_r_path.clone(),
+                packages_additional_library_paths: basis.packages_additional_library_paths.clone(),
+                workspace_folders: basis.workspace_folders.clone(),
+            },
+            handles: Vec::new(),
+            candidates: Vec::new(),
+            fallback: Vec::new(),
+            post_seed: None,
+            retired_post_seed_owners: Vec::new(),
+            build_notes: Vec::new(),
+        }
+    }
+
+    fn mint_id() -> u64 {
+        NEXT_LIBRARY_ROUTING_RECONCILE_REQUEST_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("library-routing pre-seal identity exhausted")
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+            && self.candidates.is_empty()
+            && self.fallback.is_empty()
+            && self.post_seed.is_none()
+            && self.retired_post_seed_owners.is_empty()
+            && self.build_notes.is_empty()
+    }
+
+    pub(crate) fn add_obligations(
+        &mut self,
+        handles: Vec<AnalysisTransferHandle>,
+        candidates: Vec<AnalysisTransferCandidate>,
+        fallback: Vec<Url>,
+        post_seed: Option<LibraryRoutingPreSealPostSeed>,
+        build_notes: Vec<String>,
+    ) {
+        let incoming = Self {
+            id: Self::mint_id(),
+            replacement_intent: self.replacement_intent,
+            telemetry: self.telemetry.clone(),
+            handles,
+            candidates,
+            fallback,
+            post_seed,
+            retired_post_seed_owners: Vec::new(),
+            build_notes,
+        };
+        if incoming.is_empty() {
+            return;
+        }
+        self.merge(incoming);
+    }
+
+    fn merge(&mut self, mut incoming: Self) {
+        self.id = Self::mint_id();
+        match (self.replacement_intent, incoming.replacement_intent) {
+            (Some(existing), Some(candidate)) if candidate.0 > existing.0 => {
+                self.replacement_intent = Some(candidate);
+                self.telemetry = incoming.telemetry.clone();
+            }
+            (None, Some(candidate)) => {
+                self.replacement_intent = Some(candidate);
+                self.telemetry = incoming.telemetry.clone();
+            }
+            (None, None) => {
+                // Additive ledgers have no intent ordering; retain the most
+                // recently deposited telemetry snapshot.
+                self.telemetry = incoming.telemetry.clone();
+            }
+            (Some(_), Some(_)) | (Some(_), None) => {}
+        }
+        for handle in incoming.handles.drain(..) {
+            if !self.handles.contains(&handle) {
+                self.handles.push(handle);
+            }
+        }
+        for candidate in incoming.candidates.drain(..) {
+            let existing = self
+                .candidates
+                .iter()
+                .position(|prior| prior.uri == candidate.uri && prior.record == candidate.record);
+            if let Some(index) = existing {
+                let replace = matches!(
+                    candidate.reservation,
+                    AnalysisTransferReservationPolicy::Subject { .. }
+                ) || !matches!(
+                    self.candidates[index].reservation,
+                    AnalysisTransferReservationPolicy::Subject { .. }
+                );
+                if replace {
+                    self.candidates[index] = candidate;
+                }
+            } else {
+                self.candidates.push(candidate);
+            }
+        }
+        for uri in incoming.fallback.drain(..) {
+            if !self.fallback.contains(&uri) {
+                self.fallback.push(uri);
+            }
+        }
+        if let Some(incoming_post_seed) = incoming.post_seed.take() {
+            match self.post_seed.take() {
+                Some(mut existing)
+                    if existing.identity.seed_install_id
+                        == incoming_post_seed.identity.seed_install_id =>
+                {
+                    if existing.deferred_system_file.is_none() {
+                        existing.deferred_system_file = incoming_post_seed.deferred_system_file;
+                    } else if incoming_post_seed.deferred_system_file
+                        != existing.deferred_system_file
+                        && let Some(retired) = incoming_post_seed.deferred_system_file
+                    {
+                        self.retired_post_seed_owners.push(retired);
+                    }
+                    self.post_seed = Some(existing);
+                }
+                Some(existing)
+                    if existing.identity.seed_install_id
+                        > incoming_post_seed.identity.seed_install_id =>
+                {
+                    self.retire_pre_seal_post_seed(incoming_post_seed);
+                    self.post_seed = Some(existing);
+                }
+                Some(existing) => {
+                    self.retire_pre_seal_post_seed(existing);
+                    self.post_seed = Some(incoming_post_seed);
+                }
+                None => self.post_seed = Some(incoming_post_seed),
+            }
+        }
+        self.retired_post_seed_owners
+            .extend(incoming.retired_post_seed_owners);
+        self.retired_post_seed_owners
+            .sort_unstable_by_key(|identity| identity.seed_install_id);
+        self.retired_post_seed_owners.dedup();
+        self.build_notes.extend(incoming.build_notes);
+    }
+
+    fn retire_pre_seal_post_seed(&mut self, owner: LibraryRoutingPreSealPostSeed) {
+        self.retired_post_seed_owners.push(owner.identity);
+        if let Some(system) = owner.deferred_system_file
+            && system != owner.identity
+        {
+            self.retired_post_seed_owners.push(system);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LibraryRoutingPreSealOwner {
+    lifecycle: Arc<parking_lot::Mutex<LibraryReplacementLifecycle>>,
+    routing_shutdown: Arc<AtomicBool>,
+    reconcile_wake: Arc<tokio::sync::Notify>,
+    reconcile_wake_generation: Arc<AtomicU64>,
+}
+
+fn notify_library_routing_reconcile_edge(wake: &tokio::sync::Notify, generation: &AtomicU64) {
+    generation
+        .fetch_update(Ordering::Release, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("library-routing wake generation exhausted");
+    wake.notify_waiters();
+    wake.notify_one();
+}
+
+impl LibraryRoutingPreSealOwner {
+    pub(crate) fn deposit(&self, mut deposit: LibraryRoutingPreSealDeposit) {
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let mut lifecycle = self.lifecycle.lock();
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        if lifecycle.pending == deposit.replacement_intent {
+            lifecycle.pending = None;
+        }
+        if let Some(existing) = lifecycle.pre_seal.as_mut() {
+            existing.merge(deposit);
+        } else {
+            deposit.id = LibraryRoutingPreSealDeposit::mint_id();
+            lifecycle.pre_seal = Some(deposit);
+        }
+        let (id, telemetry) = lifecycle
+            .pre_seal
+            .as_ref()
+            .map(|stored| (stored.id, stored.telemetry.clone()))
+            .expect("pre-seal deposit was installed");
+        lifecycle.reconcile_required = Some(LibraryRoutingReconcileRequest { id, telemetry });
+        drop(lifecycle);
+        // Wake every current durable-obligation consumer (the generic
+        // replacement coordinator and any terminal-degraded watcher repair),
+        // then retain one permit for a consumer that has not parked yet.
+        notify_library_routing_reconcile_edge(
+            &self.reconcile_wake,
+            &self.reconcile_wake_generation,
+        );
+    }
+}
+
+/// Synchronous wake-token owner for additive Changed/Dropped routing.
+///
+/// Telemetry is diagnostic-only: pickup must always capture the current
+/// package-init key and must never use this snapshot for ABA-sensitive
+/// eligibility. Concrete obligations live only in the pre-seal ledger; this
+/// owner deliberately carries no handles, candidates, or post-seed identity.
+#[derive(Clone)]
+pub(crate) struct LibraryRoutingReconcileOwner {
+    lifecycle: Arc<parking_lot::Mutex<LibraryReplacementLifecycle>>,
+    routing_shutdown: Arc<AtomicBool>,
+    reconcile_wake: Arc<tokio::sync::Notify>,
+    reconcile_wake_generation: Arc<AtomicU64>,
+    telemetry: LibraryRoutingReconcileTelemetry,
+}
+
+impl LibraryRoutingReconcileOwner {
+    pub(crate) fn request(&self) {
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let id = NEXT_LIBRARY_ROUTING_RECONCILE_REQUEST_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("library-routing reconcile request identity exhausted");
+        let mut lifecycle = self.lifecycle.lock();
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        // Requests are interchangeable wake tokens. Never mutate `pending`
+        // replacement currency or the separately durable pre-seal ledger.
+        lifecycle.reconcile_required = Some(LibraryRoutingReconcileRequest {
+            id,
+            telemetry: self.telemetry.clone(),
+        });
+        drop(lifecycle);
+        notify_library_routing_reconcile_edge(
+            &self.reconcile_wake,
+            &self.reconcile_wake_generation,
+        );
+    }
+}
+
+/// Cancellation-safe ownership of one reconcile request removed for pickup.
+///
+/// The exact request identity is restored on abandonment so a cancelled
+/// foreground pickup cannot masquerade as fresh retry currency. A request
+/// deposited after this claim wins by simple slot presence.
+pub(crate) struct LibraryRoutingReconcileClaim {
+    lifecycle: Arc<parking_lot::Mutex<LibraryReplacementLifecycle>>,
+    routing_shutdown: Arc<AtomicBool>,
+    reconcile_wake: Arc<tokio::sync::Notify>,
+    reconcile_wake_generation: Arc<AtomicU64>,
+    request: Option<LibraryRoutingReconcileRequest>,
+}
+
+impl LibraryRoutingReconcileClaim {
+    pub(crate) fn request(&self) -> &LibraryRoutingReconcileRequest {
+        self.request
+            .as_ref()
+            .expect("armed reconcile claim retains its exact request")
+    }
+
+    /// Transfer responsibility to an already-armed replacement guard and
+    /// pre-seal obligation.
+    pub(crate) fn consume(mut self) {
+        let _lifecycle = self.lifecycle.lock();
+        self.request = None;
+    }
+}
+
+impl Drop for LibraryRoutingReconcileClaim {
+    fn drop(&mut self) {
+        let Some(request) = self.request.take() else {
+            return;
+        };
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let mut lifecycle = self.lifecycle.lock();
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        if lifecycle.reconcile_required.is_some() {
+            return;
+        }
+        lifecycle.reconcile_required = Some(request);
+        drop(lifecycle);
+        notify_library_routing_reconcile_edge(
+            &self.reconcile_wake,
+            &self.reconcile_wake_generation,
+        );
+    }
+}
+
+/// Synchronous cancellation owner for one unpublished replacement.
+///
+/// `Drop` deliberately locks only [`LibraryReplacementLifecycle`], never
+/// [`WorldState`]. If cancellation destroys the exact current obligation
+/// before publication, it retires that intent and deposits a fresh reconcile
+/// request for a later async pickup. A newer intent wins and is left intact.
+pub(crate) struct PendingLibraryReplacementGuard {
+    lifecycle: Arc<parking_lot::Mutex<LibraryReplacementLifecycle>>,
+    routing_shutdown: Arc<AtomicBool>,
+    reconcile_wake: Arc<tokio::sync::Notify>,
+    reconcile_wake_generation: Arc<AtomicU64>,
+    intent: LibraryReplacementIntent,
+    telemetry: LibraryRoutingReconcileTelemetry,
+    abort_policy: LibraryReplacementAbortPolicy,
+    armed: bool,
+}
+
+impl PendingLibraryReplacementGuard {
+    /// Retire a deliberately redundant replacement bundle atomically.
+    ///
+    /// `preserved` contains only adopted currency or concrete pre-seal
+    /// content; a fresh vacuous payload is passed as `None`. The exact pending
+    /// intent and both Drop owners are therefore resolved under one lifecycle
+    /// mutex, with no partial-take window that can manufacture phantom
+    /// reconciliation. A newer intent is never cleared.
+    pub(crate) fn retire_bundle_without_reconcile(
+        mut self,
+        mut preserved: Option<LibraryRoutingPreSealDeposit>,
+    ) {
+        let mut lifecycle = self.lifecycle.lock();
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            self.armed = false;
+            return;
+        }
+        if lifecycle.pending == Some(self.intent) {
+            lifecycle.pending = None;
+        }
+        self.armed = false;
+        let wake = if let Some(mut deposit) = preserved.take() {
+            if let Some(existing) = lifecycle.pre_seal.as_mut() {
+                existing.merge(deposit);
+            } else {
+                deposit.id = LibraryRoutingPreSealDeposit::mint_id();
+                lifecycle.pre_seal = Some(deposit);
+            }
+            let (id, telemetry) = lifecycle
+                .pre_seal
+                .as_ref()
+                .map(|stored| (stored.id, stored.telemetry.clone()))
+                .expect("preserved pre-seal deposit was installed");
+            lifecycle.reconcile_required = Some(LibraryRoutingReconcileRequest { id, telemetry });
+            true
+        } else {
+            false
+        };
+        drop(lifecycle);
+        if wake {
+            notify_library_routing_reconcile_edge(
+                &self.reconcile_wake,
+                &self.reconcile_wake_generation,
+            );
+        }
+    }
+}
+
+impl Drop for PendingLibraryReplacementGuard {
+    fn drop(&mut self) {
+        if !self.armed || self.routing_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let mut lifecycle = self.lifecycle.lock();
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        if lifecycle.pending != Some(self.intent) {
+            return;
+        }
+        lifecycle.pending = None;
+        if self.abort_policy == LibraryReplacementAbortPolicy::NoReconcile {
+            return;
+        }
+        let id = NEXT_LIBRARY_ROUTING_RECONCILE_REQUEST_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("library-routing reconcile request identity exhausted");
+        lifecycle.reconcile_required = Some(LibraryRoutingReconcileRequest {
+            id,
+            telemetry: self.telemetry.clone(),
+        });
+        drop(lifecycle);
+        notify_library_routing_reconcile_edge(
+            &self.reconcile_wake,
+            &self.reconcile_wake_generation,
+        );
+    }
+}
 
 /// Exact old authority owned by one package-library routing driver.
 ///
@@ -1863,9 +2391,12 @@ pub(crate) struct LibraryRoutingBasis {
     packages_enabled: bool,
     packages_r_path: Option<PathBuf>,
     packages_additional_library_paths: Vec<PathBuf>,
+    packages_watch_library_paths: bool,
+    packages_watch_debounce_ms: u64,
     workspace_folders: Vec<Url>,
     watcher_owner: Option<LibpathWatcherOwner>,
     replacement_intent: Option<LibraryReplacementIntent>,
+    adopted_reconcile_obligation: bool,
     mutation: LibraryRoutingMutation,
 }
 
@@ -1876,6 +2407,30 @@ impl LibraryRoutingBasis {
 
     pub(crate) fn is_replacement(&self) -> bool {
         self.mutation == LibraryRoutingMutation::Replacement
+    }
+
+    pub(crate) fn keeps_current_watcher(&self) -> bool {
+        matches!(
+            self.mutation,
+            LibraryRoutingMutation::Changed
+                | LibraryRoutingMutation::FullRescan
+                | LibraryRoutingMutation::DegradedReconcile
+        )
+    }
+
+    pub(crate) fn system_file_routing_owner(&self) -> SystemFileRoutingOwnerIdentity {
+        self.routing.owner
+    }
+
+    pub(crate) fn should_watch_library_paths(&self, ready: bool, library: &PackageLibrary) -> bool {
+        self.packages_enabled
+            && self.packages_watch_library_paths
+            && ready
+            && !library.lib_paths().is_empty()
+    }
+
+    pub(crate) fn watcher_debounce_ms(&self) -> u64 {
+        self.packages_watch_debounce_ms
     }
 }
 
@@ -1895,6 +2450,12 @@ pub(crate) struct ProspectiveLibraryRouting {
     routing: SystemFileRoutingStamp,
 }
 
+impl ProspectiveLibraryRouting {
+    pub(crate) fn watcher_owner(&self) -> LibpathWatcherOwner {
+        self.watcher_owner
+    }
+}
+
 pub(crate) struct PreparedLibraryRoutingAnalysis {
     pub(crate) basis: LibraryRoutingBasis,
     pub(crate) prospective: ProspectiveLibraryRouting,
@@ -1902,6 +2463,52 @@ pub(crate) struct PreparedLibraryRoutingAnalysis {
     pub(crate) ready: bool,
     pub(crate) warm_basis: Option<OpenPackageWarmBasis>,
     pub(crate) system_file: PreparedSystemFileAnalysis,
+    pub(crate) watcher: PreparedLibpathWatcherInstall,
+}
+
+#[derive(Clone)]
+pub(crate) enum PreparedLibpathWatcherInstall {
+    Keep,
+    Active {
+        handle: Arc<crate::libpath_watcher::LibpathWatcherHandle>,
+        journal: Arc<crate::libpath_watcher::LibpathWatchJournal>,
+        recovery: bool,
+    },
+    Disabled,
+    AttachFailed {
+        recovery: bool,
+        can_recover: bool,
+    },
+}
+
+impl std::fmt::Debug for PreparedLibpathWatcherInstall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keep => formatter.write_str("Keep"),
+            Self::Active { recovery, .. } => formatter
+                .debug_struct("Active")
+                .field("recovery", recovery)
+                .finish_non_exhaustive(),
+            Self::Disabled => formatter.write_str("Disabled"),
+            Self::AttachFailed {
+                recovery,
+                can_recover,
+            } => formatter
+                .debug_struct("AttachFailed")
+                .field("recovery", recovery)
+                .field("can_recover", can_recover)
+                .finish(),
+        }
+    }
+}
+
+impl PreparedLibpathWatcherInstall {
+    fn is_buffering_active(&self) -> bool {
+        match self {
+            Self::Active { journal, .. } => journal.is_buffering(),
+            Self::Keep | Self::Disabled | Self::AttachFailed { .. } => true,
+        }
+    }
 }
 
 /// Compact proof that an unpublished replacement cache was warmed for the
@@ -1973,6 +2580,7 @@ pub(crate) struct PreparedSystemFileDraft {
     open_metadata: Vec<PreparedWorkspaceOpenMetadata>,
     graph: DependencyGraph,
     changed_uris: Vec<Url>,
+    content_changed_uris: HashSet<Url>,
     external_observations: Vec<SystemFileExternalObservation>,
 }
 
@@ -1982,6 +2590,7 @@ pub(crate) struct PreparedSystemFileAnalysis {
     open_metadata: Vec<PreparedWorkspaceOpenMetadata>,
     graph: DependencyGraph,
     changed_uris: Vec<Url>,
+    content_changed_uris: HashSet<Url>,
     external_observations: Vec<SystemFileExternalObservation>,
 }
 
@@ -2539,6 +3148,158 @@ pub(crate) struct SystemFileRoutingOwnerIdentity(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct LibpathWatcherOwner(u64);
 
+/// Applied state of the libpath watcher for the current exact owner lineage.
+///
+/// `AwaitingRecovery` is a one-shot token: only the same never-reused owner may
+/// install the recovery watcher. `Degraded` is terminal until an external
+/// settings/library edge starts a fresh primary lineage. A watcher-only
+/// transition into degradation carries one exact `reconcile_pending`
+/// obligation to clear/warm the current library without another watcher
+/// attachment; a routing-CAS degradation has already done that work and stores
+/// no obligation. `ActiveUnapplied` preserves a healthy old watcher when a
+/// same-coverage settings-only replacement fails to attach.
+enum LibpathWatcherState {
+    Disabled,
+    Active {
+        handle: Option<Arc<crate::libpath_watcher::LibpathWatcherHandle>>,
+        journal: Arc<crate::libpath_watcher::LibpathWatchJournal>,
+        is_recovery: bool,
+        applied: LibpathWatcherSpec,
+    },
+    AwaitingRecovery,
+    Degraded {
+        reconcile_pending: bool,
+    },
+    ActiveUnapplied {
+        handle: Option<Arc<crate::libpath_watcher::LibpathWatcherHandle>>,
+        journal: Arc<crate::libpath_watcher::LibpathWatchJournal>,
+        is_recovery: bool,
+        applied: LibpathWatcherSpec,
+        desired: LibpathWatcherSpec,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct LibpathWatcherSpec {
+    paths: Vec<PathBuf>,
+    debounce_ms: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum LibpathWatcherLifecycleSignature {
+    Disabled,
+    Active {
+        is_recovery: bool,
+        applied: LibpathWatcherSpec,
+    },
+    AwaitingRecovery,
+    Degraded {
+        reconcile_pending: bool,
+    },
+    ActiveUnapplied {
+        is_recovery: bool,
+        applied: LibpathWatcherSpec,
+        desired: LibpathWatcherSpec,
+    },
+}
+
+impl LibpathWatcherState {
+    fn active_journal(&self) -> Option<&Arc<crate::libpath_watcher::LibpathWatchJournal>> {
+        match self {
+            Self::Active { journal, .. } | Self::ActiveUnapplied { journal, .. } => Some(journal),
+            Self::Disabled | Self::AwaitingRecovery | Self::Degraded { .. } => None,
+        }
+    }
+
+    fn signature(&self) -> LibpathWatcherLifecycleSignature {
+        match self {
+            Self::Disabled => LibpathWatcherLifecycleSignature::Disabled,
+            Self::Active {
+                is_recovery,
+                applied,
+                ..
+            } => LibpathWatcherLifecycleSignature::Active {
+                is_recovery: *is_recovery,
+                applied: applied.clone(),
+            },
+            Self::AwaitingRecovery => LibpathWatcherLifecycleSignature::AwaitingRecovery,
+            Self::Degraded { reconcile_pending } => LibpathWatcherLifecycleSignature::Degraded {
+                reconcile_pending: *reconcile_pending,
+            },
+            Self::ActiveUnapplied {
+                is_recovery,
+                applied,
+                desired,
+                ..
+            } => LibpathWatcherLifecycleSignature::ActiveUnapplied {
+                is_recovery: *is_recovery,
+                applied: applied.clone(),
+                desired: desired.clone(),
+            },
+        }
+    }
+
+    /// Retire callback delivery synchronously and return the OS handle for
+    /// potentially blocking teardown after the `WorldState` lock is released.
+    fn retire(&mut self) -> Option<Arc<crate::libpath_watcher::LibpathWatcherHandle>> {
+        let old = std::mem::replace(self, Self::Disabled);
+        match old {
+            Self::Active {
+                handle, journal, ..
+            }
+            | Self::ActiveUnapplied {
+                handle, journal, ..
+            } => {
+                journal.close();
+                handle
+            }
+            Self::Disabled | Self::AwaitingRecovery | Self::Degraded { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LibpathWatcherSwapBasis {
+    library: Arc<PackageLibrary>,
+    install_id: u64,
+    content_generation: u64,
+    current_owner: LibpathWatcherOwner,
+    lifecycle: LibpathWatcherLifecycleSignature,
+    pub(crate) prospective_owner: LibpathWatcherOwner,
+    ready: bool,
+    packages_enabled: bool,
+    watch_enabled: bool,
+    debounce_ms: u64,
+    library_paths: Vec<PathBuf>,
+}
+
+pub(crate) struct LibpathWatcherSwapCommit {
+    pub(crate) retired_handle: Option<Arc<crate::libpath_watcher::LibpathWatcherHandle>>,
+    pub(crate) recovery_owner: Option<LibpathWatcherOwner>,
+    pub(crate) degraded_reconcile_owner: Option<LibpathWatcherOwner>,
+}
+
+impl LibpathWatcherSwapBasis {
+    pub(crate) fn should_watch(&self) -> bool {
+        self.packages_enabled && self.watch_enabled && self.ready && !self.library_paths.is_empty()
+    }
+
+    pub(crate) fn library_paths(&self) -> Vec<PathBuf> {
+        self.library_paths.clone()
+    }
+
+    pub(crate) fn debounce_ms(&self) -> u64 {
+        self.debounce_ms
+    }
+
+    fn desired_spec(&self) -> LibpathWatcherSpec {
+        LibpathWatcherSpec {
+            paths: self.library_paths.clone(),
+            debounce_ms: self.debounce_ms,
+        }
+    }
+}
+
 impl WorldState {
     /// Whether the complete package seed/library/routing record installed by a
     /// seed transaction is still the current owner.
@@ -2574,6 +3335,9 @@ impl WorldState {
         &mut self,
         identity: PackageSeedInstalledIdentity,
     ) -> bool {
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return false;
+        }
         if self.pending_system_file_seed_retry.is_some() {
             return false;
         }
@@ -2605,6 +3369,9 @@ impl WorldState {
         &mut self,
         identity: PackageSeedInstalledIdentity,
     ) -> PostSeedRefreshOwnerRegistration {
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return PostSeedRefreshOwnerRegistration::Shutdown;
+        }
         match self.pending_post_seed_refresh_retry {
             None => {
                 self.pending_post_seed_refresh_retry = Some(identity);
@@ -2626,6 +3393,9 @@ impl WorldState {
         identity: PackageSeedInstalledIdentity,
         requires_system_file_retry: bool,
     ) -> PostSeedRefreshOwnerRegistration {
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return PostSeedRefreshOwnerRegistration::Shutdown;
+        }
         match self.pending_post_seed_refresh_retry {
             Some(current) if current != identity => {
                 return PostSeedRefreshOwnerRegistration::ExistingDifferent(current);
@@ -2758,6 +3528,7 @@ pub(crate) enum PostSeedRefreshOwnerRegistration {
     Added,
     ExistingSame,
     ExistingDifferent(PackageSeedInstalledIdentity),
+    Shutdown,
 }
 
 #[cfg(test)]
@@ -2776,11 +3547,97 @@ impl AnalysisTransferHandle {
 pub(crate) struct PackageRoutingCommitEffects {
     pub(crate) owner: SystemFileRoutingOwnerIdentity,
     pub(crate) candidates: Vec<AnalysisTransferCandidate>,
+    pub(crate) handoff: Option<AnalysisTransferHandle>,
+}
+
+#[derive(Clone, Default)]
+struct LibraryRoutingTail {
+    post_seed: Option<LibraryRoutingPreSealPostSeed>,
+    retired_post_seed_owners: Vec<PackageSeedInstalledIdentity>,
+    build_notes: Vec<String>,
+}
+
+impl LibraryRoutingTail {
+    fn from_deposit(deposit: &mut LibraryRoutingPreSealDeposit) -> Option<Self> {
+        let tail = Self {
+            post_seed: deposit.post_seed.take(),
+            retired_post_seed_owners: std::mem::take(&mut deposit.retired_post_seed_owners),
+            build_notes: std::mem::take(&mut deposit.build_notes),
+        };
+        (!tail.is_empty()).then_some(tail)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.post_seed.is_none()
+            && self.retired_post_seed_owners.is_empty()
+            && self.build_notes.is_empty()
+    }
+
+    fn merge(&mut self, mut incoming: Self) {
+        if let Some(incoming_post_seed) = incoming.post_seed.take() {
+            match self.post_seed.take() {
+                Some(mut existing)
+                    if existing.identity.seed_install_id
+                        == incoming_post_seed.identity.seed_install_id =>
+                {
+                    if existing.deferred_system_file.is_none() {
+                        existing.deferred_system_file = incoming_post_seed.deferred_system_file;
+                    } else if incoming_post_seed.deferred_system_file
+                        != existing.deferred_system_file
+                        && let Some(retired) = incoming_post_seed.deferred_system_file
+                    {
+                        self.retired_post_seed_owners.push(retired);
+                    }
+                    self.post_seed = Some(existing);
+                }
+                Some(existing)
+                    if existing.identity.seed_install_id
+                        > incoming_post_seed.identity.seed_install_id =>
+                {
+                    self.retire_post_seed(incoming_post_seed);
+                    self.post_seed = Some(existing);
+                }
+                Some(existing) => {
+                    self.retire_post_seed(existing);
+                    self.post_seed = Some(incoming_post_seed);
+                }
+                None => self.post_seed = Some(incoming_post_seed),
+            }
+        }
+        self.retired_post_seed_owners
+            .append(&mut incoming.retired_post_seed_owners);
+        self.retired_post_seed_owners
+            .sort_unstable_by_key(|identity| identity.seed_install_id);
+        self.retired_post_seed_owners.dedup();
+        self.build_notes.append(&mut incoming.build_notes);
+    }
+
+    fn retire_post_seed(&mut self, owner: LibraryRoutingPreSealPostSeed) {
+        self.retired_post_seed_owners.push(owner.identity);
+        if let Some(system) = owner.deferred_system_file
+            && system != owner.identity
+        {
+            self.retired_post_seed_owners.push(system);
+        }
+    }
 }
 
 #[derive(Clone)]
 struct AnalysisTransferState {
     candidates: Vec<AnalysisTransferCandidate>,
+    /// Package-routing obligations stay on the successor lineage until a
+    /// finalizer atomically registers their durable retry owner.
+    routing_tail: Option<LibraryRoutingTail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LibraryRoutingTailClaim {
+    None,
+    NotesOnly,
+    PostSeedAdded(LibraryRoutingPreSealPostSeed),
+    PostSeedExisting,
+    Blocked,
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2964,14 +3821,230 @@ impl WorldState {
     }
 
     /// Retire the current watcher before any asynchronous teardown/spawn work.
+    #[cfg(test)]
     pub(crate) fn begin_libpath_watcher_restart(&mut self) -> LibpathWatcherOwner {
+        assert!(!self.routing_shutdown.load(Ordering::Acquire));
         self.libpath_watcher_owner_generation = Self::mint_libpath_watcher_owner_generation();
-        self.libpath_watcher_handle = None;
+        assert!(
+            self.libpath_watcher.retire().is_none(),
+            "test-only direct retirement cannot tear down an OS watcher under WorldState"
+        );
+        notify_library_routing_reconcile_edge(
+            &self.library_routing_reconcile_wake,
+            &self.library_routing_reconcile_wake_generation,
+        );
         self.libpath_watcher_owner()
     }
 
     pub(crate) fn libpath_watcher_owner_is_current(&self, owner: LibpathWatcherOwner) -> bool {
-        self.libpath_watcher_owner() == owner
+        !self.routing_shutdown.load(Ordering::Acquire) && self.libpath_watcher_owner() == owner
+    }
+
+    pub(crate) fn degraded_libpath_reconcile_is_current(&self, owner: LibpathWatcherOwner) -> bool {
+        self.libpath_watcher_owner_is_current(owner)
+            && matches!(
+                self.libpath_watcher,
+                LibpathWatcherState::Degraded {
+                    reconcile_pending: true
+                }
+            )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn degraded_libpath_reconcile_pending_for_test(&self) -> Option<bool> {
+        match self.libpath_watcher {
+            LibpathWatcherState::Degraded { reconcile_pending } => Some(reconcile_pending),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_libpath_journal_for_test(
+        &mut self,
+    ) -> Arc<crate::libpath_watcher::LibpathWatchJournal> {
+        let journal = crate::libpath_watcher::LibpathWatchJournal::new_buffering();
+        assert!(journal.try_activate());
+        let _ = self.libpath_watcher.retire();
+        self.libpath_watcher = LibpathWatcherState::Active {
+            handle: None,
+            journal: Arc::clone(&journal),
+            is_recovery: false,
+            applied: LibpathWatcherSpec {
+                paths: self.package_library.lib_paths().to_vec(),
+                debounce_ms: self.cross_file_config.packages_watch_debounce_ms,
+            },
+        };
+        journal
+    }
+
+    pub(crate) fn capture_libpath_watcher_swap_basis(&self) -> Option<LibpathWatcherSwapBasis> {
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(LibpathWatcherSwapBasis {
+            library: Arc::clone(&self.package_library),
+            install_id: self.package_library_install_id,
+            content_generation: self.package_library_content_generation,
+            current_owner: self.libpath_watcher_owner(),
+            lifecycle: self.libpath_watcher.signature(),
+            prospective_owner: LibpathWatcherOwner(Self::mint_libpath_watcher_owner_generation()),
+            ready: self.package_library_ready,
+            packages_enabled: self.cross_file_config.packages_enabled,
+            watch_enabled: self.cross_file_config.packages_watch_library_paths,
+            debounce_ms: self.cross_file_config.packages_watch_debounce_ms,
+            library_paths: self.package_library.lib_paths().to_vec(),
+        })
+    }
+
+    pub(crate) fn capture_libpath_watcher_recovery_basis(
+        &self,
+        owner: LibpathWatcherOwner,
+    ) -> Option<LibpathWatcherSwapBasis> {
+        if self.libpath_watcher_owner() != owner
+            || !matches!(self.libpath_watcher, LibpathWatcherState::AwaitingRecovery)
+        {
+            return None;
+        }
+        let mut basis = self.capture_libpath_watcher_swap_basis()?;
+        // The AwaitingRecovery owner is the never-reused token. Recovery does
+        // not mint a second lineage; its CAS must consume this exact token.
+        basis.prospective_owner = owner;
+        Some(basis)
+    }
+
+    pub(crate) fn try_commit_libpath_watcher_swap(
+        &mut self,
+        basis: &LibpathWatcherSwapBasis,
+        watcher: PreparedLibpathWatcherInstall,
+    ) -> Result<LibpathWatcherSwapCommit, PreparedLibpathWatcherInstall> {
+        let exact_recovery = basis.prospective_owner == basis.current_owner;
+        let supersedes_watcher_owner = basis.prospective_owner != basis.current_owner;
+        let watcher_recovery_shape_is_valid = match &watcher {
+            PreparedLibpathWatcherInstall::Active { recovery, .. }
+            | PreparedLibpathWatcherInstall::AttachFailed { recovery, .. } => {
+                *recovery == exact_recovery
+            }
+            PreparedLibpathWatcherInstall::Disabled => true,
+            PreparedLibpathWatcherInstall::Keep => false,
+        };
+        if self.routing_shutdown.load(Ordering::Acquire)
+            || !Arc::ptr_eq(&self.package_library, &basis.library)
+            || self.package_library_install_id != basis.install_id
+            || self.package_library_content_generation != basis.content_generation
+            || self.libpath_watcher_owner() != basis.current_owner
+            || self.libpath_watcher.signature() != basis.lifecycle
+            || self.package_library_ready != basis.ready
+            || self.cross_file_config.packages_enabled != basis.packages_enabled
+            || self.cross_file_config.packages_watch_library_paths != basis.watch_enabled
+            || self.cross_file_config.packages_watch_debounce_ms != basis.debounce_ms
+            || self.package_library.lib_paths() != basis.library_paths
+            || (exact_recovery
+                && !matches!(self.libpath_watcher, LibpathWatcherState::AwaitingRecovery))
+            || !watcher_recovery_shape_is_valid
+            || !watcher.is_buffering_active()
+        {
+            return Err(watcher);
+        }
+        let (retired_handle, recovery_owner, degraded_reconcile_owner) = match watcher {
+            PreparedLibpathWatcherInstall::Active {
+                handle,
+                journal,
+                recovery,
+            } => {
+                let retired = self.libpath_watcher.retire();
+                assert!(
+                    journal.try_activate(),
+                    "watcher-only CAS must activate an exact buffering journal"
+                );
+                self.libpath_watcher_owner_generation = basis.prospective_owner.0;
+                self.libpath_watcher = LibpathWatcherState::Active {
+                    handle: Some(handle),
+                    journal,
+                    is_recovery: recovery,
+                    applied: basis.desired_spec(),
+                };
+                (retired, None, None)
+            }
+            PreparedLibpathWatcherInstall::Disabled => {
+                let retired = self.libpath_watcher.retire();
+                self.libpath_watcher_owner_generation = basis.prospective_owner.0;
+                (retired, None, None)
+            }
+            PreparedLibpathWatcherInstall::AttachFailed {
+                recovery,
+                can_recover,
+            } => {
+                if recovery {
+                    let retired = self.libpath_watcher.retire();
+                    self.libpath_watcher_owner_generation = basis.prospective_owner.0;
+                    self.libpath_watcher = LibpathWatcherState::Degraded {
+                        reconcile_pending: true,
+                    };
+                    (retired, None, Some(basis.prospective_owner))
+                } else if matches!(
+                    &self.libpath_watcher,
+                    LibpathWatcherState::Active { applied, .. }
+                        | LibpathWatcherState::ActiveUnapplied { applied, .. }
+                        if applied.paths == basis.library_paths
+                ) {
+                    let old =
+                        std::mem::replace(&mut self.libpath_watcher, LibpathWatcherState::Disabled);
+                    self.libpath_watcher = match old {
+                        LibpathWatcherState::Active {
+                            handle,
+                            journal,
+                            is_recovery,
+                            applied,
+                        }
+                        | LibpathWatcherState::ActiveUnapplied {
+                            handle,
+                            journal,
+                            is_recovery,
+                            applied,
+                            ..
+                        } => LibpathWatcherState::ActiveUnapplied {
+                            handle,
+                            journal,
+                            is_recovery,
+                            applied,
+                            desired: basis.desired_spec(),
+                        },
+                        _ => unreachable!("the active watcher shape was prechecked"),
+                    };
+                    // Failed same-coverage settings application retains the
+                    // exact applied owner and callback lifecycle.
+                    (None, None, None)
+                } else if can_recover {
+                    let retired = self.libpath_watcher.retire();
+                    self.libpath_watcher_owner_generation = basis.prospective_owner.0;
+                    self.libpath_watcher = LibpathWatcherState::AwaitingRecovery;
+                    (retired, Some(basis.prospective_owner), None)
+                } else {
+                    let retired = self.libpath_watcher.retire();
+                    self.libpath_watcher_owner_generation = basis.prospective_owner.0;
+                    self.libpath_watcher = LibpathWatcherState::Degraded {
+                        reconcile_pending: true,
+                    };
+                    (retired, None, Some(basis.prospective_owner))
+                }
+            }
+            rejected @ PreparedLibpathWatcherInstall::Keep => return Err(rejected),
+        };
+        if supersedes_watcher_owner {
+            // A terminal degraded worker can be parked on the shared wake.
+            // Publishing the new watcher owner is therefore itself a wake
+            // edge: the old root must observe supersession promptly instead
+            // of lingering until its heartbeat.
+            notify_library_routing_reconcile_edge(
+                &self.library_routing_reconcile_wake,
+                &self.library_routing_reconcile_wake_generation,
+            );
+        }
+        Ok(LibpathWatcherSwapCommit {
+            retired_handle,
+            recovery_owner,
+            degraded_reconcile_owner,
+        })
     }
 
     /// Install a newly built package library and mint every authority identity
@@ -3027,6 +4100,11 @@ impl WorldState {
         self.package_library_content_generation
     }
 
+    #[cfg(test)]
+    pub(crate) fn package_library_install_id_for_test(&self) -> u64 {
+        self.package_library_install_id
+    }
+
     pub(crate) fn system_file_routing_owner_identity(&self) -> SystemFileRoutingOwnerIdentity {
         SystemFileRoutingOwnerIdentity(self.system_file_routing_owner_generation)
     }
@@ -3068,6 +4146,9 @@ impl WorldState {
         mutation: LibraryRoutingMutation,
         watcher_owner: Option<LibpathWatcherOwner>,
     ) -> Option<LibraryRoutingBasis> {
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return None;
+        }
         if !Arc::ptr_eq(&self.package_library, expected_library)
             || watcher_owner.is_some_and(|owner| !self.libpath_watcher_owner_is_current(owner))
         {
@@ -3081,11 +4162,26 @@ impl WorldState {
                     })
                     .expect("library-replacement intent generation counter exhausted");
                 let intent = LibraryReplacementIntent(generation);
-                self.pending_library_replacement = Some(intent);
-                Some(intent)
+                let mut lifecycle = self.library_replacement_lifecycle.lock();
+                let adopted_reconcile_obligation = lifecycle.reconcile_required.is_some();
+                lifecycle.pending = Some(intent);
+                // The current exact capture adopts any previously deposited
+                // reconcile obligation. If this owner is cancelled, its guard
+                // deposits a fresh never-reused request.
+                lifecycle.reconcile_required = None;
+                drop(lifecycle);
+                // Stored below after the match so additive captures remain
+                // explicitly obligation-free.
+                Some((intent, adopted_reconcile_obligation))
             }
-            LibraryRoutingMutation::Changed | LibraryRoutingMutation::Dropped => None,
+            LibraryRoutingMutation::Changed
+            | LibraryRoutingMutation::FullRescan
+            | LibraryRoutingMutation::DegradedReconcile
+            | LibraryRoutingMutation::Dropped => None,
         };
+        let (replacement_intent, adopted_reconcile_obligation) = replacement_intent
+            .map(|(intent, adopted)| (Some(intent), adopted))
+            .unwrap_or((None, false));
         Some(LibraryRoutingBasis {
             library: Arc::clone(&self.package_library),
             cache_operation_epoch,
@@ -3100,9 +4196,12 @@ impl WorldState {
                 .cross_file_config
                 .packages_additional_library_paths
                 .clone(),
+            packages_watch_library_paths: self.cross_file_config.packages_watch_library_paths,
+            packages_watch_debounce_ms: self.cross_file_config.packages_watch_debounce_ms,
             workspace_folders: self.workspace_folders.clone(),
             watcher_owner,
             replacement_intent,
+            adopted_reconcile_obligation,
             mutation,
         })
     }
@@ -3110,23 +4209,273 @@ impl WorldState {
     fn library_replacement_basis_is_current(&self, basis: &LibraryRoutingBasis) -> bool {
         match basis.mutation {
             LibraryRoutingMutation::Replacement => {
-                self.pending_library_replacement == basis.replacement_intent
+                self.library_replacement_lifecycle.lock().pending == basis.replacement_intent
             }
-            LibraryRoutingMutation::Changed | LibraryRoutingMutation::Dropped => {
-                basis.replacement_intent.is_none()
-            }
+            LibraryRoutingMutation::Changed
+            | LibraryRoutingMutation::FullRescan
+            | LibraryRoutingMutation::DegradedReconcile
+            | LibraryRoutingMutation::Dropped => basis.replacement_intent.is_none(),
         }
+    }
+
+    fn library_watch_settings_are_current(&self, basis: &LibraryRoutingBasis) -> bool {
+        self.cross_file_config.packages_watch_library_paths == basis.packages_watch_library_paths
+            && self.cross_file_config.packages_watch_debounce_ms == basis.packages_watch_debounce_ms
     }
 
     /// Retire an unpublished replacement only when it still owns the pending
     /// slot. A newer replacement keeps its own intent and inherited/current
     /// open-document convergence responsibility.
+    #[cfg(test)]
     pub(crate) fn abort_library_replacement(&mut self, basis: &LibraryRoutingBasis) {
+        let mut lifecycle = self.library_replacement_lifecycle.lock();
         if basis.mutation == LibraryRoutingMutation::Replacement
-            && self.pending_library_replacement == basis.replacement_intent
+            && lifecycle.pending == basis.replacement_intent
         {
-            self.pending_library_replacement = None;
+            lifecycle.pending = None;
         }
+    }
+
+    /// Arm synchronous cancellation ownership while the caller still holds the
+    /// state lock used to capture `basis`; this leaves no await/cancellation gap
+    /// between intent publication and guard ownership.
+    pub(crate) fn guard_library_replacement(
+        &self,
+        basis: &LibraryRoutingBasis,
+        abort_policy: LibraryReplacementAbortPolicy,
+    ) -> Option<PendingLibraryReplacementGuard> {
+        let intent = basis.replacement_intent?;
+        let lifecycle = self.library_replacement_lifecycle.lock();
+        if lifecycle.pending != Some(intent) {
+            return None;
+        }
+        drop(lifecycle);
+        Some(PendingLibraryReplacementGuard {
+            lifecycle: Arc::clone(&self.library_replacement_lifecycle),
+            routing_shutdown: Arc::clone(&self.routing_shutdown),
+            reconcile_wake: Arc::clone(&self.library_routing_reconcile_wake),
+            reconcile_wake_generation: Arc::clone(&self.library_routing_reconcile_wake_generation),
+            intent,
+            telemetry: LibraryRoutingReconcileTelemetry {
+                package_config_generation: basis.package_config_generation,
+                package_input_generation: basis.package_input_generation,
+                packages_enabled: basis.packages_enabled,
+                packages_r_path: basis.packages_r_path.clone(),
+                packages_additional_library_paths: basis.packages_additional_library_paths.clone(),
+                workspace_folders: basis.workspace_folders.clone(),
+            },
+            abort_policy,
+            armed: true,
+        })
+    }
+
+    pub(crate) fn adopt_library_routing_pre_seal(
+        &self,
+        basis: &LibraryRoutingBasis,
+    ) -> (
+        LibraryRoutingPreSealOwner,
+        LibraryRoutingPreSealDeposit,
+        bool,
+    ) {
+        let mut lifecycle = self.library_replacement_lifecycle.lock();
+        let adopted_existing = lifecycle.pre_seal.is_some();
+        let mut deposit = lifecycle
+            .pre_seal
+            .take()
+            .unwrap_or_else(|| LibraryRoutingPreSealDeposit::from_basis(basis));
+        deposit.replacement_intent = basis.replacement_intent;
+        deposit.telemetry = LibraryRoutingPreSealDeposit::from_basis(basis).telemetry;
+        (
+            LibraryRoutingPreSealOwner {
+                lifecycle: Arc::clone(&self.library_replacement_lifecycle),
+                routing_shutdown: Arc::clone(&self.routing_shutdown),
+                reconcile_wake: Arc::clone(&self.library_routing_reconcile_wake),
+                reconcile_wake_generation: Arc::clone(
+                    &self.library_routing_reconcile_wake_generation,
+                ),
+            },
+            deposit,
+            adopted_existing || basis.adopted_reconcile_obligation,
+        )
+    }
+
+    pub(crate) fn capture_current_library_routing_pre_seal(
+        &self,
+    ) -> (LibraryRoutingPreSealOwner, LibraryRoutingPreSealDeposit) {
+        let telemetry = LibraryRoutingReconcileTelemetry {
+            package_config_generation: self.package_config_generation,
+            package_input_generation: self.package_input_generation(),
+            packages_enabled: self.cross_file_config.packages_enabled,
+            packages_r_path: self.cross_file_config.packages_r_path.clone(),
+            packages_additional_library_paths: self
+                .cross_file_config
+                .packages_additional_library_paths
+                .clone(),
+            workspace_folders: self.workspace_folders.clone(),
+        };
+        let mut lifecycle = self.library_replacement_lifecycle.lock();
+        let deposit = lifecycle
+            .pre_seal
+            .take()
+            .unwrap_or(LibraryRoutingPreSealDeposit {
+                id: LibraryRoutingPreSealDeposit::mint_id(),
+                replacement_intent: lifecycle.pending,
+                telemetry,
+                handles: Vec::new(),
+                candidates: Vec::new(),
+                fallback: Vec::new(),
+                post_seed: None,
+                retired_post_seed_owners: Vec::new(),
+                build_notes: Vec::new(),
+            });
+        (
+            LibraryRoutingPreSealOwner {
+                lifecycle: Arc::clone(&self.library_replacement_lifecycle),
+                routing_shutdown: Arc::clone(&self.routing_shutdown),
+                reconcile_wake: Arc::clone(&self.library_routing_reconcile_wake),
+                reconcile_wake_generation: Arc::clone(
+                    &self.library_routing_reconcile_wake_generation,
+                ),
+            },
+            deposit,
+        )
+    }
+
+    pub(crate) fn claim_library_routing_reconcile_request(
+        &self,
+    ) -> Option<LibraryRoutingReconcileClaim> {
+        let request = self
+            .library_replacement_lifecycle
+            .lock()
+            .reconcile_required
+            .take()?;
+        Some(LibraryRoutingReconcileClaim {
+            lifecycle: Arc::clone(&self.library_replacement_lifecycle),
+            routing_shutdown: Arc::clone(&self.routing_shutdown),
+            reconcile_wake: Arc::clone(&self.library_routing_reconcile_wake),
+            reconcile_wake_generation: Arc::clone(&self.library_routing_reconcile_wake_generation),
+            request: Some(request),
+        })
+    }
+
+    /// Capture a synchronous wake owner for additive Changed/Dropped work.
+    pub(crate) fn library_routing_reconcile_owner_current(&self) -> LibraryRoutingReconcileOwner {
+        LibraryRoutingReconcileOwner {
+            lifecycle: Arc::clone(&self.library_replacement_lifecycle),
+            routing_shutdown: Arc::clone(&self.routing_shutdown),
+            reconcile_wake: Arc::clone(&self.library_routing_reconcile_wake),
+            reconcile_wake_generation: Arc::clone(&self.library_routing_reconcile_wake_generation),
+            telemetry: LibraryRoutingReconcileTelemetry {
+                package_config_generation: self.package_config_generation,
+                package_input_generation: self.package_input_generation(),
+                packages_enabled: self.cross_file_config.packages_enabled,
+                packages_r_path: self.cross_file_config.packages_r_path.clone(),
+                packages_additional_library_paths: self
+                    .cross_file_config
+                    .packages_additional_library_paths
+                    .clone(),
+                workspace_folders: self.workspace_folders.clone(),
+            },
+        }
+    }
+
+    pub(crate) fn request_library_routing_reconcile_current(&self) {
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let id = NEXT_LIBRARY_ROUTING_RECONCILE_REQUEST_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("library-routing reconcile request identity exhausted");
+        let mut lifecycle = self.library_replacement_lifecycle.lock();
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        lifecycle.reconcile_required = Some(LibraryRoutingReconcileRequest {
+            id,
+            telemetry: LibraryRoutingReconcileTelemetry {
+                package_config_generation: self.package_config_generation,
+                package_input_generation: self.package_input_generation(),
+                packages_enabled: self.cross_file_config.packages_enabled,
+                packages_r_path: self.cross_file_config.packages_r_path.clone(),
+                packages_additional_library_paths: self
+                    .cross_file_config
+                    .packages_additional_library_paths
+                    .clone(),
+                workspace_folders: self.workspace_folders.clone(),
+            },
+        });
+        drop(lifecycle);
+        notify_library_routing_reconcile_edge(
+            &self.library_routing_reconcile_wake,
+            &self.library_routing_reconcile_wake_generation,
+        );
+    }
+
+    /// Durable reconcile request currently available to the pickup
+    /// coordinator. This is a peek: the request remains resident until an
+    /// initialization attempt claims it.
+    pub(crate) fn library_routing_reconcile_request(
+        &self,
+    ) -> Option<LibraryRoutingReconcileRequest> {
+        self.library_replacement_lifecycle
+            .lock()
+            .reconcile_required
+            .clone()
+    }
+
+    pub(crate) fn library_routing_reconcile_wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.library_routing_reconcile_wake)
+    }
+
+    pub(crate) fn library_routing_reconcile_wake_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.library_routing_reconcile_wake_generation)
+    }
+
+    pub(crate) fn library_routing_reconcile_eligibility_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.library_routing_reconcile_eligibility_generation)
+    }
+
+    pub(crate) fn routing_is_shutdown(&self) -> bool {
+        self.routing_shutdown.load(Ordering::Acquire)
+    }
+
+    /// Wake the resident reconcile coordinator after an external eligibility
+    /// change, such as packages being re-enabled.
+    pub(crate) fn notify_library_routing_reconcile(&self) {
+        self.library_routing_reconcile_eligibility_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .expect("library-routing eligibility generation exhausted");
+        notify_library_routing_reconcile_edge(
+            &self.library_routing_reconcile_wake,
+            &self.library_routing_reconcile_wake_generation,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn library_routing_reconcile_request_for_test(
+        &self,
+    ) -> Option<LibraryRoutingReconcileRequest> {
+        self.library_replacement_lifecycle
+            .lock()
+            .reconcile_required
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn library_routing_pre_seal_is_empty_for_test(&self) -> bool {
+        self.library_replacement_lifecycle.lock().pre_seal.is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn library_replacement_basis_is_current_for_test(
+        &self,
+        basis: &LibraryRoutingBasis,
+    ) -> bool {
+        self.library_replacement_basis_is_current(basis)
     }
 
     /// Rebase the same pending replacement intent onto an additive
@@ -3140,7 +4489,8 @@ impl WorldState {
         cache_operation_epoch: u64,
     ) -> Option<LibraryRoutingBasis> {
         if basis.mutation != LibraryRoutingMutation::Replacement
-            || self.pending_library_replacement != basis.replacement_intent
+            || self.library_replacement_lifecycle.lock().pending != basis.replacement_intent
+            || !self.library_watch_settings_are_current(basis)
             || !Arc::ptr_eq(&self.package_library, expected_library)
             || self.package_input_generation() != basis.package_input_generation
             || self.package_config_generation != basis.package_config_generation
@@ -3168,6 +4518,7 @@ impl WorldState {
     ) -> bool {
         Arc::ptr_eq(&self.package_library, &basis.library)
             && self.library_replacement_basis_is_current(basis)
+            && self.library_watch_settings_are_current(basis)
             && basis.library.cache_operation_epoch(lease) == basis.cache_operation_epoch
             && self.system_file_routing_stamp() == basis.routing
             && self.package_library_ready == basis.ready
@@ -3191,6 +4542,7 @@ impl WorldState {
     ) -> Option<LibraryRoutingBasis> {
         if !Arc::ptr_eq(&self.package_library, &basis.library)
             || !self.library_replacement_basis_is_current(basis)
+            || !self.library_watch_settings_are_current(basis)
             || self.system_file_routing_stamp() != basis.routing
             || self.package_library_ready != basis.ready
             || self.package_input_generation() != basis.package_input_generation
@@ -3219,6 +4571,7 @@ impl WorldState {
     ) -> Option<ProspectiveLibraryRouting> {
         if !Arc::ptr_eq(&self.package_library, &basis.library)
             || !self.library_replacement_basis_is_current(basis)
+            || !self.library_watch_settings_are_current(basis)
             || self.system_file_routing_stamp() != basis.routing
             || self.package_input_generation() != basis.package_input_generation
             || self.package_config_generation != basis.package_config_generation
@@ -3236,13 +4589,17 @@ impl WorldState {
         }
         let install_id = match basis.mutation {
             LibraryRoutingMutation::Replacement => Self::mint_package_library_install_id(),
-            LibraryRoutingMutation::Changed | LibraryRoutingMutation::Dropped => {
-                basis.routing.package_library_install_id
-            }
+            LibraryRoutingMutation::Changed
+            | LibraryRoutingMutation::FullRescan
+            | LibraryRoutingMutation::DegradedReconcile
+            | LibraryRoutingMutation::Dropped => basis.routing.package_library_install_id,
         };
         let content_generation = match basis.mutation {
             LibraryRoutingMutation::Replacement => 0,
-            LibraryRoutingMutation::Changed | LibraryRoutingMutation::Dropped => basis
+            LibraryRoutingMutation::Changed
+            | LibraryRoutingMutation::FullRescan
+            | LibraryRoutingMutation::DegradedReconcile
+            | LibraryRoutingMutation::Dropped => basis
                 .routing
                 .package_library_content_generation
                 .checked_add(1)
@@ -3251,9 +4608,11 @@ impl WorldState {
         let routing_owner =
             SystemFileRoutingOwnerIdentity(Self::mint_system_file_routing_owner_generation());
         let watcher_owner = match basis.mutation {
-            LibraryRoutingMutation::Changed => basis
+            LibraryRoutingMutation::Changed
+            | LibraryRoutingMutation::FullRescan
+            | LibraryRoutingMutation::DegradedReconcile => basis
                 .watcher_owner
-                .expect("Changed routing must retain its watcher provenance"),
+                .expect("watcher-owner-preserving routing must retain its provenance"),
             LibraryRoutingMutation::Replacement | LibraryRoutingMutation::Dropped => {
                 LibpathWatcherOwner(Self::mint_libpath_watcher_owner_generation())
             }
@@ -3398,17 +4757,204 @@ impl WorldState {
         previous: Option<AnalysisTransferIdentity>,
         mut candidates: Vec<AnalysisTransferCandidate>,
     ) -> AnalysisTransferHandle {
+        let mut routing_tail = None;
         if let Some(previous) = previous
             && let Some(inherited) = self.analysis_transfers.remove(&previous)
         {
             candidates.extend(inherited.candidates);
+            routing_tail = inherited.routing_tail;
             self.analysis_transfer_successors.insert(previous, identity);
         }
         candidates.sort_unstable_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
         candidates.dedup();
-        self.analysis_transfers
-            .insert(identity, AnalysisTransferState { candidates });
+        self.analysis_transfers.insert(
+            identity,
+            AnalysisTransferState {
+                candidates,
+                routing_tail,
+            },
+        );
         AnalysisTransferHandle { identity }
+    }
+
+    /// Collapse deposited pre-seal ledgers and the current routing capture into
+    /// one pending transfer. The ordinary outer finalization remains the sole
+    /// place that filters exact tokens, resolves per-URI reservation precedence,
+    /// caps, and seals diagnostic work.
+    fn install_library_routing_transfer(
+        &mut self,
+        identity: AnalysisTransferIdentity,
+        previous: Option<AnalysisTransferIdentity>,
+        current: Vec<AnalysisTransferCandidate>,
+        mut deposit: LibraryRoutingPreSealDeposit,
+    ) -> AnalysisTransferHandle {
+        let mut inherited = Vec::new();
+        let mut routing_tail = LibraryRoutingTail::from_deposit(&mut deposit);
+        let mut consumed_excluded = HashSet::new();
+        let mut missing = false;
+        let mut terminals = Vec::new();
+        if let Some(previous) = previous {
+            terminals.push(previous);
+        }
+        terminals.extend(deposit.handles.iter().map(|handle| handle.identity));
+
+        let mut unique_terminals = HashSet::new();
+        for origin in terminals {
+            let mut terminal = origin;
+            let mut visited = HashSet::new();
+            let mut cycle = false;
+            while let Some(successor) = self.analysis_transfer_successors.get(&terminal).copied() {
+                if !visited.insert(terminal) {
+                    log::error!(
+                        "analysis-transfer successor cycle detected during routing collapse"
+                    );
+                    debug_assert!(false, "analysis-transfer successor chain must be acyclic");
+                    missing = true;
+                    cycle = true;
+                    break;
+                }
+                terminal = successor;
+            }
+            if cycle {
+                continue;
+            }
+            if terminal == identity || !unique_terminals.insert(terminal) {
+                continue;
+            }
+            if self.analysis_transfers_consumed.contains_key(&terminal) {
+                consumed_excluded.extend(self.current_consumed_analysis_transfer_candidate_uris(
+                    AnalysisTransferHandle { identity: terminal },
+                ));
+                continue;
+            }
+            if let Some(state) = self.analysis_transfers.remove(&terminal) {
+                inherited.extend(state.candidates);
+                if let Some(incoming_tail) = state.routing_tail {
+                    if let Some(existing) = routing_tail.as_mut() {
+                        existing.merge(incoming_tail);
+                    } else {
+                        routing_tail = Some(incoming_tail);
+                    }
+                }
+                self.analysis_transfer_successors.insert(terminal, identity);
+            } else {
+                missing = true;
+            }
+        }
+        if missing {
+            inherited.extend(self.capture_analysis_transfer_candidates(deposit.fallback));
+        }
+        inherited.retain(|candidate| !consumed_excluded.contains(&candidate.uri));
+
+        let mut merged = current;
+        merged.extend(deposit.candidates);
+        merged.extend(inherited);
+        self.analysis_transfers.insert(
+            identity,
+            AnalysisTransferState {
+                candidates: merged,
+                routing_tail,
+            },
+        );
+        AnalysisTransferHandle { identity }
+    }
+
+    /// Move a routing tail from the pending transfer into durable state-owned
+    /// registries without sealing its diagnostic handle. A post-seed
+    /// coordinator later consumes the retained handle after package state is
+    /// current, preserving the single outer publication cap.
+    pub(crate) fn claim_library_routing_tail(
+        &mut self,
+        handle: AnalysisTransferHandle,
+    ) -> LibraryRoutingTailClaim {
+        let mut identity = handle.identity;
+        let mut visited = HashSet::new();
+        while let Some(successor) = self.analysis_transfer_successors.get(&identity).copied() {
+            if !visited.insert(identity) {
+                log::error!("analysis-transfer successor cycle while claiming routing tail");
+                debug_assert!(false, "analysis-transfer successor chain must be acyclic");
+                return LibraryRoutingTailClaim::Blocked;
+            }
+            identity = successor;
+        }
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            if let Some(mut transfer) = self.analysis_transfers.remove(&identity) {
+                if let Some(mut tail) = transfer.routing_tail.take() {
+                    let mut retired = tail.retired_post_seed_owners;
+                    if let Some(post_seed) = tail.post_seed.take() {
+                        retired.push(post_seed.identity);
+                        retired.extend(post_seed.deferred_system_file);
+                    }
+                    for owner in retired {
+                        self.complete_post_seed_refresh_retry(owner);
+                        self.complete_system_file_seed_retry(owner);
+                    }
+                }
+                self.analysis_transfers_consumed
+                    .insert(identity, Vec::new());
+            }
+            return LibraryRoutingTailClaim::Shutdown;
+        }
+        let Some(mut tail) = self
+            .analysis_transfers
+            .get_mut(&identity)
+            .and_then(|state| state.routing_tail.take())
+        else {
+            return LibraryRoutingTailClaim::None;
+        };
+
+        if let Some(post_seed) = tail.post_seed.take() {
+            let registration = self.begin_post_seed_refresh_retry_with_system_dependency(
+                post_seed.identity,
+                post_seed.deferred_system_file.is_some(),
+            );
+            if matches!(
+                registration,
+                PostSeedRefreshOwnerRegistration::ExistingDifferent(_)
+            ) {
+                tail.post_seed = Some(post_seed);
+                self.analysis_transfers
+                    .get_mut(&identity)
+                    .expect("routing-tail transfer remained pending")
+                    .routing_tail = Some(tail);
+                self.request_library_routing_reconcile_current();
+                return LibraryRoutingTailClaim::Blocked;
+            }
+            let retained = self.retain_post_seed_outer_finalization(
+                post_seed.identity,
+                [AnalysisTransferHandle { identity }],
+                [],
+            );
+            debug_assert!(retained);
+            for retired in tail.retired_post_seed_owners {
+                self.complete_post_seed_refresh_retry(retired);
+                self.complete_system_file_seed_retry(retired);
+            }
+            self.deferred_library_routing_build_notes
+                .append(&mut tail.build_notes);
+            return match registration {
+                PostSeedRefreshOwnerRegistration::Added => {
+                    LibraryRoutingTailClaim::PostSeedAdded(post_seed)
+                }
+                PostSeedRefreshOwnerRegistration::ExistingSame => {
+                    LibraryRoutingTailClaim::PostSeedExisting
+                }
+                PostSeedRefreshOwnerRegistration::ExistingDifferent(_) => unreachable!(),
+                PostSeedRefreshOwnerRegistration::Shutdown => LibraryRoutingTailClaim::Shutdown,
+            };
+        }
+
+        for retired in tail.retired_post_seed_owners {
+            self.complete_post_seed_refresh_retry(retired);
+            self.complete_system_file_seed_retry(retired);
+        }
+        self.deferred_library_routing_build_notes
+            .append(&mut tail.build_notes);
+        LibraryRoutingTailClaim::NotesOnly
+    }
+
+    pub(crate) fn take_deferred_library_routing_build_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.deferred_library_routing_build_notes)
     }
 
     /// Atomically consume every supplied transfer and reserve the union of its
@@ -3534,6 +5080,119 @@ impl WorldState {
         handle: AnalysisTransferHandle,
     ) -> bool {
         self.analysis_transfers.contains_key(&handle.identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn analysis_transfer_candidate_uris_for_test(
+        &self,
+        handle: AnalysisTransferHandle,
+    ) -> Vec<Url> {
+        self.analysis_transfers
+            .get(&handle.identity)
+            .map(|transfer| {
+                transfer
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.uri.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_post_seed_outer_is_empty_for_test(&self) -> bool {
+        self.pending_post_seed_outer_handles.is_empty()
+            && self.pending_post_seed_outer_candidates.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_routing_tail_for_test(
+        &mut self,
+        post_seed: LibraryRoutingPreSealPostSeed,
+    ) -> AnalysisTransferHandle {
+        let (_owner, mut deposit) = self.capture_current_library_routing_pre_seal();
+        deposit.post_seed = Some(post_seed);
+        deposit
+            .build_notes
+            .push("test routing tail build note".to_string());
+        let identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+            routing_owner: self.system_file_routing_owner_identity(),
+            commit_generation: Self::mint_system_file_commit_generation(),
+        });
+        self.install_library_routing_transfer(identity, None, Vec::new(), deposit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_system_file_transfer_for_test(
+        &mut self,
+        uris: impl IntoIterator<Item = Url>,
+    ) -> SystemFileTransferredEffects {
+        let candidates = self.capture_analysis_transfer_candidates(uris);
+        let identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+            routing_owner: self.system_file_routing_owner_identity(),
+            commit_generation: Self::mint_system_file_commit_generation(),
+        });
+        let handle =
+            self.install_analysis_transfer(identity, self.latest_system_file_transfer, candidates);
+        self.latest_system_file_transfer = Some(identity);
+        SystemFileTransferredEffects {
+            handle,
+            changed_uris: Vec::new(),
+        }
+    }
+
+    /// Collapse an ownerless/degraded pre-seal ledger into one fresh pending
+    /// SystemFile transfer against the current routing lineage.
+    pub(crate) fn collapse_current_library_routing_pre_seal(
+        &mut self,
+        mut deposit: LibraryRoutingPreSealDeposit,
+    ) -> Option<LibraryRoutingTransferredEffects> {
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            for handle in deposit.handles {
+                let mut identity = handle.identity;
+                let mut visited = HashSet::new();
+                while let Some(successor) =
+                    self.analysis_transfer_successors.get(&identity).copied()
+                {
+                    if !visited.insert(identity) {
+                        break;
+                    }
+                    identity = successor;
+                }
+                self.analysis_transfers.remove(&identity);
+                self.analysis_transfers_consumed
+                    .insert(identity, Vec::new());
+            }
+            if let Some(post_seed) = deposit.post_seed.take() {
+                self.complete_post_seed_refresh_retry(post_seed.identity);
+                self.complete_system_file_seed_retry(post_seed.identity);
+                if let Some(system) = post_seed.deferred_system_file {
+                    self.complete_post_seed_refresh_retry(system);
+                    self.complete_system_file_seed_retry(system);
+                }
+            }
+            for retired in deposit.retired_post_seed_owners {
+                self.complete_post_seed_refresh_retry(retired);
+                self.complete_system_file_seed_retry(retired);
+            }
+            return None;
+        }
+        let identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+            routing_owner: self.system_file_routing_owner_identity(),
+            commit_generation: Self::mint_system_file_commit_generation(),
+        });
+        let handle = self.install_library_routing_transfer(
+            identity,
+            self.latest_system_file_transfer,
+            Vec::new(),
+            deposit,
+        );
+        self.latest_system_file_transfer = Some(identity);
+        Some(LibraryRoutingTransferredEffects {
+            handle,
+            changed_uris: Vec::new(),
+            restart_owner: None,
+        })
     }
 
     #[cfg(test)]
@@ -3804,6 +5463,18 @@ impl WorldState {
             .apply_package_event_with_routing_policy(delta, PackageRoutingOwnerPolicy::IfChanged);
     }
 
+    /// Apply an event while returning the exact routing owner minted by a
+    /// workspace/package-routing change.
+    ///
+    /// Configuration transitions use this instead of the compatibility
+    /// adapter above so `system.file()` convergence cannot be discarded.
+    pub(crate) fn apply_package_event_with_routing_owner(
+        &mut self,
+        delta: &crate::package_state::PackageInputDelta,
+    ) -> Option<SystemFileRoutingOwnerIdentity> {
+        self.apply_package_event_with_routing_policy(delta, PackageRoutingOwnerPolicy::IfChanged)
+    }
+
     /// Compatibility tail for the single-owner CLI seed adapter.
     ///
     /// LSP seed/reseed callers install a complete
@@ -3996,7 +5667,8 @@ impl WorldState {
     }
 
     fn package_projection_basis_is_current(&self, basis: &PackageProjectionBasis) -> bool {
-        self.package_input_generation() == basis.package_input_generation
+        !self.routing_shutdown.load(Ordering::Acquire)
+            && self.package_input_generation() == basis.package_input_generation
             && self.package_state_record_generation == basis.package_state_record_generation
             && self.workspace_scan_generation == basis.workspace_scan_generation
             && self.package_config_generation == basis.package_config_generation
@@ -4283,7 +5955,13 @@ impl WorldState {
             package_library: Arc::new(PackageLibrary::new_empty()),
             package_library_install_id: Self::mint_package_library_install_id(),
             package_library_content_generation: 0,
-            pending_library_replacement: None,
+            library_replacement_lifecycle: Arc::new(parking_lot::Mutex::new(
+                LibraryReplacementLifecycle::default(),
+            )),
+            routing_shutdown: Arc::new(AtomicBool::new(false)),
+            library_routing_reconcile_wake: Arc::new(tokio::sync::Notify::new()),
+            library_routing_reconcile_wake_generation: Arc::new(AtomicU64::new(0)),
+            library_routing_reconcile_eligibility_generation: Arc::new(AtomicU64::new(0)),
             package_seed_install_id: 0,
             pending_system_file_seed_retry: None,
             pending_post_seed_refresh_retry: None,
@@ -4291,6 +5969,7 @@ impl WorldState {
             pending_post_seed_requires_system_transfer: false,
             pending_post_seed_outer_handles: Vec::new(),
             pending_post_seed_outer_candidates: Vec::new(),
+            deferred_library_routing_build_notes: Vec::new(),
             system_file_routing_owner_generation: Self::mint_system_file_routing_owner_generation(),
 
             // Caches
@@ -4349,6 +6028,12 @@ impl WorldState {
             watched_batch_pre_finalize_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
+            watched_batch_fallback_after_updates_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            config_system_file_post_send_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
             diagnostics_post_publish_lock_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
@@ -4356,6 +6041,18 @@ impl WorldState {
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
             package_init_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            package_init_post_claim_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            library_routing_reconcile_pre_drain_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            library_routing_reconcile_post_reload_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            degraded_reconcile_pre_park_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
             system_file_pre_commit_test_pause:
@@ -4367,6 +6064,8 @@ impl WorldState {
             system_file_test_reject_remaining: 0,
             #[cfg(test)]
             system_file_test_commit_attempts: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            library_routing_derivation_on_tokio_for_test: false,
             #[cfg(test)]
             library_routing_test_reject_remaining: 0,
             #[cfg(test)]
@@ -4406,6 +6105,8 @@ impl WorldState {
             force_open_install_local_only_for_test: false,
             #[cfg(test)]
             force_package_library_not_ready_for_test: false,
+            #[cfg(test)]
+            force_package_init_stale_for_test: false,
 
             // Cross-file state
             cross_file_config: config,
@@ -4436,7 +6137,7 @@ impl WorldState {
             editor_chunk_kind_overrides: HashMap::new(),
             watched_file_resync_generation_counter: 0,
             watched_file_resync_generations: HashMap::new(),
-            libpath_watcher_handle: None,
+            libpath_watcher: LibpathWatcherState::Disabled,
             libpath_watcher_owner_generation: Self::mint_libpath_watcher_owner_generation(),
             package_library_ready: false,
             workspace_scan_generation: 0,
@@ -4470,8 +6171,12 @@ impl WorldState {
             package_inputs: crate::package_state::PackageInputs::default(),
             package_input_lifecycle: crate::package_state::PackageInputLifecycle::default(),
             package_seed_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
-            library_routing_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
-            watched_package_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
+            library_routing_retry: Arc::new(
+                crate::package_state::PackageSeedRetryLifecycle::default(),
+            ),
+            watched_package_retry: Arc::new(
+                crate::package_state::PackageSeedRetryLifecycle::default(),
+            ),
             sysdata_fallback_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
         }
     }
@@ -4816,6 +6521,95 @@ impl WorldState {
         self.library_routing_retry.cancel();
         self.watched_package_retry.cancel();
         self.sysdata_fallback_retry.cancel();
+    }
+
+    /// Retire every unpublished routing tail during shutdown without creating
+    /// diagnostic tickets. Diagnostic epochs are already retired by the
+    /// caller; this sweep deterministically releases retry identities and
+    /// state-owned ledgers so detached coordinators fail their next owner
+    /// check.
+    pub(crate) fn drain_library_routing_tails_for_shutdown(
+        &mut self,
+    ) -> Option<Arc<crate::libpath_watcher::LibpathWatcherHandle>> {
+        self.routing_shutdown.store(true, Ordering::Release);
+        self.libpath_watcher_owner_generation = Self::mint_libpath_watcher_owner_generation();
+        let retired_watcher = self.libpath_watcher.retire();
+        let mut transfer_identities: Vec<_> = self
+            .analysis_transfers
+            .iter()
+            .filter_map(|(identity, transfer)| transfer.routing_tail.as_ref().map(|_| *identity))
+            .collect();
+        // Shutdown retires every diagnostic lifecycle, so no pending
+        // analysis handoff may remain publishable. This also covers a
+        // config-system.file delivery already sent to its caller: it has no
+        // routing tail, but the tracked fallback root must observe the drain
+        // instead of finalizing it after shutdown.
+        transfer_identities.extend(self.analysis_transfers.keys().copied());
+        transfer_identities.extend(
+            self.pending_post_seed_outer_handles
+                .iter()
+                .map(|handle| handle.identity),
+        );
+        transfer_identities.extend(
+            self.pending_post_seed_system_transfer
+                .as_ref()
+                .map(|(_, handle)| handle.identity),
+        );
+        let mut terminal_identities = HashSet::new();
+        for origin in transfer_identities {
+            let mut terminal = origin;
+            let mut visited = HashSet::new();
+            while let Some(successor) = self.analysis_transfer_successors.get(&terminal).copied() {
+                if !visited.insert(terminal) {
+                    log::error!("analysis-transfer successor cycle during shutdown drain");
+                    break;
+                }
+                terminal = successor;
+            }
+            terminal_identities.insert(terminal);
+        }
+        let mut tails = Vec::new();
+        for identity in terminal_identities {
+            if let Some(mut transfer) = self.analysis_transfers.remove(&identity)
+                && let Some(tail) = transfer.routing_tail.take()
+            {
+                tails.push(tail);
+            }
+            self.analysis_transfers_consumed
+                .insert(identity, Vec::new());
+        }
+        let deposited = {
+            let mut lifecycle = self.library_replacement_lifecycle.lock();
+            lifecycle.pending = None;
+            lifecycle.reconcile_required = None;
+            lifecycle.pre_seal.take()
+        };
+        if let Some(mut deposit) = deposited
+            && let Some(tail) = LibraryRoutingTail::from_deposit(&mut deposit)
+        {
+            tails.push(tail);
+        }
+        let mut identities = Vec::new();
+        for mut tail in tails {
+            if let Some(post_seed) = tail.post_seed.take() {
+                identities.push(post_seed.identity);
+                identities.extend(post_seed.deferred_system_file);
+            }
+            identities.append(&mut tail.retired_post_seed_owners);
+        }
+        identities.extend(self.pending_post_seed_refresh_retry);
+        identities.extend(self.pending_system_file_seed_retry);
+        identities.sort_unstable_by_key(|identity| identity.seed_install_id);
+        identities.dedup();
+        for identity in identities {
+            self.complete_post_seed_refresh_retry(identity);
+            self.complete_system_file_seed_retry(identity);
+        }
+        self.pending_post_seed_outer_handles.clear();
+        self.pending_post_seed_outer_candidates.clear();
+        self.pending_post_seed_system_transfer = None;
+        self.deferred_library_routing_build_notes.clear();
+        retired_watcher
     }
 
     fn open_alias_candidates_for_uri(&self, uri: &Url) -> Vec<Url> {
@@ -6034,7 +7828,7 @@ impl WorldState {
                 return self.try_commit_watched_batch(*prepared);
             }
         };
-        self.try_commit_closed_batch(mutations, None, true)
+        self.try_commit_closed_batch(mutations, None, true, false)
     }
 
     fn try_commit_watched_batch(
@@ -6060,7 +7854,12 @@ impl WorldState {
         {
             return Err(AnalysisCommitRejected::StaleBasis);
         }
-        self.try_commit_closed_batch(prepared.mutations, prepared.package, false)
+        self.try_commit_closed_batch(
+            prepared.mutations,
+            prepared.package,
+            false,
+            prepared.durable_package_handoff,
+        )
     }
 
     /// Atomically install one complete workspace-scan projection.
@@ -6202,6 +8001,9 @@ impl WorldState {
         &self,
         basis: &SystemFileAnalysisBasis,
     ) -> bool {
+        if self.routing_shutdown.load(Ordering::Acquire) {
+            return false;
+        }
         let index = self.workspace_index.authority_snapshot();
         let open_records: std::collections::BTreeMap<_, _> = self
             .documents
@@ -6268,7 +8070,8 @@ impl WorldState {
         }
 
         let changed_uris = prepared.changed_uris;
-        let candidate_uris = self.system_file_republish_set(&changed_uris);
+        let candidate_uris = self
+            .system_file_republish_set_with_content(&changed_uris, &prepared.content_changed_uris);
         let candidates = self.capture_analysis_transfer_candidates(
             candidate_uris
                 .into_iter()
@@ -6304,11 +8107,25 @@ impl WorldState {
     /// cache helpers never wait on that lease while holding `WorldState`, so
     /// acquiring this state write lock after the lease is the single fair,
     /// deadlock-free finalization order.
+    ///
+    /// `prepared.watcher` must be a clone of a driver-owned install: a rejected
+    /// attempt may drop this per-attempt clone under the state lock, while the
+    /// driver retains the last prospective OS-handle `Arc` until after the
+    /// guard is released.
     pub(crate) fn try_commit_library_routing(
         &mut self,
         prepared: PreparedLibraryRoutingAnalysis,
         lease: &PackageLibraryRoutingLease<'_>,
-    ) -> Result<LibraryRoutingTransferredEffects, AnalysisCommitRejected> {
+        mut replacement_guard: Option<&mut PendingLibraryReplacementGuard>,
+        pre_seal: &mut Option<LibraryRoutingPreSealDeposit>,
+        mut delivery: Option<&mut crate::libpath_watcher::LibpathJournalDelivery>,
+    ) -> Result<
+        (
+            LibraryRoutingTransferredEffects,
+            Option<Arc<crate::libpath_watcher::LibpathWatcherHandle>>,
+        ),
+        AnalysisCommitRejected,
+    > {
         let PreparedLibraryRoutingAnalysis {
             basis,
             prospective,
@@ -6316,15 +8133,71 @@ impl WorldState {
             ready,
             warm_basis,
             system_file,
+            watcher,
         } = prepared;
         let warm_basis_is_valid = warm_basis
             .as_ref()
             .is_some_and(|basis| self.open_package_warm_basis_is_current(basis, &library));
+        let watcher_shape_is_valid = match basis.mutation {
+            LibraryRoutingMutation::Changed
+            | LibraryRoutingMutation::FullRescan
+            | LibraryRoutingMutation::DegradedReconcile => {
+                matches!(watcher, PreparedLibpathWatcherInstall::Keep)
+            }
+            LibraryRoutingMutation::Replacement | LibraryRoutingMutation::Dropped => {
+                !matches!(watcher, PreparedLibpathWatcherInstall::Keep)
+                    && watcher.is_buffering_active()
+            }
+        };
+        let delivery_is_valid = match basis.mutation {
+            LibraryRoutingMutation::Replacement => delivery.is_none(),
+            LibraryRoutingMutation::Changed => delivery.as_deref().is_some_and(|delivery| {
+                matches!(
+                    delivery.event(),
+                    crate::libpath_watcher::LibpathEvent::Changed { .. }
+                ) && self
+                    .libpath_watcher
+                    .active_journal()
+                    .is_some_and(|journal| Arc::ptr_eq(journal, delivery.journal()))
+            }),
+            LibraryRoutingMutation::FullRescan => delivery.as_deref().is_some_and(|delivery| {
+                matches!(
+                    delivery.event(),
+                    crate::libpath_watcher::LibpathEvent::Rescan
+                ) && self
+                    .libpath_watcher
+                    .active_journal()
+                    .is_some_and(|journal| Arc::ptr_eq(journal, delivery.journal()))
+            }),
+            LibraryRoutingMutation::DegradedReconcile => {
+                delivery.is_none()
+                    && matches!(
+                        self.libpath_watcher,
+                        LibpathWatcherState::Degraded {
+                            reconcile_pending: true
+                        }
+                    )
+            }
+            LibraryRoutingMutation::Dropped => delivery.as_deref().is_some_and(|delivery| {
+                matches!(
+                    delivery.event(),
+                    crate::libpath_watcher::LibpathEvent::Dropped
+                ) && self
+                    .libpath_watcher
+                    .active_journal()
+                    .is_some_and(|journal| Arc::ptr_eq(journal, delivery.journal()))
+            }),
+        };
         let requires_full_warm = matches!(
             basis.mutation,
-            LibraryRoutingMutation::Replacement | LibraryRoutingMutation::Dropped
+            LibraryRoutingMutation::Replacement
+                | LibraryRoutingMutation::FullRescan
+                | LibraryRoutingMutation::DegradedReconcile
+                | LibraryRoutingMutation::Dropped
         );
         if !self.library_routing_basis_is_current(&basis, lease)
+            || !watcher_shape_is_valid
+            || !delivery_is_valid
             || (requires_full_warm && !warm_basis_is_valid)
             || (!requires_full_warm && warm_basis.as_ref().is_some_and(|_| !warm_basis_is_valid))
             || system_file.basis.routing != prospective.routing
@@ -6357,6 +8230,9 @@ impl WorldState {
         {
             return Err(AnalysisCommitRejected::StaleBasis);
         }
+        if let Some(delivery) = delivery.as_mut() {
+            delivery.ack();
+        }
 
         basis.library.retire(lease);
         self.package_library = library;
@@ -6365,19 +8241,103 @@ impl WorldState {
         self.system_file_routing_owner_generation = prospective.routing_owner.0;
         self.package_library_ready = ready;
         self.refresh_local_dev_overlay();
-        let restart_owner = match basis.mutation {
-            LibraryRoutingMutation::Changed => None,
-            LibraryRoutingMutation::Replacement | LibraryRoutingMutation::Dropped => {
+        let watcher_owner_changed = prospective.watcher_owner != self.libpath_watcher_owner();
+        let mut restart_owner = None;
+        let retired_handle = match watcher {
+            PreparedLibpathWatcherInstall::Keep => {
+                debug_assert!(matches!(
+                    basis.mutation,
+                    LibraryRoutingMutation::Changed
+                        | LibraryRoutingMutation::FullRescan
+                        | LibraryRoutingMutation::DegradedReconcile
+                ));
+                if basis.mutation == LibraryRoutingMutation::DegradedReconcile {
+                    self.libpath_watcher = LibpathWatcherState::Degraded {
+                        reconcile_pending: false,
+                    };
+                }
+                None
+            }
+            PreparedLibpathWatcherInstall::Active {
+                handle,
+                journal,
+                recovery,
+            } => {
+                debug_assert_ne!(basis.mutation, LibraryRoutingMutation::Changed);
+                let retired = self.libpath_watcher.retire();
+                assert!(
+                    journal.try_activate(),
+                    "library-routing CAS must activate an exact buffering journal"
+                );
                 self.libpath_watcher_owner_generation = prospective.watcher_owner.0;
-                self.libpath_watcher_handle = None;
-                Some(prospective.watcher_owner)
+                self.libpath_watcher = LibpathWatcherState::Active {
+                    handle: Some(handle),
+                    journal,
+                    is_recovery: recovery,
+                    applied: LibpathWatcherSpec {
+                        paths: self.package_library.lib_paths().to_vec(),
+                        debounce_ms: basis.packages_watch_debounce_ms,
+                    },
+                };
+                retired
+            }
+            PreparedLibpathWatcherInstall::Disabled => {
+                debug_assert_ne!(basis.mutation, LibraryRoutingMutation::Changed);
+                let retired = self.libpath_watcher.retire();
+                self.libpath_watcher_owner_generation = prospective.watcher_owner.0;
+                retired
+            }
+            PreparedLibpathWatcherInstall::AttachFailed {
+                recovery,
+                can_recover,
+            } => {
+                debug_assert_ne!(basis.mutation, LibraryRoutingMutation::Changed);
+                let retired = self.libpath_watcher.retire();
+                self.libpath_watcher_owner_generation = prospective.watcher_owner.0;
+                if recovery {
+                    self.libpath_watcher = LibpathWatcherState::Degraded {
+                        reconcile_pending: false,
+                    };
+                } else if can_recover {
+                    self.libpath_watcher = LibpathWatcherState::AwaitingRecovery;
+                    restart_owner = Some(prospective.watcher_owner);
+                } else {
+                    self.libpath_watcher = LibpathWatcherState::Degraded {
+                        reconcile_pending: false,
+                    };
+                }
+                retired
             }
         };
-        if basis.mutation == LibraryRoutingMutation::Replacement {
-            debug_assert_eq!(self.pending_library_replacement, basis.replacement_intent);
-            self.pending_library_replacement = None;
+        let finalized_pre_seal = if basis.mutation == LibraryRoutingMutation::Replacement {
+            let mut lifecycle = self.library_replacement_lifecycle.lock();
+            debug_assert_eq!(lifecycle.pending, basis.replacement_intent);
+            let guard = replacement_guard
+                .as_mut()
+                .expect("a replacement CAS must own its synchronous lifecycle guard");
+            debug_assert!(Arc::ptr_eq(
+                &guard.lifecycle,
+                &self.library_replacement_lifecycle
+            ));
+            debug_assert_eq!(Some(guard.intent), basis.replacement_intent);
+            let mut adopted = pre_seal
+                .take()
+                .expect("replacement CAS retains its adopted pre-seal bundle");
+            if let Some(late) = lifecycle.pre_seal.take() {
+                adopted.merge(late);
+            }
+            // Any reconcile request installed by a late depositor is
+            // satisfied by this same atomic adoption.
+            lifecycle.reconcile_required = None;
+            lifecycle.pending = None;
+            guard.armed = false;
+            drop(lifecycle);
             self.bump_package_config_generation();
-        }
+            Some(adopted)
+        } else {
+            debug_assert!(replacement_guard.is_none());
+            None
+        };
 
         let open_changed = !system_file.open_metadata.is_empty();
         for replacement in system_file.open_metadata {
@@ -6397,10 +8357,14 @@ impl WorldState {
 
         let changed_uris = system_file.changed_uris;
         let candidate_uris = match basis.mutation {
-            LibraryRoutingMutation::Replacement | LibraryRoutingMutation::Dropped => {
-                self.documents.keys().cloned().collect()
-            }
-            LibraryRoutingMutation::Changed => self.system_file_republish_set(&changed_uris),
+            LibraryRoutingMutation::Replacement
+            | LibraryRoutingMutation::FullRescan
+            | LibraryRoutingMutation::DegradedReconcile
+            | LibraryRoutingMutation::Dropped => self.documents.keys().cloned().collect(),
+            LibraryRoutingMutation::Changed => self.system_file_republish_set_with_content(
+                &changed_uris,
+                &system_file.content_changed_uris,
+            ),
         };
         let candidates = self.capture_analysis_transfer_candidates(
             candidate_uris
@@ -6411,15 +8375,36 @@ impl WorldState {
             routing_owner: prospective.routing_owner,
             commit_generation: Self::mint_system_file_commit_generation(),
         });
-        let handle =
-            self.install_analysis_transfer(identity, self.latest_system_file_transfer, candidates);
+        let handle = if let Some(deposit) = finalized_pre_seal {
+            self.install_library_routing_transfer(
+                identity,
+                self.latest_system_file_transfer,
+                candidates,
+                deposit,
+            )
+        } else {
+            self.install_analysis_transfer(identity, self.latest_system_file_transfer, candidates)
+        };
         self.latest_system_file_transfer = Some(identity);
+        if watcher_owner_changed {
+            // Full replacement and Dropped commits publish watcher ownership
+            // directly rather than through the watcher-only swap CAS. They
+            // must still wake a terminal degraded root parked on the old
+            // owner.
+            notify_library_routing_reconcile_edge(
+                &self.library_routing_reconcile_wake,
+                &self.library_routing_reconcile_wake_generation,
+            );
+        }
 
-        Ok(LibraryRoutingTransferredEffects {
-            handle,
-            changed_uris,
-            restart_owner,
-        })
+        Ok((
+            LibraryRoutingTransferredEffects {
+                handle,
+                changed_uris,
+                restart_owner,
+            },
+            retired_handle,
+        ))
     }
 
     fn try_commit_open_close(
@@ -6498,6 +8483,7 @@ impl WorldState {
             package_routing: package_routing_owner.map(|owner| PackageRoutingCommitEffects {
                 owner,
                 candidates: plan_effects.transfer_candidates,
+                handoff: None,
             }),
         })
     }
@@ -6576,6 +8562,7 @@ impl WorldState {
             package_routing: package_routing_owner.map(|owner| PackageRoutingCommitEffects {
                 owner,
                 candidates: plan_effects.transfer_candidates,
+                handoff: None,
             }),
         })
     }
@@ -6635,6 +8622,7 @@ impl WorldState {
             package_routing: package_routing_owner.map(|owner| PackageRoutingCommitEffects {
                 owner,
                 candidates: plan_effects.transfer_candidates,
+                handoff: None,
             }),
         })
     }
@@ -6959,6 +8947,7 @@ impl WorldState {
         mutations: Vec<PreparedClosedMutation>,
         package: Option<(PackageProjectionBasis, PreparedPackageProjection)>,
         reserve_closed_fanout: bool,
+        durable_package_handoff: bool,
     ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
         let mut targets = HashSet::with_capacity(mutations.len());
         let no_duplicates = mutations.iter().all(|mutation| {
@@ -7146,9 +9135,29 @@ impl WorldState {
             package.and_then(|(_, prepared)| self.install_prepared_package_projection(prepared));
         let mut effects = self.reserve_analysis_revalidations(affected);
         effects.affected_candidates = affected_candidates;
-        effects.package_routing = package_routing_owner.map(|owner| PackageRoutingCommitEffects {
-            owner,
-            candidates: Vec::new(),
+        effects.package_routing = package_routing_owner.map(|owner| {
+            let (candidates, handoff) = if durable_package_handoff {
+                let candidates =
+                    self.capture_analysis_transfer_candidates(self.documents.keys().cloned());
+                let identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+                    routing_owner: owner,
+                    commit_generation: Self::mint_system_file_commit_generation(),
+                });
+                let handoff = self.install_analysis_transfer(
+                    identity,
+                    self.latest_system_file_transfer,
+                    candidates.clone(),
+                );
+                self.latest_system_file_transfer = Some(identity);
+                (candidates, Some(handoff))
+            } else {
+                (Vec::new(), None)
+            };
+            PackageRoutingCommitEffects {
+                owner,
+                candidates,
+                handoff,
+            }
         });
         Ok(effects)
     }
@@ -7596,6 +9605,7 @@ impl WorldState {
             open_metadata: draft.open_metadata,
             graph: draft.graph,
             changed_uris: draft.changed_uris,
+            content_changed_uris: draft.content_changed_uris,
             external_observations: draft.external_observations,
         })
     }
@@ -7878,6 +9888,14 @@ impl WorldState {
     /// fan-out `did_change` performs via
     /// `compute_affected_dependents_after_edit`.
     pub fn system_file_republish_set(&self, changed: &[Url]) -> Vec<Url> {
+        self.system_file_republish_set_with_content(changed, &HashSet::new())
+    }
+
+    fn system_file_republish_set_with_content(
+        &self,
+        changed: &[Url],
+        content_changed: &HashSet<Url>,
+    ) -> Vec<Url> {
         let mut seen: std::collections::HashSet<Url> = std::collections::HashSet::new();
         let mut out: Vec<Url> = Vec::new();
         for uri in changed {
@@ -7887,8 +9905,9 @@ impl WorldState {
                 out.push(open_uri);
             }
             let dependents = self.affected_open_dependents_after_edit(
-                uri, false, // the file's text (interface) did not change
-                true,  // its dependency edges did
+                uri,
+                content_changed.contains(uri),
+                true, // its dependency edges may have changed
             );
             for dep in dependents {
                 if seen.insert(dep.clone()) {
@@ -8176,13 +10195,54 @@ pub(crate) fn prepare_system_file_analysis(
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok();
     let mut installs = Vec::new();
+    let mut content_changed_uris = HashSet::new();
     let mut missing_targets: Vec<_> = referenced_targets
         .iter()
         .filter(|uri| !existing.contains(*uri))
         .cloned()
         .collect();
     missing_targets.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-    for uri in missing_targets {
+    let mut refresh_targets: Vec<_> = referenced_targets
+        .iter()
+        .filter(|uri| !protected_open.contains(*uri))
+        .filter(|uri| {
+            uri.to_file_path()
+                .ok()
+                .is_none_or(|path| !workspace_dirs.iter().any(|root| path.starts_with(root)))
+        })
+        .filter_map(|uri| {
+            let entry = artifacts
+                .iter()
+                .find_map(|(candidate, entry)| (candidate == uri).then_some(entry))?;
+            if entry.provenance != ClosedProvenance::Dynamic {
+                return None;
+            }
+            let path = uri.to_file_path().ok()?;
+            let (observation, _) = observed_external.get(&path)?;
+            match &observation.identity {
+                SystemFileExternalIdentity::Valid(snapshot) if snapshot != &entry.snapshot => {
+                    Some(uri.clone())
+                }
+                SystemFileExternalIdentity::Valid(_)
+                | SystemFileExternalIdentity::Missing
+                | SystemFileExternalIdentity::InvalidBytes => None,
+            }
+        })
+        .collect();
+    refresh_targets.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    let refresh_set: HashSet<_> = refresh_targets.iter().cloned().collect();
+    // A refreshed full record owns its metadata replacement. Supplying the
+    // same URI to both targeted `metadata` and `installs` would reject the
+    // whole atomic batch.
+    metadata_changes.retain(|(uri, _)| !refresh_set.contains(uri));
+
+    let mut install_targets: Vec<_> = missing_targets
+        .into_iter()
+        .map(|uri| (uri, false))
+        .chain(refresh_targets.into_iter().map(|uri| (uri, true)))
+        .collect();
+    install_targets.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+    for (uri, refresh) in install_targets {
         let Some(path) = uri.to_file_path().ok() else {
             continue;
         };
@@ -8194,7 +10254,14 @@ pub(crate) fn prepare_system_file_analysis(
         };
         let content = content.clone();
         let tree = parser.parse(&content, None);
-        let metadata = Arc::new(crate::cross_file::extract_metadata(&content));
+        let mut metadata = crate::cross_file::extract_metadata(&content);
+        crate::cross_file::resolve_system_file_source_entries(
+            &mut metadata.sources,
+            basis.routing.workspace_name.as_deref(),
+            basis.routing.workspace_root.as_deref(),
+            &basis.routing.library_paths,
+        );
+        let metadata = Arc::new(metadata);
         let artifacts = tree.as_ref().map_or_else(
             || Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
             |tree| {
@@ -8212,12 +10279,17 @@ pub(crate) fn prepare_system_file_analysis(
             data_packages: extract_data_packages(&tree, &content),
             tree,
             snapshot: snapshot.clone(),
-            metadata,
+            metadata: metadata.clone(),
             artifacts,
             indexed_at_version: 0,
         };
         full_content.insert(uri.clone(), content);
+        closed_metadata.insert(uri.clone(), metadata);
         provenance.insert(uri.clone(), ClosedProvenance::Dynamic);
+        if refresh {
+            content_changed_uris.insert(uri.clone());
+            changed_uris.push(uri.clone());
+        }
         installs.push((uri, entry, ClosedProvenance::Dynamic));
     }
 
@@ -8235,6 +10307,23 @@ pub(crate) fn prepare_system_file_analysis(
         graph.update_file(uri, graph_metadata.as_ref(), workspace_root, |parent| {
             full_content.get(parent).cloned()
         });
+    }
+    for uri in &content_changed_uris {
+        let metadata = closed_metadata
+            .get(uri)
+            .expect("every refreshed target has parsed metadata");
+        let graph_metadata = WorldState::metadata_for_dependency_graph_with_exclusions(
+            &exclusions,
+            uri,
+            metadata,
+            workspace_root,
+        );
+        graph.update_file(uri, graph_metadata.as_ref(), workspace_root, |parent| {
+            full_content.get(parent).cloned()
+        });
+        if exclusions.is_excluded_uri(uri) {
+            graph.make_forward_edges_non_lending(uri);
+        }
     }
     for input in &open {
         if !changed_open.contains(&input.uri) && !changed_closed.contains(&input.uri) {
@@ -8313,6 +10402,7 @@ pub(crate) fn prepare_system_file_analysis(
         open_metadata,
         graph,
         changed_uris,
+        content_changed_uris,
         external_observations,
     }
 }
@@ -11597,6 +13687,94 @@ mod tests {
         assert!(dependencies.iter().any(|edge| edge.to == second));
     }
 
+    #[tokio::test]
+    async fn system_file_refreshes_changed_dynamic_target_and_retains_invalid_bytes() {
+        let library = tempfile::tempdir().unwrap();
+        let package = library.path().join("otherpkg");
+        std::fs::create_dir_all(&package).unwrap();
+        let helper_path = package.join("helper.R");
+        std::fs::write(&helper_path, "old_symbol <- 1\n").unwrap();
+        let helper = Url::from_file_path(&helper_path).unwrap();
+        let source = Url::parse("file:///workspace/dynamic-source.R").unwrap();
+        let text = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
+        let mut state = WorldState::new();
+        state.open_document(source.clone(), text, Some(1));
+        let generation = state.documents.get_record(&source).unwrap().generation();
+        state
+            .replace_open_document_metadata_if_current(
+                &source,
+                generation,
+                Arc::new(crate::cross_file::extract_metadata(text)),
+            )
+            .unwrap();
+        let mut package_library = crate::package_library::PackageLibrary::new_empty();
+        package_library.set_lib_paths(vec![library.path().to_path_buf()]);
+        state.install_package_library(Arc::new(package_library), true);
+
+        crate::backend::run_system_file_convergence_for_test(&mut state, None)
+            .await
+            .expect("initial dynamic target install commits");
+        assert!(
+            state
+                .workspace_index
+                .get(&helper)
+                .unwrap()
+                .artifacts
+                .exported_interface
+                .keys()
+                .any(|name| &**name == "old_symbol")
+        );
+
+        std::fs::write(&helper_path, "new_symbol <- 2\n").unwrap();
+        let captured = state.capture_system_file_analysis(None);
+        let draft = prepare_system_file_analysis(captured);
+        let prepared = state
+            .finish_system_file_analysis(draft)
+            .expect("same-URI dynamic refresh remains admissible");
+        let effects = state
+            .try_commit_analysis(PreparedAnalysisCommit::SystemFile(Box::new(prepared)))
+            .expect("same-URI dynamic refresh commits");
+        let transfer = effects
+            .system_file
+            .expect("changed content installs a fanout handoff");
+        assert!(
+            state
+                .analysis_transfer_candidate_uris_for_test(transfer.handle)
+                .contains(&source),
+            "the open dependent must be owned by the changed-target fanout"
+        );
+        let refreshed = state.workspace_index.get(&helper).unwrap();
+        assert_eq!(refreshed.contents.to_string(), "new_symbol <- 2\n");
+        assert!(
+            refreshed
+                .artifacts
+                .exported_interface
+                .keys()
+                .any(|name| &**name == "new_symbol")
+        );
+        let unchanged = crate::backend::run_system_file_convergence_for_test(&mut state, None)
+            .await
+            .expect("identical dynamic observation commits as a no-op");
+        assert!(
+            unchanged.is_empty(),
+            "identical bytes must not create content/interface fanout"
+        );
+
+        std::fs::write(&helper_path, [0xff]).unwrap();
+        crate::backend::run_system_file_convergence_for_test(&mut state, None)
+            .await
+            .expect("invalid observation is a retaining no-op");
+        assert_eq!(
+            state
+                .workspace_index
+                .get(&helper)
+                .unwrap()
+                .contents
+                .to_string(),
+            "new_symbol <- 2\n"
+        );
+    }
+
     #[test]
     fn artifact_only_source_protects_resolved_external_target_from_orphan_cleanup() {
         use crate::cross_file::file_cache::FileSnapshot;
@@ -11904,8 +14082,613 @@ mod tests {
             "readiness drift is a construction-key change, not an additive rebase"
         );
         assert_eq!(
-            state.pending_library_replacement, basis.replacement_intent,
+            state.library_replacement_lifecycle.lock().pending,
+            basis.replacement_intent,
             "a failed old-intent rebase must not clear its still-current owner"
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_guard_drop_retires_exact_intent_and_requests_reconcile() {
+        let mut state = WorldState::new();
+        let library = state.package_library.clone();
+        let lease = library.routing_lease().await;
+        let basis = state
+            .capture_library_routing_basis(
+                &library,
+                library.cache_operation_epoch(&lease),
+                LibraryRoutingMutation::Replacement,
+                None,
+            )
+            .unwrap();
+        let guard = state
+            .guard_library_replacement(&basis, LibraryReplacementAbortPolicy::Reconcile)
+            .unwrap();
+        drop(lease);
+
+        drop(guard);
+
+        assert!(state.library_replacement_lifecycle.lock().pending.is_none());
+        let request = state
+            .library_routing_reconcile_request_for_test()
+            .expect("exact cancellation must deposit durable reconcile work");
+        assert_eq!(
+            request.telemetry.package_config_generation,
+            basis.package_config_generation
+        );
+        assert_eq!(request.telemetry.workspace_folders, basis.workspace_folders);
+    }
+
+    #[tokio::test]
+    async fn old_replacement_guard_drop_does_not_touch_newer_intent() {
+        let mut state = WorldState::new();
+        let library = state.package_library.clone();
+        let lease = library.routing_lease().await;
+        let epoch = library.cache_operation_epoch(&lease);
+        let old_basis = state
+            .capture_library_routing_basis(
+                &library,
+                epoch,
+                LibraryRoutingMutation::Replacement,
+                None,
+            )
+            .unwrap();
+        let old_guard = state
+            .guard_library_replacement(&old_basis, LibraryReplacementAbortPolicy::Reconcile)
+            .unwrap();
+        let new_basis = state
+            .capture_library_routing_basis(
+                &library,
+                epoch,
+                LibraryRoutingMutation::Replacement,
+                None,
+            )
+            .unwrap();
+        let new_guard = state
+            .guard_library_replacement(&new_basis, LibraryReplacementAbortPolicy::Reconcile)
+            .unwrap();
+        drop(lease);
+
+        drop(old_guard);
+
+        assert_eq!(
+            state.library_replacement_lifecycle.lock().pending,
+            new_basis.replacement_intent
+        );
+        assert!(state.library_routing_reconcile_request_for_test().is_none());
+        state.abort_library_replacement(&new_basis);
+        drop(new_guard);
+    }
+
+    #[tokio::test]
+    async fn refresh_replacement_guard_drop_does_not_request_reconcile() {
+        let mut state = WorldState::new();
+        let library = state.package_library.clone();
+        let lease = library.routing_lease().await;
+        let basis = state
+            .capture_library_routing_basis(
+                &library,
+                library.cache_operation_epoch(&lease),
+                LibraryRoutingMutation::Replacement,
+                None,
+            )
+            .unwrap();
+        let guard = state
+            .guard_library_replacement(&basis, LibraryReplacementAbortPolicy::NoReconcile)
+            .unwrap();
+        drop(lease);
+
+        drop(guard);
+
+        assert!(state.library_replacement_lifecycle.lock().pending.is_none());
+        assert!(state.library_routing_reconcile_request_for_test().is_none());
+    }
+
+    #[tokio::test]
+    async fn replacement_guard_unwind_is_synchronous_and_disarmed_drop_never_locks() {
+        let mut state = WorldState::new();
+        let library = state.package_library.clone();
+        let lease = library.routing_lease().await;
+        let basis = state
+            .capture_library_routing_basis(
+                &library,
+                library.cache_operation_epoch(&lease),
+                LibraryRoutingMutation::Replacement,
+                None,
+            )
+            .unwrap();
+        let guard = state
+            .guard_library_replacement(&basis, LibraryReplacementAbortPolicy::Reconcile)
+            .unwrap();
+        drop(lease);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = guard;
+            panic!("exercise cancellation unwind");
+        }));
+        assert!(unwind.is_err());
+        assert!(state.library_routing_reconcile_request_for_test().is_some());
+
+        let lease = library.routing_lease().await;
+        let next_basis = state
+            .capture_library_routing_basis(
+                &library,
+                library.cache_operation_epoch(&lease),
+                LibraryRoutingMutation::Replacement,
+                None,
+            )
+            .unwrap();
+        let mut disarmed = state
+            .guard_library_replacement(&next_basis, LibraryReplacementAbortPolicy::NoReconcile)
+            .unwrap();
+        disarmed.armed = false;
+        let lifecycle = Arc::clone(&state.library_replacement_lifecycle);
+        let mut locked = lifecycle.lock();
+        drop(disarmed);
+        locked.pending = None;
+        drop(locked);
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn shutdown_fences_guard_and_pre_seal_drop_registration() {
+        let mut state = WorldState::new();
+        let library = state.package_library.clone();
+        let lease = library.routing_lease().await;
+        let basis = state
+            .capture_library_routing_basis(
+                &library,
+                library.cache_operation_epoch(&lease),
+                LibraryRoutingMutation::Replacement,
+                None,
+            )
+            .unwrap();
+        let guard = state
+            .guard_library_replacement(&basis, LibraryReplacementAbortPolicy::Reconcile)
+            .unwrap();
+        state.request_library_routing_reconcile_current();
+        let (owner, mut late_deposit) = state.capture_current_library_routing_pre_seal();
+        late_deposit
+            .fallback
+            .push(Url::parse("file:///shutdown-late-ledger.R").unwrap());
+
+        state.retire_all_diagnostic_lifecycles();
+        state.cancel_package_seed_retry();
+        let _ = state.drain_library_routing_tails_for_shutdown();
+        drop(guard);
+        owner.deposit(late_deposit);
+
+        let lifecycle = state.library_replacement_lifecycle.lock();
+        assert!(lifecycle.pending.is_none());
+        assert!(lifecycle.reconcile_required.is_none());
+        assert!(lifecycle.pre_seal.is_none());
+        drop(lifecycle);
+        drop(lease);
+    }
+
+    #[test]
+    fn routing_tail_survives_commit_handoff_until_state_locked_claim() {
+        let mut state = WorldState::new();
+        let post_seed = state.record_package_seed_installed();
+        let (_owner, mut deposit) = state.capture_current_library_routing_pre_seal();
+        deposit.post_seed = Some(LibraryRoutingPreSealPostSeed {
+            root: PathBuf::from("/tmp/routing-tail"),
+            identity: post_seed,
+            deferred_system_file: None,
+        });
+        deposit.build_notes.push("retained warning".to_string());
+        let identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+            routing_owner: state.system_file_routing_owner_identity(),
+            commit_generation: WorldState::mint_system_file_commit_generation(),
+        });
+        let handle = state.install_library_routing_transfer(identity, None, Vec::new(), deposit);
+
+        assert!(
+            state
+                .analysis_transfers
+                .get(&handle.identity)
+                .is_some_and(|transfer| transfer.routing_tail.is_some()),
+            "cancellation after CAS must leave the complete tail on the pending transfer"
+        );
+        assert_eq!(
+            state.claim_library_routing_tail(handle),
+            LibraryRoutingTailClaim::PostSeedAdded(LibraryRoutingPreSealPostSeed {
+                root: PathBuf::from("/tmp/routing-tail"),
+                identity: post_seed,
+                deferred_system_file: None,
+            })
+        );
+        assert!(state.analysis_transfer_is_pending_for_test(handle));
+        assert!(state.post_seed_refresh_retry_is_current(post_seed));
+        assert_eq!(
+            state.take_deferred_library_routing_build_notes(),
+            vec!["retained warning".to_string()]
+        );
+    }
+
+    #[test]
+    fn shutdown_drain_retires_claimed_and_unclaimed_routing_tails_without_publish() {
+        let mut state = WorldState::new();
+        let claimed_seed = state.record_package_seed_installed();
+        let (_owner, mut claimed_deposit) = state.capture_current_library_routing_pre_seal();
+        claimed_deposit.post_seed = Some(LibraryRoutingPreSealPostSeed {
+            root: PathBuf::from("/tmp/claimed-tail"),
+            identity: claimed_seed,
+            deferred_system_file: None,
+        });
+        let claimed_identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+            routing_owner: state.system_file_routing_owner_identity(),
+            commit_generation: WorldState::mint_system_file_commit_generation(),
+        });
+        let claimed = state.install_library_routing_transfer(
+            claimed_identity,
+            None,
+            Vec::new(),
+            claimed_deposit,
+        );
+        assert!(matches!(
+            state.claim_library_routing_tail(claimed),
+            LibraryRoutingTailClaim::PostSeedAdded(_)
+        ));
+
+        let unclaimed_seed = state.record_package_seed_installed();
+        let (_owner, mut unclaimed_deposit) = state.capture_current_library_routing_pre_seal();
+        unclaimed_deposit.post_seed = Some(LibraryRoutingPreSealPostSeed {
+            root: PathBuf::from("/tmp/unclaimed-tail"),
+            identity: unclaimed_seed,
+            deferred_system_file: None,
+        });
+        let unclaimed_identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+            routing_owner: state.system_file_routing_owner_identity(),
+            commit_generation: WorldState::mint_system_file_commit_generation(),
+        });
+        let unclaimed = state.install_library_routing_transfer(
+            unclaimed_identity,
+            Some(claimed.identity),
+            Vec::new(),
+            unclaimed_deposit,
+        );
+        let (_owner, mut post_drain_deposit) = state.capture_current_library_routing_pre_seal();
+        let stranded_identity = AnalysisTransferIdentity::SystemFile(SystemFileTransferIdentity {
+            routing_owner: state.system_file_routing_owner_identity(),
+            commit_generation: WorldState::mint_system_file_commit_generation(),
+        });
+        let stranded_handle = state.install_analysis_transfer(stranded_identity, None, Vec::new());
+        post_drain_deposit.handles.push(stranded_handle);
+        let post_drain_seed = state.record_package_seed_installed();
+        let deferred_post_drain_seed = state.record_package_seed_installed();
+        let _ = state.begin_post_seed_refresh_retry(post_drain_seed);
+        let _ = state.begin_system_file_seed_retry(deferred_post_drain_seed);
+        post_drain_deposit.post_seed = Some(LibraryRoutingPreSealPostSeed {
+            root: PathBuf::from("/tmp/post-drain-collapse"),
+            identity: post_drain_seed,
+            deferred_system_file: Some(deferred_post_drain_seed),
+        });
+
+        state.retire_all_diagnostic_lifecycles();
+        state.cancel_package_seed_retry();
+        let _ = state.drain_library_routing_tails_for_shutdown();
+        assert!(
+            state
+                .collapse_current_library_routing_pre_seal(post_drain_deposit)
+                .is_none(),
+            "a tracked escrow reaching its collapse after shutdown must fail closed"
+        );
+        assert!(!state.analysis_transfer_is_pending_for_test(stranded_handle));
+        assert!(!state.post_seed_refresh_retry_is_current(post_drain_seed));
+        assert!(!state.system_file_seed_retry_is_current(deferred_post_drain_seed));
+
+        assert!(!state.post_seed_refresh_retry_is_current(claimed_seed));
+        assert!(!state.post_seed_refresh_retry_is_current(unclaimed_seed));
+        assert!(!state.analysis_transfer_is_pending_for_test(claimed));
+        assert!(!state.analysis_transfer_is_pending_for_test(unclaimed));
+        assert!(state.pending_post_seed_outer_handles.is_empty());
+        assert!(state.deferred_library_routing_build_notes.is_empty());
+        assert_eq!(state.analysis_revalidation_reservation_count, 0);
+    }
+
+    #[test]
+    fn libpath_primary_attach_failure_owns_one_exact_recovery_then_degrades() {
+        let mut state = WorldState::new();
+        let basis = state.capture_libpath_watcher_swap_basis().unwrap();
+        let commit = state
+            .try_commit_libpath_watcher_swap(
+                &basis,
+                PreparedLibpathWatcherInstall::AttachFailed {
+                    recovery: false,
+                    can_recover: true,
+                },
+            )
+            .unwrap();
+        let owner = commit
+            .recovery_owner
+            .expect("primary failure mints one exact recovery owner");
+        assert!(
+            commit.degraded_reconcile_owner.is_none(),
+            "AwaitingRecovery is not terminal degradation"
+        );
+        assert!(matches!(
+            state.libpath_watcher,
+            LibpathWatcherState::AwaitingRecovery
+        ));
+        assert_eq!(state.libpath_watcher_owner(), owner);
+        assert!(state.library_routing_reconcile_request_for_test().is_none());
+
+        let recovery = state
+            .capture_libpath_watcher_recovery_basis(owner)
+            .expect("the exact owner may claim one recovery");
+        let terminal = state
+            .try_commit_libpath_watcher_swap(
+                &recovery,
+                PreparedLibpathWatcherInstall::AttachFailed {
+                    recovery: true,
+                    can_recover: false,
+                },
+            )
+            .unwrap();
+        assert!(terminal.recovery_owner.is_none());
+        assert_eq!(
+            terminal.degraded_reconcile_owner,
+            Some(owner),
+            "terminal watcher-only degradation arms one exact reconcile owner"
+        );
+        assert!(matches!(
+            state.libpath_watcher,
+            LibpathWatcherState::Degraded {
+                reconcile_pending: true
+            }
+        ));
+        assert!(state.degraded_libpath_reconcile_is_current(owner));
+        assert!(
+            state
+                .capture_libpath_watcher_recovery_basis(owner)
+                .is_none()
+        );
+        assert!(state.library_routing_reconcile_request_for_test().is_none());
+    }
+
+    #[test]
+    fn libpath_same_coverage_attach_failure_preserves_applied_owner() {
+        let mut state = WorldState::new();
+        let journal = state.install_libpath_journal_for_test();
+        let owner = state.libpath_watcher_owner();
+        state.cross_file_config.packages_watch_debounce_ms += 1;
+        let basis = state.capture_libpath_watcher_swap_basis().unwrap();
+        let commit = state
+            .try_commit_libpath_watcher_swap(
+                &basis,
+                PreparedLibpathWatcherInstall::AttachFailed {
+                    recovery: false,
+                    can_recover: true,
+                },
+            )
+            .unwrap();
+        assert!(commit.recovery_owner.is_none());
+        assert!(commit.retired_handle.is_none());
+        assert_eq!(state.libpath_watcher_owner(), owner);
+        let LibpathWatcherState::ActiveUnapplied {
+            applied, desired, ..
+        } = &state.libpath_watcher
+        else {
+            panic!("same path coverage remains actively watched")
+        };
+        assert_ne!(applied.debounce_ms, desired.debounce_ms);
+        assert!(!journal.is_closed_for_test());
+    }
+
+    #[test]
+    fn libpath_changed_coverage_failure_closes_old_journal_and_awaits_recovery() {
+        let mut state = WorldState::new();
+        let journal = state.install_libpath_journal_for_test();
+        let mut library = PackageLibrary::new_empty();
+        library.set_lib_paths(vec![PathBuf::from("/tmp/raven-new-libpath")]);
+        state.package_library = Arc::new(library);
+        let basis = state.capture_libpath_watcher_swap_basis().unwrap();
+        let commit = state
+            .try_commit_libpath_watcher_swap(
+                &basis,
+                PreparedLibpathWatcherInstall::AttachFailed {
+                    recovery: false,
+                    can_recover: true,
+                },
+            )
+            .unwrap();
+        assert!(commit.recovery_owner.is_some());
+        assert!(journal.is_closed_for_test());
+        assert!(matches!(
+            state.libpath_watcher,
+            LibpathWatcherState::AwaitingRecovery
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_prospective_watcher_loser_closes_its_buffering_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = WorldState::new();
+        state.cross_file_config.packages_enabled = true;
+        state.cross_file_config.packages_watch_library_paths = true;
+        state.package_library_ready = true;
+        let mut library = PackageLibrary::new_empty();
+        library.set_lib_paths(vec![temp.path().to_path_buf()]);
+        state.package_library = Arc::new(library);
+
+        let basis = state.capture_libpath_watcher_swap_basis().unwrap();
+        let journal = crate::libpath_watcher::LibpathWatchJournal::new_buffering();
+        journal.require_rescan();
+        let handle = crate::libpath_watcher::prearm_watcher(
+            vec![temp.path().to_path_buf()],
+            std::time::Duration::from_millis(basis.debounce_ms()),
+            Arc::clone(&journal),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("temporary directory is fully watchable");
+
+        // Invalidate the exact settings basis after prearm. The rejected CAS
+        // consumes and drops the unpublished handle; its Drop closes the
+        // buffering journal so the prospective consumer cannot survive.
+        state.cross_file_config.packages_watch_debounce_ms += 1;
+        assert!(
+            state
+                .try_commit_libpath_watcher_swap(
+                    &basis,
+                    PreparedLibpathWatcherInstall::Active {
+                        handle: Arc::new(handle),
+                        journal: Arc::clone(&journal),
+                        recovery: false,
+                    },
+                )
+                .is_err()
+        );
+        assert!(journal.is_closed_for_test());
+        assert!(matches!(
+            state.libpath_watcher,
+            LibpathWatcherState::Disabled
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_to_active_watcher_swap_activates_seed_and_retires_old_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = WorldState::new();
+        state.cross_file_config.packages_enabled = true;
+        state.cross_file_config.packages_watch_library_paths = true;
+        state.package_library_ready = true;
+        let mut library = PackageLibrary::new_empty();
+        library.set_lib_paths(vec![temp.path().to_path_buf()]);
+        state.package_library = Arc::new(library);
+
+        let first_basis = state.capture_libpath_watcher_swap_basis().unwrap();
+        let first_journal = crate::libpath_watcher::LibpathWatchJournal::new_buffering();
+        first_journal.require_rescan();
+        let first_handle = crate::libpath_watcher::prearm_watcher(
+            vec![temp.path().to_path_buf()],
+            std::time::Duration::from_millis(first_basis.debounce_ms()),
+            Arc::clone(&first_journal),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let first = state
+            .try_commit_libpath_watcher_swap(
+                &first_basis,
+                PreparedLibpathWatcherInstall::Active {
+                    handle: Arc::new(first_handle),
+                    journal: Arc::clone(&first_journal),
+                    recovery: false,
+                },
+            )
+            .unwrap();
+        assert!(first.retired_handle.is_none());
+        let first_owner = state.libpath_watcher_owner();
+        let mut first_seed = first_journal.claim().await.unwrap();
+        assert!(matches!(
+            first_seed.event(),
+            crate::libpath_watcher::LibpathEvent::Rescan
+        ));
+        first_seed.ack();
+
+        state.cross_file_config.packages_watch_debounce_ms += 1;
+        let second_basis = state.capture_libpath_watcher_swap_basis().unwrap();
+        let second_journal = crate::libpath_watcher::LibpathWatchJournal::new_buffering();
+        second_journal.require_rescan();
+        let second_handle = crate::libpath_watcher::prearm_watcher(
+            vec![temp.path().to_path_buf()],
+            std::time::Duration::from_millis(second_basis.debounce_ms()),
+            Arc::clone(&second_journal),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let second = state
+            .try_commit_libpath_watcher_swap(
+                &second_basis,
+                PreparedLibpathWatcherInstall::Active {
+                    handle: Arc::new(second_handle),
+                    journal: Arc::clone(&second_journal),
+                    recovery: false,
+                },
+            )
+            .unwrap();
+        assert!(second.retired_handle.is_some());
+        assert_ne!(state.libpath_watcher_owner(), first_owner);
+        assert!(first_journal.is_closed_for_test());
+        let mut second_seed = second_journal.claim().await.unwrap();
+        assert!(matches!(
+            second_seed.event(),
+            crate::libpath_watcher::LibpathEvent::Rescan
+        ));
+        second_seed.ack();
+        drop(second.retired_handle);
+    }
+
+    #[tokio::test]
+    async fn concurrent_prospective_watchers_leave_one_active_winner_and_close_all_losers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = WorldState::new();
+        state.cross_file_config.packages_enabled = true;
+        state.cross_file_config.packages_watch_library_paths = true;
+        state.package_library_ready = true;
+        let mut library = PackageLibrary::new_empty();
+        library.set_lib_paths(vec![temp.path().to_path_buf()]);
+        state.package_library = Arc::new(library);
+
+        let mut prospective = Vec::new();
+        for _ in 0..4 {
+            let basis = state.capture_libpath_watcher_swap_basis().unwrap();
+            let journal = crate::libpath_watcher::LibpathWatchJournal::new_buffering();
+            journal.require_rescan();
+            let handle = crate::libpath_watcher::prearm_watcher(
+                vec![temp.path().to_path_buf()],
+                std::time::Duration::from_millis(basis.debounce_ms()),
+                Arc::clone(&journal),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            prospective.push((basis, journal, handle));
+        }
+
+        let (winner_basis, winner_journal, winner_handle) = prospective.remove(0);
+        state
+            .try_commit_libpath_watcher_swap(
+                &winner_basis,
+                PreparedLibpathWatcherInstall::Active {
+                    handle: Arc::new(winner_handle),
+                    journal: Arc::clone(&winner_journal),
+                    recovery: false,
+                },
+            )
+            .unwrap();
+
+        for (basis, journal, handle) in prospective {
+            let outcome = state.try_commit_libpath_watcher_swap(
+                &basis,
+                PreparedLibpathWatcherInstall::Active {
+                    handle: Arc::new(handle),
+                    journal: Arc::clone(&journal),
+                    recovery: false,
+                },
+            );
+            let rejected = match outcome {
+                Err(rejected) => rejected,
+                Ok(_) => panic!("the first exact owner supersedes every sibling basis"),
+            };
+            drop(rejected);
+            assert!(journal.is_closed_for_test());
+            assert!(journal.claim().await.is_none());
+        }
+
+        let active = state
+            .libpath_watcher
+            .active_journal()
+            .expect("one exact winner remains active");
+        assert!(Arc::ptr_eq(active, &winner_journal));
+        assert!(!winner_journal.is_closed_for_test());
+        let mut seed = winner_journal.claim().await.unwrap();
+        assert!(matches!(
+            seed.event(),
+            crate::libpath_watcher::LibpathEvent::Rescan
+        ));
+        seed.ack();
     }
 }

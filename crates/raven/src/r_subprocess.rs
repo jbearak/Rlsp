@@ -39,6 +39,47 @@ use tokio::sync::Semaphore;
 
 use crate::parameter_resolver::ParameterInfo;
 
+tokio::task_local! {
+    /// Optional caller-owned wall deadline for a package-routing lifecycle.
+    ///
+    /// Ordinary R requests keep their existing per-call timeout semantics.
+    /// Package-library construction/warm paths scope their complete lifecycle
+    /// with this deadline so semaphore queueing and child execution both count
+    /// against the foreground/coordinator budget.
+    static OUTER_R_DEADLINE: tokio::time::Instant;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OuterDeadlineExpired {
+    pub(crate) phase: &'static str,
+}
+
+impl std::fmt::Display for OuterDeadlineExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "package-routing deadline expired during {}", self.phase)
+    }
+}
+
+impl std::error::Error for OuterDeadlineExpired {}
+
+fn outer_deadline_expired(phase: &'static str) -> anyhow::Error {
+    anyhow::Error::new(OuterDeadlineExpired { phase })
+}
+
+pub(crate) async fn with_outer_r_deadline<F>(deadline: tokio::time::Instant, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let effective = OUTER_R_DEADLINE
+        .try_with(|existing| std::cmp::min(*existing, deadline))
+        .unwrap_or(deadline);
+    OUTER_R_DEADLINE.scope(effective, future).await
+}
+
+pub(crate) fn current_outer_r_deadline() -> Option<tokio::time::Instant> {
+    OUTER_R_DEADLINE.try_with(|deadline| *deadline).ok()
+}
+
 /// Global bound on the number of R subprocesses running concurrently.
 ///
 /// Every R spawn is CPU-heavy (loading the base packages alone takes
@@ -172,6 +213,25 @@ impl RSubprocess {
                 working_dir: None,
             }
         })
+    }
+
+    /// Async, cancellation-safe constructor used by package-routing work.
+    ///
+    /// Unlike [`Self::new`], every PATH lookup and `R --version` probe uses a
+    /// kill-on-drop Tokio child and honors the scoped outer routing deadline.
+    /// Deadline expiry is returned as [`OuterDeadlineExpired`], never folded
+    /// into "R not found".
+    pub(crate) async fn new_for_routing(r_path: Option<PathBuf>) -> Result<Option<Self>> {
+        let path = match r_path {
+            Some(path) => Self::is_valid_r_executable_async(&path)
+                .await?
+                .then_some(path),
+            None => Self::discover_r_path_async().await?,
+        };
+        Ok(path.map(|r_path| Self {
+            r_path,
+            working_dir: None,
+        }))
     }
 
     /// Set the working directory for the R subprocess
@@ -310,6 +370,96 @@ impl RSubprocess {
         Self::find_r_in_common_locations()
     }
 
+    async fn discover_r_path_async() -> Result<Option<PathBuf>> {
+        #[cfg(unix)]
+        let path_output = {
+            let mut command = Command::new("which");
+            command.arg("R");
+            match Self::probe_output(command, "R PATH discovery").await {
+                Ok(output) => Some(output),
+                Err(error) if error.downcast_ref::<OuterDeadlineExpired>().is_some() => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    log::trace!("Skipping unavailable R PATH probe: {error}");
+                    None
+                }
+            }
+        };
+        #[cfg(windows)]
+        let path_output = {
+            let mut command = Command::new("where");
+            command.arg("R");
+            match Self::probe_output(command, "R PATH discovery").await {
+                Ok(output) => Some(output),
+                Err(error) if error.downcast_ref::<OuterDeadlineExpired>().is_some() => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    log::trace!("Skipping unavailable R PATH probe: {error}");
+                    None
+                }
+            }
+        };
+        #[cfg(not(any(unix, windows)))]
+        let path_output: Option<std::process::Output> = None;
+
+        if let Some(output) = path_output
+            && output.status.success()
+        {
+            let path_text = String::from_utf8_lossy(&output.stdout);
+            for line in path_text.lines() {
+                let path = PathBuf::from(line.trim());
+                if Self::is_valid_r_executable_async(&path).await? {
+                    return Ok(Some(path));
+                }
+            }
+        }
+        for path in Self::get_common_r_paths() {
+            if Self::is_valid_r_executable_async(&path).await? {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn probe_output(
+        mut command: Command,
+        phase: &'static str,
+    ) -> Result<std::process::Output> {
+        let _permit = if let Ok(deadline) = OUTER_R_DEADLINE.try_with(|outer| *outer) {
+            tokio::time::timeout_at(deadline, r_subprocess_semaphore().acquire())
+                .await
+                .map_err(|_| outer_deadline_expired("R discovery semaphore queue"))?
+                .expect("R subprocess semaphore is never closed")
+        } else {
+            r_subprocess_semaphore()
+                .acquire()
+                .await
+                .expect("R subprocess semaphore is never closed")
+        };
+        // `wait_with_output` only captures streams that were explicitly
+        // piped. Inheriting them would leak `R --version` into the LSP/CLI
+        // protocol stream (notably corrupting `raven check --format json`).
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let deadline = OUTER_R_DEADLINE
+            .try_with(|outer| *outer)
+            .unwrap_or_else(|_| tokio::time::Instant::now() + Self::SUBPROCESS_TIMEOUT);
+        if deadline <= tokio::time::Instant::now() {
+            return Err(outer_deadline_expired(phase));
+        }
+        let child = command
+            .spawn()
+            .map_err(|error| anyhow!("Failed to spawn {phase}: {error}"))?;
+        tokio::time::timeout_at(deadline, child.wait_with_output())
+            .await
+            .map_err(|_| outer_deadline_expired(phase))?
+            .map_err(|error| anyhow!("Failed to wait for {phase}: {error}"))
+    }
+
     /// Locate an R executable by searching the system PATH.
     ///
     /// Returns `Some(PathBuf)` with the first valid R executable found in PATH, or `None` if no valid executable is discovered.
@@ -431,6 +581,22 @@ impl RSubprocess {
         }
     }
 
+    async fn is_valid_r_executable_async(path: &PathBuf) -> Result<bool> {
+        let mut command = Command::new(path);
+        command.args(["--version"]);
+        match Self::probe_output(command, "R --version probe").await {
+            Ok(output) => {
+                let version_output = String::from_utf8_lossy(&output.stderr);
+                Ok(output.status.success() || version_output.contains("R version"))
+            }
+            Err(error) if error.downcast_ref::<OuterDeadlineExpired>().is_some() => Err(error),
+            Err(error) => {
+                log::trace!("R executable probe failed for {}: {error}", path.display());
+                Ok(false)
+            }
+        }
+    }
+
     /// Executes an R expression using the configured R executable and returns its stdout output.
     ///
     /// # Errors
@@ -460,13 +626,17 @@ impl RSubprocess {
         // `r_subprocess_semaphore`). Acquired before — and held across — the
         // timeout below so queue-wait is excluded from the per-call timeout
         // budget. The semaphore is never closed, so `acquire` cannot error.
-        let _permit = r_subprocess_semaphore()
-            .acquire()
-            .await
-            .expect("R subprocess semaphore is never closed");
-
-        let start = std::time::Instant::now();
-        crate::perf::increment_r_subprocess_calls();
+        let permit = r_subprocess_semaphore().acquire();
+        let _permit = if let Ok(deadline) = OUTER_R_DEADLINE.try_with(|deadline| *deadline) {
+            tokio::time::timeout_at(deadline, permit)
+                .await
+                .map_err(|_| outer_deadline_expired("R semaphore queue"))?
+                .expect("R subprocess semaphore is never closed")
+        } else {
+            permit
+                .await
+                .expect("R subprocess semaphore is never closed")
+        };
 
         let mut cmd = Command::new(&self.r_path);
         cmd.args(["--vanilla", "--slave", "-e", r_code]);
@@ -478,15 +648,34 @@ impl RSubprocess {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+
+        let now = tokio::time::Instant::now();
+        let per_call_deadline = now + timeout;
+        let execution_deadline = OUTER_R_DEADLINE
+            .try_with(|outer| std::cmp::min(*outer, per_call_deadline))
+            .unwrap_or(per_call_deadline);
+        if execution_deadline <= now {
+            return Err(outer_deadline_expired("R pre-spawn"));
+        }
+
+        let start = std::time::Instant::now();
         let child = cmd
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn R subprocess: {e}"))?;
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(result) => result.map_err(|e| anyhow!("Failed to execute R subprocess: {e}"))?,
-            Err(_) => {
-                return Err(anyhow!("R subprocess timed out after {timeout:?}"));
-            }
-        };
+        crate::perf::increment_r_subprocess_calls();
+        let output =
+            match tokio::time::timeout_at(execution_deadline, child.wait_with_output()).await {
+                Ok(result) => result.map_err(|e| anyhow!("Failed to execute R subprocess: {e}"))?,
+                Err(_) => {
+                    if OUTER_R_DEADLINE
+                        .try_with(|outer| *outer <= execution_deadline)
+                        .unwrap_or(false)
+                    {
+                        return Err(outer_deadline_expired("R child execution"));
+                    }
+                    return Err(anyhow!("R subprocess timed out after {timeout:?}"));
+                }
+            };
 
         let elapsed = start.elapsed();
         if crate::perf::is_enabled() {
@@ -548,6 +737,7 @@ impl RSubprocess {
                     Ok(paths)
                 }
             }
+            Err(error) if error.downcast_ref::<OuterDeadlineExpired>().is_some() => Err(error),
             Err(e) => {
                 log::trace!(
                     "Failed to get .libPaths() from R: {}, using fallback paths",
@@ -1308,6 +1498,21 @@ mod tests {
         assert!(subprocess.is_none());
     }
 
+    #[tokio::test]
+    async fn test_new_for_routing_captures_and_classifies_version_probe() {
+        // The synchronous lookup supplies an executable path without invoking
+        // the async probe under test. Skip on hosts without R.
+        let Some(discovered) = RSubprocess::new(None) else {
+            return;
+        };
+        let path = discovered.r_path().clone();
+        let routed = RSubprocess::new_for_routing(Some(path.clone()))
+            .await
+            .unwrap()
+            .expect("captured R --version output must still classify the executable");
+        assert_eq!(routed.r_path(), &path);
+    }
+
     #[test]
     fn test_get_common_r_paths_returns_paths() {
         let paths = RSubprocess::get_common_r_paths();
@@ -1771,6 +1976,39 @@ mod tests {
         for path in &fallback {
             assert!(path.exists(), "Fallback path should exist");
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_lib_paths_falls_back_for_ordinary_execution_errors() {
+        let missing = tempfile::tempdir().unwrap().path().join("missing-R");
+        let subprocess = RSubprocess {
+            r_path: missing,
+            working_dir: None,
+        };
+
+        assert_eq!(
+            subprocess.get_lib_paths().await.unwrap(),
+            get_fallback_lib_paths(),
+            "ordinary discovery/execution errors retain the semantic fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_lib_paths_propagates_already_expired_outer_deadline() {
+        let missing = tempfile::tempdir().unwrap().path().join("missing-R");
+        let subprocess = RSubprocess {
+            r_path: missing,
+            working_dir: None,
+        };
+        let deadline = tokio::time::Instant::now() - std::time::Duration::from_millis(1);
+
+        let error = with_outer_r_deadline(deadline, subprocess.get_lib_paths())
+            .await
+            .expect_err("an outer deadline must never be converted into fallback paths");
+        assert!(
+            error.downcast_ref::<OuterDeadlineExpired>().is_some(),
+            "the typed outer deadline error must remain available to routing callers: {error}"
+        );
     }
 
     #[tokio::test]
