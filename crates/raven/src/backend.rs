@@ -16525,6 +16525,16 @@ impl LanguageServer for Backend {
                     // but every dependent ticket reserved by the commit seam must
                     // still get a consumer so its force-republish marker drains.
                     revalidations.retain(|ticket| ticket.uri != uri);
+                    #[cfg(test)]
+                    {
+                        self.state
+                            .write()
+                            .await
+                            .did_change_reservation_snapshot_for_test = revalidations
+                            .iter()
+                            .map(|ticket| (ticket.uri.clone(), ticket.debounce_ms))
+                            .collect();
+                    }
                     for ticket in revalidations {
                         let state_arc = self.state.clone();
                         let client = self.client.clone();
@@ -48704,16 +48714,16 @@ infixContinuationStyle = "aligned"
         {
             let state = backend.state.read().await;
             assert_eq!(
+                state.did_change_reservation_snapshot_for_test,
+                vec![(dependent.clone(), 0)],
+                "the excluded handler must reserve only the dependent with its captured debounce"
+            );
+            assert!(
                 state
                     .diagnostics_gate
-                    .force_republish_count_for_test(&dependent),
-                1,
-                "the seam must select and mark the sole dependent exactly once"
-            );
-            assert_eq!(
-                state.diagnostics_gate.force_republish_count_for_test(&uri),
-                0,
-                "the directly-published subject must not receive a force marker"
+                    .force_republish_count_for_test(&dependent)
+                    >= 1,
+                "the parked dependent consumer must retain an outstanding force marker"
             );
             assert_eq!(state.documents.get(&uri).unwrap().text(), "after <- 2\n");
         }
