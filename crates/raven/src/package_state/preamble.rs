@@ -432,9 +432,11 @@ fn read_source_with_overrides(
     if let Some(text) = overrides.get(path) {
         return Some(text.to_string());
     }
-    let routing_path = canonicalize_for_routing(path);
-    if let Some(text) = overrides.get(&routing_path) {
-        return Some(text.to_string());
+    if !overrides.is_empty() {
+        let routing_path = canonicalize_for_routing(path);
+        if let Some(text) = overrides.get(&routing_path) {
+            return Some(text.to_string());
+        }
     }
     allow_disk_fallback
         .then(|| crate::state::read_source(path).ok())
