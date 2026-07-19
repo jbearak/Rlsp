@@ -12070,6 +12070,9 @@ struct WatchedResyncBatch {
     transfer_handles: Vec<AnalysisTransferHandle>,
     mode: WatchedResyncBatchMode,
     attempts_remaining: usize,
+    #[cfg(test)]
+    final_handoff_test_capture:
+        Option<crate::state::FinalHandoffCaptureClaim<crate::state::WatchedFinalHandoffForTest>>,
 }
 
 struct WatchedClosedBatchOverlay {
@@ -12855,21 +12858,28 @@ async fn resync_file_from_disk(
 /// its resync waits is caught by the preflight/commit vetoes.
 static CLOSE_RESYNC_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
-/// `package_sibling_fanout` carries `did_close`'s package-visibility fanout
-/// (open siblings whose diagnostics depend on the closed buffer's package
-/// symbols). Folding it in here — instead of `did_close` marking and
-/// scheduling it separately — guarantees each URI is force-marked at most
-/// once per close (two independent marks would race: the second
-/// `run_debounced_diagnostics` schedule cancels the first pending task and
-/// strands its marker) and publishes the siblings AFTER the disk commit.
-/// The sibling set publishes even on [`ResyncOutcome::Vetoed`] /
-/// [`ResyncOutcome::Skipped`]: the package `DidClose` event already committed
-/// synchronously inside `did_close`, independent of the cross-file commit.
-/// Graph-derived sets (`pre_affected` and the post-commit walks) publish only
-/// after a successful commit — on a veto the reopened buffer's own `did_open`
-/// pipeline owns them, and on a skip nothing changed. The closed file itself
-/// is never in the affected set — `compute_affected_dependents_after_edit`
-/// excludes its root — so a close never publishes for the closed document.
+#[derive(Clone, Default)]
+struct DidCloseTestCaptures {
+    #[cfg(test)]
+    final_handoff: Option<
+        crate::state::FinalHandoffCaptureClaim<
+            Vec<crate::state::AnalysisRevalidationTicketFingerprint>,
+        >,
+    >,
+    #[cfg(test)]
+    resync_final_handoff: Option<
+        crate::state::FinalHandoffCaptureClaim<Vec<crate::state::CloseResyncConsumerForTest>>,
+    >,
+}
+
+/// Package-sibling fanout is committed synchronously inside
+/// `did_close_transactional`; this function only handles the disk-resync
+/// dependent walk. Graph-derived sets (`pre_affected` and the post-commit
+/// walks) publish only after a successful commit — on a veto the reopened
+/// buffer's own `did_open` pipeline owns them, and on a skip nothing changed.
+/// The closed file itself is never in the affected set —
+/// `compute_affected_dependents_after_edit` excludes its root — so a close
+/// never publishes for the closed document.
 ///
 /// Known counter slack (shared with every mark-then-bounded-publish path,
 /// e.g. the watched-files async tail): the gate's force-republish counter is
@@ -12896,8 +12906,10 @@ async fn run_close_resync(
     chunk_kind: Option<crate::chunks::ChunkKind>,
     old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
     old_interface_hash: Option<u64>,
-    package_sibling_fanout: Vec<Url>,
+    test_captures: DidCloseTestCaptures,
 ) {
+    #[cfg(not(test))]
+    let _ = &test_captures;
     // Bound close-burst concurrency server-wide (see CLOSE_RESYNC_PERMITS).
     // The permit covers the dependent walk, the disk read, the commit, AND
     // the publish fanout.
@@ -12966,11 +12978,6 @@ async fn run_close_resync(
         .iter()
         .map(|ticket| ticket.uri.clone())
         .collect();
-    for dep in package_sibling_fanout {
-        if !reserved_uris.contains(&dep) && seen.insert(dep.clone()) {
-            affected.push(dep);
-        }
-    }
     if committed {
         for dep in pre_affected.into_iter().chain(post) {
             if !reserved_uris.contains(&dep) && seen.insert(dep.clone()) {
@@ -13014,6 +13021,24 @@ async fn run_close_resync(
     if affected.is_empty() && reserved_tickets.is_empty() {
         return;
     }
+    #[cfg(test)]
+    if let Some(capture) = &test_captures.resync_final_handoff {
+        let consumers = reserved_tickets
+            .iter()
+            .map(|ticket| {
+                crate::state::CloseResyncConsumerForTest::Reserved(
+                    crate::state::AnalysisRevalidationTicketFingerprint::from(ticket),
+                )
+            })
+            .chain(
+                affected
+                    .iter()
+                    .cloned()
+                    .map(crate::state::CloseResyncConsumerForTest::Affected),
+            )
+            .collect();
+        capture.record_and_pause(consumers).await;
+    }
     for ticket in reserved_tickets {
         tokio::spawn(run_debounced_diagnostics(
             state_arc.clone(),
@@ -13041,6 +13066,9 @@ fn spawn_watched_undecodable_retry(
     admission: WatchedTaskAdmission,
     item: WatchedResyncItem,
 ) {
+    // This delayed retry is a separately spawned invocation. The
+    // invocation-scoped final-handoff test seam deliberately ends at the
+    // spawning batch's first final handoff.
     let shutdown = routing_tasks.shutdown_token();
     let child_tasks = routing_tasks.clone();
     if !admission.spawn(&routing_tasks, async move {
@@ -13088,6 +13116,8 @@ fn spawn_watched_undecodable_retry(
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
+                #[cfg(test)]
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -13161,6 +13191,27 @@ struct WatchedFinalizationBundle {
     transfer_handles: Vec<AnalysisTransferHandle>,
     candidates: Vec<crate::state::AnalysisTransferCandidate>,
     reserved_tickets: Vec<crate::state::AnalysisRevalidationTicket>,
+    #[cfg(test)]
+    final_handoff_test_capture:
+        Option<crate::state::FinalHandoffCaptureClaim<crate::state::WatchedFinalHandoffForTest>>,
+}
+
+#[cfg(test)]
+async fn record_watched_final_handoff_for_test(
+    capture: &Option<
+        crate::state::FinalHandoffCaptureClaim<crate::state::WatchedFinalHandoffForTest>,
+    >,
+    reserved: &[crate::state::AnalysisRevalidationTicket],
+    transferred: &[crate::state::AnalysisRevalidationTicket],
+) {
+    if let Some(capture) = capture {
+        capture
+            .record_and_pause(crate::state::WatchedFinalHandoffForTest {
+                reserved: reserved.iter().map(Into::into).collect(),
+                transferred: transferred.iter().map(Into::into).collect(),
+            })
+            .await;
+    }
 }
 
 async fn run_watched_deferred_routing_finalization(
@@ -13246,6 +13297,13 @@ async fn run_watched_deferred_routing_finalization(
             &reserved_current_uris,
         )
     };
+    #[cfg(test)]
+    record_watched_final_handoff_for_test(
+        &bundle.final_handoff_test_capture,
+        &bundle.reserved_tickets,
+        &tickets,
+    )
+    .await;
     for ticket in bundle.reserved_tickets {
         let task = run_debounced_diagnostics(
             state_arc.clone(),
@@ -13286,8 +13344,13 @@ async fn run_watched_resync_batch(
     state_arc: Arc<RwLock<WorldState>>,
     client: Client,
     traversal_truncation: Arc<TraversalTruncationState>,
-    batch: WatchedResyncBatch,
+    mut batch: WatchedResyncBatch,
 ) {
+    batch.final_handoff_test_capture = state_arc
+        .read()
+        .await
+        .watched_final_handoff_test_capture
+        .claim();
     run_watched_resync_batch_owned(
         state_arc,
         client,
@@ -13318,6 +13381,8 @@ async fn run_watched_resync_batch_owned(
         mut transfer_handles,
         mode,
         attempts_remaining,
+        #[cfg(test)]
+        final_handoff_test_capture,
     } = batch;
     let await_reserved_tickets =
         matches!(mode, WatchedResyncBatchMode::Immediate) && uris_to_update.is_empty();
@@ -13329,6 +13394,8 @@ async fn run_watched_resync_batch_owned(
         transfer_handles: transfer_handles.clone(),
         mode,
         attempts_remaining: attempts_remaining.saturating_sub(1),
+        #[cfg(test)]
+        final_handoff_test_capture: final_handoff_test_capture.clone(),
     };
     let mut package_transfer_candidates = Vec::new();
     let mut deferred_routing = None;
@@ -13581,6 +13648,8 @@ async fn run_watched_resync_batch_owned(
                     transfer_handles: transfer_handles.clone(),
                     mode,
                     attempts_remaining: attempts_remaining.saturating_sub(1),
+                    #[cfg(test)]
+                    final_handoff_test_capture: final_handoff_test_capture.clone(),
                 }
             };
             #[cfg(any(test, feature = "test-support"))]
@@ -14006,6 +14075,8 @@ async fn run_watched_resync_batch_owned(
                 transfer_handles,
                 candidates: package_transfer_candidates,
                 reserved_tickets,
+                #[cfg(test)]
+                final_handoff_test_capture,
             },
             await_reserved_tickets,
         );
@@ -14060,6 +14131,13 @@ async fn run_watched_resync_batch_owned(
             &reserved_current_uris,
         )
     };
+    #[cfg(test)]
+    record_watched_final_handoff_for_test(
+        &final_handoff_test_capture,
+        &reserved_tickets,
+        &transfer_tickets,
+    )
+    .await;
     for ticket in reserved_tickets {
         let task = run_debounced_diagnostics(
             state_arc.clone(),
@@ -15051,13 +15129,20 @@ async fn did_open_transactional(
     true
 }
 
-fn spawn_open_close_continuation(
+async fn spawn_open_close_continuation(
     state: Arc<RwLock<WorldState>>,
     client: Client,
     traversal: Arc<TraversalTruncationState>,
     effects: crate::state::AnalysisCommitEffects,
     close: OpenCloseCommitOutcome,
+    test_captures: DidCloseTestCaptures,
 ) {
+    #[cfg(test)]
+    if let Some(capture) = &test_captures.final_handoff {
+        capture
+            .record_and_pause(effects.revalidations.iter().map(Into::into).collect())
+            .await;
+    }
     if close.resync.is_empty() {
         for ticket in effects.revalidations {
             tokio::spawn(run_debounced_diagnostics(
@@ -15098,7 +15183,7 @@ fn spawn_open_close_continuation(
                 Some(ticket.chunk_kind),
                 ticket.old_metadata,
                 ticket.old_interface_hash,
-                Vec::new(),
+                test_captures.clone(),
             )
             .await;
         }
@@ -15106,10 +15191,17 @@ fn spawn_open_close_continuation(
 }
 
 async fn did_close_transactional(backend: &Backend, uri: &Url) {
-    let intent = {
+    let (intent, test_captures) = {
         let mut state = backend.state.write().await;
         state.open_tar_source_refreshes.cancel(uri);
-        state.begin_open_close_intent(uri)
+        #[cfg(test)]
+        let test_captures = DidCloseTestCaptures {
+            final_handoff: state.did_close_final_handoff_test_capture.claim(),
+            resync_final_handoff: state.close_resync_final_handoff_test_capture.claim(),
+        };
+        #[cfg(not(test))]
+        let test_captures = DidCloseTestCaptures::default();
+        (state.begin_open_close_intent(uri), test_captures)
     };
 
     for attempt in 0..2 {
@@ -15269,7 +15361,15 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
                     if !backend.routing_tasks.spawn_root(async move {
                         let mut effects = effects;
                         effects.revalidations = await_open_package_routing(&state, routing).await;
-                        spawn_open_close_continuation(state, client, traversal, effects, close);
+                        spawn_open_close_continuation(
+                            state,
+                            client,
+                            traversal,
+                            effects,
+                            close,
+                            test_captures,
+                        )
+                        .await;
                     }) {
                         log::debug!("Shutdown drain retired deferred didClose package routing");
                     }
@@ -15283,7 +15383,9 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
             backend.traversal_truncation.clone(),
             effects,
             close,
-        );
+            test_captures,
+        )
+        .await;
         return;
     }
 
@@ -17026,6 +17128,13 @@ impl LanguageServer for Backend {
             "Received watched files change: {} changes",
             params.changes.len()
         );
+        #[cfg(test)]
+        let final_handoff_test_capture = self
+            .state
+            .read()
+            .await
+            .watched_final_handoff_test_capture
+            .claim();
         let tar_source_parents = if params.changes.is_empty() {
             Vec::new()
         } else {
@@ -17360,6 +17469,8 @@ impl LanguageServer for Backend {
                         transfer_handles: Vec::new(),
                         mode: WatchedResyncBatchMode::Immediate,
                         attempts_remaining: 2,
+                        #[cfg(test)]
+                        final_handoff_test_capture,
                     },
                 )
                 .await;
@@ -17392,6 +17503,8 @@ impl LanguageServer for Backend {
                     transfer_handles: Vec::new(),
                     mode: WatchedResyncBatchMode::Immediate,
                     attempts_remaining: 2,
+                    #[cfg(test)]
+                    final_handoff_test_capture,
                 },
             )
             .await;
@@ -23768,6 +23881,7 @@ mod tests {
                 transfer_handles: Vec::new(),
                 mode: super::WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
+                final_handoff_test_capture: None,
             },
             lifecycle,
             generation,
@@ -23846,6 +23960,7 @@ mod tests {
                     transfer_handles: Vec::new(),
                     candidates: Vec::new(),
                     reserved_tickets: Vec::new(),
+                    final_handoff_test_capture: None,
                 },
                 false,
             )
@@ -35340,7 +35455,7 @@ mod project_config_initialize_tests {
         )
         .await;
 
-        let reservation_baseline = {
+        {
             let mut state = backend.state.write().await;
             state
                 .watched_file_resync_generations
@@ -35373,10 +35488,10 @@ mod project_config_initialize_tests {
                     .any(|edge| edge.from == canonical_parent && !edge.non_lending),
                 "precondition: excluded alias must not have a lending reverse edge"
             );
-            state.analysis_revalidation_reservation_count
-        };
+        }
 
-        close_doc(backend, &alias_a).await;
+        let (transactional, resync, _) =
+            close_with_final_handoff_capture(backend, &alias_a, false).await;
 
         let state = backend.state.read().await;
         assert_eq!(
@@ -35409,17 +35524,12 @@ mod project_config_initialize_tests {
             Some(&4_242),
             "surviving alias ownership must retain canonical watched authority"
         );
-        assert!(
-            state.analysis_revalidation_reservation_count > reservation_baseline,
-            "the canonical interface handoff must reserve its open dependent"
+        assert_eq!(
+            close_handoff_count(&transactional, &resync, &consumer_uri),
+            1,
+            "the canonical dependent must own one exact close-handoff consumer"
         );
-        assert!(
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&consumer_uri)
-                >= 1,
-            "the canonical dependent must own a close-handoff marker"
-        );
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -35471,7 +35581,7 @@ mod project_config_initialize_tests {
         .await;
         open_doc(backend, &consumer_uri, "r", 1, "b_value\n").await;
 
-        let reservation_baseline = {
+        {
             let state = backend.state.read().await;
             assert_eq!(
                 state.open_document_uri_for_authoritative_uri(&canonical_uri),
@@ -35481,10 +35591,10 @@ mod project_config_initialize_tests {
                 !has_dependency_edge(&state, &consumer_uri, &canonical_uri),
                 "precondition: owner A does not expose alias B's backward edge"
             );
-            state.analysis_revalidation_reservation_count
-        };
+        }
 
-        close_doc(backend, &alias_a).await;
+        let (transactional, resync, _) =
+            close_with_final_handoff_capture(backend, &alias_a, false).await;
 
         let state = backend.state.read().await;
         assert_eq!(
@@ -35495,17 +35605,12 @@ mod project_config_initialize_tests {
             has_dependency_edge(&state, &consumer_uri, &canonical_uri),
             "remirroring B must install its newly introduced backward edge"
         );
-        assert!(
-            state.analysis_revalidation_reservation_count > reservation_baseline,
-            "the post-apply canonical walk must reserve the new dependent"
+        assert_eq!(
+            close_handoff_count(&transactional, &resync, &consumer_uri),
+            1,
+            "the newly introduced dependent must own one exact close-handoff consumer"
         );
-        assert!(
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&consumer_uri)
-                >= 1,
-            "the newly introduced dependent must own a close-handoff marker"
-        );
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -35553,7 +35658,7 @@ mod project_config_initialize_tests {
         )
         .await;
 
-        let reservation_baseline = {
+        {
             let state = backend.state.read().await;
             assert_eq!(
                 state.open_document_uri_for_authoritative_uri(&canonical_uri),
@@ -35564,11 +35669,11 @@ mod project_config_initialize_tests {
                 !state.workspace_index.contains(&canonical_uri),
                 "precondition: the canonical root has no retained closed shadow"
             );
-            state.analysis_revalidation_reservation_count
-        };
+        }
         fs::remove_file(real.join("parent.R")).unwrap();
 
-        close_doc(backend, &alias_uri).await;
+        let (transactional, resync, _) =
+            close_with_final_handoff_capture(backend, &alias_uri, false).await;
 
         let state = backend.state.read().await;
         assert!(
@@ -35578,17 +35683,12 @@ mod project_config_initialize_tests {
                 .is_empty(),
             "the reset-only canonical root must be removed"
         );
-        assert!(
-            state.analysis_revalidation_reservation_count > reservation_baseline,
-            "removing a reset-only canonical root must reserve its existing dependent"
+        assert_eq!(
+            close_handoff_count(&transactional, &resync, &consumer_uri),
+            1,
+            "the existing canonical dependent must own one exact close-removal consumer"
         );
-        assert!(
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&consumer_uri)
-                >= 1,
-            "the existing canonical dependent must own a close-removal marker"
-        );
+        drop(state);
     }
 
     #[cfg(unix)]
@@ -42636,7 +42736,7 @@ mod project_config_initialize_tests {
             "child_fn <- function() 1\n",
         )
         .await;
-        let parent_force_before_change = {
+        {
             let state = backend.state.read().await;
             assert_eq!(
                 state.open_document_uri_for_authoritative_uri(&child_real_uri),
@@ -42647,10 +42747,7 @@ mod project_config_initialize_tests {
                 !snapshot_diagnostics(&state, &parent_uri).is_empty(),
                 "precondition: live_fn is undefined before the alias buffer defines it"
             );
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&parent_uri)
-        };
+        }
 
         change_doc(
             backend,
@@ -42669,12 +42766,14 @@ mod project_config_initialize_tests {
                 .any(|edge| edge.to == child_real_uri),
             "parent edge must remain keyed by the real on-disk spelling"
         );
-        assert!(
+        assert_eq!(
             state
-                .diagnostics_gate
-                .force_republish_count_for_test(&parent_uri)
-                > parent_force_before_change,
-            "editing the alias buffer must schedule the canonical dependent parent"
+                .did_change_reservation_snapshot_for_test
+                .iter()
+                .filter(|(uri, _)| uri == &parent_uri)
+                .count(),
+            1,
+            "editing the alias buffer must select the canonical dependent parent exactly once"
         );
         assert!(
             snapshot_diagnostics(&state, &parent_uri).is_empty(),
@@ -43100,12 +43199,14 @@ mod project_config_initialize_tests {
             Some(link_uri.clone()),
             "target URI must resolve to the symlink-open buffer"
         );
-        assert!(
+        assert_eq!(
             state
-                .diagnostics_gate
-                .force_republish_count_for_test(&parent_uri)
-                > 0,
-            "opening the symlink alias must schedule the target's dependent parent"
+                .did_open_reservation_snapshot_for_test
+                .iter()
+                .filter(|(uri, _)| uri == &parent_uri)
+                .count(),
+            1,
+            "opening the symlink alias must select the target's dependent parent exactly once"
         );
         assert!(
             snapshot_diagnostics(&state, &parent_uri).is_empty(),
@@ -43740,7 +43841,7 @@ mod project_config_initialize_tests {
         )
         .await;
 
-        let sibling_force_before_change = {
+        {
             let state = backend.state.read().await;
             assert_eq!(
                 state.open_document_uri_for_authoritative_uri(&foo_uri),
@@ -43752,10 +43853,7 @@ mod project_config_initialize_tests {
                 !alias_diags.iter().any(|diag| diag.message.contains("peer")),
                 "alias buffer's own diagnostics must see package peer symbols: {alias_diags:?}"
             );
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&sibling_uri)
-        };
+        }
 
         change_doc(
             backend,
@@ -43766,12 +43864,14 @@ mod project_config_initialize_tests {
         .await;
 
         let state = backend.state.read().await;
-        assert!(
+        assert_eq!(
             state
-                .diagnostics_gate
-                .force_republish_count_for_test(&sibling_uri)
-                > sibling_force_before_change,
-            "editing the symlink alias package file must fan out to package siblings"
+                .did_change_reservation_snapshot_for_test
+                .iter()
+                .filter(|(uri, _)| uri == &sibling_uri)
+                .count(),
+            1,
+            "editing the symlink alias package file must select its sibling exactly once"
         );
         let sibling_diags = snapshot_diagnostics(&state, &sibling_uri);
         assert!(
@@ -44184,18 +44284,16 @@ mod project_config_initialize_tests {
             .cross_file_config
             .revalidation_debounce_ms = 60_000;
 
-        let (input_generation, record_generation, routing_owner, consumer_markers) = {
+        let (input_generation, record_generation, routing_owner) = {
             let state = backend.state.read().await;
             (
                 state.package_input_generation(),
                 state.package_state_record_generation_for_test(),
                 state.system_file_routing_owner_generation(),
-                state
-                    .diagnostics_gate
-                    .force_republish_count_for_test(&consumer_uri),
             )
         };
-        close_doc(backend, &description_uri).await;
+        let (final_handoff, _, _) =
+            close_with_final_handoff_capture(backend, &description_uri, false).await;
 
         let state = backend.state.read().await;
         assert_eq!(
@@ -44215,11 +44313,12 @@ mod project_config_initialize_tests {
             "closing the dirty DESCRIPTION must restore disk-package routing"
         );
         assert_eq!(
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&consumer_uri),
-            consumer_markers + 1,
-            "the restored routing consumer must be marked exactly once"
+            final_handoff
+                .iter()
+                .filter(|ticket| ticket.uri == consumer_uri)
+                .count(),
+            1,
+            "the restored routing consumer must have one exact didClose ticket"
         );
     }
 
@@ -45099,13 +45198,16 @@ mod project_config_initialize_tests {
             state.system_file_test_reject_remaining = 2;
             state.cross_file_config.max_revalidations_per_trigger = 1;
         }
-        let (routing_before, reservations_before) = {
+        let routing_before = {
             let state = backend.state.read().await;
-            (
-                state.system_file_routing_owner_generation(),
-                state.analysis_revalidation_reservation_count,
-            )
+            state.system_file_routing_owner_generation()
         };
+        let handoff = backend
+            .state
+            .read()
+            .await
+            .watched_final_handoff_test_capture
+            .arm();
         backend
             .did_change_watched_files(DidChangeWatchedFilesParams {
                 changes: [
@@ -45125,6 +45227,10 @@ mod project_config_initialize_tests {
                 .collect(),
             })
             .await;
+        let final_handoff =
+            tokio::time::timeout(std::time::Duration::from_secs(5), handoff.wait_payload())
+                .await
+                .expect("the target watched batch must reach its final handoff");
 
         let converged = wait_for_state(backend, 5_000, |state| {
             state
@@ -45154,7 +45260,6 @@ mod project_config_initialize_tests {
                     .get_dependencies(&main_uri)
                     .iter()
                     .any(|edge| edge.to == Url::from_file_path(&system_helper).unwrap())
-                && state.analysis_revalidation_reservation_count > reservations_before
         })
         .await;
         if !converged {
@@ -45163,7 +45268,7 @@ mod project_config_initialize_tests {
                 "one watched projection must converge every package-backed input tier: \
                  package={:?}, namespace={}, r_file={}, dataset={}, sysdata={}, preamble={}, \
                  system_edge={}, helper_index={}, attempts={}, sources={:?}, \
-                 reservations={} (before={})",
+                 final_handoff={final_handoff:?}",
                 state
                     .package_state
                     .workspace()
@@ -45190,15 +45295,12 @@ mod project_config_initialize_tests {
                     .documents
                     .get_record(&main_uri)
                     .map(|record| record.metadata().sources.clone()),
-                state.analysis_revalidation_reservation_count,
-                reservations_before,
             );
         }
-        let (routing_after, reservations_after, attempts_after) = {
+        let (routing_after, attempts_after) = {
             let state = backend.state.read().await;
             (
                 state.system_file_routing_owner_generation(),
-                state.analysis_revalidation_reservation_count,
                 state.watched_batch_test_commit_attempts,
             )
         };
@@ -45206,11 +45308,20 @@ mod project_config_initialize_tests {
             routing_after, routing_before,
             "DESCRIPTION package-name installation must own routing convergence"
         );
-        assert_eq!(
-            reservations_after - reservations_before,
-            1,
-            "package, system-file, and file candidates must merge into one final reservation"
+        assert!(
+            final_handoff.reserved.is_empty(),
+            "the central watched commit transfers its unmarked fanout"
         );
+        assert_eq!(
+            final_handoff
+                .transferred
+                .iter()
+                .map(|ticket| &ticket.uri)
+                .collect::<Vec<_>>(),
+            vec![&sibling_uri],
+            "package, system-file, and file candidates must merge into one exact final ticket"
+        );
+        handoff.release();
 
         send_watched_change(backend, &Url::from_file_path(&description).unwrap()).await;
         assert!(
@@ -45372,6 +45483,7 @@ mod project_config_initialize_tests {
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -45427,6 +45539,7 @@ mod project_config_initialize_tests {
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -45478,6 +45591,7 @@ mod project_config_initialize_tests {
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -45535,6 +45649,7 @@ mod project_config_initialize_tests {
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -45609,6 +45724,7 @@ mod project_config_initialize_tests {
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -46369,14 +46485,10 @@ mod project_config_initialize_tests {
     }
 
     /// An open file that is BOTH a package-visibility sibling and a graph
-    /// dependent of the closing document must be force-marked exactly once:
-    /// the sibling fanout rides the close resync instead of being marked and
-    /// scheduled separately (a second schedule cancels the first pending
-    /// debounced task and strands its marker). A second, package-ONLY
-    /// sibling (`c.R`, no graph edge to the closed file) pins the fold
-    /// itself: it can only be marked through `package_sibling_fanout`, so an
-    /// implementation that drops the sibling set from `run_close_resync`
-    /// fails its stage-1 assertion.
+    /// dependent of the closing document must appear once in the
+    /// transactional close fanout, alongside a package-only sibling. The
+    /// later disk resync is a distinct real transition: it selects the graph
+    /// dependent once, but must not reselect the package-only sibling.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_marks_overlapping_package_sibling_and_dependent_once() {
         let tmp = TempDir::new().unwrap();
@@ -46432,57 +46544,39 @@ mod project_config_initialize_tests {
             "the open/change fanout must drain before the close"
         );
 
-        close_doc(backend, &a_uri).await;
-
-        // b.R is in the sibling fanout (open R/ file, package visibility
-        // changed) AND in the resync's dependent walk (it sources a.R);
-        // c.R is in the sibling fanout ONLY. Stage 1: observe the resync
-        // actually MARK both (the publish rides a 200ms debounce after
-        // marking, so the counters are visibly >= 1 in between) — without
-        // this the final `== 0` would pass vacuously, since the counters
-        // were drained before the close. The c.R half fails if the sibling
-        // set is dropped from `run_close_resync` (nothing else marks a
-        // package-only sibling).
-        let marked = wait_for_state(backend, 5_000, |state| {
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&b_uri)
-                >= 1
-        })
-        .await;
-        assert!(
-            marked,
-            "the close resync must force-mark the overlapping sibling/dependent"
+        let (transactional, resync, resync_handoff) =
+            close_with_final_handoff_capture(backend, &a_uri, true).await;
+        assert_eq!(
+            transactional
+                .iter()
+                .filter(|ticket| ticket.uri == b_uri)
+                .count(),
+            1,
+            "the transactional package fanout must deduplicate the overlapping sibling/dependent"
         );
-        let sibling_marked = wait_for_state(backend, 5_000, |state| {
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&c_uri)
-                >= 1
-        })
-        .await;
-        assert!(
-            sibling_marked,
-            "the close resync must force-mark the package-only sibling (the fold itself)"
+        assert_eq!(
+            transactional
+                .iter()
+                .filter(|ticket| ticket.uri == c_uri)
+                .count(),
+            1,
+            "the package-only sibling must have one transactional consumer"
         );
-        // Stage 2: each single publish must consume each single marker. A
-        // double mark (sibling path + resync path) would leave a counter
-        // stuck at 1 after its publish.
-        let settled = wait_for_state(backend, 5_000, |state| {
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&b_uri)
-                == 0
-                && state
-                    .diagnostics_gate
-                    .force_republish_count_for_test(&c_uri)
-                    == 0
-        })
-        .await;
-        assert!(
-            settled,
-            "both siblings must be force-marked exactly once and consumed"
+        assert_eq!(
+            resync
+                .iter()
+                .filter(|consumer| consumer.uri() == &b_uri)
+                .count(),
+            1,
+            "the disk resync must select its graph dependent exactly once"
         );
+        assert_eq!(
+            resync.len(),
+            1,
+            "the disk resync must not reselect the package-only sibling or any foreign consumer: \
+             transactional={transactional:?}, resync={resync:?}"
+        );
+        resync_handoff.unwrap().release();
     }
 
     /// Exists -> missing -> exists: deleting a sourced file strips the open
@@ -46792,29 +46886,15 @@ mod project_config_initialize_tests {
         .await;
         assert!(drained, "pre-close fanout must drain");
 
-        close_doc(backend, &a_uri).await;
-
-        // The carrier is NOT is_r_source_path and has no graph edge to a.R —
-        // only the load_all widening can mark it.
-        let marked = wait_for_state(backend, 5_000, |state| {
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&analysis_uri)
-                >= 1
-        })
-        .await;
-        assert!(
-            marked,
-            "the close visibility fanout must reach the load_all carrier"
+        let (transactional, _, _) = close_with_final_handoff_capture(backend, &a_uri, false).await;
+        assert_eq!(
+            transactional
+                .iter()
+                .map(|ticket| &ticket.uri)
+                .collect::<Vec<_>>(),
+            vec![&analysis_uri],
+            "only the load_all widening can select the non-source carrier"
         );
-        let settled = wait_for_state(backend, 5_000, |state| {
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&analysis_uri)
-                == 0
-        })
-        .await;
-        assert!(settled, "the carrier's marker must be consumed");
     }
 
     /// Closing a dirty package source reverts its package input to DISK
@@ -48892,10 +48972,12 @@ infixContinuationStyle = "aligned"
             );
             assert_eq!(
                 state
-                    .diagnostics_gate
-                    .force_republish_count_for_test(&child),
+                    .did_change_reservation_snapshot_for_test
+                    .iter()
+                    .filter(|(uri, debounce)| uri == &child && *debounce == 0)
+                    .count(),
                 1,
-                "the fresh fallback must reserve the dependent exactly once"
+                "the fresh fallback must select the dependent exactly once"
             );
         }
 
@@ -50875,6 +50957,65 @@ infixContinuationStyle = "aligned"
             .await;
     }
 
+    async fn close_with_final_handoff_capture(
+        backend: &Backend,
+        uri: &Url,
+        capture_resync: bool,
+    ) -> (
+        Vec<crate::state::AnalysisRevalidationTicketFingerprint>,
+        Vec<crate::state::CloseResyncConsumerForTest>,
+        Option<
+            crate::state::FinalHandoffCaptureHandle<Vec<crate::state::CloseResyncConsumerForTest>>,
+        >,
+    ) {
+        let (final_handoff, resync_handoff) = {
+            let state = backend.state.read().await;
+            (
+                state.did_close_final_handoff_test_capture.arm(),
+                capture_resync.then(|| state.close_resync_final_handoff_test_capture.arm()),
+            )
+        };
+        let task_backend = backend.clone();
+        let task_uri = uri.clone();
+        let handler = tokio::spawn(async move {
+            close_doc(&task_backend, &task_uri).await;
+        });
+        let final_payload = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            final_handoff.wait_payload(),
+        )
+        .await
+        .expect("didClose must reach its transactional final handoff");
+        final_handoff.release();
+        handler.await.unwrap();
+
+        let (resync_payload, resync_handoff) = if let Some(resync_handoff) = resync_handoff {
+            let payload = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                resync_handoff.wait_payload(),
+            )
+            .await
+            .expect("didClose must reach its disk-resync final handoff");
+            (payload, Some(resync_handoff))
+        } else {
+            (Vec::new(), None)
+        };
+        (final_payload, resync_payload, resync_handoff)
+    }
+
+    fn close_handoff_count(
+        transactional: &[crate::state::AnalysisRevalidationTicketFingerprint],
+        resync: &[crate::state::CloseResyncConsumerForTest],
+        uri: &Url,
+    ) -> usize {
+        transactional
+            .iter()
+            .map(|ticket| &ticket.uri)
+            .chain(resync.iter().map(|consumer| consumer.uri()))
+            .filter(|candidate| *candidate == uri)
+            .count()
+    }
+
     /// Send a single watched CHANGED event through the real watched-files path.
     async fn send_watched_change(backend: &Backend, uri: &Url) {
         use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
@@ -52147,18 +52288,23 @@ infixContinuationStyle = "aligned"
         let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
         let new_content = "child_value <- 2\nsource(\"grand.R\")\n";
         fs::write(tmp.path().join("child.R"), new_content).unwrap();
-        let (generation, attempts, pins, reservations) = {
+        let (generation, attempts, pins) = {
             let mut state = backend.state.write().await;
             state.watched_batch_test_reject_once = true;
             (
                 bump_watched_file_resync_generation(&mut state, &child_uri),
                 state.watched_batch_test_commit_attempts,
                 state.open_pin_recompute_count,
-                state.analysis_revalidation_reservation_count,
             )
         };
 
-        run_watched_resync_batch(
+        let handoff = backend
+            .state
+            .read()
+            .await
+            .watched_final_handoff_test_capture
+            .arm();
+        let batch = tokio::spawn(run_watched_resync_batch(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
@@ -52173,9 +52319,22 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
-        )
-        .await;
+        ));
+        let final_handoff = handoff.wait_payload().await;
+        assert!(final_handoff.reserved.is_empty());
+        assert_eq!(
+            final_handoff
+                .transferred
+                .iter()
+                .map(|ticket| &ticket.uri)
+                .collect::<Vec<_>>(),
+            vec![&parent_uri],
+            "the fresh retry must own one exact final fanout ticket"
+        );
+        handoff.release();
+        batch.await.unwrap();
 
         let state = backend.state.read().await;
         assert_eq!(
@@ -52193,11 +52352,6 @@ infixContinuationStyle = "aligned"
             "one rejected attempt plus one fresh retry; no third attempt"
         );
         assert_eq!(state.open_pin_recompute_count - pins, 1);
-        assert_eq!(
-            state.analysis_revalidation_reservation_count - reservations,
-            1,
-            "the rejected candidate reserves nothing and the retry owns one fanout ticket"
-        );
         assert!(
             state
                 .cross_file_graph
@@ -52241,6 +52395,7 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -52293,6 +52448,7 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
+                final_handoff_test_capture: None,
             },
         );
         tokio::pin!(run);
@@ -52358,6 +52514,7 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -52417,6 +52574,7 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
         ));
         pause.wait_arrived().await;
@@ -52532,6 +52690,7 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
         ));
         fallback_pause.wait_arrived().await;
@@ -53011,6 +53170,7 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
+                final_handoff_test_capture: None,
             },
         );
         tokio::pin!(run);
@@ -53072,6 +53232,7 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
+                final_handoff_test_capture: None,
             },
         );
         tokio::pin!(run);
@@ -53141,6 +53302,7 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -53187,6 +53349,7 @@ infixContinuationStyle = "aligned"
                     transfer_handles: Vec::new(),
                     mode: WatchedResyncBatchMode::Immediate,
                     attempts_remaining: 0,
+                    final_handoff_test_capture: None,
                 },
             )
             .await;
@@ -53241,6 +53404,7 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -53273,6 +53437,7 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
         )
         .await;
@@ -53331,15 +53496,18 @@ infixContinuationStyle = "aligned"
             .expect("system.file convergence should produce an overlapping transfer");
         let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
         fs::write(tmp.path().join("child.R"), "child_value <- 2\n").unwrap();
-        let (generation, reservations) = {
+        let generation = {
             let mut state = backend.state.write().await;
-            (
-                bump_watched_file_resync_generation(&mut state, &child_uri),
-                state.analysis_revalidation_reservation_count,
-            )
+            bump_watched_file_resync_generation(&mut state, &child_uri)
         };
 
-        run_watched_resync_batch(
+        let handoff = backend
+            .state
+            .read()
+            .await
+            .watched_final_handoff_test_capture
+            .arm();
+        let batch = tokio::spawn(run_watched_resync_batch(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
@@ -53354,16 +53522,27 @@ infixContinuationStyle = "aligned"
                 transfer_handles: vec![transfer.handle],
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
-        )
-        .await;
+        ));
+        let final_handoff = handoff.wait_payload().await;
+        assert!(
+            final_handoff.reserved.is_empty(),
+            "the central watched batch transfers its unmarked fanout"
+        );
+        assert_eq!(
+            final_handoff
+                .transferred
+                .iter()
+                .map(|ticket| &ticket.uri)
+                .collect::<Vec<_>>(),
+            vec![&parent_uri],
+            "the watched and system-file candidates must merge into one exact current-lifecycle ticket"
+        );
+        handoff.release();
+        batch.await.unwrap();
 
         let state = backend.state.read().await;
-        assert_eq!(
-            state.analysis_revalidation_reservation_count - reservations,
-            1,
-            "the watched commit ticket owns the URI; transfer finalization consumes its handle without reserving it again"
-        );
         assert!(state.documents.contains_key(&parent_uri));
         drop(state);
         let mut state = backend.state.write().await;
@@ -53408,12 +53587,13 @@ infixContinuationStyle = "aligned"
                 .unwrap();
             ticket
         };
-        let reservations = {
-            let state = backend.state.read().await;
-            state.analysis_revalidation_reservation_count
-        };
-
-        run_watched_resync_batch(
+        let handoff = backend
+            .state
+            .read()
+            .await
+            .watched_final_handoff_test_capture
+            .arm();
+        let batch = tokio::spawn(run_watched_resync_batch(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
@@ -53425,16 +53605,41 @@ infixContinuationStyle = "aligned"
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
+                final_handoff_test_capture: None,
             },
-        )
-        .await;
+        ));
+        let final_handoff = handoff.wait_payload().await;
 
         let state = backend.state.read().await;
         assert_eq!(
-            state.analysis_revalidation_reservation_count - reservations,
-            1,
-            "a retired ticket cannot URI-suppress the reopened lifecycle"
+            final_handoff
+                .reserved
+                .iter()
+                .map(|ticket| &ticket.uri)
+                .collect::<Vec<_>>(),
+            vec![&uri],
+            "the retired reservation remains an exact stale consumer"
         );
+        assert_eq!(
+            final_handoff
+                .transferred
+                .iter()
+                .map(|ticket| &ticket.uri)
+                .collect::<Vec<_>>(),
+            vec![&uri],
+            "the stale ticket must not URI-suppress the reopened lifecycle"
+        );
+        assert_ne!(
+            final_handoff.reserved[0].trigger,
+            final_handoff.transferred[0].trigger
+        );
+        assert_eq!(
+            final_handoff.transferred[0].trigger,
+            DiagnosticsTrigger::capture(&state, &uri)
+        );
+        drop(state);
+        handoff.release();
+        batch.await.unwrap();
     }
 
     #[test]
