@@ -818,7 +818,7 @@ pub struct ScopeArtifacts {
     pub calls_dev_load_all: bool,
     /// Every detected devtools/pkgload::load_all() call site (line, column), in
     /// document order. Each is emitted as a sentinel PackageLoad event in the
-    /// artifact emission loops (one per site, each with its own function scope),
+    /// canonical artifact builder (one per site, each with its own function scope),
     /// mirroring how `library()` calls are emitted. Recording every site (not
     /// just the first) matters when an earlier call is function-scoped but a
     /// later top-level call must still attach for files sourced after it.
@@ -1833,8 +1833,8 @@ fn declared_symbol_event(
 /// the whole file) and becomes visible from the line *after* the call. See
 /// [`declared_symbol_event`] for the shared symbol shape.
 ///
-/// Shared by both [`compute_artifacts`] and [`compute_artifacts_with_metadata`]
-/// so the two paths cannot drift in how `exists()` declarations are modeled.
+/// The canonical metadata-aware builder uses this for every public artifact
+/// entry point, including [`compute_artifacts`]'s metadata-free specialization.
 fn push_exists_declarations<'tree, 'text>(
     artifacts: &mut ScopeArtifacts,
     uri: &Url,
@@ -1861,8 +1861,8 @@ fn push_exists_declarations<'tree, 'text>(
 /// Fold every `ScopeEvent::Declaration` in the (already effect-position-sorted)
 /// timeline into `exported_interface`. A real (non-declared) definition is never
 /// downgraded by a declaration; among declared symbols, the later one wins
-/// (timeline order). Shared by both build paths so directive (`# raven: var` /
-/// `# raven: func`) and `exists()` declarations export identically.
+/// (timeline order). Directive (`# raven: var` / `# raven: func`) and
+/// `exists()` declarations therefore export identically.
 fn fold_declarations_into_exported_interface(artifacts: &mut ScopeArtifacts) {
     for event in &artifacts.timeline {
         if let ScopeEvent::Declaration {
@@ -1884,18 +1884,18 @@ fn fold_declarations_into_exported_interface(artifacts: &mut ScopeArtifacts) {
     }
 }
 
-/// Emit one sentinel `PackageLoad` event per recorded `load_all()` call site,
-/// each carrying the function scope that contains it (so a function-body-only
-/// call attaches only inside that body, never at top level), modelling
+/// Emit one sentinel `PackageLoad` event per recorded `load_all()` call site.
+/// Final timeline annotation attaches each event to its containing function
+/// scope (so a function-body-only call attaches only inside that body, never at
+/// top level), modelling
 /// `devtools::load_all()` / `pkgload::load_all()` as attaching the package under
 /// development. Mirrors how `library()` calls are emitted (see
 /// [`ScopeArtifacts::dev_load_all_sites`]). The out-of-root gate is applied
 /// later, at resolution (the package root is unknown here).
 ///
-/// Shared by both artifact-build paths ([`compute_artifacts`] and
-/// [`compute_artifacts_with_metadata`]) so the two cannot drift on load_all
-/// attachment semantics.
-fn push_dev_load_all_events(artifacts: &mut ScopeArtifacts, line_index: &LineIndex) {
+/// The caller must append these before finalizing the complete timeline so the
+/// sentinel events are sorted and annotated together with every other event.
+fn push_dev_load_all_events(artifacts: &mut ScopeArtifacts) {
     for site in &artifacts.dev_load_all_sites {
         artifacts.timeline.push(ScopeEvent::PackageLoad {
             line: site.line,
@@ -1905,7 +1905,6 @@ fn push_dev_load_all_events(artifacts: &mut ScopeArtifacts, line_index: &LineInd
             function_scope: None,
         });
     }
-    annotate_event_function_scopes(artifacts, line_index);
 }
 
 /// Harvest the rm-aware top-level definitions and top-level `load_all()` fact
@@ -1941,7 +1940,7 @@ pub(crate) fn static_script_definitions_and_load_all<'tree, 'text>(
     }
     let library_calls =
         detect_library_calls_with_bindings_for_scope(tree, content, capture_bindings);
-    finalize_real_and_synthetic_function_scopes(
+    append_synthetic_function_scopes(
         &mut artifacts,
         root,
         content,
@@ -1950,6 +1949,7 @@ pub(crate) fn static_script_definitions_and_load_all<'tree, 'text>(
         &library_calls,
         capture_bindings,
     );
+    finalize_scope_timeline(&mut artifacts, &line_index);
     let definitions = live_top_level_exports(&artifacts).into_iter().collect();
     let load_all = artifacts.dev_load_all_sites.iter().any(|site| {
         resolve_runtime_function_scope(
@@ -2004,141 +2004,7 @@ impl FinalizedSourceInterface {
 /// assert!(artifacts.interface_hash != 0 || artifacts.exported_interface.is_empty());
 /// ```
 pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifacts {
-    let mut artifacts = ScopeArtifacts::default();
-    let root = tree.root_node();
-    let line_index = LineIndex::new(content);
-
-    // Collect definitions from AST, then reuse the same lazy whole-tree binding
-    // cache for source, removal, exists, and package detection below.
-    let mut capture_bindings = LazyStaticBindings::new(root, content);
-    collect_definitions(
-        root,
-        &line_index,
-        uri,
-        &mut capture_bindings,
-        CaptureEvaluationFrame::Caller,
-        RuntimeFunctionScope::Lexical,
-        &mut artifacts,
-    );
-
-    // Collect source() calls and add them to timeline. Orderable calls stay on
-    // the timeline even when they target a non-inheriting environment: ordinary
-    // child bindings remain isolated, but package attachments are process-wide
-    // side effects that become visible after the call.
-    let source_calls =
-        detect_source_calls_with_bindings_and_frames(tree, content, &mut capture_bindings);
-    let source_interfaces: Vec<FinalizedSourceInterface> = source_calls
-        .iter()
-        .map(FinalizedSourceInterface::from_detected)
-        .collect();
-    for detected in source_calls {
-        if !detected.contributes_to_timeline() {
-            // The dependency still exists, but capture runtime order cannot
-            // safely place its effects on this coordinate-sorted timeline.
-            continue;
-        }
-        let source = detected.source;
-        artifacts.timeline.push(ScopeEvent::Source {
-            line: source.line,
-            column: source.column,
-            source,
-            runtime_function_scope: detected.runtime_function_scope,
-            function_scope: None,
-        });
-    }
-
-    // Collect rm()/remove() calls and add them to timeline.
-    // These events will be processed during scope resolution to remove symbols from scope.
-    let rm_calls = detect_rm_calls_with_bindings_for_scope(tree, content, &mut capture_bindings);
-    for rm_call in rm_calls {
-        artifacts.timeline.push(ScopeEvent::Removal {
-            line: rm_call.call.line,
-            column: rm_call.call.column,
-            symbols: rm_call.call.symbols,
-            runtime_function_scope: rm_call.runtime_function_scope,
-            function_scope: None,
-        });
-    }
-
-    // Collect `exists("name")` calls and add Declaration events (treated as
-    // `# raven: var name`). See `push_exists_declarations`.
-    push_exists_declarations(&mut artifacts, uri, tree, content, &mut capture_bindings);
-
-    // Collect library()/require()/loadNamespace() calls for later processing.
-    // We need to wait until the function scope tree is built to determine function_scope.
-    // (Requirements 14.2, 14.4)
-    let library_calls =
-        detect_library_calls_with_bindings_for_scope(tree, content, &mut capture_bindings);
-
-    finalize_real_and_synthetic_function_scopes(
-        &mut artifacts,
-        root,
-        content,
-        &line_index,
-        uri,
-        &library_calls,
-        &mut capture_bindings,
-    );
-
-    // Add PackageLoad events for library calls with function_scope determined from the tree.
-    // (Requirements 14.2, 14.4)
-    for detected in library_calls {
-        artifacts.timeline.push(ScopeEvent::PackageLoad {
-            line: detected.call.line,
-            column: detected.call.column,
-            package: detected.call.package,
-            runtime_function_scope: detected.runtime_function_scope,
-            function_scope: None,
-        });
-    }
-    annotate_event_function_scopes(&mut artifacts, &line_index);
-
-    // Model devtools/pkgload::load_all() as attaching a synthetic virtual package
-    // (one sentinel PackageLoad per call site); see `push_dev_load_all_events`.
-    push_dev_load_all_events(&mut artifacts, &line_index);
-
-    // Re-sort timeline to include PackageLoad events in effect-position order.
-    artifacts.timeline.sort_by_key(event_effect_position);
-
-    // Fold `exists()` Declaration events into the exported interface so a file's
-    // `exists("name")` declares `name` to files that source it (parity with
-    // `# raven: var`). No directive declarations exist on this path.
-    fold_declarations_into_exported_interface(&mut artifacts);
-
-    // Extract package loads (with position) from PackageLoad events for interface
-    // hash computation (Requirement 14.5: interface hash must include loaded
-    // packages for cache invalidation; position matters — see
-    // `extract_package_load_positions`).
-    let loaded_packages = extract_package_load_positions(&artifacts.timeline);
-
-    // Compute interface hash including symbols, loaded packages, declared
-    // symbols, and top-level rm() events (which affect cross-file scope at
-    // source() call sites). compute_artifacts (without metadata) has no
-    // declared symbols.
-    let top_level_removals = extract_top_level_removals(&artifacts.timeline);
-    let removal_refs: Vec<TopLevelRemoval> = top_level_removals
-        .iter()
-        .map(|(name, line)| (name.as_str(), *line))
-        .collect();
-    // F3: hash only the top-level interface (function-scope-filtered) so a
-    // function-local rename never invalidates dependents that source this file.
-    let top_level = top_level_interface(&artifacts);
-    let data_loads = extract_top_level_data_loads(&artifacts.timeline);
-    let declarations = extract_top_level_declarations(&artifacts.timeline);
-    artifacts.interface_hash = compute_interface_hash(
-        &top_level,
-        &loaded_packages,
-        &[],
-        &[],
-        &removal_refs,
-        &data_loads,
-        &declarations,
-        &source_interfaces,
-        // No metadata available in this path → cannot be standalone.
-        false,
-    );
-
-    artifacts
+    compute_artifacts_with_metadata(uri, tree, content, None)
 }
 
 /// True when `node` is a `load_all(...)` call — bare, or qualified as
@@ -2177,10 +2043,12 @@ fn call_is_dev_load_all(node: Node, content: &str) -> bool {
 
 /// Build scope artifacts for a source file, including both AST-detected sources and directive sources.
 ///
-/// This is an extended version of `compute_artifacts` that also includes forward directive sources
-/// (`# raven: source`, `# raven: run`, `# raven: include`) from the metadata in the timeline. This
-/// ensures that symbols from files referenced by forward directives are available in scope resolution.
-/// (The `@lsp-` forms — e.g. `@lsp-source` — are permanent aliases that parse identically.)
+/// This is the canonical artifact builder. [`compute_artifacts`] delegates here
+/// with no metadata; when metadata is present, forward directive sources
+/// (`# raven: source`, `# raven: run`, `# raven: include`) are also included in
+/// the timeline. This ensures that symbols from files referenced by forward
+/// directives are available in scope resolution. (The `@lsp-` forms — e.g.
+/// `@lsp-source` — are permanent aliases that parse identically.)
 ///
 /// The function:
 /// - collects symbol and function-scope definitions from the AST,
@@ -2279,10 +2147,12 @@ pub fn compute_artifacts_with_metadata(
     // 1. Directive sources have column=0, so column-based matching doesn't work
     // 2. Multiple source() calls on the same line to different files should all be kept
     // 3. A directive should only be suppressed if an AST source to the SAME file exists
-    let ast_line_paths: std::collections::HashSet<(u32, String)> = ast_source_calls
-        .iter()
-        .map(|detected| (detected.source.line, detected.source.path.clone()))
-        .collect();
+    let ast_line_paths = metadata.map(|_| {
+        ast_source_calls
+            .iter()
+            .map(|detected| (detected.source.line, detected.source.path.clone()))
+            .collect::<std::collections::HashSet<_>>()
+    });
 
     // Add AST-detected sources to timeline
     for detected in ast_source_calls {
@@ -2299,6 +2169,8 @@ pub fn compute_artifacts_with_metadata(
     // Add directive sources from metadata (if provided) that don't overlap with AST sources
     // This ensures `# raven: source` directives are included in scope resolution
     if let Some(meta) = metadata {
+        let ast_line_paths =
+            ast_line_paths.expect("AST source paths are collected whenever metadata is present");
         // Expanded `tar_source()` members share one call site but represent a
         // single ordered evaluation environment. Keep them out of the ordinary
         // `Source` path (whose graph lookup and streaming cache are call-site
@@ -2395,7 +2267,10 @@ pub fn compute_artifacts_with_metadata(
     let library_calls =
         detect_library_calls_with_bindings_for_scope(tree, content, &mut capture_bindings);
 
-    finalize_real_and_synthetic_function_scopes(
+    // Synthetic FunctionScope events must precede subsequently appended
+    // package effects at equal effect positions; the final stable sort retains
+    // that execution order.
+    append_synthetic_function_scopes(
         &mut artifacts,
         root,
         content,
@@ -2405,7 +2280,8 @@ pub fn compute_artifacts_with_metadata(
         &mut capture_bindings,
     );
 
-    // Add PackageLoad events for library calls with function_scope determined from the tree.
+    // Add PackageLoad events for library calls. Final timeline annotation
+    // resolves each event's function scope against the complete scope tree.
     for detected in library_calls {
         artifacts.timeline.push(ScopeEvent::PackageLoad {
             line: detected.call.line,
@@ -2415,14 +2291,12 @@ pub fn compute_artifacts_with_metadata(
             function_scope: None,
         });
     }
-    annotate_event_function_scopes(&mut artifacts, &line_index);
 
     // Model devtools/pkgload::load_all() as attaching a synthetic virtual package
     // (one sentinel PackageLoad per call site); see `push_dev_load_all_events`.
-    push_dev_load_all_events(&mut artifacts, &line_index);
+    push_dev_load_all_events(&mut artifacts);
 
-    // Re-sort timeline (now includes PackageLoad events) by effect position.
-    artifacts.timeline.sort_by_key(event_effect_position);
+    finalize_scope_timeline(&mut artifacts, &line_index);
 
     // Add declared symbols (`# raven: var` / `# raven: func` directives and
     // `exists()` declarations) to the exported interface in timeline order.
@@ -3434,14 +3308,16 @@ fn visit_runtime_reachable_scope_syntax<'tree>(
     }
 }
 
-/// Complete the function-scope model after real function definitions and other
-/// scope-sensitive events have been collected.
+/// Append synthetic function scopes after real definitions have been collected.
 ///
 /// Shiny deferred bodies and foreach execution frames are synthetic function
 /// scopes, but they are authoritative for the same top-level classification as
-/// real function bodies. Every artifact and static-prelude consumer must append
-/// them before sorting, rebuilding the interval tree, and annotating events.
-fn finalize_real_and_synthetic_function_scopes<'tree, 'text>(
+/// real function bodies. This must run after [`collect_definitions`] has built
+/// the real exported interface used by Shiny shadow detection, but before
+/// declarations are folded into that interface. Callers must also append these
+/// scopes before later package events so the stable timeline sort preserves
+/// their existing equal-position order.
+fn append_synthetic_function_scopes<'tree, 'text>(
     artifacts: &mut ScopeArtifacts,
     root: Node<'tree>,
     content: &'text str,
@@ -3459,6 +3335,15 @@ fn finalize_real_and_synthetic_function_scopes<'tree, 'text>(
         capture_bindings,
     );
     push_foreach_iterator_scopes(artifacts, root, content, line_index, uri, capture_bindings);
+}
+
+/// Sort and index a complete scope-event timeline exactly once.
+///
+/// This must be the last timeline mutation in an artifact build: rebuilding the
+/// interval tree and annotating scope-sensitive events is authoritative only
+/// after every real and synthetic `FunctionScope` and every effect event has
+/// been appended.
+fn finalize_scope_timeline(artifacts: &mut ScopeArtifacts, line_index: &LineIndex) {
     artifacts.timeline.sort_by_key(event_effect_position);
     rebuild_function_scope_index(artifacts, line_index);
 }
@@ -10165,6 +10050,231 @@ mod tests {
 
     fn test_uri() -> Url {
         Url::parse("file:///test.R").unwrap()
+    }
+
+    /// Assert that the public metadata-free builder is the exact
+    /// `metadata = None` specialization of the enriched builder.
+    ///
+    /// Keep this comparison field-complete: the two entry points historically
+    /// had independent implementations, so comparing only exported names would
+    /// miss drift in event order, function-scope annotations, or cache hashes.
+    fn assert_metadata_free_artifact_parity(name: &str, code: &str) {
+        let uri = test_uri();
+        let tree = parse_r(code);
+        let plain = compute_artifacts(&uri, &tree, code);
+        let enriched = compute_artifacts_with_metadata(&uri, &tree, code, None);
+
+        assert_eq!(
+            plain.exported_interface, enriched.exported_interface,
+            "{name}: exported interface"
+        );
+        assert_eq!(
+            format!("{:#?}", plain.timeline),
+            format!("{:#?}", enriched.timeline),
+            "{name}: complete ordered timeline"
+        );
+        assert_eq!(
+            format!("{:#?}", plain.function_scope_tree),
+            format!("{:#?}", enriched.function_scope_tree),
+            "{name}: function-scope interval tree"
+        );
+        assert_eq!(
+            plain.interface_hash, enriched.interface_hash,
+            "{name}: interface hash"
+        );
+        assert_eq!(
+            plain.calls_dev_load_all, enriched.calls_dev_load_all,
+            "{name}: load_all carrier flag"
+        );
+        assert_eq!(
+            plain.dev_load_all_sites, enriched.dev_load_all_sites,
+            "{name}: load_all call sites"
+        );
+
+        let last_line = code.lines().count().saturating_sub(1) as u32;
+        for (line, column) in [
+            (0, 0),
+            (last_line, 0),
+            (last_line, u32::MAX),
+            (u32::MAX, u32::MAX),
+        ] {
+            for hoist_globals in [false, true] {
+                let plain_scope = scope_at_position(&plain, line, column, hoist_globals);
+                let enriched_scope = scope_at_position(&enriched, line, column, hoist_globals);
+                assert_eq!(
+                    plain_scope.symbols, enriched_scope.symbols,
+                    "{name}: symbols at ({line}, {column}), hoist={hoist_globals}"
+                );
+                assert_eq!(
+                    plain_scope.removed_names, enriched_scope.removed_names,
+                    "{name}: removals at ({line}, {column}), hoist={hoist_globals}"
+                );
+                assert_eq!(
+                    plain_scope.loaded_packages, enriched_scope.loaded_packages,
+                    "{name}: packages at ({line}, {column}), hoist={hoist_globals}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_free_builder_matches_enriched_none_across_event_shapes() {
+        let fixtures = [
+            (
+                "ordinary mixed events",
+                r#"
+                    top <- 1
+                    f <- function(arg = exists("default_decl")) {
+                        local <- assign("made", 1)
+                        source("child.R", local = TRUE)
+                        rm(local)
+                        library(stats)
+                        devtools::load_all()
+                        data(iris)
+                    }
+                    foreach(i = 1:2) %do% { inner <- i }
+                "#,
+            ),
+            (
+                "synthetic and evaluated capture scopes",
+                r#"
+                    shiny::reactive({
+                        bquote(function() .({
+                            captured <- 1
+                            source("captured.R", local = TRUE)
+                            library(capturedpkg)
+                            load_all()
+                            rm(captured)
+                            exists("captured_decl")
+                        }))
+                    })
+                    foreach(i = bquote(function() .({ arg_local <- 1; 1:2 }))) %do% i
+                "#,
+            ),
+            (
+                "error-recovered incomplete syntax",
+                r#"
+                    broken <- function(arg = exists("fallback")) {
+                        source("partial.R", local = TRUE)
+                        library(stats)
+                        assign("unfinished",
+                "#,
+            ),
+        ];
+
+        for (name, code) in fixtures {
+            assert_metadata_free_artifact_parity(name, code);
+        }
+    }
+
+    #[test]
+    fn enriched_builder_finalizes_mixed_metadata_and_ast_events_together() {
+        use crate::cross_file::types::{
+            CrossFileMetadata, DeclaredSymbol, ForwardSource, NseDeclaration, NseScope,
+        };
+
+        let code = r#"
+            f <- function() {
+                library(scopedpkg)
+                load_all()
+                exists("inside_decl")
+            }
+        "#;
+        let tree = parse_r(code);
+        let metadata = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "directive.R".to_string(),
+                    line: 0,
+                    is_directive: true,
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "targets/a.R".to_string(),
+                    line: 2,
+                    column: 4,
+                    tar_source_ordinal: Some(0),
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "targets/b.R".to_string(),
+                    line: 2,
+                    column: 4,
+                    tar_source_ordinal: Some(1),
+                    ..Default::default()
+                },
+            ],
+            declared_variables: vec![DeclaredSymbol {
+                name: "declared_var".to_string(),
+                line: 1,
+                is_function: false,
+                formals: None,
+            }],
+            declared_functions: vec![DeclaredSymbol {
+                name: "declared_fn".to_string(),
+                line: 1,
+                is_function: true,
+                formals: Some(vec!["x".to_string()]),
+            }],
+            nse_declarations: vec![NseDeclaration {
+                name: "declared_fn".to_string(),
+                package: None,
+                scope: NseScope::Formals(vec!["x".to_string()]),
+                line: 1,
+            }],
+            standalone: true,
+            ..Default::default()
+        };
+
+        let artifacts = compute_artifacts_with_metadata(&test_uri(), &tree, code, Some(&metadata));
+        assert!(
+            artifacts.timeline.windows(2).all(
+                |events| event_effect_position(&events[0]) <= event_effect_position(&events[1])
+            ),
+            "the complete mixed timeline must be effect-position sorted"
+        );
+        assert!(artifacts.timeline.iter().any(|event| matches!(
+            event,
+            ScopeEvent::TarBatch { members, .. }
+                if members.iter().map(|source| source.tar_source_ordinal).collect::<Vec<_>>()
+                    == [Some(0), Some(1)]
+        )));
+        assert!(artifacts.timeline.iter().any(|event| matches!(
+            event,
+            ScopeEvent::Source {
+                source,
+                function_scope: None,
+                ..
+            } if source.is_directive && source.path == "directive.R"
+        )));
+        for name in ["declared_var", "declared_fn"] {
+            assert!(
+                artifacts.exported_interface.contains_key(name),
+                "metadata declaration `{name}` must be folded after finalization"
+            );
+        }
+
+        let scoped_packages: Vec<_> = artifacts
+            .timeline
+            .iter()
+            .filter_map(|event| match event {
+                ScopeEvent::PackageLoad {
+                    package,
+                    function_scope,
+                    ..
+                } if matches!(
+                    package.as_str(),
+                    "scopedpkg" | crate::package_library::LOAD_ALL_SENTINEL
+                ) =>
+                {
+                    Some((package.as_str(), *function_scope))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scoped_packages.len(), 2);
+        assert!(scoped_packages.iter().all(|(_, scope)| scope.is_some()));
+        assert_eq!(scoped_packages[0].1, scoped_packages[1].1);
     }
 
     /// Collect the parameter-name sets of every `FunctionScope` event in the
@@ -20938,6 +21048,7 @@ x <- 1"#;
                     captured <- 1
                     source("child.R", local = TRUE)
                     library(capturedpkg)
+                    load_all()
                     rm(x)
                     exists("captured_declared")
                 }))
@@ -20997,10 +21108,22 @@ x <- 1"#;
             };
             assert_eq!(scope, Some(shiny_scope), "{event:?}");
         }
+        assert!(artifacts.timeline.iter().any(|event| matches!(
+            event,
+            ScopeEvent::PackageLoad {
+                package,
+                function_scope: Some(scope),
+                ..
+            } if package == crate::package_library::LOAD_ALL_SENTINEL && *scope == shiny_scope
+        )));
         let eof = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
         assert!(!eof.symbols.contains_key("captured"));
         assert!(!eof.symbols.contains_key("captured_declared"));
         assert!(!eof.loaded_packages.contains("capturedpkg"));
+        assert!(
+            !eof.loaded_packages
+                .contains(crate::package_library::LOAD_ALL_SENTINEL)
+        );
     }
 
     #[test]
