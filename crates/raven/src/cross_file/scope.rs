@@ -701,6 +701,17 @@ pub enum ScopeEvent {
         runtime_function_scope: RuntimeFunctionScope,
         function_scope: Option<FunctionScopeInterval>,
     },
+    /// One statically expanded `{targets}` `tar_source()` call.
+    ///
+    /// Unlike ordinary `Source` events, all members execute in one shared
+    /// environment in ordinal order. Scope resolution therefore treats the
+    /// call as one batch: member state is threaded left-to-right and later
+    /// definitions replace earlier ones.
+    TarBatch {
+        line: u32,
+        column: u32,
+        members: Vec<ForwardSource>,
+    },
     /// A function invocation frame spanning formals/defaults through the body
     FunctionScope {
         start_line: u32,
@@ -845,6 +856,12 @@ impl Default for ScopeArtifacts {
 #[derive(Debug, Clone, Default)]
 pub struct ScopeAtPosition {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
+    /// Top-level removals still in effect at this position.
+    ///
+    /// Ordinary cross-file consumers historically needed only the surviving
+    /// symbol map. Ordered tar batches additionally need the tombstones so a
+    /// later member's `rm(x)` can remove `x` contributed by an earlier member.
+    pub(crate) removed_names: HashSet<Arc<str>>,
     pub chain: Vec<Url>,
     /// Symbols in `symbols` that came only from this scope's parent/backward
     /// prefix and have not been replaced by local definitions or forward
@@ -903,6 +920,13 @@ fn extend_visible_positions(dst: &mut HashMap<Url, (u32, u32)>, src: &HashMap<Ur
     for (uri, &(line, column)) in src {
         record_visible_position(dst, uri, line, column);
     }
+}
+
+/// Append contributor URIs in execution order, retaining only their first
+/// occurrence across both the existing chain and the appended contribution.
+fn extend_chain_first_seen(chain: &mut Vec<Url>, members: impl IntoIterator<Item = Url>) {
+    let mut seen: HashSet<Url> = chain.iter().cloned().collect();
+    chain.extend(members.into_iter().filter(|uri| seen.insert(uri.clone())));
 }
 
 /// Record that `package` was loaded by `origin_uri`. Idempotent.
@@ -1285,12 +1309,17 @@ where
 ///   collide on one key and serve the `None` (alias-free) scope to the forward
 ///   caller, dropping dataset symbols. The per-query memo never outlives the
 ///   query, so a raw address is a sound, stable identity.
+/// - `prefer_supplied_path_context`: whether ordinary relative sources in this
+///   execution prefer the recursively supplied context over URI-global graph
+///   edges. This is a two-valued resolution mode, not a tar occurrence
+///   identity; omitting it can alias graph-first and lexical-first executions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ForwardChildKey {
     child_uri: Url,
     path_fp: u64,
     pkg_fp: u64,
     provider_fp: usize,
+    prefer_supplied_path_context: bool,
 }
 
 /// Hash a child's `PathContext` (or its absence) into a `path_fp`. Hashes the
@@ -1400,6 +1429,7 @@ fn resolve_forward_child_memoized(
     child_uri: &Url,
     path_fp: u64,
     provider_fp: usize,
+    prefer_supplied_path_context: bool,
     child_depth: usize,
     packages_for_child: &HashSet<String>,
     is_cancelled: &dyn Fn() -> bool,
@@ -1418,6 +1448,7 @@ fn resolve_forward_child_memoized(
         path_fp,
         pkg_fp: package_set_fingerprint(packages_for_child),
         provider_fp,
+        prefer_supplied_path_context,
     };
     // Reuse only a stored scope whose compute-depth is at least this reach's
     // depth (the stored scope is truncation-free, so a shallower-or-equal reach
@@ -1492,48 +1523,14 @@ fn build_forward_child_path_context<G>(
 where
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
-    if child_is_standalone {
-        get_metadata(child_uri)
-            .and_then(|m| {
-                super::path_resolve::PathContext::from_metadata(child_uri, &m, workspace_root)
-            })
-            .or_else(|| {
-                super::path_resolve::PathContext::forward_without_metadata(
-                    child_uri,
-                    workspace_root,
-                )
-            })
-    } else {
-        let ctx = parent_ctx?;
-        // Start from the child's own context: its metadata when indexed, else a
-        // bare context rooted at its own directory. Both constructors parse the
-        // child URI's path (and return None if it isn't a file path), so reuse the
-        // parsed `child_ctx.file_path` below instead of parsing the URI again.
-        let mut child_ctx = match get_metadata(child_uri) {
-            Some(cm) => {
-                super::path_resolve::PathContext::from_metadata(child_uri, &cm, workspace_root)?
-            }
-            None => super::path_resolve::PathContext::forward_without_metadata(
-                child_uri,
-                workspace_root,
-            )?,
-        };
-        // Decide the inherited working directory via the shared seam that the
-        // on-demand index walk (`index_forward_chain`) also uses, so the live scope
-        // path and the dependency-graph edge cannot drift: a working directory
-        // propagates only under `chdir` or a `# raven: cd` in effect; with no cd the
-        // child resolves via its own directory + workspace-root fallback (matching
-        // `build_dependency_graph_from_workspace`). This branch is the residual seam
-        // consulted when no resolved graph edge is available. Apply the in-effect WD
-        // only when one propagates and the child declares no own `# raven: cd`;
-        // otherwise the child keeps its own context (its own cd, its own
-        // backward-directive-inherited WD, or none → own dir + fallback).
-        let inherited = ctx.forward_child_inherited_wd(&child_ctx.file_path, chdir);
-        if child_ctx.working_directory.is_none() && inherited.is_some() {
-            child_ctx.inherited_working_directory = inherited;
-        }
-        Some(child_ctx)
-    }
+    super::path_resolve::forward_child_path_context(
+        child_uri,
+        child_is_standalone,
+        chdir,
+        parent_ctx,
+        workspace_root,
+        get_metadata,
+    )
 }
 /// Finds the innermost function-scope interval that contains the given position.
 ///
@@ -1598,7 +1595,9 @@ pub(super) fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
         // effect position is one column past the call — matching the strict-<
         // check in `scope_at_position_with_graph_recursive` (line 3448).
         // `saturating_add` guards against the (theoretical) u32::MAX column.
-        ScopeEvent::Source { line, column, .. } => (*line, column.saturating_add(1)),
+        ScopeEvent::Source { line, column, .. } | ScopeEvent::TarBatch { line, column, .. } => {
+            (*line, column.saturating_add(1))
+        }
         ScopeEvent::FunctionScope {
             start_line,
             start_column,
@@ -1674,11 +1673,13 @@ fn apply_removal(
         None => {
             for sym in symbols {
                 scope.symbols.remove(sym.as_str());
+                scope.removed_names.insert(Arc::from(sym.as_str()));
             }
         }
         Some(rm_scope) if active_function_scopes.contains(&rm_scope) => {
             for sym in symbols {
                 scope.symbols.remove(sym.as_str());
+                scope.removed_names.insert(Arc::from(sym.as_str()));
             }
         }
         _ => {}
@@ -1782,7 +1783,7 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts, line_index: &L
                     None
                 };
             }
-            ScopeEvent::FunctionScope { .. } => {}
+            ScopeEvent::TarBatch { .. } | ScopeEvent::FunctionScope { .. } => {}
         }
     }
 }
@@ -2298,6 +2299,37 @@ pub fn compute_artifacts_with_metadata(
     // Add directive sources from metadata (if provided) that don't overlap with AST sources
     // This ensures `# raven: source` directives are included in scope resolution
     if let Some(meta) = metadata {
+        // Expanded `tar_source()` members share one call site but represent a
+        // single ordered evaluation environment. Keep them out of the ordinary
+        // `Source` path (whose graph lookup and streaming cache are call-site
+        // keyed) and emit one adjudicated batch event per call.
+        let mut batch_members: Vec<ForwardSource> = Vec::new();
+        let mut batch_site: Option<(u32, u32)> = None;
+        let flush_batch = |artifacts: &mut ScopeArtifacts,
+                           batch_site: &mut Option<(u32, u32)>,
+                           batch_members: &mut Vec<ForwardSource>| {
+            if let Some((line, column)) = batch_site.take() {
+                artifacts.timeline.push(ScopeEvent::TarBatch {
+                    line,
+                    column,
+                    members: std::mem::take(batch_members),
+                });
+            }
+        };
+        for source in meta
+            .sources
+            .iter()
+            .filter(|source| source.tar_source_ordinal.is_some())
+        {
+            let site = (source.line, source.column);
+            if batch_site.is_some_and(|existing| existing != site) {
+                flush_batch(&mut artifacts, &mut batch_site, &mut batch_members);
+            }
+            batch_site = Some(site);
+            batch_members.push(source.clone());
+        }
+        flush_batch(&mut artifacts, &mut batch_site, &mut batch_members);
+
         for source in &meta.sources {
             if source.is_directive {
                 // Check if there's already an AST source at the same line pointing to the same path
@@ -2505,7 +2537,7 @@ pub fn scope_at_position(
                     scope.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
             }
-            ScopeEvent::Source { .. } => {
+            ScopeEvent::Source { .. } | ScopeEvent::TarBatch { .. } => {
                 // Source events are handled by the cross-file traversal in
                 // scope_at_position_with_graph
             }
@@ -2716,7 +2748,7 @@ where
                     scope.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
             }
-            ScopeEvent::Source { .. } => {
+            ScopeEvent::Source { .. } | ScopeEvent::TarBatch { .. } => {
                 // Source events are handled by the cross-file traversal in
                 // scope_at_position_with_graph
             }
@@ -5615,6 +5647,7 @@ where
         package_contribution,
         package_query_uri,
         data_alias_provider,
+        false,
         &forward_child_memo,
     )
 }
@@ -5931,6 +5964,7 @@ where
         package_contribution,
         package_query_uri,
         data_alias_provider,
+        false,
         &forward_child_memo,
     )
 }
@@ -6087,6 +6121,10 @@ where
         declared_only: bool,
         package_barrier: bool,
         function_invocation: Option<(u32, u32)>,
+        /// Tar members sharing one call site are distinct executions. Keeping
+        /// the ordinal here prevents the ordinary same-parent substitution
+        /// rule from collapsing their lazy sibling cutoffs.
+        tar_source_ordinal: Option<u32>,
     }
     let mut parent_edge_indices: HashMap<ParentInvocationKey, usize> = HashMap::new();
     let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
@@ -6106,6 +6144,7 @@ where
             declared_only: inheritance_class,
             package_barrier,
             function_invocation,
+            tar_source_ordinal: edge.tar_source_ordinal,
         };
         match parent_edge_indices.get(&key).copied() {
             Some(existing_index) => {
@@ -6198,7 +6237,9 @@ where
         // Note: We pass empty inherited_packages here because the parent will collect
         // its own inherited packages from its parents via the dependency graph
         // We pass base_exports since child files also need access to base R functions
-        let (parent_query_line, parent_query_col) = if query_inside_function {
+        let (parent_query_line, parent_query_col) = if edge.tar_source_ordinal.is_some() {
+            (call_site_line, call_site_col)
+        } else if query_inside_function {
             (u32::MAX, u32::MAX)
         } else {
             (call_site_line, call_site_col)
@@ -6209,7 +6250,8 @@ where
         }
 
         let empty_packages = HashSet::new();
-        let parent_scope = scope_at_position_with_graph_recursive(
+        let batch_visited_base = visited.clone();
+        let mut parent_scope = scope_at_position_with_graph_recursive(
             &edge.from,
             parent_query_line,
             parent_query_col,
@@ -6217,7 +6259,7 @@ where
             get_metadata,
             graph,
             workspace_root,
-            parent_ctx,
+            parent_ctx.clone(),
             max_depth,
             current_depth + 1,
             visited,
@@ -6250,8 +6292,72 @@ where
             // scope for the issue's single-file acceptance criteria; the
             // literal-stem `Def` fallback still flows through the prefix.
             None,
+            false,
             forward_child_memo,
         );
+
+        // A queried tar member sees the exact prefix of siblings executed
+        // before its own ordinal. Compute that prefix lazily only for this
+        // incoming edge, and never evaluate the member itself.
+        if let Some(ordinal) = edge.tar_source_ordinal
+            && let Some(parent_artifacts) = get_artifacts(&edge.from)
+            && let Some(ScopeEvent::TarBatch { members, .. }) =
+                parent_artifacts.timeline.iter().find(|event| {
+                    matches!(
+                        event,
+                        ScopeEvent::TarBatch { line, column, .. }
+                            if *line == call_site_line && *column == call_site_col
+                    )
+                })
+        {
+            let cutoff = usize::try_from(ordinal)
+                .unwrap_or(usize::MAX)
+                .min(members.len());
+            let contribution = resolve_tar_batch_contribution(
+                &edge.from,
+                &members[..cutoff],
+                &parent_scope,
+                get_artifacts,
+                get_metadata,
+                graph,
+                workspace_root,
+                parent_ctx.as_ref(),
+                max_depth,
+                current_depth + 1,
+                &batch_visited_base,
+                base_exports,
+                hoist_globals,
+                backward_dep_mode,
+                is_cancelled,
+                None,
+            );
+            for name in contribution.removed_names {
+                parent_scope.symbols.remove(&name);
+                parent_scope.parent_prefix_symbol_names.remove(&name);
+                parent_scope.removed_names.insert(name);
+            }
+            for (name, symbol) in contribution.symbols {
+                parent_scope.parent_prefix_symbol_names.remove(&name);
+                parent_scope.removed_names.remove(&name);
+                parent_scope.symbols.insert(name, symbol);
+            }
+            parent_scope.chain.extend(contribution.chain);
+            extend_visible_positions(
+                &mut parent_scope.visible_positions,
+                &contribution.visible_positions,
+            );
+            parent_scope
+                .depth_exceeded
+                .extend(contribution.depth_exceeded);
+            for package in contribution.packages {
+                parent_scope.loaded_packages.insert(package.clone());
+                propagate_package_origins(
+                    &contribution.package_origins,
+                    &package,
+                    &mut parent_scope.package_origins,
+                );
+            }
+        }
 
         // Merge parent symbols (they are available at the START of this file).
         // NonInheriting destinations receive declaration facts only. Global and
@@ -6399,6 +6505,195 @@ where
     prefix
 }
 
+/// Resolve one ordered `tar_source()` batch without walking a member's
+/// backward parents.
+///
+/// The supplied `initial_scope` is the environment visible immediately before
+/// the batch. Each member receives that environment plus every preceding
+/// member's effects. A member runs with an explicit pre-computed prefix, which
+/// skips STEP 1 and prevents its incoming tar edge from recursing into the
+/// parent batch. Batch members deliberately bypass both forward-child and
+/// standalone caches: sibling symbols/removals are real inputs that those
+/// URI-keyed caches do not encode. Each member gets its own fork of the same
+/// ancestor `visited` snapshot; member-local visits never suppress a later
+/// sibling.
+#[allow(clippy::too_many_arguments)]
+fn resolve_tar_batch_contribution<F, G>(
+    parent_uri: &Url,
+    members: &[ForwardSource],
+    initial_scope: &ScopeAtPosition,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    parent_path_ctx: Option<&super::path_resolve::PathContext>,
+    max_depth: usize,
+    current_depth: usize,
+    ancestor_visited: &HashMap<Url, (u32, u32)>,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
+) -> ChildSourceContribution
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    let mut contribution = ChildSourceContribution::default();
+    let mut rolling_symbols = initial_scope.symbols.clone();
+    let mut rolling_packages: HashSet<String> = initial_scope
+        .inherited_packages
+        .iter()
+        .chain(initial_scope.loaded_packages.iter())
+        .cloned()
+        .collect();
+    let mut rolling_origins = initial_scope.package_origins.clone();
+
+    for source in members {
+        if is_cancelled() {
+            break;
+        }
+        let ordinal = source.tar_source_ordinal;
+        let child_uri = source.resolved_uri.clone().or_else(|| {
+            graph
+                .get_dependencies(parent_uri)
+                .iter()
+                .find(|edge| {
+                    edge.call_site_line == Some(source.line)
+                        && edge.call_site_column == Some(source.column)
+                        && edge.tar_source_ordinal == ordinal
+                })
+                .map(|edge| edge.to.clone())
+        });
+        let Some(child_uri) = child_uri else {
+            continue;
+        };
+        if current_depth + 1 >= max_depth {
+            contribution
+                .depth_exceeded
+                .push((parent_uri.clone(), source.line, source.column));
+            continue;
+        }
+
+        let child_is_standalone = get_metadata(&child_uri).is_some_and(|m| m.standalone);
+        let child_ctx = build_forward_child_path_context(
+            &child_uri,
+            child_is_standalone,
+            source.chdir,
+            parent_path_ctx,
+            workspace_root,
+            get_metadata,
+        );
+
+        let member_prefix = if child_is_standalone {
+            Arc::new(ParentPrefix::default())
+        } else {
+            Arc::new(ParentPrefix {
+                symbols: rolling_symbols.clone(),
+                inherited_packages: rolling_packages.clone(),
+                package_origins: rolling_origins.clone(),
+                ..ParentPrefix::default()
+            })
+        };
+        let child_provider = if child_is_standalone {
+            None
+        } else {
+            data_alias_provider
+        };
+        let mut member_visited = ancestor_visited.clone();
+        // A fresh memo has no standalone-cache context. Passing
+        // `isolate_forward_source_visits = false` below also keeps every
+        // ordinary descendant off ForwardChildMemo for this batch execution.
+        let member_forward_memo = std::cell::RefCell::new(ForwardChildMemo::default());
+        let empty_packages = HashSet::new();
+        let member_scope = scope_at_position_with_graph_recursive(
+            &child_uri,
+            u32::MAX,
+            u32::MAX,
+            get_artifacts,
+            get_metadata,
+            graph,
+            workspace_root,
+            child_ctx,
+            max_depth,
+            current_depth + 1,
+            &mut member_visited,
+            &empty_packages,
+            base_exports,
+            hoist_globals,
+            backward_dep_mode,
+            is_cancelled,
+            false,
+            Some(&member_prefix),
+            None,
+            None,
+            child_provider,
+            true,
+            &member_forward_memo,
+        );
+
+        extend_visible_positions(
+            &mut contribution.visible_positions,
+            &member_scope.visible_positions,
+        );
+        contribution
+            .chain
+            .extend(member_scope.chain.iter().cloned());
+        contribution
+            .depth_exceeded
+            .extend(member_scope.depth_exceeded.iter().cloned());
+
+        // Removals cross member boundaries because every script evaluates in
+        // the same targets environment.
+        for name in &member_scope.removed_names {
+            rolling_symbols.remove(name);
+            contribution.symbols.remove(name);
+            contribution.removed_names.insert(name.clone());
+        }
+
+        // Parent-prefix-only names are inherited environment, not bindings
+        // produced by executing this member.
+        for (name, symbol) in member_scope.symbols {
+            if member_scope.parent_prefix_symbol_names.contains(&name) {
+                continue;
+            }
+            rolling_symbols.insert(name.clone(), symbol.clone());
+            contribution.removed_names.remove(&name);
+            contribution.symbols.insert(name, symbol);
+        }
+
+        // Only packages attached while executing the member are new batch
+        // effects. Their origin remains the loading member (or its descendant),
+        // never the batch parent, so same-file leak filtering stays sound.
+        for package in member_scope.loaded_packages {
+            rolling_packages.insert(package.clone());
+            contribution.packages.insert(package.clone());
+            propagate_package_origins(
+                &member_scope.package_origins,
+                &package,
+                &mut rolling_origins,
+            );
+            propagate_package_origins(
+                &member_scope.package_origins,
+                &package,
+                &mut contribution.package_origins,
+            );
+        }
+    }
+
+    let member_chain = std::mem::take(&mut contribution.chain);
+    extend_chain_first_seen(&mut contribution.chain, member_chain);
+    contribution.depth_exceeded.sort_unstable_by(|left, right| {
+        left.0
+            .as_str()
+            .cmp(right.0.as_str())
+            .then_with(|| (left.1, left.2).cmp(&(right.1, right.2)))
+    });
+    contribution.depth_exceeded.dedup();
+    contribution
+}
+
 /// Compute the lexical and cross-file scope visible at a position using the dependency graph.
 ///
 /// This collects symbols visible at (line, column) in `uri` by merging parent (backward) symbols
@@ -6475,6 +6770,14 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // receive it — that prefix is cached provider-independently, so it always
     // passes `None`. `None` disables expansion (literal-stem `Def` fallback).
     data_alias_provider: Option<&DataAliasProvider<'_>>,
+    // A direct tar-batch member may execute more than once with distinct
+    // inherited/chdir contexts. For that one execution, ordinary relative
+    // source paths must prefer this recursively supplied context over the
+    // URI-global graph edge. The preference and derived context propagate
+    // through non-standalone ordinary descendants without carrying any
+    // call-site/ordinal identity. `system.file` stays pre-resolved, and a
+    // standalone child severs caller context.
+    prefer_supplied_path_context: bool,
     // Per-query memo of forward-sourced child EOF scopes (issue #472). Threaded
     // through STEP 1's parent walk and STEP 2's forward children so each
     // distinct `(child, path context, package set)` is resolved once per
@@ -6822,6 +7125,7 @@ where
                     column,
                     query_inside_function,
                 ) {
+                    scope.removed_names.remove(&symbol.name);
                     scope.symbols.insert(symbol.name.clone(), symbol.clone());
                     scope.parent_prefix_symbol_names.remove(&symbol.name);
                 }
@@ -6860,32 +7164,36 @@ where
                     // (which doesn't). This ensures paths like source("subdir/file.R")
                     // that rely on workspace-root-relative resolution work correctly
                     // in scope resolution, matching the dependency graph's behavior.
-                    let child_uri = graph
-                        .get_dependencies(uri)
-                        .iter()
-                        .find(|edge| {
-                            edge.call_site_line == Some(*src_line)
-                                && edge.call_site_column == Some(*src_col)
+                    let resolve_lexically = || {
+                        path_ctx.as_ref().and_then(|ctx| {
+                            let resolved =
+                                super::path_resolve::resolve_path_with_workspace_fallback(
+                                    &source.path,
+                                    ctx,
+                                )?;
+                            super::path_resolve::path_to_uri(&resolved)
                         })
-                        .map(|edge| edge.to.clone())
-                        .or_else(|| {
-                            // Fallback: use pre-resolved URI or resolve path
-                            // directly. Forward source()/directive paths use the
-                            // workspace-root fallback variant so this last-resort
-                            // seam honors the same fallback invariant as the graph
-                            // edge it stands in for (CLAUDE.md: the fallback must
-                            // hold uniformly across scope resolution).
-                            source.resolved_uri.clone().or_else(|| {
-                                path_ctx.as_ref().and_then(|ctx| {
-                                    let resolved =
-                                        super::path_resolve::resolve_path_with_workspace_fallback(
-                                            &source.path,
-                                            ctx,
-                                        )?;
-                                    super::path_resolve::path_to_uri(&resolved)
-                                })
+                    };
+                    let graph_uri = || {
+                        graph
+                            .get_dependencies(uri)
+                            .iter()
+                            .find(|edge| {
+                                edge.call_site_line == Some(*src_line)
+                                    && edge.call_site_column == Some(*src_col)
                             })
-                        });
+                            .map(|edge| edge.to.clone())
+                    };
+                    let child_uri = if prefer_supplied_path_context && source.system_file.is_none()
+                    {
+                        resolve_lexically()
+                            .or_else(|| source.resolved_uri.clone())
+                            .or_else(graph_uri)
+                    } else {
+                        graph_uri()
+                            .or_else(|| source.resolved_uri.clone())
+                            .or_else(resolve_lexically)
+                    };
 
                     if let Some(child_uri) = child_uri {
                         // Check if we would exceed max depth
@@ -6988,6 +7296,8 @@ where
                             workspace_root,
                             get_metadata,
                         );
+                        let child_prefer_supplied_path_context =
+                            prefer_supplied_path_context && !child_is_standalone;
 
                         // Early exit on cancellation before expensive recursive traversal
                         if is_cancelled() {
@@ -7020,6 +7330,7 @@ where
                                 &child_uri,
                                 path_fp,
                                 provider_fp,
+                                child_prefer_supplied_path_context,
                                 current_depth + 1,
                                 packages_for_child,
                                 is_cancelled,
@@ -7054,6 +7365,7 @@ where
                                         None,
                                         None,
                                         child_provider,
+                                        child_prefer_supplied_path_context,
                                         forward_child_memo,
                                     )
                                 },
@@ -7081,6 +7393,7 @@ where
                                 None,
                                 None,
                                 child_provider,
+                                child_prefer_supplied_path_context,
                                 forward_child_memo,
                             )
                         };
@@ -7140,8 +7453,10 @@ where
                                     continue;
                                 }
                                 if scope.parent_prefix_symbol_names.remove(&name) {
+                                    scope.removed_names.remove(&name);
                                     scope.symbols.insert(name, symbol);
                                 } else {
+                                    scope.removed_names.remove(&name);
                                     scope.symbols.entry(name).or_insert(symbol);
                                 }
                             }
@@ -7170,6 +7485,70 @@ where
                     }
                 }
             }
+            ScopeEvent::TarBatch {
+                line: batch_line,
+                column: batch_column,
+                members,
+            } => {
+                let passes_position = (*batch_line, *batch_column) < (line, column);
+                if !(passes_position || query_inside_function) {
+                    continue;
+                }
+                if current_depth + 1 >= max_depth {
+                    scope
+                        .depth_exceeded
+                        .push((uri.clone(), *batch_line, *batch_column));
+                    continue;
+                }
+                let visited_base = forward_visited_base.as_ref().unwrap_or(visited);
+                let contribution = resolve_tar_batch_contribution(
+                    uri,
+                    members,
+                    &scope,
+                    get_artifacts,
+                    get_metadata,
+                    graph,
+                    workspace_root,
+                    path_ctx.as_ref(),
+                    max_depth,
+                    current_depth,
+                    visited_base,
+                    base_exports,
+                    hoist_globals,
+                    backward_dep_mode,
+                    is_cancelled,
+                    data_alias_provider,
+                );
+                for name in contribution.removed_names {
+                    scope.symbols.remove(&name);
+                    scope.parent_prefix_symbol_names.remove(&name);
+                    scope.removed_names.insert(name);
+                }
+                for (name, symbol) in contribution.symbols {
+                    if scope.parent_prefix_symbol_names.contains(&name) {
+                        forward_contributed.insert(name.clone());
+                    }
+                    scope.parent_prefix_symbol_names.remove(&name);
+                    scope.removed_names.remove(&name);
+                    // Ordered tar members share one environment: the batch's
+                    // later winner replaces any binding visible before it.
+                    scope.symbols.insert(name, symbol);
+                }
+                extend_chain_first_seen(&mut scope.chain, contribution.chain);
+                extend_visible_positions(
+                    &mut scope.visible_positions,
+                    &contribution.visible_positions,
+                );
+                scope.depth_exceeded.extend(contribution.depth_exceeded);
+                for package in contribution.packages {
+                    scope.loaded_packages.insert(package.clone());
+                    propagate_package_origins(
+                        &contribution.package_origins,
+                        &package,
+                        &mut scope.package_origins,
+                    );
+                }
+            }
             ScopeEvent::FunctionScope {
                 start_line,
                 start_column,
@@ -7185,6 +7564,7 @@ where
                     && (line, column) <= (*end_line, *end_column)
                 {
                     for param in parameters {
+                        scope.removed_names.remove(&param.name);
                         scope.symbols.insert(param.name.clone(), param.clone());
                         scope.parent_prefix_symbol_names.remove(&param.name);
                     }
@@ -7266,6 +7646,7 @@ where
                             }
                         })
                         .or_insert_with(|| symbol.clone());
+                    scope.removed_names.remove(&symbol.name);
                 }
             }
             ScopeEvent::DataLoad {
@@ -7309,6 +7690,7 @@ where
                         };
                         for (name, symbol) in expand_data_load(stems, package, &attached, provider)
                         {
+                            scope.removed_names.remove(&name);
                             scope.parent_prefix_symbol_names.remove(&name);
                             scope.symbols.insert(name, symbol);
                         }
@@ -7990,11 +8372,33 @@ struct ScopeFrame {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ChildSourceContribution {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
+    pub removed_names: HashSet<Arc<str>>,
     pub packages: HashSet<String>,
     pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
     pub chain: Vec<Url>,
     pub visible_positions: HashMap<Url, (u32, u32)>,
     pub depth_exceeded: Vec<(Url, u32, u32)>,
+}
+
+fn merge_tar_batch_into_frame(frame: &mut ScopeFrame, contribution: ChildSourceContribution) {
+    for name in contribution.removed_names {
+        frame.symbols.remove(&name);
+        frame.removed_names.insert(name);
+    }
+    for (name, symbol) in contribution.symbols {
+        frame.removed_names.remove(&name);
+        // A tar batch is one sequential environment: the last member to bind
+        // a name wins over both earlier members and the pre-batch frame.
+        frame.symbols.insert(name, symbol);
+    }
+    frame.packages.extend(contribution.packages);
+    for (package, origins) in contribution.package_origins {
+        frame
+            .package_origins
+            .entry(package)
+            .or_default()
+            .extend(origins);
+    }
 }
 
 /// Streaming scope state.
@@ -8063,6 +8467,10 @@ where
     /// position. The same call site may be applied to both the strict and
     /// late frames; computing once and reusing is the whole point.
     source_contributions: HashMap<(u32, u32), ChildSourceContribution>,
+    /// Ordered `targets::tar_source()` batch contributions. Kept separate
+    /// from ordinary source contributions because the two event kinds have
+    /// different merge semantics.
+    tar_batch_contributions: HashMap<(u32, u32, bool), ChildSourceContribution>,
 
     /// Cross-file resolution context (closures + config, mirrors
     /// `scope_at_position_with_graph_cached`'s parameters).
@@ -8407,6 +8815,7 @@ where
             timeline_cursor: 0,
             cursor: (0, 0),
             source_contributions: HashMap::new(),
+            tar_batch_contributions: HashMap::new(),
             get_artifacts,
             get_metadata,
             graph,
@@ -8606,6 +9015,22 @@ where
                     }
                 }
             }
+            ScopeEvent::TarBatch {
+                line,
+                column,
+                members,
+            } => {
+                let key = (line, column, false);
+                if !self.tar_batch_contributions.contains_key(&key) {
+                    let initial_scope =
+                        Self::tar_batch_initial_scope(&self.prefix_top, &self.global_strict_frame);
+                    let contribution =
+                        self.resolve_tar_batch(line, column, &members, &initial_scope);
+                    self.tar_batch_contributions.insert(key, contribution);
+                }
+                let contribution = self.tar_batch_contributions[&key].clone();
+                merge_tar_batch_into_frame(&mut self.global_strict_frame, contribution);
+            }
             ScopeEvent::Declaration {
                 symbol,
                 function_scope,
@@ -8683,6 +9108,76 @@ where
         }
         out.extend(self.choose_prefix().inherited_packages.iter().cloned());
         out
+    }
+
+    /// Materialize the environment visible immediately before a global tar
+    /// batch from the supplied streaming frame.
+    fn tar_batch_initial_scope(prefix: &ParentPrefix, frame: &ScopeFrame) -> ScopeAtPosition {
+        let mut symbols = prefix.symbols.clone();
+        let mut parent_prefix_symbol_names: HashSet<Arc<str>> = symbols.keys().cloned().collect();
+        for (name, symbol) in &frame.symbols {
+            parent_prefix_symbol_names.remove(name);
+            symbols.insert(name.clone(), symbol.clone());
+        }
+        for name in &frame.removed_names {
+            symbols.remove(name);
+            parent_prefix_symbol_names.remove(name);
+        }
+
+        let mut package_origins = prefix.package_origins.clone();
+        for (package, origins) in &frame.package_origins {
+            package_origins
+                .entry(package.clone())
+                .or_default()
+                .extend(origins.iter().cloned());
+        }
+
+        ScopeAtPosition {
+            symbols,
+            removed_names: frame.removed_names.clone(),
+            chain: Vec::new(),
+            parent_prefix_symbol_names,
+            visible_positions: HashMap::new(),
+            depth_exceeded: Vec::new(),
+            inherited_packages: prefix.inherited_packages.clone(),
+            loaded_packages: frame.packages.clone(),
+            package_origins,
+        }
+    }
+
+    fn resolve_tar_batch(
+        &self,
+        line: u32,
+        column: u32,
+        members: &[ForwardSource],
+        initial_scope: &ScopeAtPosition,
+    ) -> ChildSourceContribution {
+        let mut visited = HashMap::new();
+        visited.insert(self.queried_uri.clone(), (u32::MAX, u32::MAX));
+        let mut contribution = resolve_tar_batch_contribution(
+            self.queried_uri,
+            members,
+            initial_scope,
+            self.get_artifacts,
+            self.get_metadata,
+            self.graph,
+            self.workspace_root,
+            self.path_ctx.as_ref(),
+            self.max_depth,
+            0,
+            &visited,
+            self.base_exports,
+            self.hoist_globals,
+            self.backward_dep_mode,
+            self.is_cancelled,
+            self.data_alias_provider,
+        );
+        if self.max_depth <= 1 && contribution.depth_exceeded.is_empty() {
+            contribution
+                .depth_exceeded
+                .push((self.queried_uri.clone(), line, column));
+        }
+        contribution
     }
 
     /// Pick the frame to apply an event with the given `function_scope` to.
@@ -8798,6 +9293,7 @@ where
         );
         let mut scope = ScopeAtPosition {
             symbols: prefix.symbols.clone(),
+            removed_names: HashSet::new(),
             chain,
             parent_prefix_symbol_names: prefix.symbols.keys().cloned().collect(),
             visible_positions,
@@ -8878,10 +9374,12 @@ where
         // flat set is consistent with the recursive resolver's timeline order.
         for name in &global.removed_names {
             scope.symbols.remove(name);
+            scope.removed_names.insert(name.clone());
         }
         for (_iv, frame) in &self.function_stack {
             for name in &frame.removed_names {
                 scope.symbols.remove(name);
+                scope.removed_names.insert(name.clone());
             }
         }
 
@@ -8906,6 +9404,20 @@ where
             let effect_col = src_col.saturating_add(1);
             if (src_line, effect_col) <= self.cursor {
                 scope.chain.extend(contrib.chain.iter().cloned());
+                extend_visible_positions(&mut scope.visible_positions, &contrib.visible_positions);
+                scope
+                    .depth_exceeded
+                    .extend(contrib.depth_exceeded.iter().cloned());
+            }
+        }
+        let inside = self.query_inside_function();
+        for (&(batch_line, batch_col, late), contrib) in &self.tar_batch_contributions {
+            if late != inside {
+                continue;
+            }
+            let effect_col = batch_col.saturating_add(1);
+            if late || (batch_line, effect_col) <= self.cursor {
+                extend_chain_first_seen(&mut scope.chain, contrib.chain.iter().cloned());
                 extend_visible_positions(&mut scope.visible_positions, &contrib.visible_positions);
                 scope
                     .depth_exceeded
@@ -9133,6 +9645,22 @@ where
                         .extend(origins);
                 }
             }
+            ScopeEvent::TarBatch {
+                line,
+                column,
+                members,
+            } => {
+                let key = (*line, *column, true);
+                if !self.tar_batch_contributions.contains_key(&key) {
+                    let initial_scope =
+                        Self::tar_batch_initial_scope(&self.prefix_in_function, frame);
+                    let contribution =
+                        self.resolve_tar_batch(*line, *column, members, &initial_scope);
+                    self.tar_batch_contributions.insert(key, contribution);
+                }
+                let contribution = self.tar_batch_contributions[&key].clone();
+                merge_tar_batch_into_frame(frame, contribution);
+            }
             ScopeEvent::Declaration {
                 symbol,
                 function_scope,
@@ -9320,6 +9848,7 @@ where
             &child_uri,
             path_fp,
             provider_fp,
+            false,
             1,
             &empty_packages,
             self.is_cancelled,
@@ -9346,6 +9875,7 @@ where
                     None,
                     None,
                     child_provider,
+                    false,
                     &self.forward_child_memo,
                 )
             },
@@ -13210,6 +13740,7 @@ outside_var <- 2"#;
         parent_artifacts.timeline.sort_by_key(|event| match event {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::TarBatch { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope {
                 start_line,
                 start_column,
@@ -13640,6 +14171,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
         parent_artifacts.timeline.sort_by_key(|event| match event {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::TarBatch { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope {
                 start_line,
                 start_column,
@@ -15021,6 +15553,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
             .iter()
             .map(|e| match e {
                 ScopeEvent::Source { .. } => "Source",
+                ScopeEvent::TarBatch { .. } => "TarBatch",
                 ScopeEvent::Removal { .. } => "Removal",
                 _ => "Other",
             })
@@ -15103,6 +15636,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
             .map(|e| match e {
                 ScopeEvent::Def { .. } => "Def",
                 ScopeEvent::Source { .. } => "Source",
+                ScopeEvent::TarBatch { .. } => "TarBatch",
                 ScopeEvent::FunctionScope { .. } => "FunctionScope",
                 ScopeEvent::Removal { .. } => "Removal",
                 ScopeEvent::PackageLoad { .. } => "PackageLoad",
@@ -15122,6 +15656,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
             .map(|e| match e {
                 ScopeEvent::Def { line, .. } => *line,
                 ScopeEvent::Source { line, .. } => *line,
+                ScopeEvent::TarBatch { line, .. } => *line,
                 ScopeEvent::FunctionScope { start_line, .. } => *start_line,
                 ScopeEvent::Removal { line, .. } => *line,
                 ScopeEvent::PackageLoad { line, .. } => *line,
@@ -15738,6 +16273,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
             .map(|e| match e {
                 ScopeEvent::Def { line, .. } => ("Def", *line),
                 ScopeEvent::Source { line, .. } => ("Source", *line),
+                ScopeEvent::TarBatch { line, .. } => ("TarBatch", *line),
                 ScopeEvent::FunctionScope { start_line, .. } => ("FunctionScope", *start_line),
                 ScopeEvent::Removal { line, .. } => ("Removal", *line),
                 ScopeEvent::PackageLoad { line, .. } => ("PackageLoad", *line),
@@ -31212,6 +31748,953 @@ mod package_contribution_tests {
             !scope.symbols.contains_key("mpg"),
             "dataset 'mpg' must NOT be visible outside workspace. visible: {:?}",
             scope.symbols.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tar_batch_is_sequential_with_later_winner_and_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        std::fs::write(root.join("R/01-first.R"), "shared <- 1\nkept <- 1\n").unwrap();
+        std::fs::write(root.join("R/02-second.R"), "shared <- 2\nrm(kept)\n").unwrap();
+        let parent_path = root.join("_targets.R");
+        let parent_code = "targets::tar_source(\"R\")\n";
+        std::fs::write(&parent_path, parent_code).unwrap();
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(&parent_path).unwrap();
+        let first_uri = Url::from_file_path(root.join("R/01-first.R")).unwrap();
+        let second_uri = Url::from_file_path(root.join("R/02-second.R")).unwrap();
+
+        let mut parent_metadata = crate::cross_file::extract_metadata(parent_code);
+        crate::cross_file::tar_source::finalize_tar_source_requests(
+            &mut parent_metadata,
+            &parent_uri,
+            Some(&root_uri),
+        );
+        let first_code = "shared <- 1\nkept <- 1\n";
+        let second_code = "shared <- 2\nrm(kept)\n";
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_metadata.clone())),
+            (
+                first_uri.clone(),
+                Arc::new(crate::cross_file::extract_metadata(first_code)),
+            ),
+            (
+                second_uri.clone(),
+                Arc::new(crate::cross_file::extract_metadata(second_code)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                first_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &first_uri,
+                    &parse_r(first_code),
+                    first_code,
+                )),
+            ),
+            (
+                second_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &second_uri,
+                    &parse_r(second_code),
+                    second_code,
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root_uri), |_| None);
+        let scope = scope_at_position_with_graph(
+            &parent_uri,
+            u32::MAX,
+            u32::MAX,
+            &|uri| artifacts.get(uri).cloned(),
+            &|uri| metadata.get(uri).cloned(),
+            &graph,
+            Some(&root_uri),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            None,
+        );
+        assert_eq!(
+            scope.symbols.get("shared").map(|symbol| &symbol.source_uri),
+            Some(&second_uri),
+            "the later tar member must replace the earlier binding"
+        );
+        assert!(
+            !scope.symbols.contains_key("kept"),
+            "a later tar member removal must cross the sibling boundary"
+        );
+
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let base_exports = HashSet::new();
+        let mut stream = ScopeStream::new(
+            &parent_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root_uri),
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .unwrap();
+        stream.advance_to(u32::MAX, u32::MAX);
+        let streamed = stream.snapshot();
+        assert_eq!(
+            streamed
+                .symbols
+                .get("shared")
+                .map(|symbol| &symbol.source_uri),
+            Some(&second_uri)
+        );
+        assert!(!streamed.symbols.contains_key("kept"));
+    }
+
+    #[test]
+    fn tar_option_packages_flow_into_tar_member_and_member_definition_flows_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        let member_code = "build_result <- function(df) mutate(df, ready = TRUE)\n";
+        std::fs::write(root.join("R/build.R"), member_code).unwrap();
+        let parent_path = root.join("_targets.R");
+        let parent_code = "library(targets)\n\
+                           tar_option_set(packages = c(\"dplyr\"))\n\
+                           targets::tar_source(\"R\")\n\
+                           build_result(data.frame())\n";
+        std::fs::write(&parent_path, parent_code).unwrap();
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(&parent_path).unwrap();
+        let member_uri = Url::from_file_path(root.join("R/build.R")).unwrap();
+        let mut parent_metadata = crate::cross_file::extract_metadata(parent_code);
+        crate::cross_file::tar_source::finalize_tar_source_requests(
+            &mut parent_metadata,
+            &parent_uri,
+            Some(&root_uri),
+        );
+        let member_metadata = crate::cross_file::extract_metadata(member_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_metadata.clone())),
+            (member_uri.clone(), Arc::new(member_metadata.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                member_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &member_uri,
+                    &parse_r(member_code),
+                    member_code,
+                    Some(&member_metadata),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root_uri), |_| None);
+
+        let member_scope = scope_at_position_with_graph(
+            &member_uri,
+            0,
+            0,
+            &|uri| artifacts.get(uri).cloned(),
+            &|uri| metadata.get(uri).cloned(),
+            &graph,
+            Some(&root_uri),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(
+            member_scope.inherited_packages.contains("dplyr"),
+            "`tar_option_set(packages = ...)` before the batch must reach the tar member: {:?}",
+            member_scope.inherited_packages
+        );
+
+        let parent_scope = scope_at_position_with_graph(
+            &parent_uri,
+            u32::MAX,
+            u32::MAX,
+            &|uri| artifacts.get(uri).cloned(),
+            &|uri| metadata.get(uri).cloned(),
+            &graph,
+            Some(&root_uri),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            None,
+        );
+        assert_eq!(
+            parent_scope
+                .symbols
+                .get("build_result")
+                .map(|symbol| &symbol.source_uri),
+            Some(&member_uri),
+            "the tar member definition must flow back into `_targets.R` after the batch"
+        );
+    }
+
+    #[test]
+    fn non_inheriting_tar_driver_keeps_process_packages_but_not_member_symbols() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let main_path = root.join("main.R");
+        let main_code = "sys.source(\"driver.R\", envir = new.env())\n";
+        std::fs::write(&main_path, main_code).unwrap();
+        let driver_path = root.join("driver.R");
+        let driver_code = "targets::tar_source(\"member.R\")\n";
+        std::fs::write(&driver_path, driver_code).unwrap();
+        let member_path = root.join("member.R");
+        let member_code = "library(syntheticpkg)\nprivate_member <- 1\n";
+        std::fs::write(&member_path, member_code).unwrap();
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let driver_uri = Url::from_file_path(&driver_path).unwrap();
+        let member_uri = Url::from_file_path(&member_path).unwrap();
+        let main_metadata = crate::cross_file::extract_metadata(main_code);
+        assert_eq!(
+            main_metadata.sources[0].locality,
+            super::super::types::SourceLocality::NonInheriting
+        );
+        let mut driver_metadata = crate::cross_file::extract_metadata(driver_code);
+        crate::cross_file::tar_source::finalize_tar_source_requests(
+            &mut driver_metadata,
+            &driver_uri,
+            Some(&root_uri),
+        );
+        let member_metadata = crate::cross_file::extract_metadata(member_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (main_uri.clone(), Arc::new(main_metadata.clone())),
+            (driver_uri.clone(), Arc::new(driver_metadata.clone())),
+            (member_uri.clone(), Arc::new(member_metadata.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                main_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &main_uri,
+                    &parse_r(main_code),
+                    main_code,
+                    Some(&main_metadata),
+                )),
+            ),
+            (
+                driver_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &driver_uri,
+                    &parse_r(driver_code),
+                    driver_code,
+                    Some(&driver_metadata),
+                )),
+            ),
+            (
+                member_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &member_uri,
+                    &parse_r(member_code),
+                    member_code,
+                    Some(&member_metadata),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&main_uri, &main_metadata, Some(&root_uri), |_| None);
+        graph.update_file(&driver_uri, &driver_metadata, Some(&root_uri), |_| None);
+
+        let scope = scope_at_position_with_graph(
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &|uri| artifacts.get(uri).cloned(),
+            &|uri| metadata.get(uri).cloned(),
+            &graph,
+            Some(&root_uri),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(
+            scope.loaded_packages.contains("syntheticpkg"),
+            "NonInheriting execution must retain the member's process-wide package attachment: {:?}",
+            scope.loaded_packages
+        );
+        assert!(
+            !scope.symbols.contains_key("private_member"),
+            "NonInheriting merge must still suppress ordinary member symbols"
+        );
+    }
+
+    #[test]
+    fn tar_batch_rolls_packages_origins_and_data_aliases_across_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        let first_code = "library(dplyr)\n";
+        let second_code = "data(api)\nlibrary(tidyr)\n";
+        std::fs::write(root.join("R/01-packages.R"), first_code).unwrap();
+        std::fs::write(root.join("R/02-data.R"), second_code).unwrap();
+        let parent_path = root.join("_targets.R");
+        let parent_code = "targets::tar_source(\"R\")\n";
+        std::fs::write(&parent_path, parent_code).unwrap();
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(&parent_path).unwrap();
+        let first_uri = Url::from_file_path(root.join("R/01-packages.R")).unwrap();
+        let second_uri = Url::from_file_path(root.join("R/02-data.R")).unwrap();
+        let mut parent_metadata = crate::cross_file::extract_metadata(parent_code);
+        crate::cross_file::tar_source::finalize_tar_source_requests(
+            &mut parent_metadata,
+            &parent_uri,
+            Some(&root_uri),
+        );
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_metadata.clone())),
+            (
+                first_uri.clone(),
+                Arc::new(crate::cross_file::extract_metadata(first_code)),
+            ),
+            (
+                second_uri.clone(),
+                Arc::new(crate::cross_file::extract_metadata(second_code)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                first_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &first_uri,
+                    &parse_r(first_code),
+                    first_code,
+                )),
+            ),
+            (
+                second_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &second_uri,
+                    &parse_r(second_code),
+                    second_code,
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root_uri), |_| None);
+        let lookup = |package: &str, stem: &str| {
+            if package == "dplyr" && stem == "api" {
+                vec!["api_rows".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        let base_packages = HashSet::new();
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_packages,
+        };
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let scope = scope_at_position_with_graph(
+            &parent_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root_uri),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            Some(&provider),
+        );
+        for package in ["dplyr", "tidyr"] {
+            assert!(
+                scope.loaded_packages.contains(package),
+                "{package} must roll into the parent batch scope: {:?}",
+                scope.loaded_packages
+            );
+        }
+        assert_eq!(
+            scope
+                .symbols
+                .get("api_rows")
+                .map(|symbol| symbol.source_uri.as_str()),
+            Some("package:dplyr"),
+            "the second sibling's bare data() must see the first sibling's package"
+        );
+        assert!(
+            scope.package_origins["dplyr"]
+                .iter()
+                .any(|origin| origin.as_ref() == &first_uri)
+        );
+        assert!(
+            scope.package_origins["tidyr"]
+                .iter()
+                .any(|origin| origin.as_ref() == &second_uri)
+        );
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let base_exports = HashSet::new();
+        let mut stream = ScopeStream::new(
+            &parent_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root_uri),
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            &prefix_cache,
+            None,
+            Some(&provider),
+        )
+        .unwrap();
+        stream.advance_to(u32::MAX, u32::MAX);
+        let streamed = stream.snapshot();
+        assert_eq!(streamed.symbols, scope.symbols);
+        assert_eq!(streamed.loaded_packages, scope.loaded_packages);
+        assert_eq!(streamed.inherited_packages, scope.inherited_packages);
+        assert_eq!(streamed.package_origins, scope.package_origins);
+    }
+
+    #[test]
+    fn standalone_tar_member_isolated_from_earlier_sibling_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        let first_code = "earlier <- 1\nlibrary(dplyr)\n";
+        let second_code = "# raven: standalone\ndata(api)\nlibrary(tidyr)\n";
+        std::fs::write(root.join("R/01-first.R"), first_code).unwrap();
+        std::fs::write(root.join("R/02-standalone.R"), second_code).unwrap();
+        let parent_path = root.join("_targets.R");
+        let parent_code = "targets::tar_source(\"R\")\n";
+        std::fs::write(&parent_path, parent_code).unwrap();
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(&parent_path).unwrap();
+        let first_uri = Url::from_file_path(root.join("R/01-first.R")).unwrap();
+        let second_uri = Url::from_file_path(root.join("R/02-standalone.R")).unwrap();
+        let mut parent_metadata = crate::cross_file::extract_metadata(parent_code);
+        crate::cross_file::tar_source::finalize_tar_source_requests(
+            &mut parent_metadata,
+            &parent_uri,
+            Some(&root_uri),
+        );
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_metadata.clone())),
+            (
+                first_uri.clone(),
+                Arc::new(crate::cross_file::extract_metadata(first_code)),
+            ),
+            (
+                second_uri.clone(),
+                Arc::new(crate::cross_file::extract_metadata(second_code)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                first_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &first_uri,
+                    &parse_r(first_code),
+                    first_code,
+                )),
+            ),
+            (
+                second_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &second_uri,
+                    &parse_r(second_code),
+                    second_code,
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root_uri), |_| None);
+        let lookup = |package: &str, stem: &str| {
+            if package == "dplyr" && stem == "api" {
+                vec!["api_rows".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        let base_packages = HashSet::new();
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_packages,
+        };
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let parent_scope = scope_at_position_with_graph(
+            &parent_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root_uri),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            Some(&provider),
+        );
+        assert!(parent_scope.loaded_packages.contains("dplyr"));
+        assert!(parent_scope.loaded_packages.contains("tidyr"));
+        assert!(
+            !parent_scope.symbols.contains_key("api_rows"),
+            "a standalone member must not receive the earlier sibling's package or data provider"
+        );
+
+        let member_scope = scope_at_position_with_graph(
+            &second_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root_uri),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            Some(&provider),
+        );
+        assert!(!member_scope.symbols.contains_key("earlier"));
+        assert!(!member_scope.inherited_packages.contains("dplyr"));
+        assert!(member_scope.loaded_packages.contains("tidyr"));
+    }
+
+    #[test]
+    fn tar_batch_stream_uses_late_prefix_and_preserves_hoisted_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        let member_code = "data(api)\n";
+        std::fs::write(root.join("R/data.R"), member_code).unwrap();
+        let target_code = "targets::tar_source(\"R\")\nf <- function() {\n  api_rows\n}\n";
+        let target_path = root.join("_targets.R");
+        std::fs::write(&target_path, target_code).unwrap();
+        let driver_code = "source(\"_targets.R\")\nlibrary(dplyr)\n";
+        let driver_path = root.join("driver.R");
+        std::fs::write(&driver_path, driver_code).unwrap();
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let target_uri = Url::from_file_path(target_path).unwrap();
+        let member_uri = Url::from_file_path(root.join("R/data.R")).unwrap();
+        let driver_uri = Url::from_file_path(driver_path).unwrap();
+        let mut target_metadata = crate::cross_file::extract_metadata(target_code);
+        crate::cross_file::tar_source::finalize_tar_source_requests(
+            &mut target_metadata,
+            &target_uri,
+            Some(&root_uri),
+        );
+        let driver_metadata = crate::cross_file::extract_metadata(driver_code);
+        let member_metadata = crate::cross_file::extract_metadata(member_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (target_uri.clone(), Arc::new(target_metadata.clone())),
+            (driver_uri.clone(), Arc::new(driver_metadata.clone())),
+            (member_uri.clone(), Arc::new(member_metadata)),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                target_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &target_uri,
+                    &parse_r(target_code),
+                    target_code,
+                    Some(&target_metadata),
+                )),
+            ),
+            (
+                driver_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &driver_uri,
+                    &parse_r(driver_code),
+                    driver_code,
+                )),
+            ),
+            (
+                member_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &member_uri,
+                    &parse_r(member_code),
+                    member_code,
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&target_uri, &target_metadata, Some(&root_uri), |_| None);
+        graph.update_file(&driver_uri, &driver_metadata, Some(&root_uri), |_| None);
+        let lookup = |package: &str, stem: &str| {
+            if package == "dplyr" && stem == "api" {
+                vec!["api_rows".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        let base_packages = HashSet::new();
+        let provider = DataAliasProvider {
+            lookup: &lookup,
+            base_packages: &base_packages,
+        };
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let base_exports = HashSet::new();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new(
+            &target_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root_uri),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            Some(&provider),
+        )
+        .unwrap();
+
+        stream.advance_to(0, u32::MAX);
+        assert!(
+            !stream.snapshot().symbols.contains_key("api_rows"),
+            "the strict prefix at the tar call must not see the driver's later package"
+        );
+        stream.advance_to(2, 4);
+        let streamed = stream.snapshot();
+        let recursive = scope_at_position_with_graph(
+            &target_uri,
+            2,
+            4,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root_uri),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            Some(&provider),
+        );
+        assert!(
+            recursive.symbols.contains_key("api_rows"),
+            "the in-function late prefix must hoist the driver's later dplyr attachment"
+        );
+        assert_eq!(streamed.symbols, recursive.symbols);
+        assert_eq!(streamed.loaded_packages, recursive.loaded_packages);
+        assert_eq!(streamed.inherited_packages, recursive.inherited_packages);
+        assert_eq!(streamed.package_origins, recursive.package_origins);
+        assert_eq!(streamed.chain, recursive.chain);
+        assert_eq!(streamed.visible_positions, recursive.visible_positions);
+        assert!(
+            streamed.chain.contains(&member_uri),
+            "late-hoisted batch provenance must retain the member URI"
+        );
+    }
+
+    #[test]
+    fn tar_batch_resolves_each_member_once_at_scale() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        let parent_path = root.join("_targets.R");
+        let parent_code = "targets::tar_source(\"R\")\n";
+        std::fs::write(&parent_path, parent_code).unwrap();
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(&parent_path).unwrap();
+        let mut parent_metadata = crate::cross_file::extract_metadata(parent_code);
+
+        let mut metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> =
+            HashMap::new();
+        let mut artifacts: HashMap<Url, Arc<ScopeArtifacts>> = HashMap::new();
+        let mut members = Vec::new();
+        for ordinal in 0..32 {
+            let path = root.join(format!("R/{ordinal:02}.R"));
+            let code = format!("member_{ordinal} <- {ordinal}\n");
+            std::fs::write(&path, &code).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+            metadata.insert(
+                uri.clone(),
+                Arc::new(crate::cross_file::extract_metadata(&code)),
+            );
+            artifacts.insert(
+                uri.clone(),
+                Arc::new(compute_artifacts(&uri, &parse_r(&code), &code)),
+            );
+            members.push(uri);
+        }
+        crate::cross_file::tar_source::finalize_tar_source_requests(
+            &mut parent_metadata,
+            &parent_uri,
+            Some(&root_uri),
+        );
+        artifacts.insert(
+            parent_uri.clone(),
+            Arc::new(compute_artifacts_with_metadata(
+                &parent_uri,
+                &parse_r(parent_code),
+                parent_code,
+                Some(&parent_metadata),
+            )),
+        );
+        metadata.insert(parent_uri.clone(), Arc::new(parent_metadata.clone()));
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root_uri), |_| None);
+        let reads = std::cell::RefCell::new(HashMap::<Url, usize>::new());
+        let get_artifacts = |uri: &Url| {
+            if uri != &parent_uri {
+                *reads.borrow_mut().entry(uri.clone()).or_default() += 1;
+            }
+            artifacts.get(uri).cloned()
+        };
+        let scope = scope_at_position_with_graph(
+            &parent_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &|uri| metadata.get(uri).cloned(),
+            &graph,
+            Some(&root_uri),
+            64,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            None,
+        );
+        for (ordinal, member) in members.iter().enumerate() {
+            let name = format!("member_{ordinal}");
+            assert!(scope.symbols.contains_key(name.as_str()));
+            assert_eq!(
+                reads.borrow().get(member),
+                Some(&1),
+                "member {ordinal} must be resolved exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn tar_member_inherits_only_earlier_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        let first_code = "earlier <- 1\n";
+        let second_code = "middle <- earlier\n";
+        let third_code = "later <- 3\n";
+        std::fs::write(root.join("R/01-first.R"), first_code).unwrap();
+        std::fs::write(root.join("R/02-second.R"), second_code).unwrap();
+        std::fs::write(root.join("R/03-third.R"), third_code).unwrap();
+        let parent_path = root.join("_targets.R");
+        let parent_code = "targets::tar_source(\"R\")\n";
+        std::fs::write(&parent_path, parent_code).unwrap();
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(parent_path).unwrap();
+        let first_uri = Url::from_file_path(root.join("R/01-first.R")).unwrap();
+        let second_uri = Url::from_file_path(root.join("R/02-second.R")).unwrap();
+        let third_uri = Url::from_file_path(root.join("R/03-third.R")).unwrap();
+        let mut parent_metadata = crate::cross_file::extract_metadata(parent_code);
+        crate::cross_file::tar_source::finalize_tar_source_requests(
+            &mut parent_metadata,
+            &parent_uri,
+            Some(&root_uri),
+        );
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_metadata.clone())),
+            (
+                first_uri.clone(),
+                Arc::new(crate::cross_file::extract_metadata(first_code)),
+            ),
+            (
+                second_uri.clone(),
+                Arc::new(crate::cross_file::extract_metadata(second_code)),
+            ),
+            (
+                third_uri.clone(),
+                Arc::new(crate::cross_file::extract_metadata(third_code)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                first_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &first_uri,
+                    &parse_r(first_code),
+                    first_code,
+                )),
+            ),
+            (
+                second_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &second_uri,
+                    &parse_r(second_code),
+                    second_code,
+                )),
+            ),
+            (
+                third_uri.clone(),
+                Arc::new(compute_artifacts(
+                    &third_uri,
+                    &parse_r(third_code),
+                    third_code,
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root_uri), |_| None);
+        assert!(
+            graph
+                .get_dependents(&second_uri)
+                .iter()
+                .any(|edge| { edge.from == parent_uri && edge.tar_source_ordinal == Some(1) }),
+            "second member must retain its ordinal edge: {:?}",
+            graph.get_dependents(&second_uri)
+        );
+        assert!(
+            artifacts[&parent_uri].timeline.iter().any(|event| {
+                matches!(event, ScopeEvent::TarBatch { members, .. } if members.len() == 3)
+            }),
+            "parent artifacts must retain the ordered tar batch: {:?}",
+            artifacts[&parent_uri].timeline
+        );
+
+        let scope = scope_at_position_with_graph(
+            &second_uri,
+            u32::MAX,
+            u32::MAX,
+            &|uri| artifacts.get(uri).cloned(),
+            &|uri| metadata.get(uri).cloned(),
+            &graph,
+            Some(&root_uri),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(
+            scope.symbols.contains_key("earlier"),
+            "scope keys: {:?}; chain: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>(),
+            scope.chain
+        );
+        assert!(
+            !scope.symbols.contains_key("later"),
+            "a tar member must not inherit a later sibling"
         );
     }
 }

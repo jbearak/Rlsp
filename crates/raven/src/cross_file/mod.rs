@@ -17,6 +17,7 @@ pub mod scope;
 pub mod source_detect;
 pub mod standalone_cache;
 pub(crate) mod static_path;
+pub mod tar_source;
 pub mod types;
 
 #[cfg(test)]
@@ -35,6 +36,7 @@ pub use path_resolve::*;
 pub use revalidation::*;
 pub use scope::*;
 pub use source_detect::*;
+pub use tar_source::*;
 pub use types::*;
 
 /// Extract cross-file metadata from R source by combining directive parsing with AST-detected `source()` and library-related calls.
@@ -194,11 +196,14 @@ pub fn extract_metadata_with_tree(
         // Sort by line number for consistent ordering
         meta.sources.sort_by_key(|s| (s.line, s.column));
 
-        // Detect library(), require(), loadNamespace() calls (Requirement 1.8)
-        let mut library_calls = source_detect::detect_library_calls(tree, content);
+        // Detect library(), require(), loadNamespace(), and static
+        // targets::tar_source() calls with one shared lazy binding table.
+        let (mut library_calls, tar_source_requests) =
+            source_detect::detect_library_and_tar_source_requests(tree, content);
         // Sort by line/column for document order (Requirement 1.8)
         library_calls.sort_by_key(|lc| (lc.line, lc.column));
         meta.library_calls = library_calls;
+        meta.tar_source_requests = tar_source_requests;
         meta.namespace_references = source_detect::detect_namespace_references(tree, content);
     } else {
         log::warn!("Failed to parse R code with tree-sitter during metadata extraction");

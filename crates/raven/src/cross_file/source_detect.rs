@@ -11,7 +11,7 @@ use tree_sitter::{Node, Tree};
 
 use super::binding::RuntimeFunctionScope;
 use super::scope::FunctionScopeInterval;
-use super::types::{ForwardSource, SourceLocality, byte_offset_to_utf16_column};
+use super::types::{ForwardSource, SourceLocality, TarSourceRequest, byte_offset_to_utf16_column};
 
 /// Maximum depth followed by suppressive-only static source-closure scans.
 pub(crate) const STATIC_SOURCE_MAX_DEPTH: usize = 64;
@@ -624,6 +624,7 @@ fn try_parse_source_call<'tree, 'text>(
         is_function_scoped: runtime_function_scope.is_function_scoped_at(node),
         system_file,
         resolved_uri: None,
+        tar_source_ordinal: None,
     })
 }
 
@@ -2204,27 +2205,28 @@ struct TarOptionSetCandidate {
 /// Whether `func_node` (a call's `function` child) names {targets}'
 /// `tar_option_set`: the bare identifier `tar_option_set`, or the qualified
 /// `targets::tar_option_set` / `targets:::tar_option_set`.
-fn is_tar_option_set_callee(func_node: Node, content: &str) -> bool {
+fn targets_callee_kind(func_node: Node, content: &str, fn_name: &str) -> Option<bool> {
     match func_node.kind() {
-        "identifier" => node_text(func_node, content) == "tar_option_set",
-        "namespace_operator" => {
-            let Some(lhs) = func_node.child_by_field_name("lhs") else {
-                return false;
-            };
-            let Some(rhs) = func_node.child_by_field_name("rhs") else {
-                return false;
-            };
-            lhs.kind() == "identifier"
-                && rhs.kind() == "identifier"
-                && node_text(lhs, content) == "targets"
-                && node_text(rhs, content) == "tar_option_set"
+        "identifier" => {
+            (crate::namespace_completion::unquote_package(node_text(func_node, content)) == fn_name)
+                .then_some(true)
         }
-        _ => false,
+        "namespace_operator" => {
+            let lhs = func_node.child_by_field_name("lhs")?;
+            let rhs = func_node.child_by_field_name("rhs")?;
+            (lhs.kind() == "identifier"
+                && rhs.kind() == "identifier"
+                && crate::namespace_completion::unquote_package(node_text(lhs, content))
+                    == "targets"
+                && crate::namespace_completion::unquote_package(node_text(rhs, content)) == fn_name)
+                .then_some(false)
+        }
+        _ => None,
     }
 }
 
 /// If `node` is a `tar_option_set(...)` call whose callee matches
-/// [`is_tar_option_set_callee`], parse it via
+/// [`targets_callee_kind`], parse it via
 /// [`try_parse_tar_option_set_call`] and push one gate-pending candidate per
 /// package, tagged with whether the callee was the bare spelling.
 fn collect_tar_option_set_candidates(
@@ -2238,10 +2240,9 @@ fn collect_tar_option_set_candidates(
     let Some(func_node) = node.child_by_field_name("function") else {
         return;
     };
-    if !is_tar_option_set_callee(func_node, content) {
+    let Some(bare) = targets_callee_kind(func_node, content, "tar_option_set") else {
         return;
-    }
-    let bare = func_node.kind() == "identifier";
+    };
     tar_candidates.extend(
         try_parse_tar_option_set_call(node, content, bindings)
             .into_iter()
@@ -2335,7 +2336,7 @@ fn append_gated_tar_option_set_calls(output: &mut LibraryWalkOutput) {
 ///
 /// The caller is responsible for the bare-vs-qualified targets-in-play gate
 /// (see [`append_gated_tar_option_set_calls`]); this function parses any
-/// callee matching [`is_tar_option_set_callee`].
+/// callee matching [`targets_callee_kind`].
 fn try_parse_tar_option_set_call(
     node: Node,
     content: &str,
@@ -2344,7 +2345,7 @@ fn try_parse_tar_option_set_call(
     let Some(func_node) = node.child_by_field_name("function") else {
         return Vec::new();
     };
-    if !is_tar_option_set_callee(func_node, content) {
+    if targets_callee_kind(func_node, content, "tar_option_set").is_none() {
         return Vec::new();
     }
     let Some(args_node) = node.child_by_field_name("arguments") else {
@@ -2424,6 +2425,266 @@ fn try_parse_tar_option_set_call(
     }
 }
 
+// ============================================================================
+// targets::tar_source Detection (issue #648)
+// ============================================================================
+
+struct TarSourceCandidate {
+    request: TarSourceRequest,
+    bare: bool,
+}
+
+/// Detect statically resolvable, top-level `{targets}` `tar_source()` calls.
+///
+/// Qualified calls need no attachment gate. A bare call is accepted only when
+/// the same evaluated top-level code attaches `{targets}`. Proven capture
+/// wrappers are traversed only through their evaluated controls/splices, using
+/// the same capture-aware binding machinery as source and package detection.
+pub fn detect_tar_source_requests(tree: &Tree, content: &str) -> Vec<TarSourceRequest> {
+    let root = tree.root_node();
+    let mut bindings = super::static_path::LazyStaticBindings::new(root, content);
+    detect_tar_source_requests_with_bindings(root, content, &mut bindings)
+}
+
+fn detect_tar_source_requests_with_bindings(
+    root: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> Vec<TarSourceRequest> {
+    let mut candidates = Vec::new();
+    let mut targets_attached = false;
+    visit_node_for_tar_source(
+        root,
+        content,
+        bindings,
+        RuntimeFunctionScope::Lexical,
+        &mut targets_attached,
+        &mut candidates,
+    );
+    candidates
+        .into_iter()
+        .filter(|candidate| !candidate.bare || targets_attached)
+        .map(|candidate| candidate.request)
+        .collect()
+}
+
+/// Detect library calls and tar requests while sharing one lazy binding table.
+pub(crate) fn detect_library_and_tar_source_requests(
+    tree: &Tree,
+    content: &str,
+) -> (Vec<LibraryCall>, Vec<TarSourceRequest>) {
+    let root = tree.root_node();
+    let mut bindings = super::static_path::LazyStaticBindings::new(root, content);
+    let library_calls = detect_library_calls_with_bindings(tree, content, &mut bindings);
+    let requests = detect_tar_source_requests_with_bindings(root, content, &mut bindings);
+    (library_calls, requests)
+}
+
+fn visit_node_for_tar_source(
+    node: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+    runtime_function_scope: RuntimeFunctionScope,
+    targets_attached: &mut bool,
+    candidates: &mut Vec<TarSourceCandidate>,
+) {
+    if node.kind() == "identifier" {
+        return;
+    }
+
+    if node.kind() == "call" {
+        if let Some(capture) = bindings.capturing_call_kind_at(node) {
+            let captured_runtime_scope = runtime_function_scope.for_evaluated_capture_part(node);
+            super::binding::visit_evaluated_capture_parts(
+                node,
+                content,
+                capture,
+                &mut |evaluated, _frame, _role| {
+                    visit_node_for_tar_source(
+                        evaluated,
+                        content,
+                        bindings,
+                        captured_runtime_scope,
+                        targets_attached,
+                        candidates,
+                    );
+                },
+            );
+            return;
+        }
+
+        if !runtime_function_scope.is_function_scoped_at(node) {
+            if call_attaches_targets(node, content, bindings) {
+                *targets_attached = true;
+            }
+            if let Some(func_node) = node.child_by_field_name("function")
+                && let Some(bare) = targets_callee_kind(func_node, content, "tar_source")
+                && (!bare
+                    || !bindings
+                        .get()
+                        .named_binding_may_shadow_at("tar_source", node, false))
+                && let Some(request) = try_parse_tar_source_call(node, content, bindings)
+            {
+                candidates.push(TarSourceCandidate { request, bare });
+            }
+        }
+    }
+
+    let child_runtime_scope = if node.kind() == "function_definition" {
+        runtime_function_scope.enter_function()
+    } else {
+        runtime_function_scope
+    };
+    for child in node.children(&mut node.walk()) {
+        visit_node_for_tar_source(
+            child,
+            content,
+            bindings,
+            child_runtime_scope,
+            targets_attached,
+            candidates,
+        );
+    }
+}
+
+fn call_attaches_targets(
+    node: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> bool {
+    if try_parse_apply_library_call(node, content, bindings)
+        .iter()
+        .any(|call| call.attaches && call.package == "targets")
+    {
+        return true;
+    }
+    let Some(function) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let loader = match function.kind() {
+        "identifier" => crate::namespace_completion::unquote_package(node_text(function, content)),
+        "namespace_operator" => {
+            let Some(lhs) = function.child_by_field_name("lhs") else {
+                return false;
+            };
+            let Some(rhs) = function.child_by_field_name("rhs") else {
+                return false;
+            };
+            if crate::namespace_completion::unquote_package(node_text(lhs, content)) != "base" {
+                return false;
+            }
+            crate::namespace_completion::unquote_package(node_text(rhs, content))
+        }
+        _ => return false,
+    };
+    if !matches!(loader, "library" | "require") {
+        return false;
+    }
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    if arguments.has_error() || has_character_only_true(&arguments, content) {
+        return false;
+    }
+    extract_package_name(&arguments, content)
+        .is_some_and(|package| crate::namespace_completion::unquote_package(&package) == "targets")
+}
+
+/// Parse `tar_source(files, envir, change_directory)` using R argument matching.
+fn try_parse_tar_source_call(
+    node: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> Option<TarSourceRequest> {
+    let args = node.child_by_field_name("arguments")?;
+    if args.has_error() {
+        return None;
+    }
+    const FORMALS: [&str; 3] = ["files", "envir", "change_directory"];
+    let mut values: [Option<Node>; 3] = [None, None, None];
+    let mut bound = [false; 3];
+    let mut partial_named = Vec::new();
+    let mut positional = Vec::new();
+    let mut cursor = args.walk();
+    for argument in args.children(&mut cursor) {
+        if argument.kind() != "argument" {
+            continue;
+        }
+        let value = argument.child_by_field_name("value");
+        if let Some(name_node) = argument.child_by_field_name("name") {
+            let name = crate::namespace_completion::unquote_package(node_text(name_node, content));
+            if let Some(index) = FORMALS.iter().position(|formal| *formal == name) {
+                if bound[index] {
+                    return None;
+                }
+                bound[index] = true;
+                values[index] = value;
+            } else {
+                partial_named.push((name, value));
+            }
+        } else {
+            positional.push(value);
+        }
+    }
+    for (name, value) in partial_named {
+        let matches: Vec<_> = FORMALS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, formal)| formal.starts_with(name).then_some(index))
+            .collect();
+        let [index] = matches.as_slice() else {
+            return None;
+        };
+        if bound[*index] {
+            return None;
+        }
+        bound[*index] = true;
+        values[*index] = value;
+    }
+    for value in positional {
+        let index = bound.iter().position(|is_bound| !is_bound)?;
+        bound[index] = true;
+        values[index] = value;
+    }
+
+    if values[1].is_some() {
+        return None;
+    }
+    let change_directory = match values[2] {
+        None => false,
+        Some(value) => match node_text(value, content) {
+            "TRUE" => true,
+            "FALSE" => false,
+            _ => return None,
+        },
+    };
+    let files = match values[0] {
+        None => vec!["R".to_string()],
+        Some(value) => match value.kind() {
+            "string" => vec![extract_string_literal(value, content)?],
+            "identifier" => {
+                let name = super::binding::plain_identifier_name(value, content)?;
+                bindings.resolve_package_vector(name, node)?
+            }
+            _ => {
+                let pairs = super::binding::extract_bare_c_plain_strings(value, content)?;
+                if !bindings.package_c_is_trusted_at(node) {
+                    return None;
+                }
+                pairs.into_iter().map(|(string, _)| string).collect()
+            }
+        },
+    };
+    let start = node.start_position();
+    let line_text = content.lines().nth(start.row).unwrap_or("");
+    Some(TarSourceRequest {
+        files,
+        line: start.row as u32,
+        column: byte_offset_to_utf16_column(line_text, start.column),
+        change_directory,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2435,6 +2696,103 @@ mod tests {
             .set_language(&tree_sitter_r::LANGUAGE.into())
             .unwrap();
         parser.parse(code, None).unwrap()
+    }
+
+    fn tar_requests(code: &str) -> Vec<TarSourceRequest> {
+        detect_tar_source_requests(&parse_r(code), code)
+    }
+
+    #[test]
+    fn tar_source_bare_gate_is_top_level_and_position_independent() {
+        let requests = tar_requests("tar_source()\nlibrary(targets)");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].files, ["R"]);
+
+        assert!(tar_requests("tar_source <- function(...) {}\ntar_source()").is_empty());
+        assert!(tar_requests("f <- function() library(targets)\ntar_source()").is_empty());
+        assert!(tar_requests("quote(library(targets))\ntar_source()").is_empty());
+    }
+
+    #[test]
+    fn tar_source_qualified_calls_and_capture_boundaries() {
+        let requests = tar_requests(
+            "targets::tar_source(\"one.R\")\ntargets:::tar_source(c(\"two.R\", \"dir\"))",
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].files, ["one.R"]);
+        assert_eq!(requests[1].files, ["two.R", "dir"]);
+
+        assert!(tar_requests("f <- function() targets::tar_source(\"x.R\")").is_empty());
+        assert!(tar_requests("quote(targets::tar_source(\"x.R\"))").is_empty());
+        assert!(tar_requests("rlang::expr(targets::tar_source(\"x.R\"))").is_empty());
+        assert_eq!(
+            tar_requests("rlang::expr(!!targets::tar_source(\"x.R\"))").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn tar_source_accepts_backtick_callee_and_formal_spellings() {
+        let requests =
+            tar_requests("targets::`tar_source`(`files` = \"one.R\", `change_directory` = TRUE)");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].files, ["one.R"]);
+        assert!(requests[0].change_directory);
+    }
+
+    #[test]
+    fn tar_source_static_vectors_reuse_capture_aware_bindings() {
+        let requests = tar_requests("paths <- c(\"R\", \"setup.R\")\ntargets::tar_source(paths)");
+        assert_eq!(requests[0].files, ["R", "setup.R"]);
+
+        for code in [
+            "targets::tar_source(paths)\npaths <- c(\"R\")",
+            "paths <- c(\"R\")\npaths <- c(\"more\")\ntargets::tar_source(paths)",
+            "if (ok) paths <- c(\"R\")\ntargets::tar_source(paths)",
+            "paths <- c(\"R\")\npaths[1] <- \"other\"\ntargets::tar_source(paths)",
+            "paths <- c(\"R\")\nfor (paths in \"other\") {}\ntargets::tar_source(paths)",
+            "paths <- c(\"R\")\nrm(paths)\ntargets::tar_source(paths)",
+            "paths <- c(\"R\")\nassign(\"paths\", \"other.R\")\ntargets::tar_source(paths)",
+        ] {
+            assert!(
+                tar_requests(code).is_empty(),
+                "unexpected request for: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn tar_source_matches_formals_and_static_flags() {
+        let request = tar_requests("targets::tar_source(ch = TRUE, fil = c(\"R\", \"setup.R\"))");
+        assert_eq!(request.len(), 1);
+        assert!(request[0].change_directory);
+        assert_eq!(request[0].files, ["R", "setup.R"]);
+
+        for code in [
+            "targets::tar_source(files =)",
+            "targets::tar_source(envir =)",
+            "targets::tar_source(change_directory =)",
+            "targets::tar_source(, ,)",
+        ] {
+            let requests = tar_requests(code);
+            assert_eq!(requests.len(), 1, "expected defaults for: {code}");
+            assert_eq!(requests[0].files, ["R"]);
+            assert!(!requests[0].change_directory);
+        }
+
+        for code in [
+            "targets::tar_source(\"x.R\", globalenv())",
+            "targets::tar_source(files = \"x.R\", files = \"y.R\")",
+            "targets::tar_source(files = \"x.R\", fil = \"y.R\")",
+            "targets::tar_source(\"x.R\", change_directory = flag)",
+            "targets::tar_source(\"x.R\", change_directory = T)",
+            "targets::tar_source(unknown = \"x.R\")",
+        ] {
+            assert!(
+                tar_requests(code).is_empty(),
+                "unexpected request for: {code}"
+            );
+        }
     }
 
     #[test]

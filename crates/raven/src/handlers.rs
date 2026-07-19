@@ -441,10 +441,11 @@ impl DiagnosticsSnapshot {
         Self::build_with_open_documents(state, uri, &state.documents)
     }
 
-    /// Like [`Self::build`] but with an explicit open-documents map instead of
+    /// Like [`Self::build`] but with an explicit open-documents view instead of
     /// `state.documents`. `raven check`'s parallel loop (issue #479 WI3) passes a
-    /// one-entry map holding just the worker's target, so exactly one document
-    /// is "open" per task without sharing/mutating `state.documents`. The LSP
+    /// coherent one-record store holding just the worker's target, so exactly
+    /// one document is "open" per task without sharing/mutating
+    /// `state.documents`. The LSP
     /// path calls [`Self::build`], which forwards `&state.documents` and so is
     /// behavior-identical. `get_enriched_metadata` is intentionally NOT
     /// redirected: for an indexed target it resolves from the workspace index
@@ -455,6 +456,30 @@ impl DiagnosticsSnapshot {
         state: &WorldState,
         uri: &Url,
         open_documents: &impl OpenDocumentsView,
+    ) -> Option<Self> {
+        Self::build_with_open_documents_and_extra_providers(
+            state,
+            uri,
+            open_documents,
+            &HashSet::new(),
+            false,
+        )
+    }
+
+    /// Build with an additional context-sensitive provider set.
+    ///
+    /// The dependency graph remains URI-global; callers use this only to make
+    /// already-finalized artifacts available to scope resolution when a tar
+    /// execution's supplied [`crate::cross_file::path_resolve::PathContext`]
+    /// selects a different provider than the graph edge. `context_divergence`
+    /// disables the URI-keyed standalone cache even when every provider already
+    /// belongs to the graph neighborhood.
+    pub(crate) fn build_with_open_documents_and_extra_providers(
+        state: &WorldState,
+        uri: &Url,
+        open_documents: &impl OpenDocumentsView,
+        extra_provider_uris: &HashSet<Url>,
+        context_divergence: bool,
     ) -> Option<Self> {
         let build_start = std::time::Instant::now();
         let doc = open_documents.document(uri)?;
@@ -520,6 +545,39 @@ impl DiagnosticsSnapshot {
                 .cached_neighborhood_subgraph(uri, max_depth, max_visited);
         let neighborhood_elapsed = neighborhood_start.elapsed();
         let content_provider = state.content_provider_with_documents(open_documents);
+        // The dependency graph remains URI-global, but ordered tar execution
+        // may reach one provider URI under multiple PathContexts. Collect the
+        // ordinary graph-prefix-to-tar closure for every snapshot so LSP and
+        // CLI use the same contextual provider plan. This is pure in-memory
+        // collection under the state snapshot: no filesystem or graph writes.
+        let contextual_providers = crate::cross_file::tar_source::collect_contextual_tar_providers(
+            uri,
+            &directive_meta,
+            state.workspace_folders.first(),
+            state.cross_file_config.max_forward_depth,
+            max_visited,
+            &|provider_uri| content_provider.get_metadata(provider_uri),
+            &|parent_uri, source| {
+                if !payload.neighborhood.contains(parent_uri) {
+                    return crate::cross_file::tar_source::GraphPrefixEdgeLookup::Unknown;
+                }
+                let target = payload
+                    .subgraph
+                    .get_dependencies(parent_uri)
+                    .into_iter()
+                    .find(|edge| {
+                        edge.call_site_line == Some(source.line)
+                            && edge.call_site_column == Some(source.column)
+                            && edge.tar_source_ordinal == source.tar_source_ordinal
+                    })
+                    .map(|edge| edge.to.clone());
+                crate::cross_file::tar_source::GraphPrefixEdgeLookup::Known(target)
+            },
+        );
+        let mut all_extra_provider_uris = extra_provider_uris.clone();
+        all_extra_provider_uris.extend(contextual_providers.providers);
+        let context_divergence =
+            context_divergence || contextual_providers.divergence || contextual_providers.truncated;
 
         let precollect_start = std::time::Instant::now();
         let mut artifacts_map = HashMap::new();
@@ -536,7 +594,7 @@ impl DiagnosticsSnapshot {
         // Computed in this already-O(neighborhood) loop, so it adds no new
         // asymptotic cost (just a `bool` OR per entry already being inserted).
         let mut any_nse_or_func_directives = directive_meta.has_nse_or_func_directives();
-        for neighbor_uri in &payload.neighborhood {
+        for neighbor_uri in payload.neighborhood.iter().chain(&all_extra_provider_uris) {
             if let Some(artifacts) = content_provider.get_artifacts(neighbor_uri) {
                 artifacts_map.insert(neighbor_uri.clone(), artifacts);
             }
@@ -645,7 +703,9 @@ impl DiagnosticsSnapshot {
             // graph (the trimmed `cross_file_graph` above is a clone whose
             // counter resets to 0). `None` when disabled via the env toggle
             // (cache-on vs cache-off byte-identity gate).
-            standalone_ctx: if crate::cross_file::standalone_cache::standalone_cache_disabled() {
+            standalone_ctx: if context_divergence
+                || crate::cross_file::standalone_cache::standalone_cache_disabled()
+            {
                 None
             } else {
                 Some(crate::cross_file::standalone_cache::StandaloneCacheCtx {
@@ -22726,6 +22786,192 @@ fn hover_blocking(state: &WorldState, uri: &Url, position: Position) -> Option<H
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn contextual_divergence_disables_standalone_cache_even_without_extras() {
+        let uri = Url::parse("file:///workspace/report.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "x <- 1\n", Some(1));
+        let extras = HashSet::new();
+
+        let ordinary = DiagnosticsSnapshot::build_with_open_documents_and_extra_providers(
+            &state,
+            &uri,
+            &state.documents,
+            &extras,
+            false,
+        )
+        .unwrap();
+        assert!(
+            ordinary.standalone_ctx.is_some(),
+            "coincident contexts with no extras keep the persistent cache"
+        );
+
+        let divergent = DiagnosticsSnapshot::build_with_open_documents_and_extra_providers(
+            &state,
+            &uri,
+            &state.documents,
+            &extras,
+            true,
+        )
+        .unwrap();
+        assert!(
+            divergent.standalone_ctx.is_none(),
+            "context divergence must disable the URI-keyed cache even when extras are empty"
+        );
+    }
+
+    #[test]
+    fn ordinary_snapshot_collects_alternate_tar_provider_direct_and_below_source() {
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("runtime")).unwrap();
+        std::fs::write(temp.path().join("child.R"), "source(\"config.R\")\n").unwrap();
+        std::fs::write(temp.path().join("config.R"), "root_symbol <- 1\n").unwrap();
+        std::fs::write(
+            temp.path().join("runtime/config.R"),
+            "runtime_symbol <- 1\n",
+        )
+        .unwrap();
+        let parent_code = "# raven: cd runtime\n\
+                           targets::tar_source(\"../child.R\", change_directory = FALSE)\n\
+                           targets::tar_source(\"../child.R\", change_directory = TRUE)\n\
+                           runtime_symbol\nroot_symbol\n";
+        let parent_path = temp.path().join("_targets.R");
+        std::fs::write(&parent_path, parent_code).unwrap();
+
+        let root_uri = Url::from_directory_path(temp.path()).unwrap();
+        let parent_uri = Url::from_file_path(&parent_path).unwrap();
+        let child_uri = Url::from_file_path(temp.path().join("child.R")).unwrap();
+        let root_config_uri = Url::from_file_path(temp.path().join("config.R")).unwrap();
+        let runtime_config_uri = Url::from_file_path(temp.path().join("runtime/config.R")).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root_uri.clone()];
+
+        fn index_closed(
+            state: &mut WorldState,
+            uri: &Url,
+            code: &str,
+            workspace_root: &Url,
+        ) -> Arc<crate::cross_file::CrossFileMetadata> {
+            let doc = crate::state::Document::new_with_uri(code, None, uri);
+            let mut metadata = crate::cross_file::extract_metadata(code);
+            crate::cross_file::tar_source::finalize_tar_source_requests(
+                &mut metadata,
+                uri,
+                Some(workspace_root),
+            );
+            let metadata = Arc::new(metadata);
+            let artifacts = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+                uri,
+                doc.tree.as_ref().expect("fixture parses"),
+                code,
+                Some(&metadata),
+            ));
+            let entry = crate::workspace_index::IndexEntry {
+                contents: doc.contents.clone(),
+                tree: doc.tree.clone(),
+                loaded_packages: doc.loaded_packages.clone(),
+                data_packages: vec![],
+                snapshot: crate::cross_file::file_cache::FileSnapshot {
+                    mtime: SystemTime::UNIX_EPOCH,
+                    size: code.len() as u64,
+                    content_hash: None,
+                },
+                metadata: metadata.clone(),
+                artifacts,
+                indexed_at_version: state.workspace_index.version(),
+            };
+            assert!(state.workspace_index.insert(uri.clone(), entry));
+            metadata
+        }
+
+        let child_metadata =
+            index_closed(&mut state, &child_uri, "source(\"config.R\")\n", &root_uri);
+        let root_config_metadata = index_closed(
+            &mut state,
+            &root_config_uri,
+            "root_symbol <- 1\n",
+            &root_uri,
+        );
+        let runtime_config_metadata = index_closed(
+            &mut state,
+            &runtime_config_uri,
+            "runtime_symbol <- 1\n",
+            &root_uri,
+        );
+        let mut parent_metadata = crate::cross_file::extract_metadata(parent_code);
+        crate::cross_file::tar_source::finalize_tar_source_requests(
+            &mut parent_metadata,
+            &parent_uri,
+            Some(&root_uri),
+        );
+        let parent_metadata = Arc::new(parent_metadata);
+        state.open_document_with_language_id_and_metadata(
+            parent_uri.clone(),
+            parent_code,
+            Some(1),
+            Some("r"),
+            parent_metadata.clone(),
+            None,
+        );
+        for (uri, metadata) in [
+            (&parent_uri, &parent_metadata),
+            (&child_uri, &child_metadata),
+            (&root_config_uri, &root_config_metadata),
+            (&runtime_config_uri, &runtime_config_metadata),
+        ] {
+            state
+                .cross_file_graph
+                .update_file(uri, metadata, Some(&root_uri), |_| None);
+        }
+
+        assert!(
+            !state
+                .cross_file_graph
+                .cached_neighborhood_subgraph(&parent_uri, 10, 100)
+                .neighborhood
+                .contains(&runtime_config_uri),
+            "precondition: URI-global child edge selects only root/config.R"
+        );
+        let snapshot = DiagnosticsSnapshot::build(&state, &parent_uri).unwrap();
+        assert!(
+            snapshot.artifacts_map.contains_key(&runtime_config_uri),
+            "normal LSP snapshot must precollect the alternate contextual provider"
+        );
+        assert!(
+            snapshot.standalone_ctx.is_none(),
+            "multiple contexts for one child disable the URI-keyed standalone cache"
+        );
+
+        let main_uri = Url::from_file_path(temp.path().join("main.R")).unwrap();
+        let main_code = "source(\"_targets.R\")\nruntime_symbol\nroot_symbol\n";
+        std::fs::write(temp.path().join("main.R"), main_code).unwrap();
+        let main_metadata = Arc::new(crate::cross_file::extract_metadata(main_code));
+        state.open_document_with_language_id_and_metadata(
+            main_uri.clone(),
+            main_code,
+            Some(1),
+            Some("r"),
+            main_metadata.clone(),
+            None,
+        );
+        state
+            .cross_file_graph
+            .update_file(&main_uri, &main_metadata, Some(&root_uri), |_| None);
+
+        let nested = DiagnosticsSnapshot::build(&state, &main_uri).unwrap();
+        assert!(
+            nested.artifacts_map.contains_key(&runtime_config_uri),
+            "main -> driver -> repeated tar child must collect the alternate provider"
+        );
+        assert!(
+            nested.standalone_ctx.is_none(),
+            "nested contextual divergence must also disable the URI-keyed cache"
+        );
+    }
 
     #[test]
     fn read_file_content_strips_bom_on_disk_fallback() {

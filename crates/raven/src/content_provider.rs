@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tower_lsp::lsp_types::Url;
 
 use crate::cross_file::file_cache::CrossFileFileCache;
-use crate::cross_file::scope::{self, ScopeArtifacts};
+use crate::cross_file::scope::ScopeArtifacts;
 use crate::cross_file::types::CrossFileMetadata;
 use crate::open_document_store::OpenDocumentStore;
 use crate::state::{Document, OpenDocumentAliases};
@@ -128,41 +128,6 @@ impl OpenDocumentsView for OpenDocumentStore {
     fn artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
         self.get_record(uri)
             .map(|record| record.artifacts().clone())
-    }
-
-    fn contains(&self, uri: &Url) -> bool {
-        self.contains_key(uri)
-    }
-}
-
-impl OpenDocumentsView for HashMap<Url, Document> {
-    fn document(&self, uri: &Url) -> Option<&Document> {
-        self.get(uri)
-    }
-
-    fn content(&self, uri: &Url) -> Option<String> {
-        self.get(uri).map(Document::text)
-    }
-
-    fn metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
-        self.get(uri).map(|document| {
-            Arc::new(crate::cross_file::extract_metadata(
-                &document.analysis_text(),
-            ))
-        })
-    }
-
-    fn artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
-        let document = self.get(uri)?;
-        let tree = document.tree.as_ref()?;
-        let analysis_text = document.analysis_text();
-        let metadata = crate::cross_file::extract_metadata(&analysis_text);
-        Some(Arc::new(scope::compute_artifacts_with_metadata(
-            uri,
-            tree,
-            &analysis_text,
-            Some(&metadata),
-        )))
     }
 
     fn contains(&self, uri: &Url) -> bool {
