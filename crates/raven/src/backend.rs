@@ -23199,51 +23199,25 @@ mod tests {
             }
         }
         park_pause.wait_arrived().await;
-        backend
-            .state
-            .write()
-            .await
-            .library_routing_test_reject_remaining = 0;
-        let (basis, replacement_guard, pre_seal) = super::capture_library_routing_basis(
-            &backend.state,
-            crate::state::LibraryRoutingMutation::Replacement,
-            None,
-            crate::state::LibraryReplacementAbortPolicy::Reconcile,
-            super::LibraryRoutingDeadline::foreground(),
-        )
-        .await
-        .unwrap()
-        .into_parts();
-        let driver = super::prepare_library_routing_driver(
-            &backend.state,
-            basis,
-            replacement_guard,
-            Some(pre_seal),
-            Arc::new(crate::package_library::PackageLibrary::new_empty()),
-            super::LibraryRoutingDriverOptions {
-                ready: false,
-                only_packages: None,
-                warm_open_packages: true,
-                refresh_cache_epoch: false,
-                attempt_limit: 1,
-                deadline: super::LibraryRoutingDeadline::foreground(),
-                watcher_runtime: None,
-                watcher_recovery: false,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            super::run_library_routing_transaction(&backend.state, driver).await,
-            super::LibraryRoutingTransactionOutcome::Committed(_)
-        ));
         let (successor, attempts_after_replacement) = {
-            let state = backend.state.read().await;
+            let mut state = backend.state.write().await;
+            state.library_routing_test_reject_remaining = 0;
+            let basis = state.capture_libpath_watcher_swap_basis().unwrap();
+            state
+                .try_commit_libpath_watcher_swap(
+                    &basis,
+                    crate::state::PreparedLibpathWatcherInstall::Disabled,
+                )
+                .unwrap();
             (
                 state.libpath_watcher_owner(),
                 state.library_routing_test_commit_attempts,
             )
         };
+        assert_ne!(
+            successor, owner,
+            "the fixture must install a genuinely superseding watcher owner"
+        );
         park_pause.release();
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -42672,7 +42646,8 @@ mod project_config_initialize_tests {
         fs::write(real.join("sub").join("child.R"), child).unwrap();
         fs::write(tmp.path().join("driver.R"), "driver <- 1\n").unwrap();
 
-        let (svc, _driver_uri) = open_in_workspace(&tmp, "driver.R", "r", "driver <- 1\n").await;
+        let (svc, _driver_uri) =
+            open_in_quiescent_workspace(&tmp, "driver.R", "r", "driver <- 1\n").await;
         let backend = svc.inner();
         let parent_uri = Url::from_file_path(real.join("parent.R")).unwrap();
         let link_parent_uri =
@@ -47331,6 +47306,37 @@ infixContinuationStyle = "aligned"
         language_id: &str,
         content: &str,
     ) -> (tower_lsp::LspService<Backend>, Url) {
+        open_in_workspace_with_options(tmp, rel_path, language_id, content, None).await
+    }
+
+    /// Variant for tests whose CAS/graph preconditions require a quiescent
+    /// backend instance with no startup workspace scan or package routing.
+    async fn open_in_quiescent_workspace(
+        tmp: &TempDir,
+        rel_path: &str,
+        language_id: &str,
+        content: &str,
+    ) -> (tower_lsp::LspService<Backend>, Url) {
+        open_in_workspace_with_options(
+            tmp,
+            rel_path,
+            language_id,
+            content,
+            Some(serde_json::json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+        )
+        .await
+    }
+
+    async fn open_in_workspace_with_options(
+        tmp: &TempDir,
+        rel_path: &str,
+        language_id: &str,
+        content: &str,
+        initialization_options: Option<serde_json::Value>,
+    ) -> (tower_lsp::LspService<Backend>, Url) {
         use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
 
         let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
@@ -47341,6 +47347,7 @@ infixContinuationStyle = "aligned"
                     uri: Url::from_file_path(tmp.path()).unwrap(),
                     name: "t".into(),
                 }]),
+                initialization_options,
                 ..Default::default()
             })
             .await
@@ -47737,7 +47744,8 @@ infixContinuationStyle = "aligned"
     #[tokio::test]
     async fn did_change_overflow_retry_refreshes_flipped_exclusion_policy() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "flip-exclusion.R", "r", "before <- 1\n").await;
+        let (svc, uri) =
+            open_in_quiescent_workspace(&tmp, "flip-exclusion.R", "r", "before <- 1\n").await;
         let backend = svc.inner();
         let child = Url::from_file_path(tmp.path().join("child.R")).unwrap();
         open_doc(backend, &child, "r", 1, "child_value <- 1\n").await;
