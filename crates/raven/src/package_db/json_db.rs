@@ -1,6 +1,7 @@
 //! Tier 2 encoding: a committed, deterministic, diff-friendly `.raven/packages.json`.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,10 @@ pub enum RepoDbError {
     UnsupportedSchema { found: u32, supported: u32 },
     /// File present but unparseable / corrupt.
     Corrupt(String),
+    /// The file was replaced or modified during both load attempts.
+    ConcurrentModification,
+    /// The provider generation's original routing deadline expired.
+    DeadlineExpired,
 }
 
 impl std::fmt::Display for RepoDbError {
@@ -35,6 +40,13 @@ impl std::fmt::Display for RepoDbError {
                  with `raven packages freeze`. Falling back to the bundled database."
             ),
             RepoDbError::Corrupt(d) => write!(f, ".raven/packages.json is unreadable: {d}"),
+            RepoDbError::ConcurrentModification => write!(
+                f,
+                ".raven/packages.json changed while Raven was reading it; retry the operation"
+            ),
+            RepoDbError::DeadlineExpired => {
+                write!(f, ".raven/packages.json load exceeded the routing deadline")
+            }
         }
     }
 }
@@ -102,10 +114,32 @@ pub fn read_repo_db_str(text: &str) -> Result<RepoDb, RepoDbError> {
 
 /// Parse a Tier 2 document from a file path. A missing file maps to `Absent`.
 pub fn read_repo_db_file(path: &Path) -> Result<RepoDb, RepoDbError> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => read_repo_db_str(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(RepoDbError::Absent),
-        Err(e) => Err(RepoDbError::Corrupt(e.to_string())),
+    read_repo_db_file_with_deadline(path, None)
+}
+
+pub(crate) fn read_repo_db_file_with_deadline(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<RepoDb, RepoDbError> {
+    match crate::package_db::load_thin_file_with_retry(path, deadline, |file| {
+        let mut text = String::new();
+        let mut file = file;
+        file.read_to_string(&mut text)
+            .map_err(|error| RepoDbError::Corrupt(error.to_string()))?;
+        read_repo_db_str(&text)
+    }) {
+        Ok(db) => Ok(db),
+        Err(crate::package_db::ThinFileLoadError::Absent) => Err(RepoDbError::Absent),
+        Err(crate::package_db::ThinFileLoadError::Load(error)) => Err(error),
+        Err(crate::package_db::ThinFileLoadError::Io(error)) => {
+            Err(RepoDbError::Corrupt(error.to_string()))
+        }
+        Err(crate::package_db::ThinFileLoadError::DeadlineExpired) => {
+            Err(RepoDbError::DeadlineExpired)
+        }
+        Err(crate::package_db::ThinFileLoadError::ConcurrentModification) => {
+            Err(RepoDbError::ConcurrentModification)
+        }
     }
 }
 
@@ -126,9 +160,17 @@ impl RepoDbProvider {
 
     /// Load from a `.raven/packages.json` file. Returns `Ok(None)` when the file
     /// is simply absent (normal, silent); `Err(e)` for the loud cases
-    /// (`UnsupportedSchema`/`Corrupt`) so the caller can explain-and-continue.
+    /// (`UnsupportedSchema`, `Corrupt`, or concurrent modification) so the
+    /// caller can explain-and-continue.
     pub fn from_file(path: &Path) -> Result<Option<Self>, RepoDbError> {
-        match read_repo_db_file(path) {
+        Self::from_file_with_deadline(path, None)
+    }
+
+    pub(crate) fn from_file_with_deadline(
+        path: &Path,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<Self>, RepoDbError> {
+        match read_repo_db_file_with_deadline(path, deadline) {
             Ok(db) => Ok(Some(Self::from_db(db))),
             Err(RepoDbError::Absent) => Ok(None),
             Err(e) => Err(e),

@@ -42,6 +42,10 @@ pub enum ShippedDbError {
     UnsupportedFormat { found: u32, supported: u32 },
     /// Bad magic, header decode failure, checksum mismatch, or truncation.
     Corrupt(String),
+    /// The file was replaced or modified during both load attempts.
+    ConcurrentModification,
+    /// The provider generation's original routing deadline expired.
+    DeadlineExpired,
 }
 
 impl std::fmt::Display for ShippedDbError {
@@ -55,6 +59,13 @@ impl std::fmt::Display for ShippedDbError {
                  is unavailable. Upgrade Raven to match the bundled database."
             ),
             ShippedDbError::Corrupt(d) => write!(f, "names.db is unreadable: {d}"),
+            ShippedDbError::ConcurrentModification => write!(
+                f,
+                "names.db changed while Raven was reading it; retry the operation"
+            ),
+            ShippedDbError::DeadlineExpired => {
+                write!(f, "names.db load exceeded the routing deadline")
+            }
         }
     }
 }
@@ -150,20 +161,39 @@ impl std::fmt::Debug for ShippedDb {
 }
 
 impl ShippedDb {
-    /// Open + verify a `names.db`. Synchronous (the caller in `build_package_library`
-    /// wraps it in `spawn_blocking`, decision #13). Returns a typed error so the
-    /// caller can explain-and-continue.
+    /// Open + verify a `names.db`. Synchronous; runtime consumers call it from
+    /// the dedicated, capacity-bounded provider thread. Returns a typed error
+    /// so the caller can explain-and-continue.
     pub fn open(path: &Path) -> Result<Self, ShippedDbError> {
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ShippedDbError::Absent);
+        Self::open_with_deadline(path, None)
+    }
+
+    fn open_with_deadline(
+        path: &Path,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self, ShippedDbError> {
+        match crate::package_db::load_thin_file_with_retry(path, deadline, Self::open_file) {
+            Ok(db) => Ok(db),
+            Err(crate::package_db::ThinFileLoadError::Absent) => Err(ShippedDbError::Absent),
+            Err(crate::package_db::ThinFileLoadError::Load(error)) => Err(error),
+            Err(crate::package_db::ThinFileLoadError::Io(error)) => {
+                Err(ShippedDbError::Corrupt(error.to_string()))
             }
-            Err(e) => return Err(ShippedDbError::Corrupt(e.to_string())),
-        };
-        // SAFETY: opened read-only; treated as immutable bytes. A concurrent
-        // external truncation could fault — acceptable for a read-only sidecar.
-        let mmap = match unsafe { Mmap::map(&file) } {
+            Err(crate::package_db::ThinFileLoadError::DeadlineExpired) => {
+                Err(ShippedDbError::DeadlineExpired)
+            }
+            Err(crate::package_db::ThinFileLoadError::ConcurrentModification) => {
+                Err(ShippedDbError::ConcurrentModification)
+            }
+        }
+    }
+
+    fn open_file(file: &std::fs::File) -> Result<Self, ShippedDbError> {
+        // SAFETY: the mapping is read-only. The shared thin-file loader retains
+        // this opened handle and compares its identity with the addressed path
+        // after parsing before accepting the database. That detects replacement
+        // and metadata-visible mutation races and retries from a new handle.
+        let mmap = match unsafe { Mmap::map(file) } {
             Ok(m) => m,
             Err(e) => return Err(ShippedDbError::Corrupt(e.to_string())),
         };
@@ -305,10 +335,17 @@ impl ShippedDbProvider {
     }
 
     /// Open a `names.db` as a provider. `Ok(None)` when absent (silent); `Err(e)`
-    /// for the loud cases (`UnsupportedFormat`/`Corrupt`) so the caller can
-    /// explain-and-continue (decision #9).
+    /// for the loud cases (`UnsupportedFormat`, `Corrupt`, or concurrent
+    /// modification) so the caller can explain-and-continue (decision #9).
     pub fn from_file(path: &Path) -> Result<Option<Self>, ShippedDbError> {
-        match ShippedDb::open(path) {
+        Self::from_file_with_deadline(path, None)
+    }
+
+    pub(crate) fn from_file_with_deadline(
+        path: &Path,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<Self>, ShippedDbError> {
+        match ShippedDb::open_with_deadline(path, deadline) {
             Ok(db) => Ok(Some(Self::new(db))),
             Err(ShippedDbError::Absent) => Ok(None),
             Err(e) => Err(e),

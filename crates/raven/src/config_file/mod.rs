@@ -188,6 +188,11 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         cache.clear();
     }
     state.workspace_exclusions = compile_workspace_exclusions(&merged, workspace_roots);
+    // This is the sole parsed-config writer. Advance the typed authority only
+    // after every parsed analysis field and compiled exclusion has been
+    // installed, so detached transactions observe either the complete old
+    // configuration or the complete new one.
+    state.advance_analysis_config_generation();
 }
 
 #[cfg(test)]

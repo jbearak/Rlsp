@@ -88,6 +88,8 @@ pub struct IndexEntry {
     pub tree: Option<Tree>,
     /// Packages loaded via library() calls
     pub loaded_packages: Vec<String>,
+    /// Packages named by `data(..., package = ...)` calls.
+    pub data_packages: Vec<String>,
     /// File snapshot for freshness checking
     pub snapshot: FileSnapshot,
     /// Cross-file metadata (source() calls, directives)
@@ -104,6 +106,7 @@ impl Clone for IndexEntry {
             contents: self.contents.clone(),
             tree: self.tree.clone(),
             loaded_packages: self.loaded_packages.clone(),
+            data_packages: self.data_packages.clone(),
             snapshot: self.snapshot.clone(),
             metadata: self.metadata.clone(),
             artifacts: self.artifacts.clone(),
@@ -111,6 +114,211 @@ impl Clone for IndexEntry {
         }
     }
 }
+
+/// Explicit finalization state for a closed-file analysis.
+///
+/// A pending entry has parsed text and local metadata but still needs
+/// context-dependent enrichment (for example inherited working directory).
+/// Consumers that require stable cross-file metadata must use only
+/// [`Self::Complete`] entries rather than inferring finalization from the
+/// presence or absence of a second store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentStatus {
+    /// Context-dependent enrichment has not completed.
+    Pending,
+    /// Metadata and artifacts are ready for cross-file consumers.
+    Complete,
+}
+
+/// Artifact-only projection retained beyond the full-payload LRU.
+///
+/// This is a tier inside [`WorkspaceIndex`], not an independent authority.
+#[derive(Debug, Clone)]
+pub struct ArtifactEntry {
+    pub snapshot: FileSnapshot,
+    pub metadata: Arc<CrossFileMetadata>,
+    pub artifacts: Arc<ScopeArtifacts>,
+    pub indexed_at_version: u64,
+    pub provenance: ClosedProvenance,
+    pub(crate) record_generation: u64,
+}
+
+impl From<&IndexEntry> for ArtifactEntry {
+    fn from(entry: &IndexEntry) -> Self {
+        Self {
+            snapshot: entry.snapshot.clone(),
+            metadata: entry.metadata.clone(),
+            artifacts: entry.artifacts.clone(),
+            indexed_at_version: entry.indexed_at_version,
+            provenance: ClosedProvenance::Dynamic,
+            record_generation: 0,
+        }
+    }
+}
+
+/// Origin of a closed-file analysis record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedProvenance {
+    /// Owned by a committed workspace scan.
+    WorkspaceScan { generation: u64 },
+    /// Installed by watcher, on-demand, resync, or external-file indexing.
+    Dynamic,
+}
+
+#[derive(Debug, Clone)]
+enum ArtifactSlot {
+    Pending {
+        claim_generation: u64,
+        provenance: ClosedProvenance,
+    },
+    Complete(ArtifactEntry),
+}
+
+/// Never-reused token authorizing one Pending → Complete transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrichmentClaim {
+    uri: Url,
+    generation: u64,
+}
+
+impl EnrichmentClaim {
+    pub(crate) fn uri(&self) -> &Url {
+        &self.uri
+    }
+}
+
+/// Exact identity authorizing refresh of one existing Complete record.
+///
+/// Unlike the index-wide version, this remains current across unrelated URI
+/// mutations. Any replacement, metadata refresh, removal, or Pending
+/// transition for this URI invalidates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteRefreshToken {
+    uri: Url,
+    record_generation: u64,
+}
+
+/// Non-mutating identity for removing exactly the observed closed slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClosedRecordToken {
+    uri: Url,
+    identity: ClosedRecordIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosedRecordIdentity {
+    Absent,
+    Pending(u64),
+    Complete(u64),
+}
+
+impl ClosedRecordToken {
+    pub(crate) fn uri(&self) -> &Url {
+        &self.uri
+    }
+}
+
+impl CompleteRefreshToken {
+    pub(crate) fn uri(&self) -> &Url {
+        &self.uri
+    }
+}
+
+/// Result of atomically claiming context-dependent enrichment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimEnrichment {
+    /// A Complete artifact record already exists.
+    AlreadyComplete(CompleteRefreshToken),
+    /// Another worker owns the current Pending claim.
+    AlreadyPending,
+    /// The caller owns this claim and may commit or abort it.
+    Claimed(EnrichmentClaim),
+}
+
+/// Rejection from a guarded enrichment transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentCommitError {
+    /// The URI no longer has the claimed Pending generation.
+    StaleClaim,
+    /// The URI no longer has the exact Complete record being refreshed.
+    StaleRefresh,
+    /// The authority lock is poisoned.
+    Unavailable,
+}
+
+/// Coherent read of the closed-document authority used to prepare a batch
+/// replacement off-lock.
+#[derive(Clone)]
+pub(crate) struct WorkspaceIndexSnapshot {
+    pub(crate) version: u64,
+    pub(crate) artifacts: Vec<(Url, ArtifactEntry)>,
+    pub(crate) full: Vec<(Url, IndexEntry)>,
+    pub(crate) pinned: HashSet<Url>,
+    pub(crate) artifact_capacity_limit: usize,
+}
+
+#[derive(Debug, Clone)]
+struct IndexState {
+    version: u64,
+    next_claim_generation: u64,
+    artifacts: LruCache<Url, ArtifactSlot>,
+    full: LruCache<Url, IndexEntry>,
+    pinned: HashSet<Url>,
+    artifact_user_cap: usize,
+}
+
+/// Targeted Complete-record changes prepared against one exact index version.
+pub(crate) struct WorkspaceIndexTargetedChanges {
+    pub(crate) metadata: Vec<(Url, Arc<CrossFileMetadata>)>,
+    pub(crate) installs: Vec<(Url, IndexEntry, ClosedProvenance)>,
+    pub(crate) removals: Vec<Url>,
+    pub(crate) pins: HashSet<Url>,
+}
+
+/// Fully prepared targeted index state.
+///
+/// Unaffected cache entries retain their record generations and relative LRU
+/// order. Commit is a single exact-version swap under the internal lock.
+pub(crate) struct PreparedWorkspaceIndexTargetedBatch {
+    expected_version: u64,
+    state: IndexState,
+}
+
+fn push_with_pins<V>(
+    cache: &mut LruCache<Url, V>,
+    pinned: &HashSet<Url>,
+    uri: Url,
+    value: V,
+) -> Option<Url> {
+    let mut evicted = None;
+    if !cache.contains(&uri) && cache.len() >= cache.cap().get() {
+        let victim = cache
+            .iter()
+            .rev()
+            .find(|(candidate, _)| !pinned.contains(*candidate))
+            .map(|(candidate, _)| candidate.clone());
+        if let Some(victim) = victim {
+            cache.pop(&victim);
+            evicted = Some(victim);
+        } else {
+            cache.resize(
+                NonZeroUsize::new(cache.len().saturating_add(1))
+                    .expect("len + 1 is always non-zero"),
+            );
+        }
+    }
+    cache.push(uri, value);
+    evicted
+}
+
+/// Default capacity for artifact-only closed-file records.
+pub const DEFAULT_ARTIFACT_CAPACITY: usize = 5000;
+
+/// Process-wide Complete-record generation source.
+///
+/// A replacement `WorkspaceIndex` must not permit a stale refresh token from
+/// its predecessor to pass an ABA check.
+static NEXT_CLOSED_RECORD_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 // ============================================================================
 // Workspace Index
@@ -124,10 +332,8 @@ impl Clone for IndexEntry {
 ///
 /// **Validates: Requirements 4.1, 4.2, 4.3, 4.4**
 pub struct WorkspaceIndex {
-    /// Index entries by URI (LRU-bounded)
-    inner: RwLock<LruCache<Url, IndexEntry>>,
-    /// Monotonic version counter
-    version: AtomicU64,
+    /// Single authority lock for status, both residency tiers, pins, and version.
+    inner: RwLock<IndexState>,
     /// Configuration
     config: WorkspaceIndexConfig,
     /// Pending debounced updates (URI -> scheduled time)
@@ -136,14 +342,6 @@ pub struct WorkspaceIndex {
     update_queue: RwLock<HashSet<Url>>,
     /// Metrics
     metrics: RwLock<WorkspaceIndexMetrics>,
-    /// URIs protected from LRU eviction.
-    ///
-    /// Mirrors `DocumentStore::pinned_uris` so closed-but-reachable
-    /// neighbors of open documents are not silently dropped under cache
-    /// pressure, which would force `compute_artifacts_with_metadata`
-    /// recomputation on the fallback path. Lock order: when both `inner`
-    /// and `pinned` need to be held simultaneously, acquire `inner` first.
-    pinned: RwLock<HashSet<Url>>,
 }
 
 impl WorkspaceIndex {
@@ -156,14 +354,21 @@ impl WorkspaceIndex {
     /// A new WorkspaceIndex instance
     pub fn new(config: WorkspaceIndexConfig) -> Self {
         let cap = Self::effective_cap_for(&config);
+        let artifact_cap =
+            NonZeroUsize::new(DEFAULT_ARTIFACT_CAPACITY).expect("non-zero artifact capacity");
         Self {
-            inner: RwLock::new(LruCache::new(cap)),
-            version: AtomicU64::new(0),
+            inner: RwLock::new(IndexState {
+                version: 0,
+                next_claim_generation: 0,
+                artifacts: LruCache::new(artifact_cap),
+                full: LruCache::new(cap),
+                pinned: HashSet::new(),
+                artifact_user_cap: DEFAULT_ARTIFACT_CAPACITY,
+            }),
             config,
             pending_updates: RwLock::new(std::collections::HashMap::new()),
             update_queue: RwLock::new(HashSet::new()),
             metrics: RwLock::new(WorkspaceIndexMetrics::default()),
-            pinned: RwLock::new(HashSet::new()),
         }
     }
 
@@ -173,6 +378,14 @@ impl WorkspaceIndex {
     /// `max_files == 0` identically.
     fn effective_cap_for(config: &WorkspaceIndexConfig) -> NonZeroUsize {
         crate::cross_file::cache::non_zero_or(config.max_files, 1000)
+    }
+
+    fn mint_record_generation() -> u64 {
+        NEXT_CLOSED_RECORD_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("closed analysis record generation exhausted")
     }
 
     /// Replace the set of URIs protected from LRU eviction.
@@ -189,22 +402,36 @@ impl WorkspaceIndex {
     /// upward indefinitely (issue #128). The shrink only fires when it
     /// can't itself force eviction.
     ///
-    /// Lock order: acquires `inner.write()` before `pinned.write()`,
-    /// matching the order established by `pin_aware_push` (which holds
-    /// `inner.write()` and then takes `pinned.read()`).
     pub fn set_pinned_uris(&self, uris: HashSet<Url>) {
-        let Ok(mut guard) = self.inner.write() else {
+        let Ok(mut state) = self.inner.write() else {
             return;
         };
-        if let Ok(mut pinned) = self.pinned.write() {
-            *pinned = uris;
+        if state.pinned == uris {
+            return;
         }
+        state.pinned = uris;
 
         let user_cap_nz = Self::effective_cap_for(&self.config);
         let user_cap = user_cap_nz.get();
-        if guard.cap().get() > user_cap && guard.len() <= user_cap {
-            guard.resize(user_cap_nz);
+        if state.full.cap().get() > user_cap && state.full.len() <= user_cap {
+            state.full.resize(user_cap_nz);
         }
+        let artifact_user_cap = state.artifact_user_cap;
+        if let Some(cap) = NonZeroUsize::new(artifact_user_cap)
+            && state.artifacts.cap().get() > artifact_user_cap
+            && state.artifacts.len() <= artifact_user_cap
+        {
+            state.artifacts.resize(cap);
+        }
+        state.version = state.version.wrapping_add(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pinned_uris_for_test(&self) -> HashSet<Url> {
+        self.inner
+            .read()
+            .map(|state| state.pinned.clone())
+            .unwrap_or_default()
     }
 
     // ========================================================================
@@ -224,7 +451,7 @@ impl WorkspaceIndex {
     /// Clone of IndexEntry if found, None otherwise
     pub fn get(&self, uri: &Url) -> Option<IndexEntry> {
         let guard = self.inner.read().ok()?;
-        let entry = guard.peek(uri).cloned();
+        let entry = guard.full.peek(uri).cloned();
 
         // Update metrics
         if let Ok(mut metrics) = self.metrics.write() {
@@ -252,7 +479,7 @@ impl WorkspaceIndex {
     /// Clone of IndexEntry if found and fresh, None otherwise
     pub fn get_if_fresh(&self, uri: &Url, snapshot: &FileSnapshot) -> Option<IndexEntry> {
         let guard = self.inner.read().ok()?;
-        guard.peek(uri).and_then(|entry| {
+        guard.full.peek(uri).and_then(|entry| {
             if entry.snapshot.matches_disk(snapshot) {
                 Some(entry.clone())
             } else {
@@ -274,7 +501,10 @@ impl WorkspaceIndex {
     /// Clone of CrossFileMetadata if found, None otherwise
     pub fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
         let guard = self.inner.read().ok()?;
-        guard.peek(uri).map(|entry| entry.metadata.clone())
+        guard.artifacts.peek(uri).and_then(|slot| match slot {
+            ArtifactSlot::Complete(entry) => Some(entry.metadata.clone()),
+            ArtifactSlot::Pending { .. } => None,
+        })
     }
 
     /// Get artifacts for a URI
@@ -290,7 +520,171 @@ impl WorkspaceIndex {
     /// Clone of ScopeArtifacts if found, None otherwise
     pub fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
         let guard = self.inner.read().ok()?;
-        guard.peek(uri).map(|entry| entry.artifacts.clone())
+        guard.artifacts.peek(uri).and_then(|slot| match slot {
+            ArtifactSlot::Complete(entry) => Some(entry.artifacts.clone()),
+            ArtifactSlot::Pending { .. } => None,
+        })
+    }
+
+    /// Get an artifact-tier entry regardless of enrichment state.
+    pub fn get_artifact_entry(&self, uri: &Url) -> Option<ArtifactEntry> {
+        self.inner
+            .read()
+            .ok()?
+            .artifacts
+            .peek(uri)
+            .and_then(|slot| match slot {
+                ArtifactSlot::Complete(entry) => Some(entry.clone()),
+                ArtifactSlot::Pending { .. } => None,
+            })
+    }
+
+    /// Coherent artifact/full/version snapshot for guarded consumers.
+    #[cfg(test)]
+    pub(crate) fn get_complete_views(
+        &self,
+        uri: &Url,
+    ) -> Option<(ArtifactEntry, Option<IndexEntry>, u64)> {
+        let state = self.inner.read().ok()?;
+        let artifact = match state.artifacts.peek(uri)? {
+            ArtifactSlot::Complete(entry) => entry.clone(),
+            ArtifactSlot::Pending { .. } => return None,
+        };
+        Some((artifact, state.full.peek(uri).cloned(), state.version))
+    }
+
+    /// Snapshot both residency tiers and their shared authority identity under
+    /// one read lock. Pending slots are intentionally omitted: a scan prepared
+    /// from this snapshot cannot adopt another worker's unfinished record.
+    pub(crate) fn authority_snapshot(&self) -> WorkspaceIndexSnapshot {
+        let Ok(state) = self.inner.read() else {
+            return WorkspaceIndexSnapshot {
+                version: 0,
+                artifacts: Vec::new(),
+                full: Vec::new(),
+                pinned: HashSet::new(),
+                artifact_capacity_limit: DEFAULT_ARTIFACT_CAPACITY,
+            };
+        };
+        WorkspaceIndexSnapshot {
+            version: state.version,
+            artifacts: state
+                .artifacts
+                .iter()
+                .filter_map(|(uri, slot)| match slot {
+                    ArtifactSlot::Complete(entry) => Some((uri.clone(), entry.clone())),
+                    ArtifactSlot::Pending { .. } => None,
+                })
+                .collect(),
+            full: state
+                .full
+                .iter()
+                .map(|(uri, entry)| (uri.clone(), entry.clone()))
+                .collect(),
+            pinned: state.pinned.clone(),
+            artifact_capacity_limit: state.artifact_user_cap,
+        }
+    }
+
+    /// Return the origin of a finalized record.
+    pub(crate) fn provenance(&self, uri: &Url) -> Option<ClosedProvenance> {
+        self.get_artifact_entry(uri).map(|entry| entry.provenance)
+    }
+
+    /// Return the explicit enrichment state for a URI.
+    pub fn enrichment_status(&self, uri: &Url) -> Option<EnrichmentStatus> {
+        self.inner
+            .read()
+            .ok()?
+            .artifacts
+            .peek(uri)
+            .map(|slot| match slot {
+                ArtifactSlot::Pending { .. } => EnrichmentStatus::Pending,
+                ArtifactSlot::Complete(_) => EnrichmentStatus::Complete,
+            })
+    }
+
+    /// Whether the URI has a finalized artifact-tier record.
+    pub fn is_complete(&self, uri: &Url) -> bool {
+        self.enrichment_status(uri) == Some(EnrichmentStatus::Complete)
+    }
+
+    /// Whether any artifact-tier record exists for the URI.
+    pub fn contains_artifacts(&self, uri: &Url) -> bool {
+        self.inner
+            .read()
+            .map(|guard| guard.artifacts.contains(uri))
+            .unwrap_or(false)
+    }
+
+    /// Snapshot all artifact-tier URIs.
+    pub fn artifact_uris(&self) -> Vec<Url> {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .artifacts
+                    .iter()
+                    .filter(|(_, slot)| matches!(slot, ArtifactSlot::Complete(_)))
+                    .map(|(uri, _)| uri.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Snapshot all artifact-tier entries.
+    pub fn artifact_iter(&self) -> Vec<(Url, ArtifactEntry)> {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .artifacts
+                    .iter()
+                    .filter_map(|(uri, slot)| match slot {
+                        ArtifactSlot::Complete(entry) => Some((uri.clone(), entry.clone())),
+                        ArtifactSlot::Pending { .. } => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Snapshot finalized artifact entries satisfying `pred`.
+    pub(crate) fn artifact_entries_matching<F>(&self, pred: F) -> Vec<(Url, ArtifactEntry)>
+    where
+        F: Fn(&ArtifactEntry) -> bool,
+    {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .artifacts
+                    .iter()
+                    .filter_map(|(uri, slot)| match slot {
+                        ArtifactSlot::Complete(entry) if pred(entry) => {
+                            Some((uri.clone(), entry.clone()))
+                        }
+                        ArtifactSlot::Complete(_) | ArtifactSlot::Pending { .. } => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether any finalized artifact entry satisfies `pred`.
+    pub(crate) fn any_artifact<F>(&self, pred: F) -> bool
+    where
+        F: Fn(&ArtifactEntry) -> bool,
+    {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard.artifacts.iter().any(|(_, slot)| match slot {
+                    ArtifactSlot::Complete(entry) => pred(entry),
+                    ArtifactSlot::Pending { .. } => false,
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// Check if URI is indexed
@@ -303,7 +697,7 @@ impl WorkspaceIndex {
     pub fn contains(&self, uri: &Url) -> bool {
         self.inner
             .read()
-            .map(|guard| guard.contains(uri))
+            .map(|guard| guard.full.contains(uri))
             .unwrap_or(false)
     }
 
@@ -316,7 +710,7 @@ impl WorkspaceIndex {
     pub fn uris(&self) -> Vec<Url> {
         self.inner
             .read()
-            .map(|guard| guard.iter().map(|(k, _)| k.clone()).collect())
+            .map(|guard| guard.full.iter().map(|(k, _)| k.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -331,7 +725,45 @@ impl WorkspaceIndex {
     pub fn iter(&self) -> Vec<(Url, IndexEntry)> {
         self.inner
             .read()
-            .map(|guard| guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .map(|guard| {
+                guard
+                    .full
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Snapshot every Complete artifact resident as a full-shaped graph
+    /// derivation input. Full payloads win when resident; artifact-only
+    /// records use empty content while retaining their authoritative metadata
+    /// and artifacts.
+    pub(crate) fn graph_derivation_entries(&self) -> Vec<(Url, IndexEntry)> {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .artifacts
+                    .iter()
+                    .filter_map(|(uri, slot)| {
+                        let ArtifactSlot::Complete(artifact) = slot else {
+                            return None;
+                        };
+                        let entry = guard.full.peek(uri).cloned().unwrap_or_else(|| IndexEntry {
+                            contents: Rope::new(),
+                            tree: None,
+                            loaded_packages: Vec::new(),
+                            data_packages: Vec::new(),
+                            snapshot: artifact.snapshot.clone(),
+                            metadata: artifact.metadata.clone(),
+                            artifacts: artifact.artifacts.clone(),
+                            indexed_at_version: artifact.indexed_at_version,
+                        });
+                        Some((uri.clone(), entry))
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -345,7 +777,7 @@ impl WorkspaceIndex {
     {
         self.inner
             .read()
-            .map(|guard| guard.iter().any(|(_, v)| pred(v)))
+            .map(|guard| guard.full.iter().any(|(_, v)| pred(v)))
             .unwrap_or(false)
     }
 
@@ -361,6 +793,7 @@ impl WorkspaceIndex {
             .read()
             .map(|guard| {
                 guard
+                    .full
                     .iter()
                     .filter(|(_, v)| pred(v))
                     .map(|(k, v)| (k.clone(), v.clone()))
@@ -378,12 +811,12 @@ impl WorkspaceIndex {
     /// # Returns
     /// Current version number
     pub fn version(&self) -> u64 {
-        self.version.load(Ordering::SeqCst)
+        self.inner.read().map(|state| state.version).unwrap_or(0)
     }
 
     /// Get the number of indexed entries
     pub fn len(&self) -> usize {
-        self.inner.read().map(|guard| guard.len()).unwrap_or(0)
+        self.inner.read().map(|guard| guard.full.len()).unwrap_or(0)
     }
 
     /// Get the current cache capacity.
@@ -395,16 +828,16 @@ impl WorkspaceIndex {
     pub fn cap(&self) -> usize {
         self.inner
             .read()
-            .map(|guard| guard.cap().get())
+            .map(|guard| guard.full.cap().get())
             .unwrap_or(0)
     }
 
-    /// Snapshot the URIs protected from LRU eviction.
-    pub(crate) fn pinned_uris(&self) -> HashSet<Url> {
-        self.pinned
+    /// Current artifact-tier capacity.
+    pub fn artifact_cap(&self) -> usize {
+        self.inner
             .read()
-            .map(|pinned| pinned.clone())
-            .unwrap_or_default()
+            .map(|guard| guard.artifacts.cap().get())
+            .unwrap_or(0)
     }
 
     /// Check if the index is empty
@@ -444,36 +877,536 @@ impl WorkspaceIndex {
     /// # Returns
     /// true if inserted, false if rejected due to file size limit
     pub fn insert(&self, uri: Url, entry: IndexEntry) -> bool {
-        // Check max_file_size_bytes limit for all entries (cheap; no need
-        // to acquire the inner lock for an oversized rejection).
-        if self.config.max_file_size_bytes > 0
-            && entry.snapshot.size > self.config.max_file_size_bytes as u64
-        {
-            log::info!(
-                "WorkspaceIndex rejecting oversized file {} ({} bytes > {} limit)",
-                uri,
-                entry.snapshot.size,
-                self.config.max_file_size_bytes
-            );
-            return false;
-        }
+        self.install_complete(uri, entry, ClosedProvenance::Dynamic)
+    }
 
-        let Ok(mut guard) = self.inner.write() else {
+    /// Atomically install one Complete record and derive both projections.
+    ///
+    /// The artifact projection always commits. The full payload is admitted
+    /// only when it satisfies the configured size limit; either way this is
+    /// one locked transaction and one version increment.
+    pub fn install_complete(
+        &self,
+        uri: Url,
+        mut entry: IndexEntry,
+        provenance: ClosedProvenance,
+    ) -> bool {
+        let Ok(mut state) = self.inner.write() else {
             return false;
         };
+        let next_version = state.version.wrapping_add(1);
+        entry.indexed_at_version = next_version;
+        let mut artifact = ArtifactEntry::from(&entry);
+        artifact.indexed_at_version = next_version;
+        artifact.provenance = provenance;
 
-        crate::cross_file::cache::pin_aware_push(&mut guard, &self.pinned, uri, entry);
-        drop(guard);
+        Self::install_complete_locked(
+            &mut state,
+            uri.clone(),
+            artifact,
+            Some(entry),
+            self.config.max_file_size_bytes,
+        );
+        state.version = next_version;
+        let full_resident = state.full.contains(&uri);
+        drop(state);
 
-        // Increment version counter
-        self.version.fetch_add(1, Ordering::SeqCst);
-
-        // Update metrics
         if let Ok(mut metrics) = self.metrics.write() {
             metrics.insertions += 1;
         }
+        full_resident
+    }
 
+    /// Refresh a finalized record without changing who owns its lifecycle.
+    pub(crate) fn install_complete_preserving_provenance(
+        &self,
+        uri: Url,
+        entry: IndexEntry,
+    ) -> bool {
+        let provenance = self.provenance(&uri).unwrap_or(ClosedProvenance::Dynamic);
+        self.install_complete(uri, entry, provenance)
+    }
+
+    /// Replace metadata for one finalized record in both residency tiers.
+    ///
+    /// Artifact-only Complete records remain artifact-only. Full residents
+    /// keep sharing the exact metadata `Arc` with their artifact projection.
+    pub(crate) fn replace_complete_metadata(
+        &self,
+        uri: &Url,
+        metadata: Arc<CrossFileMetadata>,
+    ) -> bool {
+        let Ok(mut state) = self.inner.write() else {
+            return false;
+        };
+        let Some(ArtifactSlot::Complete(existing)) = state.artifacts.peek(uri) else {
+            return false;
+        };
+        let mut artifact = existing.clone();
+        let next_version = state.version.wrapping_add(1);
+        artifact.metadata = metadata.clone();
+        artifact.indexed_at_version = next_version;
+        artifact.record_generation = Self::mint_record_generation();
+        state
+            .artifacts
+            .push(uri.clone(), ArtifactSlot::Complete(artifact));
+        if let Some(mut full) = state.full.pop(uri) {
+            full.metadata = metadata;
+            full.indexed_at_version = next_version;
+            state.full.push(uri.clone(), full);
+        }
+        state.version = next_version;
         true
+    }
+
+    fn install_complete_locked(
+        state: &mut IndexState,
+        uri: Url,
+        mut artifact: ArtifactEntry,
+        full: Option<IndexEntry>,
+        max_file_size_bytes: usize,
+    ) {
+        artifact.record_generation = Self::mint_record_generation();
+        let mut protected = state.pinned.clone();
+        protected.extend(
+            state
+                .artifacts
+                .iter()
+                .filter(|(_, slot)| matches!(slot, ArtifactSlot::Pending { .. }))
+                .map(|(pending_uri, _)| pending_uri.clone()),
+        );
+        if let Some(evicted) = push_with_pins(
+            &mut state.artifacts,
+            &protected,
+            uri.clone(),
+            ArtifactSlot::Complete(artifact),
+        ) {
+            state.full.pop(&evicted);
+        }
+
+        if let Some(full) = full {
+            if max_file_size_bytes > 0 && full.snapshot.size > max_file_size_bytes as u64 {
+                state.full.pop(&uri);
+            } else {
+                push_with_pins(&mut state.full, &state.pinned, uri, full);
+            }
+        }
+    }
+
+    /// Atomically claim enrichment for an absent URI.
+    pub fn claim_enrichment(&self, uri: Url, provenance: ClosedProvenance) -> ClaimEnrichment {
+        let Ok(mut state) = self.inner.write() else {
+            return ClaimEnrichment::AlreadyPending;
+        };
+        match state.artifacts.peek(&uri) {
+            Some(ArtifactSlot::Complete(entry)) => {
+                return ClaimEnrichment::AlreadyComplete(CompleteRefreshToken {
+                    uri,
+                    record_generation: entry.record_generation,
+                });
+            }
+            Some(ArtifactSlot::Pending { .. }) => return ClaimEnrichment::AlreadyPending,
+            None => {}
+        }
+
+        state.next_claim_generation = state.next_claim_generation.wrapping_add(1);
+        let generation = state.next_claim_generation;
+        let mut protected = state.pinned.clone();
+        protected.extend(
+            state
+                .artifacts
+                .iter()
+                .filter(|(_, slot)| matches!(slot, ArtifactSlot::Pending { .. }))
+                .map(|(pending_uri, _)| pending_uri.clone()),
+        );
+        if let Some(evicted) = push_with_pins(
+            &mut state.artifacts,
+            &protected,
+            uri.clone(),
+            ArtifactSlot::Pending {
+                claim_generation: generation,
+                provenance,
+            },
+        ) {
+            state.full.pop(&evicted);
+        }
+        state.version = state.version.wrapping_add(1);
+        ClaimEnrichment::Claimed(EnrichmentClaim { uri, generation })
+    }
+
+    /// Commit a claimed Pending record atomically into both projections.
+    pub fn commit_enrichment(
+        &self,
+        claim: &EnrichmentClaim,
+        mut entry: IndexEntry,
+    ) -> Result<bool, EnrichmentCommitError> {
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| EnrichmentCommitError::Unavailable)?;
+        let provenance = match state.artifacts.peek(&claim.uri) {
+            Some(ArtifactSlot::Pending {
+                claim_generation,
+                provenance,
+            }) if *claim_generation == claim.generation => *provenance,
+            _ => return Err(EnrichmentCommitError::StaleClaim),
+        };
+        let next_version = state.version.wrapping_add(1);
+        entry.indexed_at_version = next_version;
+        let mut artifact = ArtifactEntry::from(&entry);
+        artifact.indexed_at_version = next_version;
+        artifact.provenance = provenance;
+        Self::install_complete_locked(
+            &mut state,
+            claim.uri.clone(),
+            artifact,
+            Some(entry),
+            self.config.max_file_size_bytes,
+        );
+        state.version = next_version;
+        Ok(state.full.contains(&claim.uri))
+    }
+
+    pub(crate) fn enrichment_claim_is_current(&self, claim: &EnrichmentClaim) -> bool {
+        self.inner.read().is_ok_and(|state| {
+            matches!(
+                state.artifacts.peek(&claim.uri),
+                Some(ArtifactSlot::Pending { claim_generation, .. })
+                    if *claim_generation == claim.generation
+            )
+        })
+    }
+
+    pub(crate) fn complete_refresh_is_current(&self, token: &CompleteRefreshToken) -> bool {
+        self.inner.read().is_ok_and(|state| {
+            matches!(
+                state.artifacts.peek(&token.uri),
+                Some(ArtifactSlot::Complete(entry))
+                    if entry.record_generation == token.record_generation
+            )
+        })
+    }
+
+    pub(crate) fn closed_record_token(&self, uri: &Url) -> ClosedRecordToken {
+        let identity = self
+            .inner
+            .read()
+            .ok()
+            .and_then(|state| {
+                state.artifacts.peek(uri).map(|slot| match slot {
+                    ArtifactSlot::Pending {
+                        claim_generation, ..
+                    } => ClosedRecordIdentity::Pending(*claim_generation),
+                    ArtifactSlot::Complete(entry) => {
+                        ClosedRecordIdentity::Complete(entry.record_generation)
+                    }
+                })
+            })
+            .unwrap_or(ClosedRecordIdentity::Absent);
+        ClosedRecordToken {
+            uri: uri.clone(),
+            identity,
+        }
+    }
+
+    pub(crate) fn closed_record_token_is_current(&self, token: &ClosedRecordToken) -> bool {
+        self.closed_record_token(&token.uri).identity == token.identity
+    }
+
+    pub(crate) fn closed_record_token_is_present(&self, token: &ClosedRecordToken) -> bool {
+        !matches!(token.identity, ClosedRecordIdentity::Absent)
+    }
+
+    /// Replace the exact Complete record captured by `token`.
+    ///
+    /// The comparison and replacement occur under the authority write lock.
+    /// Unrelated index mutations do not invalidate the token, while every
+    /// replacement of this URI does. Callers must separately validate any
+    /// surrounding authority such as open-document ownership while holding
+    /// their encompassing state lock.
+    pub fn commit_complete_refresh(
+        &self,
+        token: &CompleteRefreshToken,
+        mut entry: IndexEntry,
+    ) -> Result<bool, EnrichmentCommitError> {
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| EnrichmentCommitError::Unavailable)?;
+        let provenance = match state.artifacts.peek(&token.uri) {
+            Some(ArtifactSlot::Complete(current))
+                if current.record_generation == token.record_generation =>
+            {
+                current.provenance
+            }
+            _ => return Err(EnrichmentCommitError::StaleRefresh),
+        };
+        let next_version = state.version.wrapping_add(1);
+        entry.indexed_at_version = next_version;
+        let mut artifact = ArtifactEntry::from(&entry);
+        artifact.indexed_at_version = next_version;
+        artifact.provenance = provenance;
+        Self::install_complete_locked(
+            &mut state,
+            token.uri.clone(),
+            artifact,
+            Some(entry),
+            self.config.max_file_size_bytes,
+        );
+        state.version = next_version;
+        Ok(state.full.contains(&token.uri))
+    }
+
+    /// Abort a Pending claim; stale claims cannot remove a newer generation.
+    pub fn abort_enrichment(&self, claim: &EnrichmentClaim) -> Result<(), EnrichmentCommitError> {
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| EnrichmentCommitError::Unavailable)?;
+        let current = matches!(
+            state.artifacts.peek(&claim.uri),
+            Some(ArtifactSlot::Pending { claim_generation, .. })
+                if *claim_generation == claim.generation
+        );
+        if !current {
+            return Err(EnrichmentCommitError::StaleClaim);
+        }
+        state.artifacts.pop(&claim.uri);
+        state.full.pop(&claim.uri);
+        state.version = state.version.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Atomically replace all Complete records, both residency tiers, and pins.
+    ///
+    /// `artifact_only` represents Complete records whose full payload is not
+    /// resident. Full records always derive and overwrite their own artifact
+    /// projection, so callers cannot provide divergent metadata/artifacts for
+    /// the same URI. URI ordering is canonical before both LRU admissions.
+    pub(crate) fn replace_all_complete(
+        &self,
+        artifact_only: Vec<(Url, ArtifactEntry)>,
+        full_records: Vec<(Url, IndexEntry, ClosedProvenance)>,
+        pins: HashSet<Url>,
+    ) -> Result<(), EnrichmentCommitError> {
+        self.replace_all_complete_if_version(None, artifact_only, full_records, pins)
+            .map(|replaced| {
+                debug_assert!(replaced);
+            })
+    }
+
+    /// Atomically replace all Complete records only while the exact authority
+    /// version captured by a detached transaction remains installed.
+    pub(crate) fn replace_all_complete_if_current(
+        &self,
+        expected_version: u64,
+        artifact_only: Vec<(Url, ArtifactEntry)>,
+        full_records: Vec<(Url, IndexEntry, ClosedProvenance)>,
+        pins: HashSet<Url>,
+    ) -> Result<bool, EnrichmentCommitError> {
+        self.replace_all_complete_if_version(
+            Some(expected_version),
+            artifact_only,
+            full_records,
+            pins,
+        )
+    }
+
+    /// Prepare a targeted Complete-record transaction without mutating the
+    /// live index.
+    ///
+    /// The internal state is cloned coherently, so unaffected generations,
+    /// Pending leases, residency, capacity, and relative LRU order survive.
+    /// Selected metadata replacements preserve provenance and full/artifact
+    /// residency; installs and removals apply the ordinary pin-aware policy.
+    pub(crate) fn prepare_targeted_batch_if_current(
+        &self,
+        expected_version: u64,
+        mut changes: WorkspaceIndexTargetedChanges,
+    ) -> Result<Option<PreparedWorkspaceIndexTargetedBatch>, EnrichmentCommitError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| EnrichmentCommitError::Unavailable)?;
+        if state.version != expected_version {
+            return Ok(None);
+        }
+        let mut candidate = state.clone();
+        drop(state);
+
+        changes
+            .metadata
+            .sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        changes
+            .installs
+            .sort_unstable_by(|(left, ..), (right, ..)| left.as_str().cmp(right.as_str()));
+        changes
+            .removals
+            .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        if changes
+            .metadata
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0)
+            || changes
+                .installs
+                .windows(2)
+                .any(|pair| pair[0].0 == pair[1].0)
+            || changes.removals.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Ok(None);
+        }
+        let metadata_uris: HashSet<_> = changes.metadata.iter().map(|(uri, _)| uri).collect();
+        let install_uris: HashSet<_> = changes.installs.iter().map(|(uri, ..)| uri).collect();
+        if changes
+            .removals
+            .iter()
+            .any(|uri| metadata_uris.contains(uri) || install_uris.contains(uri))
+            || metadata_uris.iter().any(|uri| install_uris.contains(*uri))
+        {
+            return Ok(None);
+        }
+        if changes.metadata.iter().any(|(uri, _)| {
+            !matches!(
+                candidate.artifacts.peek(uri),
+                Some(ArtifactSlot::Complete(_))
+            )
+        }) {
+            return Ok(None);
+        }
+
+        let next_version = candidate.version.wrapping_add(1);
+        for uri in changes.removals {
+            candidate.artifacts.pop(&uri);
+            candidate.full.pop(&uri);
+        }
+        candidate.pinned = changes.pins;
+        for (uri, metadata) in changes.metadata {
+            let Some(ArtifactSlot::Complete(existing)) = candidate.artifacts.peek(&uri) else {
+                return Ok(None);
+            };
+            let mut artifact = existing.clone();
+            artifact.metadata = metadata.clone();
+            artifact.indexed_at_version = next_version;
+            artifact.record_generation = Self::mint_record_generation();
+            candidate
+                .artifacts
+                .push(uri.clone(), ArtifactSlot::Complete(artifact));
+            if let Some(mut full) = candidate.full.pop(&uri) {
+                full.metadata = metadata;
+                full.indexed_at_version = next_version;
+                candidate.full.push(uri, full);
+            }
+        }
+        for (uri, mut entry, provenance) in changes.installs {
+            entry.indexed_at_version = next_version;
+            let mut artifact = ArtifactEntry::from(&entry);
+            artifact.indexed_at_version = next_version;
+            artifact.provenance = provenance;
+            Self::install_complete_locked(
+                &mut candidate,
+                uri,
+                artifact,
+                Some(entry),
+                self.config.max_file_size_bytes,
+            );
+        }
+        let user_cap_nz = Self::effective_cap_for(&self.config);
+        let user_cap = user_cap_nz.get();
+        if candidate.full.cap().get() > user_cap && candidate.full.len() <= user_cap {
+            candidate.full.resize(user_cap_nz);
+        }
+        let artifact_user_cap = candidate.artifact_user_cap;
+        if let Some(cap) = NonZeroUsize::new(artifact_user_cap)
+            && candidate.artifacts.cap().get() > artifact_user_cap
+            && candidate.artifacts.len() <= artifact_user_cap
+        {
+            candidate.artifacts.resize(cap);
+        }
+        candidate.version = next_version;
+        Ok(Some(PreparedWorkspaceIndexTargetedBatch {
+            expected_version,
+            state: candidate,
+        }))
+    }
+
+    /// Commit a previously prepared targeted batch if its source version is
+    /// still current.
+    pub(crate) fn commit_prepared_targeted_batch(
+        &self,
+        prepared: PreparedWorkspaceIndexTargetedBatch,
+    ) -> Result<bool, EnrichmentCommitError> {
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| EnrichmentCommitError::Unavailable)?;
+        if state.version != prepared.expected_version {
+            return Ok(false);
+        }
+        *state = prepared.state;
+        Ok(true)
+    }
+
+    fn replace_all_complete_if_version(
+        &self,
+        expected_version: Option<u64>,
+        artifact_only: Vec<(Url, ArtifactEntry)>,
+        full_records: Vec<(Url, IndexEntry, ClosedProvenance)>,
+        pins: HashSet<Url>,
+    ) -> Result<bool, EnrichmentCommitError> {
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| EnrichmentCommitError::Unavailable)?;
+        if expected_version.is_some_and(|expected| state.version != expected) {
+            return Ok(false);
+        }
+        let next_version = state.version.wrapping_add(1);
+        let mut artifacts: std::collections::HashMap<Url, ArtifactEntry> =
+            artifact_only.into_iter().collect();
+        let mut full_records = full_records;
+        for (uri, entry, provenance) in &full_records {
+            let mut artifact = ArtifactEntry::from(entry);
+            artifact.indexed_at_version = next_version;
+            artifact.provenance = *provenance;
+            artifacts.insert(uri.clone(), artifact);
+        }
+
+        state.artifacts.clear();
+        state.full.clear();
+        state.pinned = pins;
+
+        let mut artifacts: Vec<_> = artifacts.into_iter().collect();
+        artifacts.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        for (uri, mut artifact) in artifacts {
+            artifact.indexed_at_version = next_version;
+            artifact.record_generation = Self::mint_record_generation();
+            let protected = state.pinned.clone();
+            if let Some(evicted) = push_with_pins(
+                &mut state.artifacts,
+                &protected,
+                uri,
+                ArtifactSlot::Complete(artifact),
+            ) {
+                state.full.pop(&evicted);
+            }
+        }
+
+        full_records.sort_by(|(left, _, _), (right, _, _)| left.as_str().cmp(right.as_str()));
+        for (uri, mut entry, _) in full_records {
+            if !matches!(state.artifacts.peek(&uri), Some(ArtifactSlot::Complete(_))) {
+                continue;
+            }
+            if self.config.max_file_size_bytes > 0
+                && entry.snapshot.size > self.config.max_file_size_bytes as u64
+            {
+                continue;
+            }
+            entry.indexed_at_version = next_version;
+            let pins = state.pinned.clone();
+            push_with_pins(&mut state.full, &pins, uri, entry);
+        }
+        state.version = next_version;
+        Ok(true)
     }
 
     /// Invalidate entry for a URI
@@ -492,17 +1425,17 @@ impl WorkspaceIndex {
             return false;
         };
 
-        let removed = guard.pop(uri).is_some();
-        drop(guard);
+        let removed_full = guard.full.pop(uri).is_some();
+        let removed_artifacts = guard.artifacts.pop(uri).is_some();
+        let removed = removed_full || removed_artifacts;
 
         if removed {
-            // Increment version counter
-            self.version.fetch_add(1, Ordering::SeqCst);
+            guard.version = guard.version.wrapping_add(1);
+        }
+        drop(guard);
 
-            // Update metrics
-            if let Ok(mut metrics) = self.metrics.write() {
-                metrics.invalidations += 1;
-            }
+        if removed && let Ok(mut metrics) = self.metrics.write() {
+            metrics.invalidations += 1;
         }
 
         removed
@@ -518,18 +1451,67 @@ impl WorkspaceIndex {
             return;
         };
 
-        let count = guard.len();
-        guard.clear();
+        let count = guard.full.len();
+        let artifact_count = guard.artifacts.len();
+        guard.full.clear();
+        guard.artifacts.clear();
+        guard.version = guard.version.wrapping_add(1);
         drop(guard);
 
-        // Always increment version counter
-        self.version.fetch_add(1, Ordering::SeqCst);
-
         // Update metrics
-        if count > 0
+        if count.saturating_add(artifact_count) > 0
             && let Ok(mut metrics) = self.metrics.write()
         {
-            metrics.invalidations += count as u64;
+            metrics.invalidations += count.saturating_add(artifact_count) as u64;
+        }
+    }
+
+    /// Clear only full payloads while retaining artifact reachability.
+    pub fn invalidate_all_full(&self) {
+        if let Ok(mut state) = self.inner.write()
+            && !state.full.is_empty()
+        {
+            state.full.clear();
+            state.version = state.version.wrapping_add(1);
+        }
+    }
+
+    /// Resize the artifact-only tier.
+    pub fn resize_artifacts(&self, cap: usize) {
+        let cap = crate::cross_file::cache::non_zero_or(cap, DEFAULT_ARTIFACT_CAPACITY);
+        if let Ok(mut state) = self.inner.write() {
+            state.artifact_user_cap = cap.get();
+            while state.artifacts.len() > cap.get() {
+                let victim = state
+                    .artifacts
+                    .iter()
+                    .rev()
+                    .find(|(uri, slot)| {
+                        !state.pinned.contains(*uri)
+                            && !matches!(slot, ArtifactSlot::Pending { .. })
+                    })
+                    .map(|(uri, _)| uri.clone());
+                let Some(victim) = victim else {
+                    break;
+                };
+                state.artifacts.pop(&victim);
+                state.full.pop(&victim);
+            }
+            let runtime_cap = cap.get().max(state.artifacts.len());
+            if let Some(runtime_cap) = NonZeroUsize::new(runtime_cap)
+                && state.artifacts.cap() != runtime_cap
+            {
+                state.artifacts.resize(runtime_cap);
+            }
+            let artifact_residents: HashSet<_> =
+                state.artifacts.iter().map(|(uri, _)| uri.clone()).collect();
+            let full_uris: Vec<_> = state.full.iter().map(|(uri, _)| uri.clone()).collect();
+            for full_uri in full_uris {
+                if !artifact_residents.contains(&full_uri) {
+                    state.full.pop(&full_uri);
+                }
+            }
+            state.version = state.version.wrapping_add(1);
         }
     }
 
@@ -597,7 +1579,7 @@ impl WorkspaceIndex {
         pending
             .iter()
             .filter(|(uri, scheduled_at)| {
-                // Skip open URIs - they are managed by DocumentStore
+                // Skip open URIs - they are managed by open-document authority
                 if open_uris.contains(*uri) {
                     return false;
                 }
@@ -611,7 +1593,7 @@ impl WorkspaceIndex {
     /// Process pending updates (called periodically)
     ///
     /// Processes URIs that have been in the queue longer than debounce_ms.
-    /// Skips URIs that are currently open (they are managed by DocumentStore).
+    /// Skips URIs that are currently open (they are managed by open-document authority).
     ///
     /// **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
     ///
@@ -670,7 +1652,7 @@ impl WorkspaceIndex {
 
     /// Remove a URI from the pending update queue
     ///
-    /// Used when a file is opened (becomes managed by DocumentStore)
+    /// Used when a file is opened (becomes managed by open-document authority)
     /// or when a file is deleted.
     ///
     /// # Arguments
@@ -769,6 +1751,7 @@ mod tests {
             contents: Rope::from_str("x <- 1"),
             tree: None,
             loaded_packages: vec!["dplyr".to_string()],
+            data_packages: vec![],
             snapshot: make_test_snapshot(),
             metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
@@ -810,6 +1793,9 @@ mod tests {
         assert_eq!(config.debounce_ms, 200);
         assert_eq!(config.max_files, 1000);
         assert_eq!(config.max_file_size_bytes, 512 * 1024);
+        let index = WorkspaceIndex::new(config);
+        assert_eq!(index.cap(), 1000);
+        assert_eq!(index.artifact_cap(), 5000);
     }
 
     #[test]
@@ -843,6 +1829,299 @@ mod tests {
         let retrieved = index.get(&uri).unwrap();
         assert_eq!(retrieved.contents.to_string(), "x <- 1");
         assert_eq!(retrieved.loaded_packages, vec!["dplyr".to_string()]);
+    }
+
+    #[test]
+    fn full_install_projects_once_and_shares_arcs() {
+        let index = WorkspaceIndex::new(make_test_config());
+        let uri = test_uri("shared.R");
+        let entry = make_test_entry(0);
+        let metadata = entry.metadata.clone();
+        let artifacts = entry.artifacts.clone();
+        let before = index.version();
+
+        assert!(index.install_complete(uri.clone(), entry, ClosedProvenance::Dynamic));
+
+        let (artifact_view, full_view, version) =
+            index.get_complete_views(&uri).expect("complete record");
+        let full_view = full_view.expect("full payload resident");
+        assert_eq!(version, before + 1, "one logical install bumps once");
+        assert!(Arc::ptr_eq(&metadata, &artifact_view.metadata));
+        assert!(Arc::ptr_eq(&artifacts, &artifact_view.artifacts));
+        assert!(Arc::ptr_eq(&full_view.metadata, &artifact_view.metadata));
+        assert!(Arc::ptr_eq(&full_view.artifacts, &artifact_view.artifacts));
+    }
+
+    #[test]
+    fn pending_is_invisible_and_generation_guarded() {
+        let index = WorkspaceIndex::new(make_test_config());
+        let uri = test_uri("pending.R");
+        let claim_a = match index.claim_enrichment(uri.clone(), ClosedProvenance::Dynamic) {
+            ClaimEnrichment::Claimed(claim) => claim,
+            other => panic!("expected first claim, got {other:?}"),
+        };
+        assert_eq!(
+            index.enrichment_status(&uri),
+            Some(EnrichmentStatus::Pending)
+        );
+        assert!(index.get_metadata(&uri).is_none());
+        assert!(index.get_artifacts(&uri).is_none());
+        assert!(index.get(&uri).is_none());
+        assert_eq!(
+            index.claim_enrichment(uri.clone(), ClosedProvenance::Dynamic),
+            ClaimEnrichment::AlreadyPending
+        );
+
+        index.abort_enrichment(&claim_a).expect("claim A abort");
+        let claim_b = match index.claim_enrichment(uri.clone(), ClosedProvenance::Dynamic) {
+            ClaimEnrichment::Claimed(claim) => claim,
+            other => panic!("expected replacement claim, got {other:?}"),
+        };
+        assert_ne!(claim_a.generation, claim_b.generation);
+        assert_eq!(
+            index.commit_enrichment(&claim_a, make_test_entry(0)),
+            Err(EnrichmentCommitError::StaleClaim)
+        );
+        assert_eq!(
+            index.abort_enrichment(&claim_a),
+            Err(EnrichmentCommitError::StaleClaim)
+        );
+        assert!(
+            index
+                .commit_enrichment(&claim_b, make_test_entry(0))
+                .expect("claim B commit")
+        );
+        assert_eq!(
+            index.enrichment_status(&uri),
+            Some(EnrichmentStatus::Complete)
+        );
+    }
+
+    #[test]
+    fn complete_refresh_token_is_per_record_and_invalidated_by_replacement() {
+        let index = WorkspaceIndex::new(make_test_config());
+        let target = test_uri("refresh-target.R");
+        index.insert(target.clone(), make_test_entry(0));
+        let token = match index.claim_enrichment(target.clone(), ClosedProvenance::Dynamic) {
+            ClaimEnrichment::AlreadyComplete(token) => token,
+            other => panic!("expected Complete token, got {other:?}"),
+        };
+
+        index.insert(test_uri("unrelated.R"), make_test_entry(0));
+        let mut refreshed = make_test_entry(0);
+        refreshed.contents = Rope::from_str("refreshed <- 1");
+        assert!(
+            index
+                .commit_complete_refresh(&token, refreshed)
+                .expect("unrelated mutation must not invalidate target token")
+        );
+
+        let stale = match index.claim_enrichment(target.clone(), ClosedProvenance::Dynamic) {
+            ClaimEnrichment::AlreadyComplete(token) => token,
+            other => panic!("expected replacement token, got {other:?}"),
+        };
+        index.replace_complete_metadata(
+            &target,
+            Arc::new(CrossFileMetadata {
+                working_directory: Some("/new-basis".to_string()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            index.commit_complete_refresh(&stale, make_test_entry(0)),
+            Err(EnrichmentCommitError::StaleRefresh)
+        );
+        assert_eq!(
+            index
+                .get_metadata(&target)
+                .unwrap()
+                .working_directory
+                .as_deref(),
+            Some("/new-basis")
+        );
+
+        let predecessor_token =
+            match index.claim_enrichment(target.clone(), ClosedProvenance::Dynamic) {
+                ClaimEnrichment::AlreadyComplete(token) => token,
+                other => panic!("expected predecessor token, got {other:?}"),
+            };
+        let replacement_index = WorkspaceIndex::new(make_test_config());
+        replacement_index.insert(target, make_test_entry(0));
+        assert_eq!(
+            replacement_index.commit_complete_refresh(&predecessor_token, make_test_entry(0)),
+            Err(EnrichmentCommitError::StaleRefresh),
+            "replacing the entire authority must not permit token ABA"
+        );
+    }
+
+    #[test]
+    fn dual_capacity_and_pins_preserve_artifact_only_complete() {
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 1,
+            max_file_size_bytes: 1024,
+        };
+        let index = WorkspaceIndex::new(config);
+        index.resize_artifacts(3);
+        let uris: Vec<_> = (0..3).map(|i| test_uri(&format!("cap{i}.R"))).collect();
+        for (i, uri) in uris.iter().enumerate() {
+            assert!(index.insert(uri.clone(), make_test_entry(i as u64)));
+        }
+
+        assert_eq!(index.artifact_uris().len(), 3);
+        assert_eq!(index.len(), 1);
+        let evicted_full = &uris[0];
+        assert!(index.get(evicted_full).is_none());
+        assert!(index.get_metadata(evicted_full).is_some());
+        assert!(index.get_artifacts(evicted_full).is_some());
+        assert!(index.is_complete(evicted_full));
+
+        let pinned = uris[2].clone();
+        index.resize_artifacts(1);
+        index.set_pinned_uris(HashSet::from([pinned.clone()]));
+        let newcomer = test_uri("newcomer.R");
+        assert!(index.insert(newcomer.clone(), make_test_entry(4)));
+        assert!(index.contains_artifacts(&pinned));
+        assert!(index.contains(&pinned));
+        assert!(index.contains_artifacts(&newcomer));
+        assert!(index.contains(&newcomer));
+    }
+
+    #[test]
+    fn artifact_eviction_cascades_to_matching_full_payload() {
+        let config = WorkspaceIndexConfig {
+            debounce_ms: 50,
+            max_files: 3,
+            max_file_size_bytes: 1024,
+        };
+        let index = WorkspaceIndex::new(config);
+        index.resize_artifacts(1);
+        let evicted = test_uri("artifact-victim.R");
+        let survivor = test_uri("artifact-survivor.R");
+        assert!(index.insert(evicted.clone(), make_test_entry(0)));
+        assert!(index.contains(&evicted));
+
+        assert!(index.insert(survivor.clone(), make_test_entry(1)));
+
+        assert!(!index.contains_artifacts(&evicted));
+        assert!(
+            !index.contains(&evicted),
+            "a full payload may never outlive its artifact authority"
+        );
+        assert!(index.is_complete(&survivor));
+        assert!(index.contains(&survivor));
+    }
+
+    #[test]
+    fn batch_replace_is_atomic_and_versioned_once() {
+        use std::sync::mpsc;
+
+        let index = Arc::new(WorkspaceIndex::new(make_test_config()));
+        let uri = test_uri("batch.R");
+        assert!(index.insert(uri.clone(), make_test_entry(0)));
+        let before = index.version();
+
+        let state_guard = index.inner.write().expect("authority lock");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = {
+            let index = index.clone();
+            let uri = uri.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx.send(index.get_complete_views(&uri)).unwrap();
+            })
+        };
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "reader must block while the atomic authority lock is held"
+        );
+        drop(state_guard);
+        assert!(done_rx.recv().unwrap().is_some());
+        reader.join().unwrap();
+
+        index
+            .replace_all_complete(
+                Vec::new(),
+                vec![(
+                    uri.clone(),
+                    make_test_entry(1),
+                    ClosedProvenance::WorkspaceScan { generation: 7 },
+                )],
+                HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(index.version(), before + 1);
+        let (artifact, full, _) = index.get_complete_views(&uri).unwrap();
+        let full = full.unwrap();
+        assert!(Arc::ptr_eq(&artifact.metadata, &full.metadata));
+        assert!(Arc::ptr_eq(&artifact.artifacts, &full.artifacts));
+    }
+
+    #[test]
+    fn racing_batch_observers_see_only_old_or_new_sets() {
+        let index = Arc::new(WorkspaceIndex::new(make_test_config()));
+        let old = [test_uri("old-a.R"), test_uri("old-b.R")];
+        let new = [test_uri("new-a.R"), test_uri("new-b.R")];
+        index
+            .replace_all_complete(
+                Vec::new(),
+                old.iter()
+                    .cloned()
+                    .map(|uri| (uri, make_test_entry(0), ClosedProvenance::Dynamic))
+                    .collect(),
+                HashSet::new(),
+            )
+            .unwrap();
+
+        let writer_index = index.clone();
+        let old_writer = old.clone();
+        let new_writer = new.clone();
+        let writer = std::thread::spawn(move || {
+            for generation in 0..500 {
+                let selected = if generation % 2 == 0 {
+                    &new_writer
+                } else {
+                    &old_writer
+                };
+                writer_index
+                    .replace_all_complete(
+                        Vec::new(),
+                        selected
+                            .iter()
+                            .cloned()
+                            .map(|uri| {
+                                (
+                                    uri,
+                                    make_test_entry(generation),
+                                    ClosedProvenance::WorkspaceScan { generation },
+                                )
+                            })
+                            .collect(),
+                        HashSet::new(),
+                    )
+                    .unwrap();
+            }
+        });
+
+        let old: HashSet<_> = old.into_iter().collect();
+        let new: HashSet<_> = new.into_iter().collect();
+        for _ in 0..2_000 {
+            let observed: HashSet<_> = index
+                .authority_snapshot()
+                .artifacts
+                .into_iter()
+                .map(|(uri, _)| uri)
+                .collect();
+            assert!(
+                observed == old || observed == new,
+                "batch observer saw a torn authority set: {observed:?}"
+            );
+        }
+        writer.join().unwrap();
     }
 
     #[test]
@@ -1760,6 +3039,7 @@ mod tests {
             contents: Rope::from_str("x <- 1"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: FileSnapshot {
                 mtime: SystemTime::UNIX_EPOCH,
                 size: 6,

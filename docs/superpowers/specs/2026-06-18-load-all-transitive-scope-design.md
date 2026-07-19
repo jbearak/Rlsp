@@ -272,7 +272,7 @@ Goto on an internal function exposed by `load_all()` (e.g. `my_func()` in a
 caller, callee, the `load_all()` file itself, or another `R/` file in dev-context)
 should navigate to its real definition in the package's `R/` source. This works
 **without adding any location data to `PackageScopeContribution`** — the package's
-`R/` files are already in the workspace index (`workspace_index_new`) with real
+`R/` files are already in the workspace index (`workspace_index`) with real
 `ScopedSymbol` locations, and the goto handler already has a workspace-index
 fallback (`handlers.rs` ~20516).
 

@@ -46,16 +46,9 @@ fn main() {
     // ── Phase 1: scan_workspace (cold filesystem) ──
     eprintln!("\n=== Phase 1: scan_workspace (cold) ===");
     let t0 = Instant::now();
-    let (index, cross_file_entries, new_index_entries) =
-        scan_workspace(std::slice::from_ref(&workspace_url), 20);
+    let entries = scan_workspace(std::slice::from_ref(&workspace_url), 20);
     let scan_time = t0.elapsed();
-    eprintln!(
-        "  {:?} ({} files, {} cross-file entries, {} new index)",
-        scan_time,
-        index.len(),
-        cross_file_entries.len(),
-        new_index_entries.len(),
-    );
+    eprintln!("  {:?} ({} files)", scan_time, entries.len(),);
 
     // ── Phase 2: apply_workspace_index ──
     eprintln!("\n=== Phase 2: apply_workspace_index ===");
@@ -66,7 +59,7 @@ fn main() {
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
     state.cross_file_config.out_of_scope_severity =
         Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
-    state.apply_workspace_index(index, cross_file_entries, new_index_entries);
+    state.apply_workspace_index(entries);
     let apply_time = t1.elapsed();
     eprintln!("  {:?}", apply_time);
     eprintln!(
@@ -80,10 +73,7 @@ fn main() {
     let (build_dur, diag_dur, _diag_count) = if data_path.exists() {
         let data_uri = Url::from_file_path(&data_path).unwrap();
         let data_content = std::fs::read_to_string(&data_path).expect("read data.r");
-        state.documents.insert(
-            data_uri.clone(),
-            Document::new_with_uri(&data_content, None, &data_uri),
-        );
+        state.open_document(data_uri.clone(), &data_content, None);
         let result = diagnostics_via_snapshot_profile(&state, &data_uri, &DiagCancelToken::never());
         eprintln!("  snapshot build:      {:?}", result.0);
         eprintln!("  diagnostics compute: {:?}", result.1);
@@ -118,9 +108,7 @@ fn main() {
                 continue;
             }
         };
-        state
-            .documents
-            .insert(uri.clone(), Document::new_with_uri(&content, None, &uri));
+        state.open_document(uri.clone(), &content, None);
         let (b, d, c) = diagnostics_via_snapshot_profile(&state, &uri, &DiagCancelToken::never());
         eprintln!(
             "  {:50} build={:>7.2}ms  diag={:>7.2}ms  total={:>7.2}ms  diags={}",
@@ -135,7 +123,7 @@ fn main() {
     // ── Phase 4: scan_workspace (warm filesystem) ──
     eprintln!("\n=== Phase 4: scan_workspace (warm) ===");
     let t4 = Instant::now();
-    let (index2, _, _) = scan_workspace(std::slice::from_ref(&workspace_url), 20);
+    let index2 = scan_workspace(std::slice::from_ref(&workspace_url), 20);
     let scan_warm_time = t4.elapsed();
     eprintln!("  {:?} ({} files)", scan_warm_time, index2.len());
 

@@ -16,8 +16,7 @@ use tower_lsp::lsp_types::Url;
 use crate::cross_file::file_cache::CrossFileFileCache;
 use crate::cross_file::scope::{self, ScopeArtifacts};
 use crate::cross_file::types::CrossFileMetadata;
-use crate::cross_file::workspace_index::CrossFileWorkspaceIndex;
-use crate::document_store::{DocumentState, DocumentStore};
+use crate::open_document_store::OpenDocumentStore;
 use crate::state::{Document, OpenDocumentAliases};
 use crate::workspace_index::WorkspaceIndex;
 
@@ -56,7 +55,7 @@ pub trait ContentProvider: Send + Sync {
     /// Check if URI exists in cache (no I/O)
     ///
     /// Returns true if the URI is available in any cached source
-    /// (DocumentStore, WorkspaceIndex, or file cache) without
+    /// (open-document authority, WorkspaceIndex, or file cache) without
     /// performing any filesystem I/O.
     fn exists_cached(&self, uri: &Url) -> bool;
 
@@ -103,24 +102,157 @@ pub trait AsyncContentProvider: ContentProvider {
 // Default Content Provider
 // ============================================================================
 
-/// Default content provider using DocumentStore and WorkspaceIndex
+/// Minimal read-only projection needed from the sole open-document authority.
+///
+pub trait OpenDocumentsView: Send + Sync {
+    fn document(&self, uri: &Url) -> Option<&Document>;
+    fn content(&self, uri: &Url) -> Option<String>;
+    fn metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>>;
+    fn artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>>;
+    fn contains(&self, uri: &Url) -> bool;
+}
+
+impl OpenDocumentsView for OpenDocumentStore {
+    fn document(&self, uri: &Url) -> Option<&Document> {
+        self.get(uri)
+    }
+
+    fn content(&self, uri: &Url) -> Option<String> {
+        self.get(uri).map(Document::text)
+    }
+
+    fn metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
+        self.get_record(uri).map(|record| record.metadata().clone())
+    }
+
+    fn artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
+        self.get_record(uri)
+            .map(|record| record.artifacts().clone())
+    }
+
+    fn contains(&self, uri: &Url) -> bool {
+        self.contains_key(uri)
+    }
+}
+
+impl OpenDocumentsView for HashMap<Url, Document> {
+    fn document(&self, uri: &Url) -> Option<&Document> {
+        self.get(uri)
+    }
+
+    fn content(&self, uri: &Url) -> Option<String> {
+        self.get(uri).map(Document::text)
+    }
+
+    fn metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
+        self.get(uri).map(|document| {
+            Arc::new(crate::cross_file::extract_metadata(
+                &document.analysis_text(),
+            ))
+        })
+    }
+
+    fn artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
+        let document = self.get(uri)?;
+        let tree = document.tree.as_ref()?;
+        let analysis_text = document.analysis_text();
+        let metadata = crate::cross_file::extract_metadata(&analysis_text);
+        Some(Arc::new(scope::compute_artifacts_with_metadata(
+            uri,
+            tree,
+            &analysis_text,
+            Some(&metadata),
+        )))
+    }
+
+    fn contains(&self, uri: &Url) -> bool {
+        self.contains_key(uri)
+    }
+}
+
+#[cfg(test)]
+struct TestOpenDocuments {
+    records: OpenDocumentStore,
+}
+
+#[cfg(test)]
+impl TestOpenDocuments {
+    fn new() -> Self {
+        Self {
+            records: OpenDocumentStore::new(),
+        }
+    }
+
+    async fn open(&mut self, uri: Url, content: &str, version: i32) {
+        let document = Document::new_with_uri(content, Some(version), &uri);
+        let metadata = Arc::new(crate::cross_file::extract_metadata(
+            &document.analysis_text(),
+        ));
+        self.records.open(uri, document, metadata, None);
+    }
+
+    async fn update(
+        &mut self,
+        uri: &Url,
+        changes: Vec<tower_lsp::lsp_types::TextDocumentContentChangeEvent>,
+        version: i32,
+    ) {
+        let prepared = self
+            .records
+            .prepare_changes(uri, changes, version)
+            .expect("test document must be open");
+        let metadata = Arc::new(crate::cross_file::extract_metadata(
+            &prepared.document().analysis_text(),
+        ));
+        self.records
+            .commit_prepared_if_current(uri, prepared, metadata)
+            .expect("test update basis must be current");
+    }
+
+    fn close(&mut self, uri: &Url) {
+        self.records.close(uri);
+    }
+}
+
+#[cfg(test)]
+impl OpenDocumentsView for TestOpenDocuments {
+    fn document(&self, uri: &Url) -> Option<&Document> {
+        self.records.get(uri)
+    }
+
+    fn content(&self, uri: &Url) -> Option<String> {
+        self.records.get(uri).map(Document::text)
+    }
+
+    fn metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
+        self.records
+            .get_record(uri)
+            .map(|record| record.metadata().clone())
+    }
+
+    fn artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
+        self.records
+            .get_record(uri)
+            .map(|record| record.artifacts().clone())
+    }
+
+    fn contains(&self, uri: &Url) -> bool {
+        self.records.contains_key(uri)
+    }
+}
+
+/// Default content provider using open-document authority and WorkspaceIndex
 ///
 /// This implementation respects the open-docs-authoritative rule:
-/// 1. Check DocumentStore first (open docs are authoritative)
-/// 2. Check legacy documents HashMap (for migration compatibility)
-/// 3. Check WorkspaceIndex (closed files)
-/// 4. Check legacy workspace_index and cross_file_workspace_index (for migration compatibility)
-/// 5. Check file cache (no synchronous disk I/O)
+/// 1. Check open-document authority first (open docs are authoritative)
+/// 2. Check WorkspaceIndex (closed files)
+/// 3. Check file cache for content/existence (no synchronous disk I/O)
 ///
 /// **Validates: Requirements 7.2, 13.2, 14.1, 14.2, 14.3, 14.4**
 pub struct DefaultContentProvider<'a> {
-    document_store: &'a DocumentStore,
+    open_documents: &'a dyn OpenDocumentsView,
     workspace_index: &'a WorkspaceIndex,
     file_cache: &'a CrossFileFileCache,
-    // Legacy fields for migration compatibility
-    legacy_documents: Option<&'a HashMap<Url, Document>>,
-    legacy_workspace_index: Option<&'a HashMap<Url, Document>>,
-    legacy_cross_file_workspace_index: Option<&'a CrossFileWorkspaceIndex>,
     open_aliases: Option<&'a OpenDocumentAliases>,
 }
 
@@ -128,53 +260,38 @@ impl<'a> DefaultContentProvider<'a> {
     /// Create a new DefaultContentProvider
     ///
     /// # Arguments
-    /// * `document_store` - Reference to the DocumentStore for open documents
+    /// * `open-document authority` - Reference to the open-document authority for open documents
     /// * `workspace_index` - Reference to the WorkspaceIndex for closed files
     /// * `file_cache` - Reference to the CrossFileFileCache for disk file caching
     pub fn new(
-        document_store: &'a DocumentStore,
+        open_documents: &'a impl OpenDocumentsView,
         workspace_index: &'a WorkspaceIndex,
         file_cache: &'a CrossFileFileCache,
     ) -> Self {
         Self {
-            document_store,
+            open_documents,
             workspace_index,
             file_cache,
-            legacy_documents: None,
-            legacy_workspace_index: None,
-            legacy_cross_file_workspace_index: None,
             open_aliases: None,
         }
     }
 
-    /// Create a new DefaultContentProvider with legacy field support
-    ///
-    /// This constructor includes references to legacy fields for migration compatibility.
-    /// Use this during the migration period when both old and new fields are in use.
+    /// Create a provider that recognizes aliases of open documents.
     ///
     /// # Arguments
-    /// * `document_store` - Reference to the DocumentStore for open documents
+    /// * `open-document authority` - Reference to the open-document authority for open documents
     /// * `workspace_index` - Reference to the WorkspaceIndex for closed files
     /// * `file_cache` - Reference to the CrossFileFileCache for disk file caching
-    /// * `legacy_documents` - Reference to the legacy documents HashMap
-    /// * `legacy_workspace_index` - Reference to the legacy workspace_index HashMap
-    /// * `legacy_cross_file_workspace_index` - Reference to the legacy CrossFileWorkspaceIndex
-    pub fn with_legacy(
-        document_store: &'a DocumentStore,
+    pub fn with_aliases(
+        open_documents: &'a impl OpenDocumentsView,
         workspace_index: &'a WorkspaceIndex,
         file_cache: &'a CrossFileFileCache,
-        legacy_documents: &'a HashMap<Url, Document>,
-        legacy_workspace_index: &'a HashMap<Url, Document>,
-        legacy_cross_file_workspace_index: &'a CrossFileWorkspaceIndex,
         open_aliases: &'a OpenDocumentAliases,
     ) -> Self {
         Self {
-            document_store,
+            open_documents,
             workspace_index,
             file_cache,
-            legacy_documents: Some(legacy_documents),
-            legacy_workspace_index: Some(legacy_workspace_index),
-            legacy_cross_file_workspace_index: Some(legacy_cross_file_workspace_index),
             open_aliases: Some(open_aliases),
         }
     }
@@ -185,28 +302,15 @@ impl<'a> DefaultContentProvider<'a> {
             .and_then(|aliases| aliases.open_uris_for_canonical(uri))
     }
 
-    /// Project a value from the authoritative open-document sources.
-    ///
-    /// Lookup order is exact `DocumentStore`, exact legacy document, then each
-    /// canonical alias in registration order with `DocumentStore` before legacy.
+    /// Project a value from the authoritative open-document source.
     fn project_open_document<T>(
         &self,
         uri: &Url,
-        mut from_store: impl FnMut(&Url, &DocumentState) -> Option<T>,
-        mut from_legacy: impl FnMut(&Url, &Document) -> Option<T>,
+        mut project: impl FnMut(&dyn OpenDocumentsView, &Url) -> Option<T>,
     ) -> Option<T> {
         let alias_uris = self.open_alias_uris(uri).into_iter().flatten();
         for open_uri in std::iter::once(uri).chain(alias_uris) {
-            if let Some(doc) = self.document_store.get_without_touch(open_uri)
-                && let Some(value) = from_store(open_uri, doc)
-            {
-                return Some(value);
-            }
-            if let Some(doc) = self
-                .legacy_documents
-                .and_then(|documents| documents.get(open_uri))
-                && let Some(value) = from_legacy(open_uri, doc)
-            {
+            if let Some(value) = project(self.open_documents, open_uri) {
                 return Some(value);
             }
         }
@@ -218,82 +322,42 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// Get content for a URI (prefers open docs)
     ///
     /// Checks sources in order:
-    /// 1. DocumentStore (open docs are authoritative)
-    /// 2. Legacy documents HashMap (for migration compatibility)
-    /// 3. WorkspaceIndex (closed files)
-    /// 4. Legacy workspace_index (for migration compatibility)
-    /// 5. File cache (no synchronous disk I/O)
+    /// 1. open-document authority (open docs are authoritative)
+    /// 2. WorkspaceIndex (closed files)
+    /// 3. File cache (no synchronous disk I/O)
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_content(&self, uri: &Url) -> Option<String> {
-        if let Some(content) = self.project_open_document(
-            uri,
-            |_open_uri, doc| Some(doc.contents.to_string()),
-            |_open_uri, doc| Some(doc.text()),
-        ) {
+        if let Some(content) =
+            self.project_open_document(uri, |documents, open_uri| documents.content(open_uri))
+        {
             return Some(content);
         }
 
-        // 3. Check WorkspaceIndex
         if let Some(entry) = self.workspace_index.get(uri) {
             return Some(entry.contents.to_string());
         }
 
-        // 4. Check legacy workspace_index (for migration compatibility)
-        if let Some(legacy_ws) = self.legacy_workspace_index
-            && let Some(doc) = legacy_ws.get(uri)
-        {
-            return Some(doc.text());
-        }
-
-        // 5. Check file cache (no synchronous disk I/O)
+        // Check file cache (no synchronous disk I/O)
         self.file_cache.get(uri)
     }
 
     /// Get metadata for a URI
     ///
     /// Checks sources in order:
-    /// 1. DocumentStore (open docs are authoritative)
-    /// 2. Legacy documents HashMap (for migration compatibility)
-    /// 3. WorkspaceIndex (closed files)
-    /// 4. Legacy cross_file_workspace_index (for migration compatibility)
-    /// 5. Legacy workspace_index (for migration compatibility)
+    /// 1. open-document authority (open docs are authoritative)
+    /// 2. WorkspaceIndex (closed files)
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
-        // Legacy documents use analysis text (masked for Rmd/Quarto, raw
-        // otherwise) so metadata comes from chunk bodies and byte offsets stay
-        // consistent with downstream uses (#343).
-        if let Some(metadata) = self.project_open_document(
-            uri,
-            |_open_uri, doc| Some(doc.metadata.clone()),
-            |_open_uri, doc| {
-                let text = doc.analysis_text();
-                Some(Arc::new(crate::cross_file::extract_metadata(&text)))
-            },
-        ) {
+        if let Some(metadata) =
+            self.project_open_document(uri, |documents, open_uri| documents.metadata(open_uri))
+        {
             return Some(metadata);
         }
 
-        // 3. Check WorkspaceIndex
         if let Some(metadata) = self.workspace_index.get_metadata(uri) {
             return Some(metadata);
-        }
-
-        // 4. Check legacy cross_file_workspace_index (for migration compatibility)
-        if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index
-            && let Some(metadata) = legacy_cf_ws.get_metadata(uri)
-        {
-            return Some(metadata);
-        }
-
-        // 5. Check legacy workspace_index (for migration compatibility).
-        //    Analysis text (masked for Rmd/Quarto, raw otherwise) — see step 2.
-        if let Some(legacy_ws) = self.legacy_workspace_index
-            && let Some(doc) = legacy_ws.get(uri)
-        {
-            let text = doc.analysis_text();
-            return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
         }
 
         None
@@ -302,62 +366,19 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// Get artifacts for a URI
     ///
     /// Checks sources in order:
-    /// 1. DocumentStore (open docs are authoritative)
-    /// 2. Legacy documents HashMap (for migration compatibility)
-    /// 3. WorkspaceIndex (closed files)
-    /// 4. Legacy cross_file_workspace_index (for migration compatibility)
-    /// 5. Legacy workspace_index (for migration compatibility)
+    /// 1. open-document authority (open docs are authoritative)
+    /// 2. WorkspaceIndex (closed files)
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
-        // Legacy documents pair the tree with its analysis text (masked for
-        // Rmd/Quarto, raw otherwise) so artifact byte offsets stay aligned.
-        if let Some(artifacts) = self.project_open_document(
-            uri,
-            |_open_uri, doc| Some(doc.artifacts.clone()),
-            |open_uri, doc| {
-                let tree = doc.tree.as_ref()?;
-                let text = doc.analysis_text();
-                let metadata = crate::cross_file::extract_metadata(&text);
-                Some(Arc::new(scope::compute_artifacts_with_metadata(
-                    open_uri,
-                    tree,
-                    &text,
-                    Some(&metadata),
-                )))
-            },
-        ) {
+        if let Some(artifacts) =
+            self.project_open_document(uri, |documents, open_uri| documents.artifacts(open_uri))
+        {
             return Some(artifacts);
         }
 
-        // 3. Check WorkspaceIndex
         if let Some(artifacts) = self.workspace_index.get_artifacts(uri) {
             return Some(artifacts);
-        }
-
-        // 4. Check legacy cross_file_workspace_index (for migration compatibility)
-        if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index
-            && let Some(artifacts) = legacy_cf_ws.get_artifacts(uri)
-        {
-            return Some(artifacts);
-        }
-
-        // 5. Check legacy workspace_index (for migration compatibility).
-        //    Analysis text matches the tree's byte offsets (see step 2).
-        if let Some(legacy_ws) = self.legacy_workspace_index
-            && let Some(doc) = legacy_ws.get(uri)
-            && let Some(tree) = &doc.tree
-        {
-            let text = doc.analysis_text();
-            // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
-            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            let metadata = crate::cross_file::extract_metadata(&text);
-            return Some(Arc::new(scope::compute_artifacts_with_metadata(
-                uri,
-                tree,
-                &text,
-                Some(&metadata),
-            )));
         }
 
         None
@@ -370,15 +391,11 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// **Validates: Requirements 14.3**
     fn exists_cached(&self, uri: &Url) -> bool {
-        self.project_open_document(uri, |_open_uri, _doc| Some(()), |_open_uri, _doc| Some(()))
-            .is_some()
-            || self.workspace_index.contains(uri)
-            || self
-                .legacy_workspace_index
-                .is_some_and(|ws: &HashMap<Url, Document>| ws.contains_key(uri))
-            || self
-                .legacy_cross_file_workspace_index
-                .is_some_and(|cf_ws| cf_ws.contains(uri))
+        self.project_open_document(uri, |documents, open_uri| {
+            documents.contains(open_uri).then_some(())
+        })
+        .is_some()
+            || self.workspace_index.is_complete(uri)
             || self.file_cache.get(uri).is_some()
     }
 
@@ -388,8 +405,10 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// **Validates: Requirements 3.3, 7.1**
     fn is_open(&self, uri: &Url) -> bool {
-        self.project_open_document(uri, |_open_uri, _doc| Some(()), |_open_uri, _doc| Some(()))
-            .is_some()
+        self.project_open_document(uri, |documents, open_uri| {
+            documents.contains(open_uri).then_some(())
+        })
+        .is_some()
     }
 }
 
@@ -455,7 +474,6 @@ impl<'a> AsyncContentProvider for DefaultContentProvider<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document_store::DocumentStoreConfig;
     use crate::workspace_index::WorkspaceIndexConfig;
     use proptest::prelude::*;
     use std::sync::Arc;
@@ -600,11 +618,8 @@ mod tests {
     // DefaultContentProvider Tests
     // ========================================================================
 
-    fn make_test_document_store() -> DocumentStore {
-        DocumentStore::new(DocumentStoreConfig {
-            max_documents: 10,
-            max_memory_bytes: 10 * 1024 * 1024,
-        })
+    fn make_test_open_documents() -> TestOpenDocuments {
+        TestOpenDocuments::new()
     }
 
     fn make_test_workspace_index() -> WorkspaceIndex {
@@ -618,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_provider_open_doc_takes_precedence() {
         // Test that open documents take precedence over workspace index
-        let mut doc_store = make_test_document_store();
+        let mut doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
 
@@ -629,6 +644,7 @@ mod tests {
             contents: ropey::Rope::from_str("workspace_content"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 17,
@@ -653,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_provider_falls_back_to_workspace_index() {
         // Test that workspace index is used when document is not open
-        let doc_store = make_test_document_store();
+        let doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
 
@@ -664,6 +680,7 @@ mod tests {
             contents: ropey::Rope::from_str("workspace_content"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 17,
@@ -684,7 +701,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_provider_is_open() {
-        let mut doc_store = make_test_document_store();
+        let mut doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
 
@@ -701,12 +718,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_provider_open_lookup_precedence() {
-        let mut doc_store = make_test_document_store();
+        let mut doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
-        let mut legacy_documents = HashMap::new();
-        let legacy_workspace_index = HashMap::new();
-        let legacy_cross_file_workspace_index = CrossFileWorkspaceIndex::new();
         let mut open_aliases = OpenDocumentAliases::default();
 
         let canonical_uri = test_uri("canonical.R");
@@ -722,58 +736,28 @@ mod tests {
         doc_store
             .open(second_alias.clone(), "second store", 1)
             .await;
-        legacy_documents.insert(
-            canonical_uri.clone(),
-            Document::new("exact legacy", Some(1)),
-        );
-        legacy_documents.insert(first_alias.clone(), Document::new("first legacy", Some(1)));
-
-        let content = |doc_store: &DocumentStore, legacy_documents: &HashMap<Url, Document>| {
-            DefaultContentProvider::with_legacy(
+        let content = |doc_store: &TestOpenDocuments| {
+            DefaultContentProvider::with_aliases(
                 doc_store,
                 &workspace_index,
                 &file_cache,
-                legacy_documents,
-                &legacy_workspace_index,
-                &legacy_cross_file_workspace_index,
                 &open_aliases,
             )
             .get_content(&canonical_uri)
         };
 
-        assert_eq!(
-            content(&doc_store, &legacy_documents).as_deref(),
-            Some("exact store")
-        );
+        assert_eq!(content(&doc_store).as_deref(), Some("exact store"));
 
         doc_store.close(&canonical_uri);
-        assert_eq!(
-            content(&doc_store, &legacy_documents).as_deref(),
-            Some("exact legacy")
-        );
-
-        legacy_documents.remove(&canonical_uri);
-        assert_eq!(
-            content(&doc_store, &legacy_documents).as_deref(),
-            Some("first store")
-        );
+        assert_eq!(content(&doc_store).as_deref(), Some("first store"));
 
         doc_store.close(&first_alias);
-        assert_eq!(
-            content(&doc_store, &legacy_documents).as_deref(),
-            Some("first legacy")
-        );
-
-        legacy_documents.remove(&first_alias);
-        assert_eq!(
-            content(&doc_store, &legacy_documents).as_deref(),
-            Some("second store")
-        );
+        assert_eq!(content(&doc_store).as_deref(), Some("second store"));
     }
 
     #[tokio::test]
     async fn test_default_provider_exists_cached() {
-        let mut doc_store = make_test_document_store();
+        let mut doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
 
@@ -790,6 +774,7 @@ mod tests {
             contents: ropey::Rope::from_str("indexed"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 7,
@@ -822,7 +807,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_provider_get_metadata_open_doc_precedence() {
-        let mut doc_store = make_test_document_store();
+        let mut doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
 
@@ -835,6 +820,7 @@ mod tests {
             contents: ropey::Rope::from_str("content"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 7,
@@ -860,7 +846,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_provider_get_artifacts_open_doc_precedence() {
-        let mut doc_store = make_test_document_store();
+        let mut doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
 
@@ -885,6 +871,7 @@ mod tests {
             contents: ropey::Rope::from_str("workspace_func <- function() {}"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 31,
@@ -911,7 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_provider_async_check_existence_cached() {
-        let mut doc_store = make_test_document_store();
+        let mut doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
 
@@ -926,6 +913,7 @@ mod tests {
             contents: ropey::Rope::from_str("indexed"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 7,
@@ -953,7 +941,7 @@ mod tests {
         use std::io::Write;
         use tempfile::NamedTempFile;
 
-        let doc_store = make_test_document_store();
+        let doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
 
@@ -979,7 +967,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_provider_async_exists_single() {
-        let mut doc_store = make_test_document_store();
+        let mut doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
 
@@ -994,7 +982,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_provider_content_not_found() {
-        let doc_store = make_test_document_store();
+        let doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
 
@@ -1014,8 +1002,8 @@ mod tests {
     // Feature: workspace-index-consolidation, Property 1: Open Documents Are Authoritative
     // **Validates: Requirements 3.1, 3.2, 3.4**
     //
-    // Property: For any URI that exists in both DocumentStore and WorkspaceIndex,
-    // the ContentProvider SHALL always return data from DocumentStore.
+    // Property: For any URI that exists in both open-document authority and WorkspaceIndex,
+    // the ContentProvider SHALL always return data from open-document authority.
 
     /// Strategy for generating valid R code content
     fn r_content_strategy() -> impl Strategy<Value = String> {
@@ -1052,6 +1040,7 @@ mod tests {
             contents: ropey::Rope::from_str(content),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: content.len() as u64,
@@ -1068,8 +1057,8 @@ mod tests {
 
         /// Property 1: Open Documents Are Authoritative
         ///
-        /// For any URI that exists in both DocumentStore and WorkspaceIndex,
-        /// the ContentProvider SHALL always return data from DocumentStore.
+        /// For any URI that exists in both open-document authority and WorkspaceIndex,
+        /// the ContentProvider SHALL always return data from open-document authority.
         ///
         /// **Validates: Requirements 3.1, 3.2, 3.4**
         #[test]
@@ -1083,7 +1072,7 @@ mod tests {
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let mut doc_store = make_test_document_store();
+                let mut doc_store = make_test_open_documents();
                 let workspace_index = make_test_workspace_index();
                 let file_cache = CrossFileFileCache::new();
 
@@ -1124,7 +1113,7 @@ mod tests {
         /// Property 1 extended: Open documents are authoritative for metadata
         ///
         /// When a document is open, get_metadata() must return metadata from
-        /// DocumentStore, not WorkspaceIndex.
+        /// open-document authority, not WorkspaceIndex.
         ///
         /// **Validates: Requirements 3.1, 3.2, 3.4**
         #[test]
@@ -1138,7 +1127,7 @@ mod tests {
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let mut doc_store = make_test_document_store();
+                let mut doc_store = make_test_open_documents();
                 let workspace_index = make_test_workspace_index();
                 let file_cache = CrossFileFileCache::new();
 
@@ -1151,6 +1140,7 @@ mod tests {
                     contents: ropey::Rope::from_str("x <- 1"),
                     tree: None,
                     loaded_packages: vec![],
+                    data_packages: vec![],
                     snapshot: crate::cross_file::file_cache::FileSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
                         size: 6,
@@ -1184,7 +1174,7 @@ mod tests {
         /// Property 1 extended: Open documents are authoritative for artifacts
         ///
         /// When a document is open, get_artifacts() must return artifacts from
-        /// DocumentStore, not WorkspaceIndex.
+        /// open-document authority, not WorkspaceIndex.
         ///
         /// **Validates: Requirements 3.1, 3.2, 3.4**
         #[test]
@@ -1199,7 +1189,7 @@ mod tests {
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let mut doc_store = make_test_document_store();
+                let mut doc_store = make_test_open_documents();
                 let workspace_index = make_test_workspace_index();
                 let file_cache = CrossFileFileCache::new();
 
@@ -1225,6 +1215,7 @@ mod tests {
                     contents: ropey::Rope::from_str(&index_content),
                     tree: None,
                     loaded_packages: vec![],
+                    data_packages: vec![],
                     snapshot: crate::cross_file::file_cache::FileSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
                         size: index_content.len() as u64,
@@ -1260,9 +1251,9 @@ mod tests {
 
         /// Property 1 extended: Consistency across all accessor methods
         ///
-        /// For any URI that exists in both DocumentStore and WorkspaceIndex,
+        /// For any URI that exists in both open-document authority and WorkspaceIndex,
         /// all accessor methods (get_content, get_metadata, get_artifacts)
-        /// must return data from the same source (DocumentStore).
+        /// must return data from the same source (open-document authority).
         ///
         /// **Validates: Requirements 3.1, 3.2, 3.4**
         #[test]
@@ -1280,7 +1271,7 @@ mod tests {
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let mut doc_store = make_test_document_store();
+                let mut doc_store = make_test_open_documents();
                 let workspace_index = make_test_workspace_index();
                 let file_cache = CrossFileFileCache::new();
 
@@ -1308,6 +1299,7 @@ mod tests {
                     contents: ropey::Rope::from_str(&index_content),
                     tree: None,
                     loaded_packages: vec![],
+                    data_packages: vec![],
                     snapshot: crate::cross_file::file_cache::FileSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
                         size: index_content.len() as u64,
@@ -1326,7 +1318,7 @@ mod tests {
                 // Create provider
                 let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
 
-                // INVARIANT: All accessors must return data from DocumentStore
+                // INVARIANT: All accessors must return data from open-document authority
 
                 // Check content
                 let content = provider.get_content(&uri).unwrap();
@@ -1352,7 +1344,7 @@ mod tests {
                     "Artifacts should contain open doc function"
                 );
 
-                // All three accessors returned data from DocumentStore - consistent!
+                // All three accessors returned data from open-document authority - consistent!
             });
         }
 
@@ -1369,7 +1361,7 @@ mod tests {
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let doc_store = make_test_document_store();
+                let doc_store = make_test_open_documents();
                 let workspace_index = make_test_workspace_index();
                 let file_cache = CrossFileFileCache::new();
 
@@ -1415,7 +1407,7 @@ mod tests {
         /// Property 8: Content Provider Consistency - Open Documents
         ///
         /// When a document is open, all accessor methods must return data
-        /// from the DocumentStore, ensuring consistency.
+        /// from the open-document authority, ensuring consistency.
         ///
         /// **Validates: Requirements 7.1, 7.2, 7.3**
         #[test]
@@ -1427,7 +1419,7 @@ mod tests {
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let mut doc_store = make_test_document_store();
+                let mut doc_store = make_test_open_documents();
                 let workspace_index = make_test_workspace_index();
                 let file_cache = CrossFileFileCache::new();
 
@@ -1491,7 +1483,7 @@ mod tests {
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let doc_store = make_test_document_store();
+                let doc_store = make_test_open_documents();
                 let workspace_index = make_test_workspace_index();
                 let file_cache = CrossFileFileCache::new();
 
@@ -1520,6 +1512,7 @@ mod tests {
                     contents: ropey::Rope::from_str(&content),
                     tree: None,
                     loaded_packages: vec![],
+                    data_packages: vec![],
                     snapshot: crate::cross_file::file_cache::FileSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
                         size: content.len() as u64,
@@ -1583,7 +1576,7 @@ mod tests {
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let doc_store = make_test_document_store();
+                let doc_store = make_test_open_documents();
                 let workspace_index = make_test_workspace_index();
                 let file_cache = CrossFileFileCache::new();
 
@@ -1634,7 +1627,7 @@ mod tests {
         ) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let mut doc_store = make_test_document_store();
+                let mut doc_store = make_test_open_documents();
                 let workspace_index = make_test_workspace_index();
                 let file_cache = CrossFileFileCache::new();
 
@@ -1668,6 +1661,7 @@ mod tests {
                     contents: ropey::Rope::from_str(&index_content),
                     tree: None,
                     loaded_packages: vec![],
+                    data_packages: vec![],
                     snapshot: crate::cross_file::file_cache::FileSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
                         size: index_content.len() as u64,
@@ -1711,7 +1705,7 @@ mod tests {
 
                 // INVARIANT: All accessors must use the same source
                 if expected_from_open {
-                    // All should come from DocumentStore
+                    // All should come from open-document authority
                     assert!(
                         content_from_open,
                         "Content should come from open doc when is_open=true"
@@ -1753,7 +1747,6 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::document_store::DocumentStoreConfig;
     use crate::workspace_index::WorkspaceIndexConfig;
 
     fn test_uri(name: &str) -> Url {
@@ -1766,10 +1759,7 @@ mod integration_tests {
     /// **Validates: Requirements 1.3, 1.4, 1.5, 3.4**
     #[tokio::test]
     async fn test_document_lifecycle() {
-        let mut doc_store = DocumentStore::new(DocumentStoreConfig {
-            max_documents: 10,
-            max_memory_bytes: 10 * 1024 * 1024,
-        });
+        let mut doc_store = TestOpenDocuments::new();
         let workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig {
             debounce_ms: 50,
             max_files: 100,
@@ -1829,6 +1819,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("workspace_func <- function() {}"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 31,
@@ -1854,7 +1845,7 @@ mod integration_tests {
     /// **Validates: Requirements 7.2, 13.2**
     #[tokio::test]
     async fn test_cross_file_resolution() {
-        let mut doc_store = DocumentStore::new(DocumentStoreConfig::default());
+        let mut doc_store = TestOpenDocuments::new();
         let workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig::default());
         let file_cache = CrossFileFileCache::new();
 
@@ -1880,6 +1871,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("helper_func <- function() {}"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 28,
@@ -1919,7 +1911,7 @@ mod integration_tests {
     /// **Validates: Requirements 14.2, 14.5**
     #[tokio::test]
     async fn test_async_existence_checking() {
-        let doc_store = DocumentStore::new(DocumentStoreConfig::default());
+        let doc_store = TestOpenDocuments::new();
         let workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig::default());
         let file_cache = CrossFileFileCache::new();
 
@@ -1932,6 +1924,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("x <- 1"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 6,
@@ -1960,7 +1953,7 @@ mod integration_tests {
     /// **Validates: Requirements 3.1, 3.2, 3.4**
     #[tokio::test]
     async fn test_open_docs_precedence() {
-        let mut doc_store = DocumentStore::new(DocumentStoreConfig::default());
+        let mut doc_store = TestOpenDocuments::new();
         let workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig::default());
         let file_cache = CrossFileFileCache::new();
 
@@ -1971,6 +1964,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("old_content"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 11,
@@ -2014,7 +2008,7 @@ mod integration_tests {
         use crate::cross_file::scope::{ScopeArtifacts, ScopeEvent, ScopedSymbol, SymbolKind};
         use crate::cross_file::types::DeclaredSymbol;
 
-        let doc_store = DocumentStore::new(DocumentStoreConfig::default());
+        let doc_store = TestOpenDocuments::new();
         let workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig::default());
         let file_cache = CrossFileFileCache::new();
 
@@ -2095,6 +2089,7 @@ mod integration_tests {
             ),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 50,
@@ -2163,7 +2158,7 @@ mod integration_tests {
         use crate::cross_file::scope::{ScopeArtifacts, ScopeEvent, ScopedSymbol, SymbolKind};
         use crate::cross_file::types::DeclaredSymbol;
 
-        let mut doc_store = DocumentStore::new(DocumentStoreConfig::default());
+        let mut doc_store = TestOpenDocuments::new();
         let workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig::default());
         let file_cache = CrossFileFileCache::new();
 
@@ -2209,6 +2204,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("# @lsp-var old_declared\nx <- 1"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 30,
@@ -2289,7 +2285,7 @@ mod integration_tests {
         use crate::cross_file::types::{CrossFileMetadata, DeclaredSymbol, ForwardSource};
         use std::collections::HashSet;
 
-        let mut doc_store = DocumentStore::new(DocumentStoreConfig::default());
+        let mut doc_store = TestOpenDocuments::new();
         let workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig::default());
         let file_cache = CrossFileFileCache::new();
 
@@ -2337,6 +2333,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("# @lsp-func child_declared\nz <- 3"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 35,

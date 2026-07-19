@@ -25,6 +25,9 @@ pub mod runiverse;
 
 #[cfg(test)]
 use std::cell::RefCell;
+use std::fs::File;
+use std::fs::Metadata;
+use std::io;
 use std::path::PathBuf;
 
 use crate::package_library::PackageInfo;
@@ -47,33 +50,169 @@ pub trait PackageMetadataProvider: Send + Sync {
     fn lookup(&self, name: &str) -> Option<PackageInfo>;
 }
 
+/// The result of loading a small metadata file through an already-open handle.
+///
+/// Keeping this seam here lets both on-disk provider formats share the same
+/// replacement-race contract without coupling either parser to platform file
+/// identity APIs.
+#[derive(Debug)]
+pub(crate) enum ThinFileLoadError<E> {
+    Absent,
+    Load(E),
+    Io(io::Error),
+    DeadlineExpired,
+    ConcurrentModification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThinFileIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    readonly: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
+    #[cfg(windows)]
+    file_attributes: u32,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
+}
+
+fn thin_file_identity(metadata: &Metadata) -> ThinFileIdentity {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt;
+
+    ThinFileIdentity {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        readonly: metadata.permissions().readonly(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        mode: metadata.mode(),
+        #[cfg(unix)]
+        change_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        change_nanoseconds: metadata.ctime_nsec(),
+        #[cfg(windows)]
+        volume_serial_number: metadata.volume_serial_number(),
+        #[cfg(windows)]
+        file_index: metadata.file_index(),
+        #[cfg(windows)]
+        file_attributes: metadata.file_attributes(),
+        #[cfg(windows)]
+        creation_time: metadata.creation_time(),
+        #[cfg(windows)]
+        last_write_time: metadata.last_write_time(),
+    }
+}
+
+/// Load a thin provider file from one opened handle and verify that the path
+/// still names those exact bytes before accepting the parsed value.
+///
+/// A replace-in-place race is retried once from a new handle. If the second
+/// attempt also races, callers receive a typed concurrent-modification result
+/// rather than accidentally publishing either stale or mixed metadata. Both
+/// attempts share the physical provider generation's original deadline; expiry
+/// suppresses the retry and is returned distinctly.
+pub(crate) fn load_thin_file_with_retry<T, E>(
+    path: &std::path::Path,
+    deadline: Option<std::time::Instant>,
+    mut load: impl FnMut(&File) -> Result<T, E>,
+) -> Result<T, ThinFileLoadError<E>> {
+    for attempt in 0..2 {
+        if deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
+            return Err(ThinFileLoadError::DeadlineExpired);
+        }
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ThinFileLoadError::Absent);
+            }
+            Err(error) => return Err(ThinFileLoadError::Io(error)),
+        };
+        let before = file
+            .metadata()
+            .map(|metadata| thin_file_identity(&metadata))
+            .map_err(ThinFileLoadError::Io)?;
+        let loaded = load(&file);
+        let handle_after = file
+            .metadata()
+            .map(|metadata| thin_file_identity(&metadata));
+        let path_after = std::fs::metadata(path).map(|metadata| thin_file_identity(&metadata));
+        let unchanged = matches!(
+            (&handle_after, &path_after),
+            (Ok(handle), Ok(current)) if handle == &before && current == &before
+        );
+        if unchanged {
+            return loaded.map_err(ThinFileLoadError::Load);
+        }
+        if attempt == 1 {
+            return Err(ThinFileLoadError::ConcurrentModification);
+        }
+    }
+    unreachable!("the thin-file loader performs exactly two attempts")
+}
+
 /// Resolve ordered `names.db` sidecar candidates.
 pub fn locate_shipped_db_candidates() -> Vec<PathBuf> {
-    locate_sidecar_candidates("RAVEN_NAMES_DB", "names.db")
+    locate_shipped_db_candidates_from(&capture_shipped_db_candidate_inputs())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ShippedDbCandidateInputs {
+    override_path: Option<std::ffi::OsString>,
+    user_data_dir: Option<PathBuf>,
+    current_exe: Option<PathBuf>,
+}
+
+pub(crate) fn capture_shipped_db_candidate_inputs() -> ShippedDbCandidateInputs {
+    ShippedDbCandidateInputs {
+        override_path: std::env::var_os("RAVEN_NAMES_DB"),
+        user_data_dir: user_data_dir(),
+        current_exe: std::env::current_exe().ok(),
+    }
+}
+
+pub(crate) fn locate_shipped_db_candidates_from(inputs: &ShippedDbCandidateInputs) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(path) = inputs
+        .override_path
+        .as_ref()
+        .filter(|path| !path.is_empty())
+    {
+        out.push(PathBuf::from(path));
+    }
+    if let Some(dir) = inputs.user_data_dir.as_ref() {
+        push_unique(&mut out, dir.join("names.db"));
+    }
+    if let Some(dir) = inputs.current_exe.as_ref().and_then(|path| path.parent()) {
+        push_unique(&mut out, dir.join("names.db"));
+    }
+    out
 }
 
 pub fn user_data_sidecar_path(file_name: &str) -> Option<PathBuf> {
     user_data_dir().map(|dir| dir.join(file_name))
-}
-
-/// Resolve sidecar candidates in precedence order: non-empty env override, user
-/// data sidecar, then executable-relative bundled sidecar.
-fn locate_sidecar_candidates(env_var: &str, file_name: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(p) = std::env::var(env_var)
-        && !p.is_empty()
-    {
-        out.push(PathBuf::from(p));
-    }
-    if let Some(p) = user_data_sidecar_path(file_name) {
-        push_unique(&mut out, p);
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        push_unique(&mut out, dir.join(file_name));
-    }
-    out
 }
 
 fn push_unique(out: &mut Vec<PathBuf>, path: PathBuf) {
@@ -215,6 +354,7 @@ impl Drop for NamesDbEnvGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[tokio::test]
     async fn sidecar_candidates_prefer_env_then_user_data_then_exe_relative() {
@@ -270,5 +410,70 @@ mod tests {
             unix_user_data_dir(None, Some("/home/me".into())),
             Some(PathBuf::from("/home/me/.local/share/raven"))
         );
+    }
+
+    #[test]
+    fn thin_file_loader_retries_one_opened_file_identity_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("thin.db");
+        std::fs::write(&path, "old").unwrap();
+        let mut attempts = 0;
+        let loaded = load_thin_file_with_retry(&path, None, |file| {
+            attempts += 1;
+            let mut value = String::new();
+            let mut file = file;
+            file.read_to_string(&mut value).unwrap();
+            if attempts == 1 {
+                std::fs::write(&path, "new-longer").unwrap();
+            }
+            Ok::<_, std::convert::Infallible>(value)
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 2);
+        assert_eq!(loaded, "new-longer");
+    }
+
+    #[test]
+    fn thin_file_loader_reports_typed_concurrent_modification_after_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("thin.db");
+        std::fs::write(&path, "initial").unwrap();
+        let mut attempts = 0;
+        let result = load_thin_file_with_retry(&path, None, |file| {
+            attempts += 1;
+            let mut value = String::new();
+            let mut file = file;
+            file.read_to_string(&mut value).unwrap();
+            std::fs::write(&path, "x".repeat(20 + attempts)).unwrap();
+            Ok::<_, std::convert::Infallible>(value)
+        });
+
+        assert_eq!(attempts, 2);
+        assert!(matches!(
+            result,
+            Err(ThinFileLoadError::ConcurrentModification)
+        ));
+    }
+
+    #[test]
+    fn thin_file_retry_stays_within_original_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("thin.db");
+        std::fs::write(&path, "initial").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let mut attempts = 0;
+        let result = load_thin_file_with_retry(&path, Some(deadline), |file| {
+            attempts += 1;
+            let mut value = String::new();
+            let mut file = file;
+            file.read_to_string(&mut value).unwrap();
+            std::fs::write(&path, "replacement-is-longer").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            Ok::<_, std::convert::Infallible>(value)
+        });
+
+        assert_eq!(attempts, 1, "expiry prevents the identity-race retry");
+        assert!(matches!(result, Err(ThinFileLoadError::DeadlineExpired)));
     }
 }

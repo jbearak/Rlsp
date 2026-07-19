@@ -7,7 +7,6 @@
 pub(crate) mod binding;
 pub mod cache;
 pub mod config;
-pub mod content_provider;
 pub mod dependency;
 pub mod directive;
 pub mod file_cache;
@@ -19,7 +18,6 @@ pub mod source_detect;
 pub mod standalone_cache;
 pub(crate) mod static_path;
 pub mod types;
-pub mod workspace_index;
 
 #[cfg(test)]
 mod property_tests;
@@ -29,7 +27,6 @@ pub mod integration_tests;
 
 pub use cache::*;
 pub use config::*;
-pub use content_provider::*;
 pub use dependency::*;
 pub use directive::*;
 pub use file_cache::*;
@@ -39,7 +36,6 @@ pub use revalidation::*;
 pub use scope::*;
 pub use source_detect::*;
 pub use types::*;
-pub use workspace_index::*;
 
 /// Extract cross-file metadata from R source by combining directive parsing with AST-detected `source()` and library-related calls.
 ///
@@ -115,7 +111,8 @@ pub fn analysis_text_for_kind(
 /// (the geometry-preserving [`crate::chunks::mask_to_r`] mask) and `None` for
 /// [`ChunkKind::R`](crate::chunks::ChunkKind::R), where analysis text equals raw
 /// text. This is the single masking chokepoint for `masked_text` fields:
-/// [`crate::state::Document`] and [`crate::document_store::DocumentStore`] both
+/// [`crate::state::Document`] and
+/// [`crate::open_document_store::OpenDocumentStore`] both
 /// route through it so their analysis views can never diverge.
 pub(crate) fn masked_analysis_text(
     chunk_kind: crate::chunks::ChunkKind,
@@ -125,25 +122,6 @@ pub(crate) fn masked_analysis_text(
         std::borrow::Cow::Owned(masked) => Some(masked),
         std::borrow::Cow::Borrowed(_) => None,
     }
-}
-
-/// Classify a `did_open`'d document by its editor `language_id`-then-URI and
-/// return its [`ChunkKind`](crate::chunks::ChunkKind) paired with the R-analysis
-/// view of `text` ([`analysis_text_for_kind`]).
-///
-/// This is the chokepoint for the `did_open` branches in `backend.rs`, which all
-/// classify the same way before extracting metadata and opening the
-/// `DocumentStore`. `language_id`-then-URI classification (not path-only) is what
-/// lets untitled `.Rmd`/`.qmd` buffers — which have no file extension — mask
-/// correctly (#343).
-pub(crate) fn classify_and_mask<'a>(
-    language_id: Option<&str>,
-    uri: &tower_lsp::lsp_types::Url,
-    text: &'a str,
-) -> (crate::chunks::ChunkKind, std::borrow::Cow<'a, str>) {
-    let chunk_kind = crate::chunks::classify_chunk_document_for(language_id, uri.path());
-    let analysis_text = analysis_text_for_kind(chunk_kind, text);
-    (chunk_kind, analysis_text)
 }
 
 /// Extract cross-file metadata from `content` using an already-resolved chunk
@@ -170,7 +148,7 @@ pub fn extract_metadata_for_kind(
 ///
 /// For non-Rmd files this is identical to [`extract_metadata`]. Use this at any
 /// site that extracts metadata from a path-identified file's *raw* content
-/// (file-cache fallbacks, on-demand indexing, legacy-document arms) so that
+/// (file-cache fallbacks and on-demand indexing) so that
 /// `.Rmd` / `.Rmarkdown` / `.qmd` files contribute outgoing edges from their
 /// chunks rather than spurious prose-derived ones (issue #343). State-aware
 /// closed-file callers should prefer

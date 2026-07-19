@@ -1648,6 +1648,7 @@ dependencies = [
  "tree-sitter-r",
  "url",
  "walkdir",
+ "winapi-util",
  "xdg",
 ]
 
@@ -2119,6 +2120,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

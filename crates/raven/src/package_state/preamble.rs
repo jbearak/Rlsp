@@ -118,6 +118,10 @@ impl PreambleScan {
     /// Conversely, when this returns false, [`apply_rescanned_preambles`] must
     /// change at least one keyed live entry because it replaces every rescanned
     /// key with this scan's corresponding entry.
+    #[allow(
+        dead_code,
+        reason = "retained as a keyed-rescan invariant probe for unit tests"
+    )]
     pub(crate) fn rescanned_match_inputs(
         &self,
         rescanned: &BTreeSet<PathBuf>,
@@ -182,6 +186,30 @@ pub(crate) fn scan_testthat_preambles_with_overrides_and_exclusions(
             workspace_url.as_ref(),
             overrides,
             exclusions,
+            true,
+        );
+    }
+    snapshot.into_scan()
+}
+
+/// Scan explicit preamble roots and their closures from a detached seed's
+/// captured text map without reopening missing or invalid paths from disk.
+pub(crate) fn scan_testthat_preambles_from_captured_texts_and_exclusions(
+    workspace_root: &Path,
+    preamble_paths: Vec<PathBuf>,
+    overrides: &PreambleTextOverrides,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> PreambleScan {
+    let mut snapshot = PreambleSnapshot::default();
+    let workspace_url = Url::from_file_path(workspace_root).ok();
+    for preamble_path in preamble_paths {
+        scan_preamble_into(
+            &mut snapshot,
+            preamble_path,
+            workspace_url.as_ref(),
+            overrides,
+            exclusions,
+            false,
         );
     }
     snapshot.into_scan()
@@ -256,6 +284,7 @@ pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
             workspace_url.as_ref(),
             overrides,
             exclusions,
+            true,
         );
     }
     (snapshot.into_scan(), affected_preambles)
@@ -272,6 +301,10 @@ pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
 /// The derived routing union is always rebuilt from the resulting *live* keyed
 /// state so concurrent updates to unrelated preambles participate in it.
 /// Returns whether any keyed field or the derived union changed.
+#[allow(
+    dead_code,
+    reason = "retained as a keyed-rescan invariant probe for unit tests"
+)]
 pub(crate) fn apply_rescanned_preambles(
     inputs: &mut super::PackageInputs,
     scan: PreambleScan,
@@ -359,15 +392,23 @@ fn scan_preamble_into(
     workspace_url: Option<&Url>,
     overrides: &PreambleTextOverrides,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    allow_disk_fallback: bool,
 ) {
     if !exclusions.is_empty() && exclusions.is_excluded_path(&preamble_path) {
         return;
     }
-    let Some(text) = read_source_with_overrides(&preamble_path, overrides) else {
+    let Some(text) = read_source_with_overrides(&preamble_path, overrides, allow_disk_fallback)
+    else {
         return;
     };
-    let (symbols, attached, sourced) =
-        scan_one_preamble(&preamble_path, text, workspace_url, overrides, exclusions);
+    let (symbols, attached, sourced) = scan_one_preamble(
+        &preamble_path,
+        text,
+        workspace_url,
+        overrides,
+        exclusions,
+        allow_disk_fallback,
+    );
     if !symbols.is_empty() {
         snapshot.symbols.insert(preamble_path.clone(), symbols);
     }
@@ -383,7 +424,11 @@ fn scan_preamble_into(
     }
 }
 
-fn read_source_with_overrides(path: &Path, overrides: &PreambleTextOverrides) -> Option<String> {
+fn read_source_with_overrides(
+    path: &Path,
+    overrides: &PreambleTextOverrides,
+    allow_disk_fallback: bool,
+) -> Option<String> {
     if let Some(text) = overrides.get(path) {
         return Some(text.to_string());
     }
@@ -391,7 +436,9 @@ fn read_source_with_overrides(path: &Path, overrides: &PreambleTextOverrides) ->
     if let Some(text) = overrides.get(&routing_path) {
         return Some(text.to_string());
     }
-    crate::state::read_source(path).ok()
+    allow_disk_fallback
+        .then(|| crate::state::read_source(path).ok())
+        .flatten()
 }
 
 /// Stable watcher-routing spelling for an existing or currently missing path.
@@ -427,10 +474,12 @@ fn scan_one_preamble(
     workspace_url: Option<&Url>,
     overrides: &PreambleTextOverrides,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    allow_disk_fallback: bool,
 ) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<PathBuf>) {
     let mut policy = PreambleClosurePolicy {
         overrides,
         exclusions,
+        allow_disk_fallback,
         symbols: BTreeSet::new(),
         attached: BTreeSet::new(),
     };
@@ -442,6 +491,7 @@ fn scan_one_preamble(
 struct PreambleClosurePolicy<'a> {
     overrides: &'a PreambleTextOverrides,
     exclusions: &'a crate::config_file::CompiledWorkspaceExclusions,
+    allow_disk_fallback: bool,
     symbols: BTreeSet<String>,
     attached: BTreeSet<String>,
 }
@@ -456,7 +506,7 @@ impl super::StaticSourceClosurePolicy for PreambleClosurePolicy<'_> {
     }
 
     fn read_source(&mut self, resolved: &Path) -> Option<String> {
-        read_source_with_overrides(resolved, self.overrides)
+        read_source_with_overrides(resolved, self.overrides, self.allow_disk_fallback)
     }
 
     fn harvest(&mut self, facts: &crate::cross_file::source_detect::StaticScriptFacts) {

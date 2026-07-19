@@ -679,10 +679,10 @@ pub struct NeighborhoodSubgraph {
     pub truncation: NeighborhoodTruncation,
 }
 
-/// Cap for the per-`DependencyGraph` cycle/subgraph caches. Sized to match
-/// the document_store default (4096) so workspaces large enough to fill
-/// `DocumentStore` get the same coverage; in long-lived sessions LRU
-/// eviction prevents unbounded growth as files come and go.
+/// Cap for the per-`DependencyGraph` cycle/subgraph caches.
+///
+/// Open documents are non-evictable; these derived caches stay independently
+/// bounded because misses only require recomputation, not loss of authority.
 const CYCLE_CACHE_CAPACITY: usize = 4096;
 const SUBGRAPH_CACHE_CAPACITY: usize = 4096;
 

@@ -113,8 +113,6 @@ fn measure_scan_phases(workspace: &Path) -> ScanPhaseTimings {
     let mut total_bytes = 0usize;
 
     let mut index: HashMap<Url, Document> = HashMap::new();
-    let mut cross_file: HashMap<Url, raven::cross_file::workspace_index::IndexEntry> =
-        HashMap::new();
     let mut new_index: HashMap<Url, new_workspace_index::IndexEntry> = HashMap::new();
 
     for path in &paths {
@@ -155,21 +153,13 @@ fn measure_scan_phases(workspace: &Path) -> ScanPhaseTimings {
         let xf_meta_arc: Arc<CrossFileMetadata> = Arc::new(xf_meta);
 
         let t = Instant::now();
-        cross_file.insert(
-            uri.clone(),
-            raven::cross_file::workspace_index::IndexEntry {
-                snapshot: snapshot.clone(),
-                metadata: xf_meta_arc.clone(),
-                artifacts: artifacts.clone(),
-                indexed_at_version: 0,
-            },
-        );
         new_index.insert(
             uri.clone(),
             new_workspace_index::IndexEntry {
                 contents: doc.contents.clone(),
                 tree: doc.tree.clone(),
                 loaded_packages: doc.loaded_packages.clone(),
+                data_packages: vec![],
                 snapshot,
                 metadata: xf_meta_arc,
                 artifacts,
@@ -200,13 +190,10 @@ fn make_state(workspace: &Path) -> WorldState {
     state
 }
 
-fn open_doc(state: &mut WorldState, path: &Path, rt: &tokio::runtime::Runtime) -> Url {
+fn open_doc(state: &mut WorldState, path: &Path, _rt: &tokio::runtime::Runtime) -> Url {
     let text = std::fs::read_to_string(path).unwrap();
     let uri = Url::from_file_path(path).unwrap();
-    rt.block_on(state.document_store.open(uri.clone(), &text, 1));
-    state
-        .documents
-        .insert(uri.clone(), Document::new_with_uri(&text, Some(1), &uri));
+    state.open_document_with_language_id(uri.clone(), &text, Some(1), Some("r"));
     uri
 }
 
@@ -303,13 +290,13 @@ fn main() {
     println!("[2] scan_workspace (end-to-end, includes dependency-graph buildup):");
     let folder = Url::from_file_path(&workspace).unwrap();
     let mut runs = Vec::new();
-    let mut last: Option<(usize, usize, usize)> = None;
+    let mut last: Option<usize> = None;
     for _ in 0..3 {
         let t = Instant::now();
-        let (index, cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
+        let entries = scan_workspace(std::slice::from_ref(&folder), 20);
         let elapsed = t.elapsed();
         runs.push(elapsed);
-        last = Some((index.len(), cf.len(), new_idx.len()));
+        last = Some(entries.len());
     }
     runs.sort();
     let median = runs[runs.len() / 2];
@@ -318,11 +305,8 @@ fn main() {
         "    runs: {:?}",
         runs.iter().map(|d| ms(*d)).collect::<Vec<_>>()
     );
-    if let Some((idx, cf, new_idx)) = last {
-        println!(
-            "    files: {}, cross_file_entries: {}, new_index: {}",
-            idx, cf, new_idx
-        );
+    if let Some(entries) = last {
+        println!("    index entries: {}", entries);
     }
     println!();
 
@@ -333,10 +317,10 @@ fn main() {
     let mut apply_runs = Vec::new();
     for _ in 0..3 {
         // Fresh scan each time so the inputs aren't moved
-        let (index, cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
+        let entries = scan_workspace(std::slice::from_ref(&folder), 20);
         let mut state = make_state(&workspace);
         let t = Instant::now();
-        state.apply_workspace_index(index, cf, new_idx);
+        state.apply_workspace_index(entries);
         apply_runs.push(t.elapsed());
     }
     apply_runs.sort();
@@ -442,8 +426,8 @@ fn main() {
     // Phase 6: scripts/data.r diagnostics — POST-scan (workspace index applied)
     // ------------------------------------------------------------------
     println!("[6] scripts/data.r diagnostics — POST-scan (workspace_scan_complete=true):");
-    let (index, cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
-    state.apply_workspace_index(index, cf, new_idx);
+    let entries = scan_workspace(std::slice::from_ref(&folder), 20);
+    state.apply_workspace_index(entries);
     // Warmup
     for _ in 0..3 {
         let _ = diagnostics_via_snapshot_profile(&state, &target_uri, &cancel);
@@ -588,7 +572,6 @@ fn main() {
                 .into_iter()
                 .map(|chunk| {
                     s.spawn(move || {
-                        let mut local_cf = HashMap::new();
                         let mut local_new = HashMap::new();
                         for p in chunk {
                             let Ok(text) = std::fs::read_to_string(p) else {
@@ -618,21 +601,13 @@ fn main() {
                                     &fs_meta, &text,
                                 );
                             let xf_meta_arc: Arc<CrossFileMetadata> = Arc::new(xf_meta);
-                            local_cf.insert(
-                                uri.clone(),
-                                raven::cross_file::workspace_index::IndexEntry {
-                                    snapshot: snap.clone(),
-                                    metadata: xf_meta_arc.clone(),
-                                    artifacts: artifacts.clone(),
-                                    indexed_at_version: 0,
-                                },
-                            );
                             local_new.insert(
                                 uri,
                                 new_workspace_index::IndexEntry {
                                     contents: doc.contents.clone(),
                                     tree: doc.tree.clone(),
                                     loaded_packages: doc.loaded_packages.clone(),
+                                    data_packages: vec![],
                                     snapshot: snap,
                                     metadata: xf_meta_arc,
                                     artifacts,
@@ -640,18 +615,15 @@ fn main() {
                                 },
                             );
                         }
-                        (local_cf, local_new)
+                        local_new
                     })
                 })
                 .collect();
             // Merge results serially after parallel work
-            let mut merged_cf: HashMap<Url, raven::cross_file::workspace_index::IndexEntry> =
-                HashMap::new();
             let mut merged_new: HashMap<Url, new_workspace_index::IndexEntry> = HashMap::new();
             for h in handles {
-                let (cf, new_idx) = h.join().expect("scan thread panicked");
-                merged_cf.extend(cf);
-                merged_new.extend(new_idx);
+                let entries = h.join().expect("scan thread panicked");
+                merged_new.extend(entries);
             }
         });
         t.elapsed()

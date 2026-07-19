@@ -780,11 +780,63 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 
 use std::sync::Mutex;
 
-type SysdataCache = Mutex<Option<(super::ContentDigest, BTreeSet<String>)>>;
+type SysdataCache = Mutex<
+    Option<(
+        crate::r_subprocess::RRuntimeIdentity,
+        super::ContentDigest,
+        BTreeSet<String>,
+    )>,
+>;
 
-/// Cached result of R-subprocess sysdata loading, keyed by file content digest.
+/// Cached result keyed by the exact R runtime and sysdata content identities.
 static SYSDATA_R_CACHE: std::sync::LazyLock<SysdataCache> =
     std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// Frozen byte identity of `R/sysdata.rda` consumed by detached fallback work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SysdataFileObservation {
+    Valid {
+        digest: super::ContentDigest,
+        bytes: std::sync::Arc<[u8]>,
+    },
+    Missing,
+    Invalid,
+}
+
+impl SysdataFileObservation {
+    pub(crate) fn capture(workspace_root: &Path) -> Self {
+        let path = workspace_root.join("R").join("sysdata.rda");
+        match fs::read(&path) {
+            Ok(bytes) if path.is_file() => Self::Valid {
+                digest: super::ContentDigest::of_bytes(&bytes),
+                bytes: bytes.into(),
+            },
+            Ok(_) => Self::Invalid,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            Err(_) => Self::Invalid,
+        }
+    }
+
+    pub(crate) fn is_current(&self, workspace_root: &Path) -> bool {
+        let current = Self::capture(workspace_root);
+        match (self, current) {
+            (
+                Self::Valid {
+                    digest: expected, ..
+                },
+                Self::Valid {
+                    digest: current, ..
+                },
+            ) => *expected == current,
+            (Self::Missing, Self::Missing) | (Self::Invalid, Self::Invalid) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Missing | Self::Invalid)
+    }
+}
 
 /// R fallback: load `R/sysdata.rda` via an R subprocess and return `ls()` of
 /// the loaded environment. Called only when AST scanning found nothing AND
@@ -800,29 +852,48 @@ pub async fn load_sysdata_via_r(
     r_subprocess: &crate::r_subprocess::RSubprocess,
     workspace_root: &Path,
 ) -> BTreeSet<String> {
-    let sysdata_path = workspace_root.join("R").join("sysdata.rda");
-    if !sysdata_path.is_file() {
+    let observation = SysdataFileObservation::capture(workspace_root);
+    let SysdataFileObservation::Valid { digest, bytes } = observation else {
         return BTreeSet::new();
-    }
-
-    // Compute digest for caching
-    let digest = match fs::read(&sysdata_path) {
-        Ok(bytes) => super::ContentDigest::of_bytes(&bytes),
-        Err(_) => return BTreeSet::new(),
     };
+    load_frozen_sysdata_via_r(r_subprocess, digest, &bytes)
+        .await
+        .unwrap_or_default()
+}
 
+/// Load an immutable byte snapshot through R.
+///
+/// The temporary file ensures the subprocess cannot observe a rewrite of the
+/// workspace path between capture and `load()`. Callers must still revalidate
+/// their original [`SysdataFileObservation`] immediately before committing the
+/// derived package projection.
+pub(crate) async fn load_frozen_sysdata_via_r(
+    r_subprocess: &crate::r_subprocess::RSubprocess,
+    digest: super::ContentDigest,
+    bytes: &[u8],
+) -> Result<BTreeSet<String>, String> {
+    let runtime_identity = r_subprocess.runtime_identity();
     // Check cache
     if let Ok(guard) = SYSDATA_R_CACHE.lock()
-        && let Some((cached_digest, cached_symbols)) = guard.as_ref()
+        && let Some((cached_runtime, cached_digest, cached_symbols)) = guard.as_ref()
+        && cached_runtime == &runtime_identity
         && *cached_digest == digest
     {
-        return cached_symbols.clone();
+        return Ok(cached_symbols.clone());
     }
+
+    use std::io::Write;
+    let mut frozen = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    frozen
+        .as_file_mut()
+        .write_all(bytes)
+        .and_then(|_| frozen.as_file_mut().flush())
+        .map_err(|error| error.to_string())?;
 
     // Build R code. The path is workspace-derived, but filesystem paths can
     // legally contain `"`, `\`, and control characters, so escape it into a
     // safe R string literal rather than interpolating verbatim.
-    let sysdata_path_str = sysdata_path.to_string_lossy().replace('\\', "/");
+    let sysdata_path_str = frozen.path().to_string_lossy().replace('\\', "/");
     let escaped_path: String = sysdata_path_str
         .chars()
         .flat_map(|c| match c {
@@ -850,7 +921,7 @@ pub async fn load_sysdata_via_r(
         .await
     {
         Ok(stdout) => stdout,
-        Err(_) => return BTreeSet::new(),
+        Err(error) => return Err(error.to_string()),
     };
 
     let symbols: BTreeSet<String> = result
@@ -861,10 +932,10 @@ pub async fn load_sysdata_via_r(
 
     // Update cache
     if let Ok(mut guard) = SYSDATA_R_CACHE.lock() {
-        *guard = Some((digest, symbols.clone()));
+        *guard = Some((runtime_identity, digest, symbols.clone()));
     }
 
-    symbols
+    Ok(symbols)
 }
 
 #[cfg(test)]

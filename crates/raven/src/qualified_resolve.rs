@@ -2059,12 +2059,13 @@ mod tests {
             contents: doc.contents.clone(),
             tree: doc.tree.clone(),
             loaded_packages: doc.loaded_packages.clone(),
+            data_packages: vec![],
             snapshot,
             metadata,
             artifacts,
-            indexed_at_version: state.workspace_index_new.version(),
+            indexed_at_version: state.workspace_index.version(),
         };
-        assert!(state.workspace_index_new.insert(url.clone(), entry));
+        assert!(state.workspace_index.insert(url.clone(), entry));
         url
     }
 

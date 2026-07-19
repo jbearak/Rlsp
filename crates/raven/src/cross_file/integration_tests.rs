@@ -1931,13 +1931,13 @@ child_function <- function() {
 
     /// Regression test for workspace index population bug.
     ///
-    /// **Bug**: Workspace scan only populated legacy index, not cross-file index.
+    /// **Bug**: Workspace scan did not populate cross-file metadata.
     /// When files were closed, their symbols were not available for cross-file resolution.
     ///
     /// **Fix**: Modified scan_workspace to compute and store cross-file metadata.
     ///
     /// This test verifies that:
-    /// 1. Workspace indexing populates the cross_file_workspace_index
+    /// 1. Workspace indexing populates the closed-document authority
     /// 2. Closed files are found in the index
     /// 3. Symbols from closed files are available for cross-file resolution
     /// 4. Diagnostics do not show "undefined variable" errors for symbols from closed files
@@ -2052,10 +2052,10 @@ result2 <- process_data(my_data)
         );
         println!("  ✓ main.r sources both closed files");
 
-        println!("\nStep 3: Building dependency graph (populates cross-file index)");
+        println!("\nStep 3: Building dependency graph from closed-file metadata");
 
         // Build dependency graph
-        // The fix ensures that scan_workspace populates the cross-file index
+        // The fix ensures that scan_workspace populates cross-file metadata
         // so that closed files are available for cross-file resolution
         let graph = build_dependency_graph(&workspace).expect("Failed to build dependency graph");
 
@@ -2130,7 +2130,7 @@ result2 <- process_data(my_data)
         println!("  - Metadata from closed files is available");
         println!("  - Symbols from closed files would be available for resolution");
         println!("\nBug Fix Verified:");
-        println!("  Before: scan_workspace only populated legacy index");
+        println!("  Before: scan_workspace omitted cross-file metadata");
         println!("  After: scan_workspace computes and stores cross-file metadata");
         println!("  Result: Symbols from closed files are available for cross-file resolution");
     }

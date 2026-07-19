@@ -4,7 +4,6 @@
 // Caching structures with interior mutability for cross-file awareness
 //
 
-use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::RwLock;
 
@@ -16,55 +15,6 @@ use super::types::CrossFileMetadata;
 /// Convert a `usize` to `NonZeroUsize`, falling back to `default` if zero.
 pub(crate) fn non_zero_or(value: usize, default: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).unwrap_or(NonZeroUsize::new(default).unwrap())
-}
-
-/// Insert `(uri, entry)` into a URI-keyed `LruCache` while honoring a pin set.
-///
-/// Behavior:
-/// - If the URI already exists in the cache, value is replaced in place via
-///   `lru::push` — no eviction occurs and the pin set is not consulted.
-///   This keeps freshness updates and disk-driven replacement working for
-///   pinned URIs.
-/// - Otherwise, when at capacity, the LRU non-pinned entry is popped to
-///   make room. If every in-cache URI is pinned, the cache is resized to
-///   `len() + 1` rather than evicting a reachable neighbor.
-///
-/// Lock order: caller holds `guard` (`&mut LruCache`); this function
-/// acquires `pinned.read()` and holds the read guard across both the LRU
-/// search and the `pop` so a racing `pinned.write()` cannot install a pin
-/// on the chosen victim between selection and removal.
-///
-/// Poison recovery: if `pinned` is poisoned, the pin lookup is skipped
-/// and `push` runs unmodified — `lru` may evict a pinned entry, but the
-/// lock state is already unreliable so this is acceptable.
-pub(crate) fn pin_aware_push<V>(
-    guard: &mut LruCache<Url, V>,
-    pinned: &RwLock<HashSet<Url>>,
-    uri: Url,
-    entry: V,
-) {
-    let already_present = guard.contains(&uri);
-    let cap = guard.cap().get();
-    if !already_present
-        && guard.len() >= cap
-        && let Ok(p) = pinned.read()
-    {
-        let lru_unpinned = guard
-            .iter()
-            .rev()
-            .find(|(k, _)| !p.contains(*k))
-            .map(|(k, _)| k.clone());
-
-        if let Some(victim) = lru_unpinned {
-            guard.pop(&victim);
-        } else {
-            let new_cap = NonZeroUsize::new(guard.len() + 1).expect("len() + 1 is always non-zero");
-            guard.resize(new_cap);
-        }
-    }
-    // pinned.read() poisoned: fall through to push() — may evict a
-    // pinned entry, but the lock is already in a bad state.
-    guard.push(uri, entry);
 }
 
 /// Default capacity for the metadata cache

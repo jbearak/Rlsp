@@ -80,6 +80,15 @@ impl CrossFileRevalidationState {
         self.pending.read().unwrap().contains_key(uri)
     }
 
+    #[cfg(test)]
+    pub fn pending_generation_for_test(&self, uri: &Url) -> Option<u64> {
+        self.pending
+            .read()
+            .unwrap()
+            .get(uri)
+            .map(|(generation, _)| *generation)
+    }
+
     /// Cancel pending revalidation for a URI
     pub fn cancel(&self, uri: &Url) {
         let mut pending = self.pending.write().unwrap();

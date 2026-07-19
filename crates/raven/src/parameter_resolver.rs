@@ -389,28 +389,14 @@ pub fn resolve(
 /// resolution works even when the source file is not open in the editor.
 ///
 /// Priority order (matching the `content_provider` pattern):
-/// 1. Enriched open documents (`state.document_store`)
-/// 2. Legacy open documents (`state.documents`)
-/// 3. New workspace index (`state.workspace_index_new`)
-/// 4. Legacy workspace index (`state.workspace_index`)
-/// 5. File cache (`state.cross_file_file_cache`) — parse on demand
+/// 1. Authoritative open documents (`state.documents`)
+/// 2. New workspace index (`state.workspace_index`)
+/// 3. File cache (`state.cross_file_file_cache`) — parse on demand
 pub(crate) fn get_text_and_tree(
     state: &WorldState,
     uri: &Url,
 ) -> Option<(String, tree_sitter::Tree)> {
-    // 1. Enriched open documents (authoritative for open files). Return the
-    //    analysis text (masked for Rmd/Quarto, raw otherwise) so the caller's
-    //    byte-offset slices into `tree` align — `contents` is RAW and would
-    //    mis-slice (or panic on a non-UTF-8 boundary) for Rmd/Quarto docs (#343).
-    if let Some(doc) = state.document_store.get_without_touch(uri) {
-        if let Some(tree) = &doc.tree {
-            return Some((doc.analysis_text(), tree.clone()));
-        } else {
-            log::debug!("Document in document_store has no parsed tree: {}", uri);
-        }
-    }
-
-    // 2. Legacy open documents. Return the analysis text (masked for Rmd) so
+    // 1. Open documents. Return the analysis text (masked for Rmd) so
     //    the caller's byte-offset slices into `tree` align; identical to the
     //    raw text for plain R / JAGS / Stan.
     if let Some(doc) = state.documents.get(uri) {
@@ -421,33 +407,21 @@ pub(crate) fn get_text_and_tree(
         }
     }
 
-    // 3. New workspace index (indexed closed files). The entry's `tree` is
+    // 2. New workspace index (indexed closed files). The entry's `tree` is
     //    parsed from the masked analysis text for Rmd/Quarto (on-demand
     //    indexing), while `contents` is RAW — pair the tree with the masked
     //    analysis view so byte offsets align (#343).
-    if let Some(entry) = state.workspace_index_new.get(uri) {
+    if let Some(entry) = state.workspace_index.get(uri) {
         if let Some(tree) = &entry.tree {
             let raw = entry.contents.to_string();
             let text = state.analysis_text_for_uri(uri, &raw).into_owned();
             return Some((text, tree.clone()));
         } else {
-            log::debug!(
-                "Document in workspace_index_new has no parsed tree: {}",
-                uri
-            );
-        }
-    }
-
-    // 4. Legacy workspace index (analysis text, see step 2).
-    if let Some(doc) = state.workspace_index.get(uri) {
-        if let Some(tree) = &doc.tree {
-            return Some((doc.analysis_text(), tree.clone()));
-        } else {
             log::debug!("Document in workspace_index has no parsed tree: {}", uri);
         }
     }
 
-    // 5. File cache — content available but no pre-parsed tree; parse on demand.
+    // 3. File cache — content available but no pre-parsed tree; parse on demand.
     //    The cache stores RAW content; parse (and return) the masked analysis
     //    text for Rmd/Quarto so a closed `.Rmd` resolves chunk-defined symbols
     //    rather than failing closed, and the (text, tree) pair stays aligned
@@ -1400,6 +1374,7 @@ f(beta = 2)
             contents: lib_doc.contents.clone(),
             tree: lib_doc.tree.clone(),
             loaded_packages: lib_doc.loaded_packages.clone(),
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: SystemTime::UNIX_EPOCH,
                 size: lib_code.len() as u64,
@@ -1407,9 +1382,9 @@ f(beta = 2)
             },
             metadata: lib_metadata,
             artifacts: lib_artifacts,
-            indexed_at_version: state.workspace_index_new.version(),
+            indexed_at_version: state.workspace_index.version(),
         };
-        assert!(state.workspace_index_new.insert(lib_uri.clone(), entry));
+        assert!(state.workspace_index.insert(lib_uri.clone(), entry));
 
         // Build the dependency edge main.R -> lib.R via `source("lib.R")`.
         for (uri, code) in [(&main_uri, main_code), (&lib_uri, lib_code)] {
@@ -1480,6 +1455,7 @@ f(beta = 2)
             contents: lib_doc.contents.clone(),
             tree: lib_doc.tree.clone(),
             loaded_packages: lib_doc.loaded_packages.clone(),
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: SystemTime::UNIX_EPOCH,
                 size: lib_code.len() as u64,
@@ -1487,9 +1463,9 @@ f(beta = 2)
             },
             metadata: lib_metadata,
             artifacts: lib_artifacts,
-            indexed_at_version: state.workspace_index_new.version(),
+            indexed_at_version: state.workspace_index.version(),
         };
-        assert!(state.workspace_index_new.insert(lib_uri.clone(), entry));
+        assert!(state.workspace_index.insert(lib_uri.clone(), entry));
 
         for (uri, code) in [(&main_uri, main_code), (&lib_uri, lib_code)] {
             state.cross_file_graph.update_file(
@@ -2265,17 +2241,14 @@ mod property_tests {
     }
 
     #[tokio::test]
-    async fn get_text_and_tree_pairs_masked_tree_with_masked_text_document_store_arm() {
-        // DocumentStore arm (step 1): an open `.Rmd` whose chunk defines a
+    async fn get_text_and_tree_pairs_masked_tree_with_masked_text_open_record() {
+        // Open-record arm (step 1): an open `.Rmd` whose chunk defines a
         // function, reached via cross-file resolution. Before the fix this
         // returned RAW text paired with the masked tree, panicking on the
         // multibyte prose (or silently mis-slicing for ASCII prose).
         let uri = Url::parse("file:///doc.Rmd").unwrap();
         let mut state = WorldState::new();
-        state
-            .document_store
-            .open(uri.clone(), MULTIBYTE_RMD, 1)
-            .await;
+        state.open_document_with_language_id(uri.clone(), MULTIBYTE_RMD, Some(1), Some("rmd"));
 
         let params = extract_params_via_get_text_and_tree(&state, &uri);
         assert_eq!(
@@ -2287,7 +2260,7 @@ mod property_tests {
 
     #[tokio::test]
     async fn get_text_and_tree_pairs_masked_tree_with_masked_text_workspace_index_arm() {
-        // workspace_index_new arm (step 3): an on-demand-indexed (closed) `.Rmd`
+        // workspace_index arm (step 3): an on-demand-indexed (closed) `.Rmd`
         // pairs a masked `tree` with RAW `contents`. Mirror that construction
         // and confirm `get_text_and_tree` returns the masked analysis text so
         // the tree's byte offsets align.
@@ -2314,6 +2287,7 @@ mod property_tests {
             contents: ropey::Rope::from_str(MULTIBYTE_RMD),
             tree,
             loaded_packages: Vec::new(),
+            data_packages: vec![],
             snapshot: FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: MULTIBYTE_RMD.len() as u64,
@@ -2324,7 +2298,7 @@ mod property_tests {
             indexed_at_version: 0,
         };
         let state = WorldState::new();
-        state.workspace_index_new.insert(uri.clone(), entry);
+        state.workspace_index.insert(uri.clone(), entry);
 
         let params = extract_params_via_get_text_and_tree(&state, &uri);
         assert_eq!(

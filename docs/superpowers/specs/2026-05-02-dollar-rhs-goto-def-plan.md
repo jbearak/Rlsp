@@ -139,7 +139,7 @@ chain that `parameter_resolver::get_text_and_tree` already uses
 
 1. `state.document_store.get_without_touch(uri)` — enriched open documents.
 2. `state.documents.get(uri)` — legacy open documents.
-3. `state.workspace_index_new.get(uri)` — new workspace index.
+3. `state.workspace_index.get(uri)` — new workspace index.
 4. `state.workspace_index.get(uri)` — legacy workspace index.
 5. `state.cross_file_file_cache.get(uri)` + parse-on-demand via
    `parser_pool::with_parser`.

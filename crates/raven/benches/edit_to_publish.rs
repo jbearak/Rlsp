@@ -1,8 +1,9 @@
-// edit_to_publish.rs - End-to-end diagnostic update latency benchmark
+// edit_to_publish.rs - Diagnostic snapshot-computation benchmarks
 //
-// Simulates the per-file work that happens between `did_change` and
-// `publish_diagnostics` (snapshot build + diagnostic computation) under
-// realistic cross-file topologies:
+// Measures `diagnostics_via_snapshot` over a pre-populated `WorldState` under
+// realistic cross-file topologies. It does not run the `did_change` handler,
+// debounce, revalidation reservation, bounded publication scheduler, or client
+// send, so its historical `edit_to_publish` name is broader than what it times:
 //
 //   * `linear_chain_15` — linear `source()` chain of depth 15 (no fanout)
 //   * `fanout_30`       — 30 leaf files all source one shared "utility" file
@@ -10,9 +11,9 @@
 //
 // For each topology we measure the cost of producing diagnostics for the
 // edited file (`single_file`) and the cumulative cost of producing
-// diagnostics for the hub + every dependent serially (`hub_and_all_dependents`),
-// since that bounds the worst-case edit-to-publish latency when the runtime
-// or the lock serializes the dependent revalidations.
+// diagnostics for the hub + every dependent serially
+// (`hub_and_all_dependents`). The serial group is a synthetic computation
+// bound, not a model of Raven's bounded concurrent publication scheduler.
 //
 // Run with: cargo bench --features test-support --bench edit_to_publish
 
@@ -24,7 +25,7 @@ use tempfile::TempDir;
 use url::Url;
 
 use raven::handlers::{DiagCancelToken, diagnostics_via_snapshot};
-use raven::state::{Document, WorldState, scan_workspace};
+use raven::state::{WorldState, scan_workspace};
 
 // ---------------------------------------------------------------------------
 // Topology generators
@@ -129,10 +130,10 @@ fn write_mixed(dir: &Path, leaves: usize, chain_depth: usize) {
 // Workspace -> WorldState helper
 // ---------------------------------------------------------------------------
 
-/// Build a fully-populated `WorldState` mirroring the LSP at steady-state:
-/// each `.R` file is registered both in the `document_store` (where production
-/// caches artifacts) AND in the legacy `documents` HashMap (which `did_change`
-/// still maintains for backward compatibility), and the workspace scan is applied.
+/// Build a fully-populated `WorldState` mirroring the LSP at steady state:
+/// each `.R` file is installed in the authoritative `OpenDocumentStore` via
+/// `open_document_with_language_id`, then the workspace scan is applied. Open
+/// records remain authoritative when that closed-file projection is installed.
 fn build_state(workspace: &Path) -> (WorldState, Arc<Url>) {
     let mut state = WorldState::new();
     let folder_url = Url::from_file_path(workspace).unwrap();
@@ -146,23 +147,14 @@ fn build_state(workspace: &Path) -> (WorldState, Arc<Url>) {
         .collect();
     entries.sort();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-
     for path in &entries {
         let content = std::fs::read_to_string(path).unwrap();
         let uri = Url::from_file_path(path).unwrap();
-        // Cache artifacts in document_store (production hot path).
-        rt.block_on(state.document_store.open(uri.clone(), &content, 1));
-        state
-            .documents
-            .insert(uri.clone(), Document::new_with_uri(&content, Some(1), &uri));
+        state.open_document_with_language_id(uri.clone(), &content, Some(1), Some("r"));
     }
 
-    let (index, cross_file_entries, new_index_entries) =
-        scan_workspace(std::slice::from_ref(&folder_url), 20);
-    state.apply_workspace_index(index, cross_file_entries, new_index_entries);
+    let entries = scan_workspace(std::slice::from_ref(&folder_url), 20);
+    state.apply_workspace_index(entries);
 
     (state, Arc::new(folder_url))
 }
@@ -175,9 +167,10 @@ fn uri_of(workspace: &Path, name: &str) -> Url {
 // Benchmarks
 // ---------------------------------------------------------------------------
 
-/// Per-file synchronous diagnostic computation: matches the work done
-/// between `did_change` debounce expiry and `publish_diagnostics` for a
-/// single file (snapshot build + collectors + sync resolution).
+/// Per-file synchronous snapshot build, collection, and resolution.
+///
+/// This deliberately excludes handler, debounce, reservation, scheduling, and
+/// client-publication costs.
 fn bench_single_file(c: &mut Criterion) {
     let mut group = c.benchmark_group("edit_to_publish/single_file");
     group.sample_size(20);
@@ -302,9 +295,12 @@ fn bench_single_file(c: &mut Criterion) {
     group.finish();
 }
 
-/// Cumulative time to recompute diagnostics for the edited file *and* every
-/// open dependent serially. Bounds the worst-case time for "all diagnostics
-/// up-to-date" after editing the hub.
+/// Synthetic cumulative time to recompute diagnostics for the edited file
+/// *and* every open dependent serially.
+///
+/// Production publishes dependent revalidations through a bounded concurrent
+/// scheduler; this group isolates total computation rather than wall-clock
+/// edit-to-publication latency.
 fn bench_hub_and_all_dependents(c: &mut Criterion) {
     let mut group = c.benchmark_group("edit_to_publish/hub_and_all_dependents");
     group.sample_size(10);
