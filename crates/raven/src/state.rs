@@ -952,6 +952,14 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) watched_batch_fallback_after_updates_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) watched_final_handoff_test_capture: FinalHandoffCapture<WatchedFinalHandoffForTest>,
+    #[cfg(test)]
+    pub(crate) did_close_final_handoff_test_capture:
+        FinalHandoffCapture<Vec<AnalysisRevalidationTicketFingerprint>>,
+    #[cfg(test)]
+    pub(crate) close_resync_final_handoff_test_capture:
+        FinalHandoffCapture<Vec<CloseResyncConsumerForTest>>,
     /// Deterministic barrier after a config routing handoff is queued and
     /// before its tracked root waits for receiver acknowledgement.
     #[cfg(test)]
@@ -3141,6 +3149,156 @@ pub(crate) struct AnalysisRevalidationTicket {
     pub(crate) uri: Url,
     pub(crate) trigger: DiagnosticsTrigger,
     pub(crate) debounce_ms: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnalysisRevalidationTicketFingerprint {
+    pub(crate) uri: Url,
+    pub(crate) trigger: DiagnosticsTrigger,
+    pub(crate) debounce_ms: u64,
+}
+
+#[cfg(test)]
+impl From<&AnalysisRevalidationTicket> for AnalysisRevalidationTicketFingerprint {
+    fn from(ticket: &AnalysisRevalidationTicket) -> Self {
+        Self {
+            uri: ticket.uri.clone(),
+            trigger: ticket.trigger,
+            debounce_ms: ticket.debounce_ms,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WatchedFinalHandoffForTest {
+    pub(crate) reserved: Vec<AnalysisRevalidationTicketFingerprint>,
+    pub(crate) transferred: Vec<AnalysisRevalidationTicketFingerprint>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CloseResyncConsumerForTest {
+    Reserved(AnalysisRevalidationTicketFingerprint),
+    Affected(Url),
+}
+
+#[cfg(test)]
+impl CloseResyncConsumerForTest {
+    pub(crate) fn uri(&self) -> &Url {
+        match self {
+            Self::Reserved(ticket) => &ticket.uri,
+            Self::Affected(uri) => uri,
+        }
+    }
+}
+
+#[cfg(test)]
+struct FinalHandoffCaptureGate<T> {
+    payload: std::sync::Mutex<Option<T>>,
+    recorded: AtomicBool,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl<T> Default for FinalHandoffCaptureGate<T> {
+    fn default() -> Self {
+        Self {
+            payload: std::sync::Mutex::new(None),
+            recorded: AtomicBool::new(false),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+/// Test-only one-shot capture claimed by the handler invocation that was
+/// armed immediately before it started.
+///
+/// Claiming at the handler boundary, rather than writing a shared "latest"
+/// snapshot at finalization time, prevents unrelated setup or deferred work
+/// from overwriting or satisfying the target invocation's assertion.
+///
+/// A claim captures the first final handoff reached by that invocation,
+/// including its in-place CAS/package retries and deferred-routing tail.
+/// Empty payloads are valid. Separately spawned work, such as a delayed
+/// undecodable watched-file retry, belongs to a new invocation and does not
+/// inherit the claim. If cloned finalizers race, only the first records and
+/// pauses; later calls return without replacing the payload.
+#[cfg(test)]
+pub(crate) struct FinalHandoffCapture<T> {
+    armed: std::sync::Mutex<Option<Arc<FinalHandoffCaptureGate<T>>>>,
+}
+
+#[cfg(test)]
+impl<T> Default for FinalHandoffCapture<T> {
+    fn default() -> Self {
+        Self {
+            armed: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T> FinalHandoffCapture<T> {
+    pub(crate) fn arm(&self) -> FinalHandoffCaptureHandle<T> {
+        let gate = Arc::new(FinalHandoffCaptureGate::default());
+        let replaced = self.armed.lock().unwrap().replace(gate.clone());
+        assert!(
+            replaced.is_none(),
+            "a final-handoff capture is already armed"
+        );
+        FinalHandoffCaptureHandle { gate }
+    }
+
+    pub(crate) fn claim(&self) -> Option<FinalHandoffCaptureClaim<T>> {
+        self.armed
+            .lock()
+            .unwrap()
+            .take()
+            .map(|gate| FinalHandoffCaptureClaim { gate })
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct FinalHandoffCaptureClaim<T> {
+    gate: Arc<FinalHandoffCaptureGate<T>>,
+}
+
+#[cfg(test)]
+impl<T> FinalHandoffCaptureClaim<T> {
+    pub(crate) async fn record_and_pause(&self, payload: T) {
+        if self.gate.recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        *self.gate.payload.lock().unwrap() = Some(payload);
+        self.gate.arrived.notify_one();
+        self.gate.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct FinalHandoffCaptureHandle<T> {
+    gate: Arc<FinalHandoffCaptureGate<T>>,
+}
+
+#[cfg(test)]
+impl<T: Clone> FinalHandoffCaptureHandle<T> {
+    pub(crate) async fn wait_payload(&self) -> T {
+        loop {
+            if let Some(payload) = self.gate.payload.lock().unwrap().clone() {
+                return payload;
+            }
+            self.gate.arrived.notified().await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.gate.release.notify_one();
+    }
 }
 
 /// Exact unmarked diagnostic work carried across a multi-phase analysis
@@ -6281,6 +6439,12 @@ impl WorldState {
             #[cfg(test)]
             watched_batch_fallback_after_updates_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            watched_final_handoff_test_capture: FinalHandoffCapture::default(),
+            #[cfg(test)]
+            did_close_final_handoff_test_capture: FinalHandoffCapture::default(),
+            #[cfg(test)]
+            close_resync_final_handoff_test_capture: FinalHandoffCapture::default(),
             #[cfg(test)]
             config_system_file_post_send_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
