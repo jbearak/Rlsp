@@ -6419,10 +6419,8 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         // closures inside defaults are excluded by `containing_default_parameter`
         // and therefore follow the ordinary late-bound function path.
         let default_expression = containing_default_parameter(*usage_node).is_some();
-        let default_body_binding = default_expression
-            && containing_function_definition(*usage_node)
-                .and_then(function_body_node)
-                .is_some_and(|body| function_body_binds_name(body, text, name));
+        let default_body_binding =
+            default_expression && default_body_binding_precedes_force(*usage_node, text, name);
         let in_scope = if let Some(stream) = stream_opt.as_mut() {
             stream.advance_to(*usage_line, *usage_col);
             stream.is_visible(name)
@@ -6437,6 +6435,53 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 default_eof_symbols
                     .get(name.as_str())
                     .map(|symbol| &symbol.source_uri)
+            })
+            .flatten();
+        // A URI identifies the definition site inside the sourced file, but
+        // not the source() invocation that installed the surviving binding.
+        // Keep the latest call that made the name available (its pre-call
+        // scope lacks the name), including the exact position and target, then
+        // fail closed unless that target agrees with the EOF symbol. This
+        // preserves first-provider attribution for harmless repeated calls,
+        // while an intervening caller-side rm() makes the later call the new
+        // provider. The source metadata deliberately
+        // follows Raven's existing static load-time model for top-level calls;
+        // it does not add a separate conditional-control-flow approximation.
+        let default_eof_provider = default_expression
+            .then(|| {
+                let mut provider = None;
+                for (source, target) in source_calls.iter().zip(source_target_uris.iter()).rev() {
+                    if !source.inherits_symbols() {
+                        continue;
+                    }
+                    let Some(target_uri) = target.as_ref() else {
+                        continue;
+                    };
+                    if live_exports_cache
+                        .get(target_uri)
+                        .is_none_or(|exports| !exports.contains(name.as_str()))
+                    {
+                        continue;
+                    }
+
+                    match source_scope_symbols
+                        .get(&(source.line, source.column))
+                        .and_then(|symbols| symbols.get(name.as_str()))
+                    {
+                        // Re-sourcing the same provider does not establish new
+                        // availability; keep walking to the original call.
+                        Some(pre_source_uri) if pre_source_uri == target_uri => continue,
+                        // A local or different-file binding is an availability
+                        // barrier. Do not fall through to an older source whose
+                        // contribution was removed or overwritten.
+                        Some(_) => break,
+                        None => {
+                            provider = Some((target_uri, (source.line, source.column)));
+                            break;
+                        }
+                    }
+                }
+                provider.filter(|(target_uri, _)| Some(*target_uri) == default_eof_source_uri)
             })
             .flatten();
 
@@ -6503,15 +6548,14 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 continue;
             }
 
-            // A default is attributed only to the candidate whose target owns
-            // the rm-aware EOF binding. A pre-existing symbol at this call site
-            // still wins: this covers earlier providers and repeated calls to
-            // the same target without confusing URI equality with provenance.
+            // Defaults use the exact provider identity derived above rather
+            // than reapplying the ordinary per-candidate proxy below. URI plus
+            // call site distinguishes a provider re-established after rm()
+            // from an earlier invocation of the same target.
             if default_expression
-                && (default_eof_source_uri != Some(target_uri)
-                    || source_scope_symbols
-                        .get(&(source.line, source.column))
-                        .is_some_and(|symbols| symbols.contains_key(name.as_str())))
+                && default_eof_provider.is_none_or(|(provider_uri, provider_site)| {
+                    provider_uri != target_uri || provider_site != (source.line, source.column)
+                })
             {
                 continue;
             }
@@ -6529,7 +6573,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                     .unwrap_or(true), // No symbol record yet (will be brought by source) → still attribute
                 None => true, // Source not in pre-resolve map (e.g. doesn't inherit symbols)
             };
-            if !inherited {
+            if !default_expression && !inherited {
                 continue;
             }
 
@@ -8024,9 +8068,7 @@ fn default_expression_resolves_lazily(
         return true;
     }
 
-    containing_function_definition(node)
-        .and_then(function_body_node)
-        .is_some_and(|body| function_body_binds_name(body, text, name))
+    default_body_binding_precedes_force(node, text, name)
 }
 
 /// True when a usage inside a nested closure can resolve `name` from a later
@@ -8089,32 +8131,138 @@ fn containing_function_definition(node: Node) -> Option<Node> {
     None
 }
 
-fn function_body_binds_name(node: Node, text: &str, name: &str) -> bool {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "function_definition" {
-            continue;
-        }
+/// Whether the containing function proves that `name` is bound before the
+/// default promise containing `default_usage` can be forced.
+///
+/// A direct local assignment must be the first named body statement and its
+/// RHS must be one atomic self-evaluating literal. This narrow proof excludes
+/// branch/loop-local assignments, same-statement forcing, shadowable operators,
+/// and reflective forcing such as `get("formal")` before the assignment takes
+/// effect.
+/// Counting uncertain forms conservatively can retain a diagnostic, but cannot
+/// hide one when the promise may be forced first. A sibling formal default that
+/// names the owning formal also fails closed because forcing that sibling can
+/// transitively force this promise.
+fn default_body_binding_precedes_force(default_usage: Node, text: &str, name: &str) -> bool {
+    let Some(parameter) = containing_default_parameter(default_usage) else {
+        return false;
+    };
+    let Some(formal_name) = parameter_node_name(parameter, text) else {
+        return false;
+    };
+    let Some(function) = containing_function_definition(parameter) else {
+        return false;
+    };
+    let Some(body) = function_body_node(function) else {
+        return false;
+    };
 
-        if assignment_target_node(child)
-            .is_some_and(|target| target.kind() == "identifier" && node_text(target, text) == name)
-        {
-            return true;
-        }
-
-        if child.kind() == "for_statement"
-            && child
-                .child_by_field_name("variable")
-                .is_some_and(|var| var.kind() == "identifier" && node_text(var, text) == name)
-        {
-            return true;
-        }
-
-        if function_body_binds_name(child, text, name) {
-            return true;
-        }
+    if sibling_default_references_formal(function, parameter, text, formal_name) {
+        return false;
     }
-    false
+
+    let Some(binding_effect) = direct_body_assignment_effect(body, text, name) else {
+        return false;
+    };
+    !body_has_formal_reference_before(body, text, formal_name, binding_effect)
+}
+
+/// Effect byte of a proven first-statement local assignment to `name`.
+///
+/// Superassignment, parenthesized/nested assignments, and every RHS except one
+/// atomic self-evaluating literal fail closed. In particular, R operators are
+/// callable and shadowable, so even literal-looking `1 + 2` / `-1` expressions
+/// are not proof-safe. The assignment primitives themselves are assumed to keep
+/// their language-defined binding semantics, as elsewhere in the scope model.
+fn direct_body_assignment_effect(body: Node, text: &str, name: &str) -> Option<usize> {
+    fn assignment_effect(statement: Node, text: &str, name: &str) -> Option<usize> {
+        let target = assignment_target_node(statement)?;
+        let operator = statement.child_by_field_name("operator")?;
+        if !matches!(operator.kind(), "<-" | "=" | "->")
+            || target.kind() != "identifier"
+            || node_text(target, text) != name
+        {
+            return None;
+        }
+        let value = match operator.kind() {
+            "<-" | "=" => statement.child_by_field_name("rhs")?,
+            "->" => statement.child_by_field_name("lhs")?,
+            _ => return None,
+        };
+        matches!(
+            value.kind(),
+            "float"
+                | "integer"
+                | "complex"
+                | "string"
+                | "raw_string_literal"
+                | "true"
+                | "false"
+                | "null"
+                | "na"
+                | "inf"
+                | "nan"
+        )
+        .then_some(statement.end_byte())
+    }
+
+    if body.kind() == "binary_operator" {
+        return assignment_effect(body, text, name);
+    }
+    assignment_effect(body.named_child(0)?, text, name)
+}
+
+fn body_has_formal_reference_before(
+    node: Node,
+    text: &str,
+    formal_name: &str,
+    binding_effect: usize,
+) -> bool {
+    if node.start_byte() >= binding_effect {
+        return false;
+    }
+    if node.kind() == "identifier"
+        && node_text(node, text) == formal_name
+        && !is_structural_non_reference(node)
+    {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| body_has_formal_reference_before(child, text, formal_name, binding_effect))
+}
+
+/// Whether another formal's default refers to `formal_name`, which can force
+/// this promise transitively before a body reference to the owning formal.
+fn sibling_default_references_formal(
+    function: Node,
+    owning_parameter: Node,
+    text: &str,
+    formal_name: &str,
+) -> bool {
+    let Some(parameters) = function_parameters_node(function) else {
+        return false;
+    };
+    let mut cursor = parameters.walk();
+    parameters.named_children(&mut cursor).any(|parameter| {
+        if parameter.id() == owning_parameter.id() {
+            return false;
+        }
+        let Some(default) = parameter.child_by_field_name("default") else {
+            return false;
+        };
+        subtree_has_identifier(default, text, formal_name)
+    })
+}
+
+fn subtree_has_identifier(node: Node, text: &str, name: &str) -> bool {
+    if node.kind() == "identifier" && node_text(node, text) == name {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| subtree_has_identifier(child, text, name))
 }
 
 fn parameter_node_name<'a>(node: Node<'a>, text: &'a str) -> Option<&'a str> {
@@ -56855,7 +57003,7 @@ mod position_aware_tests {
         diagnostics_from_snapshot, goto_definition,
     };
     use crate::state::{Document, WorldState};
-    use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Url};
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Url};
 
     fn parse_r_code(code: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
@@ -56876,6 +57024,53 @@ mod position_aware_tests {
         let document = Document::new(content, None);
         state.documents.insert(uri.clone(), document);
         uri
+    }
+
+    fn default_source_diagnostics(
+        main_code: &str,
+        source_files: &[(&str, &str)],
+    ) -> Vec<Diagnostic> {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = None;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let mut files = vec![(main_uri.clone(), main_code)];
+        files.extend(source_files.iter().map(|(name, code)| {
+            (
+                Url::parse(&format!("file:///workspace/{name}")).unwrap(),
+                *code,
+            )
+        }));
+        for (uri, code) in files {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                &uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_uri).expect("build diagnostics snapshot");
+        diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+            .expect("produce diagnostics")
+    }
+
+    fn used_before_source_for<'a>(
+        diagnostics: &'a [Diagnostic],
+        name: &str,
+    ) -> Vec<&'a Diagnostic> {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.message.contains("is used before it's available")
+                    && diagnostic.message.contains(&format!("'{name}'"))
+            })
+            .collect()
     }
 
     #[test]
@@ -58610,6 +58805,40 @@ f()()
         assert!(used_before[0].message.contains("line 2"));
     }
 
+    #[test]
+    fn test_default_repeated_source_after_rm_attributes_second_provider() {
+        let diagnostics = default_source_diagnostics(
+            "f <- function(a = x) a\nsource(\"helpers.R\")\nrm(x)\nsource(\"helpers.R\")\n",
+            &[("helpers.R", "x <- 42\n")],
+        );
+        let used_before: Vec<_> = used_before_source_for(&diagnostics, "x")
+            .into_iter()
+            .filter(|diagnostic| diagnostic.range.start.line == 0)
+            .collect();
+        assert_eq!(
+            used_before.len(),
+            1,
+            "the post-rm invocation is the sole surviving availability provider: {diagnostics:?}"
+        );
+        assert!(used_before[0].message.contains("line 4"));
+    }
+
+    #[test]
+    fn test_default_local_rebind_is_barrier_to_removed_source_provider() {
+        let diagnostics = default_source_diagnostics(
+            "f <- function(a = x) a\nsource(\"helpers.R\")\nrm(x)\nx <- 1\nsource(\"helpers.R\")\n",
+            &[("helpers.R", "x <- 42\n")],
+        );
+        let default_diagnostics: Vec<_> = used_before_source_for(&diagnostics, "x")
+            .into_iter()
+            .filter(|diagnostic| diagnostic.range.start.line == 0)
+            .collect();
+        assert!(
+            default_diagnostics.is_empty(),
+            "the intervening caller-local binding must block fallback to the removed first source: {diagnostics:?}"
+        );
+    }
+
     /// A same-file top-level definition remains a valid late-bound default even
     /// when an intervening source target exports the same name. The source must
     /// not be blamed when the final default binding comes from this file.
@@ -58711,6 +58940,114 @@ source(\"helpers.R\")
                 .iter()
                 .map(|d| (d.message.clone(), d.range))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_body_binding_after_force_is_attributed() {
+        let diagnostics = default_source_diagnostics(
+            "f <- function(a = x) {\n  a\n  x <- 1\n}\nsource(\"helpers.R\")\n",
+            &[("helpers.R", "x <- 42\n")],
+        );
+        let used_before = used_before_source_for(&diagnostics, "x");
+        assert_eq!(
+            used_before.len(),
+            1,
+            "a later body assignment cannot satisfy an already-forced default: {diagnostics:?}"
+        );
+        assert!(used_before[0].message.contains("line 5"));
+    }
+
+    #[test]
+    fn test_default_parameter_nested_force_before_binding_is_attributed() {
+        let diagnostics = default_source_diagnostics(
+            "f <- function(a = x) {\n  g <- function() a\n  g()\n  x <- 1\n}\nsource(\"helpers.R\")\n",
+            &[("helpers.R", "x <- 42\n")],
+        );
+        assert_eq!(
+            used_before_source_for(&diagnostics, "x").len(),
+            1,
+            "a nested closure may force the promise before the later binding: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_assignment_rhs_force_is_attributed() {
+        let diagnostics = default_source_diagnostics(
+            "f <- function(a = x) {\n  x <- a\n}\nsource(\"helpers.R\")\n",
+            &[("helpers.R", "x <- 42\n")],
+        );
+        assert_eq!(
+            used_before_source_for(&diagnostics, "x").len(),
+            1,
+            "the assignment takes effect only after its RHS forces the promise: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_reflective_rhs_force_is_attributed() {
+        let diagnostics = default_source_diagnostics(
+            "f <- function(a = x) {\n  x <- get(\"a\")\n  a\n}\nsource(\"helpers.R\")\n",
+            &[("helpers.R", "x <- 42\n")],
+        );
+        assert_eq!(
+            used_before_source_for(&diagnostics, "x").len(),
+            1,
+            "a reflective RHS can force the promise before the assignment takes effect: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_reflective_call_before_binding_is_attributed() {
+        let diagnostics = default_source_diagnostics(
+            "f <- function(a = x) {\n  get(\"a\")\n  x <- 1\n  a\n}\nsource(\"helpers.R\")\n",
+            &[("helpers.R", "x <- 42\n")],
+        );
+        assert_eq!(
+            used_before_source_for(&diagnostics, "x").len(),
+            1,
+            "an earlier reflective call can force the promise before the binding: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_shadowable_operator_rhs_is_attributed() {
+        for code in [
+            "`+` <- function(e1, e2) get(\"a\", envir = parent.frame())\nf <- function(a = x) {\n  x <- 1 + 2\n  a\n}\nsource(\"helpers.R\")\n",
+            "`-` <- function(e1) get(\"a\", envir = parent.frame())\nf <- function(a = x) {\n  x <- -1\n  a\n}\nsource(\"helpers.R\")\n",
+        ] {
+            let diagnostics = default_source_diagnostics(code, &[("helpers.R", "x <- 42\n")]);
+            assert_eq!(
+                used_before_source_for(&diagnostics, "x").len(),
+                1,
+                "shadowable operator evaluation can force the promise before assignment: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_parameter_conditional_binding_is_not_proof() {
+        let diagnostics = default_source_diagnostics(
+            "f <- function(a = x) {\n  if (flag) x <- 1\n  a\n}\nsource(\"helpers.R\")\n",
+            &[("helpers.R", "x <- 42\n")],
+        );
+        assert_eq!(
+            used_before_source_for(&diagnostics, "x").len(),
+            1,
+            "a conditional binding may not execute before the promise is forced: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_sibling_default_force_is_attributed() {
+        let diagnostics = default_source_diagnostics(
+            "f <- function(a = x, b = a) {\n  b\n  x <- 1\n}\nsource(\"helpers.R\")\n",
+            &[("helpers.R", "x <- 42\n")],
+        );
+        assert_eq!(
+            used_before_source_for(&diagnostics, "x").len(),
+            1,
+            "forcing sibling default b can transitively force a before x is bound: {diagnostics:?}"
         );
     }
 
@@ -61049,6 +61386,38 @@ other_func <- function(y = still_missing) {
              Diagnostics: {:?}",
             undefined_var_diags
         );
+    }
+
+    #[test]
+    fn test_default_parameter_reflective_rhs_does_not_suppress_undefined() {
+        let names = undefined_variable_names("f <- function(a = x) { x <- get(\"a\"); a }\n");
+        assert!(
+            names.iter().any(|name| name == "x"),
+            "reflective RHS forcing must keep the default undefined: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_reflective_prefix_does_not_suppress_undefined() {
+        let names = undefined_variable_names("f <- function(a = x) { get(\"a\"); x <- 1; a }\n");
+        assert!(
+            names.iter().any(|name| name == "x"),
+            "an earlier reflective call must keep the default undefined: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_shadowable_operator_rhs_does_not_suppress_undefined() {
+        for code in [
+            "`+` <- function(e1, e2) get(\"a\", envir = parent.frame())\nf <- function(a = x) { x <- 1 + 2; a }\n",
+            "`-` <- function(e1) get(\"a\", envir = parent.frame())\nf <- function(a = x) { x <- -1; a }\n",
+        ] {
+            let names = undefined_variable_names(code);
+            assert!(
+                names.iter().any(|name| name == "x"),
+                "shadowable operator RHS must keep the default undefined: {names:?}"
+            );
+        }
     }
 
     #[test]

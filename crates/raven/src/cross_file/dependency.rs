@@ -956,6 +956,9 @@ impl DependencyGraph {
 
         // Collect directive edges first (they are authoritative)
         let mut directive_edges: Vec<DependencyEdge> = Vec::new();
+        // Relationship-only index for directive-vs-AST conflict detection.
+        // Edge storage is deliberately call-site-aware and is deduplicated by
+        // `GraphEdgeDedupKey` after conflict resolution.
         let mut directive_from_to: HashSet<DirectiveConflictIdentity> = HashSet::new();
 
         // Process forward directive sources (`# raven: source`, `# raven: run`, `# raven: include`)
@@ -1055,10 +1058,8 @@ impl DependencyGraph {
                     non_lending: false,
                 };
                 let pair = edge.directive_conflict_identity();
-                if !directive_from_to.contains(&pair) {
-                    directive_from_to.insert(pair);
-                    directive_edges.push(edge);
-                }
+                directive_from_to.insert(pair);
+                directive_edges.push(edge);
             }
         }
 
@@ -3588,6 +3589,45 @@ mod tests {
         let dependents = graph.get_dependents(&child);
         assert_eq!(dependents.len(), 1);
         assert_eq!(dependents[0].from, parent);
+    }
+
+    #[test]
+    fn test_backward_directives_preserve_distinct_call_sites() {
+        use super::super::types::{BackwardDirective, CallSiteSpec};
+
+        let mut graph = DependencyGraph::new();
+        let parent = Url::parse("file:///project/parent.R").unwrap();
+        let child = Url::parse("file:///project/sub/child.R").unwrap();
+        let meta = CrossFileMetadata {
+            sourced_by: vec![
+                BackwardDirective {
+                    path: "../parent.R".to_string(),
+                    call_site: CallSiteSpec::Line(10),
+                    directive_line: 0,
+                },
+                BackwardDirective {
+                    path: "../parent.R".to_string(),
+                    call_site: CallSiteSpec::Line(20),
+                    directive_line: 1,
+                },
+            ],
+            ..Default::default()
+        };
+
+        graph.update_file(&child, &meta, Some(&workspace_root()), |_| None);
+
+        let deps = graph.get_dependencies(&parent);
+        assert_eq!(deps.len(), 2);
+        assert_eq!(
+            deps.iter()
+                .map(|edge| edge.call_site_line)
+                .collect::<Vec<_>>(),
+            vec![Some(10), Some(20)]
+        );
+        assert!(
+            deps.iter()
+                .all(|edge| edge.is_directive && edge.is_backward_directive)
+        );
     }
 
     #[test]

@@ -1095,9 +1095,10 @@ fn list_directory_entries_with_canonical_workspace(
             },
         };
 
-        // Determine if this is a directory
+        // Follow symlink targets for directory classification. Workspace
+        // boundary status remains the separate canonical-target decision above.
         let is_directory = match entry.file_type() {
-            Ok(ft) => ft.is_dir(),
+            Ok(ft) => ft.is_dir() || ft.is_symlink() && path.is_dir(),
             Err(_) => {
                 // If we can't determine file type, try metadata as fallback
                 path.is_dir()
@@ -10723,6 +10724,97 @@ mod file_path_definition_tests {
             !labels.contains(&"shared.R".to_string()),
             "the excluded higher-precedence symlink must shadow the lower entry"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_nested_completion_external_directory_symlink_shadows_lower_entry() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let root = workspace.path();
+        let anchor = root.join("tests/testthat");
+        let nested = anchor.join("fixtures");
+        fs::create_dir_all(nested.join("shared")).unwrap();
+        fs::create_dir_all(external.path().join("shared-target")).unwrap();
+        symlink(external.path().join("shared-target"), anchor.join("shared")).unwrap();
+
+        let current = nested.join("test-nested.R");
+        fs::write(&current, "").unwrap();
+        let file_uri = Url::from_file_path(&current).unwrap();
+        let workspace_root = Url::from_file_path(root).unwrap();
+        let cursor = Position {
+            line: 0,
+            character: 8,
+        };
+        let context = FilePathContext::SourceCall {
+            partial_path: String::new(),
+            content_start: cursor,
+            is_sys_source: false,
+        };
+
+        let labels: Vec<_> = file_path_completions(
+            &context,
+            &file_uri,
+            &CrossFileMetadata::default(),
+            Some(&workspace_root),
+            cursor,
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect();
+
+        assert!(
+            !labels.contains(&"shared".to_string()),
+            "the excluded higher-precedence directory symlink must shadow the lower directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_completion_treats_internal_directory_symlink_as_folder() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TempDir::new().unwrap();
+        let root = workspace.path();
+        let anchor = root.join("tests/testthat");
+        let target = root.join("fixtures-target");
+        fs::create_dir_all(&anchor).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        symlink(&target, anchor.join("linked-fixtures")).unwrap();
+
+        let current = anchor.join("test-completion.R");
+        fs::write(&current, "").unwrap();
+        let file_uri = Url::from_file_path(&current).unwrap();
+        let workspace_root = Url::from_file_path(root).unwrap();
+        let cursor = Position {
+            line: 0,
+            character: 8,
+        };
+        let context = FilePathContext::SourceCall {
+            partial_path: String::new(),
+            content_start: cursor,
+            is_sys_source: false,
+        };
+
+        let completions = file_path_completions(
+            &context,
+            &file_uri,
+            &CrossFileMetadata::default(),
+            Some(&workspace_root),
+            cursor,
+        );
+        let linked = completions
+            .iter()
+            .find(|item| item.label == "linked-fixtures")
+            .expect("internal directory symlink should be completed");
+
+        assert_eq!(linked.kind, Some(CompletionItemKind::FOLDER));
+        let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &linked.text_edit else {
+            panic!("directory completion should carry a text edit");
+        };
+        assert_eq!(edit.new_text, "linked-fixtures/");
     }
 
     #[test]
