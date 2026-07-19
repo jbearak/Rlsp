@@ -273,11 +273,63 @@ Details:
 - **Union across calls.** Multiple `tar_option_set()` calls in one file union
   their `packages =` vectors. targets' real runtime semantics are
   last-call-wins, but raven deliberately favors false negatives here.
-- **Limitation: no `tar_source()`.** Raven only follows `source()` calls and
-  forward directives, so projects that load their function scripts via
-  `tar_source()` don't inherit the `tar_option_set` packages in those scripts
-  yet. A `# raven: source R/functions.R` directive (or a plain `source()`
-  call) in `_targets.R` restores the link.
+
+### targets::tar_source() Scripts
+
+Raven expands static `targets::tar_source()` calls and adds their `.R` / `.r`
+scripts to the same dependency and scope model as `source()`. The qualified
+`targets::` / `targets:::` spellings are recognized directly; the bare
+`tar_source()` spelling requires an unshadowed top-level targets attachment.
+`files =` may be a string, a non-empty literal character vector, or a
+single-assignment top-level variable holding one of those shapes. Directories
+are walked recursively in deterministic path order; hidden entries are skipped
+unless the hidden path itself was named explicitly. Ordering compares the
+relative path's platform bytes/code units, which approximates
+`sort(..., method = "radix")` under `LC_COLLATE=C`. Locale-specific collation
+and mixed-case/non-ASCII names can therefore execute in a different order in R;
+use consistently cased ASCII script names when sibling order matters.
+
+The scripts execute as one ordered batch. Each member sees `_targets.R` state
+from before the call plus the definitions, removals, and package attachments
+produced by earlier members. A later member replaces an earlier binding of the
+same name. A member never sees a later sibling. `change_directory = TRUE` is
+honored, including for ordinary `source()` calls nested inside a member.
+Packages from `tar_option_set(packages = ...)` and packages attached by earlier
+members flow through the same ordered environment.
+
+In the language server, workspace watcher events keep membership live:
+creating, deleting, or renaming a script under a finalized request refreshes
+the parent metadata, artifacts, dependency edges, and affected diagnostics
+without editing `_targets.R`. Missing candidate paths, case-corrected paths,
+and symlink targets remain watchable when their paths are covered by the
+editor's workspace watcher. External paths and symlink targets outside that
+coverage are refreshed on the next workspace refresh/reopen (and every fresh
+`raven check` run), not by an independent external watcher.
+
+Scope resolution carries each batch execution's derived working-directory
+context through ordinary nested `source()` calls, so repeated members can
+contribute different symbols in different contexts without creating
+occurrence-specific graph nodes. The dependency graph itself remains URI-keyed:
+for a nested call whose lexical target differs between executions,
+go-to-definition, missing-file checks, and edit-triggered revalidation use the
+single URI-global edge. Use distinct small wrapper scripts when those
+graph-backed features must distinguish the executions as well as scope does.
+
+Only statically determined calls participate. Dynamic `files =` expressions,
+computed `change_directory` values, and calls hidden in functions or quoted
+expressions are ignored. A missing literal path can become active after a
+workspace event, but an external missing path cannot be watched reliably.
+
+Finalized metadata and the dependency graph remain indexed by URI, not by
+execution occurrence. Consequently, a nested `tar_source()` batch in one
+physical script is finalized once under that URI's global metadata context;
+context-dependent forward directives and propagated `# raven: nse` /
+`# raven: func` facts likewise retain their URI-global graph behavior. Scope
+can carry the two-valued supplied-`PathContext` mode through ordinary nested
+`source()` calls, but it does not create a second metadata or graph identity.
+When separate executions truly need distinct nested batches, directives, NSE
+contracts, navigation, or edit revalidation, route them through distinct small
+wrapper/loader scripts so each execution has its own URI.
 
 ### Keeping Packages in Sync
 

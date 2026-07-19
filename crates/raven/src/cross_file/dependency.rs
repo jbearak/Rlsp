@@ -433,6 +433,12 @@ pub struct DependencyEdge {
     pub call_site_line: Option<u32>,
     /// 0-based UTF-16 column in parent where call occurs
     pub call_site_column: Option<u32>,
+    /// Ordered child index within one expanded `tar_source()` call.
+    ///
+    /// Together with the call site this disambiguates multiple executions
+    /// represented by the same R expression and makes reorder-only changes
+    /// visible to graph revision and dependent revalidation.
+    pub tar_source_ordinal: Option<u32>,
     /// Precise source destination class. Unlike the legacy metadata `local`
     /// boolean, this distinguishes a proven current frame from an unknown or
     /// external environment that must not inherit ordinary parent bindings.
@@ -496,6 +502,7 @@ struct DirectiveConflictIdentity {
 struct SourceCallSiteIdentity {
     line: Option<u32>,
     column: Option<u32>,
+    tar_source_ordinal: Option<u32>,
 }
 
 impl SourceCallSiteIdentity {
@@ -594,6 +601,7 @@ impl DependencyEdge {
         SourceCallSiteIdentity {
             line: self.call_site_line,
             column: self.call_site_column,
+            tar_source_ordinal: self.tar_source_ordinal,
         }
     }
 
@@ -976,6 +984,7 @@ impl DependencyGraph {
                             to: to_uri.clone(),
                             call_site_line: Some(source.line),
                             call_site_column: Some(source.column),
+                            tar_source_ordinal: source.tar_source_ordinal,
                             locality: source.locality,
                             chdir: source.chdir,
                             is_sys_source: source.is_sys_source,
@@ -1049,6 +1058,7 @@ impl DependencyGraph {
                     to: uri.clone(),
                     call_site_line,
                     call_site_column,
+                    tar_source_ordinal: None,
                     locality: SourceLocality::Global,
                     chdir: false,
                     is_sys_source: false,
@@ -1078,6 +1088,7 @@ impl DependencyGraph {
                     to: to_uri.clone(),
                     call_site_line: Some(source.line),
                     call_site_column: Some(source.column),
+                    tar_source_ordinal: source.tar_source_ordinal,
                     locality: source.locality,
                     chdir: source.chdir,
                     is_sys_source: source.is_sys_source,
@@ -5167,6 +5178,7 @@ z <- 3
             to: url("child.R"),
             call_site_line: Some(3),
             call_site_column: Some(7),
+            tar_source_ordinal: None,
             locality: SourceLocality::Global,
             chdir: false,
             is_sys_source: false,
@@ -5230,6 +5242,21 @@ z <- 3
             base.source_invocation_identity(),
             different_locality.source_invocation_identity(),
             "inheritance semantics must remain part of invocation identity"
+        );
+
+        let mut tar_child = base.clone();
+        tar_child.tar_source_ordinal = Some(0);
+        let mut next_tar_child = tar_child.clone();
+        next_tar_child.tar_source_ordinal = Some(1);
+        assert_ne!(
+            tar_child.source_invocation_identity(),
+            next_tar_child.source_invocation_identity(),
+            "ordered children from one tar_source call are distinct invocations"
+        );
+        assert_ne!(
+            tar_child.revision_identity(),
+            next_tar_child.revision_identity(),
+            "a tar_source membership reorder must advance graph revision"
         );
     }
 

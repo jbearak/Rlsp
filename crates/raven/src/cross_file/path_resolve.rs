@@ -34,7 +34,7 @@ use tower_lsp::lsp_types::Url;
 use super::types::CrossFileMetadata;
 
 /// Context for path resolution
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PathContext {
     /// Path of the current file
     pub file_path: PathBuf,
@@ -356,6 +356,42 @@ impl PathContext {
     }
 }
 
+/// Derive the execution context for one forward-source child.
+///
+/// A standalone child is caller-independent and re-anchors at its own
+/// metadata context. Other children inherit only the working directory that
+/// [`PathContext::forward_child_inherited_wd`] permits; an explicit child
+/// `# raven: cd` continues to win. Shared by scope resolution and the pure
+/// contextual tar-provider traversal so their path semantics cannot drift.
+pub(crate) fn forward_child_path_context<G>(
+    child_uri: &Url,
+    child_is_standalone: bool,
+    chdir: bool,
+    parent_ctx: Option<&PathContext>,
+    workspace_root: Option<&Url>,
+    get_metadata: &G,
+) -> Option<PathContext>
+where
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    if child_is_standalone {
+        get_metadata(child_uri)
+            .and_then(|metadata| PathContext::from_metadata(child_uri, &metadata, workspace_root))
+            .or_else(|| PathContext::forward_without_metadata(child_uri, workspace_root))
+    } else {
+        let parent_ctx = parent_ctx?;
+        let mut child_ctx = match get_metadata(child_uri) {
+            Some(metadata) => PathContext::from_metadata(child_uri, &metadata, workspace_root)?,
+            None => PathContext::forward_without_metadata(child_uri, workspace_root)?,
+        };
+        let inherited = parent_ctx.forward_child_inherited_wd(&child_ctx.file_path, chdir);
+        if child_ctx.working_directory.is_none() && inherited.is_some() {
+            child_ctx.inherited_working_directory = inherited;
+        }
+        Some(child_ctx)
+    }
+}
+
 /// Which filesystem regime produced a case-only path mismatch (issue #530).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseMismatchRegime {
@@ -408,6 +444,49 @@ impl ResolveOutcome {
             case_mismatch: None,
         }
     }
+}
+
+/// Return every lexical path tier a forward source may select, in resolution
+/// priority order, including tiers that currently lose because another path
+/// exists first.
+///
+/// Filesystem membership watchers use this enumeration so creating a missing
+/// higher-priority target retargets an existing fallback. Workspace-root
+/// absolute paths have only the workspace tier. Relative paths use the
+/// effective working directory, the nested test compatibility directory, and
+/// finally the forward-only workspace fallback when no explicit or inherited
+/// `# raven: cd` pins resolution.
+pub(crate) fn forward_path_candidate_tiers(path: &str, context: &PathContext) -> Vec<PathBuf> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let mut push_normalized = |candidate: PathBuf| {
+        if let Some(candidate) = normalize_path(&candidate)
+            && !candidates.contains(&candidate)
+        {
+            candidates.push(candidate);
+        }
+    };
+
+    if let Some(stripped) = path.strip_prefix('/') {
+        if let Some(root) = context.workspace_root.as_ref() {
+            push_normalized(root.join(stripped));
+        }
+        return candidates;
+    }
+
+    push_normalized(context.effective_working_directory().join(path));
+    if let Some(file_dir) = context.implicit_wd_file_dir_fallback() {
+        push_normalized(file_dir.join(path));
+    }
+    if !context.cd_in_effect()
+        && let Some(root) = context.workspace_root.as_ref()
+    {
+        push_normalized(root.join(path));
+    }
+    candidates
 }
 
 /// Resolve a path string to an absolute path, **without** the workspace-root

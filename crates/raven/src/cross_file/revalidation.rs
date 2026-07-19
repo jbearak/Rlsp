@@ -70,6 +70,16 @@ impl CrossFileRevalidationState {
         }
     }
 
+    /// Clone the latest pending owner for `uri`.
+    ///
+    /// Durable single-flight coordinators use this to consume the newest
+    /// desired generation after a predecessor's uncancellable blocking work
+    /// finishes. Callers must still use generation-checked [`Self::complete`]:
+    /// removing a later owner from an older snapshot would lose an event.
+    pub(crate) fn latest(&self, uri: &Url) -> Option<(u64, CancellationToken)> {
+        self.pending.read().unwrap().get(uri).cloned()
+    }
+
     /// Test-only: whether a pending revalidation entry currently exists for
     /// `uri`. Race tests use this to wait until a spawned worker has
     /// `schedule()`d (and parked in its debounce) before superseding it —

@@ -188,6 +188,17 @@ pub struct CrossFileMetadata {
     pub sourced_by: Vec<BackwardDirective>,
     /// Forward directives and detected source() calls
     pub sources: Vec<ForwardSource>,
+    /// Statically recognized top-level `{targets}` `tar_source()` calls.
+    ///
+    /// Requests remain durable even when none of their paths currently exist.
+    /// Filesystem expansion is a separate, workspace-aware phase performed
+    /// after working-directory enrichment.
+    #[serde(default)]
+    pub tar_source_requests: Vec<TarSourceRequest>,
+    /// Existing and potential filesystem roots retained by the last
+    /// `tar_source()` expansion, including real targets of followed symlinks.
+    #[serde(default)]
+    pub tar_source_expansion_watch_paths: Vec<std::path::PathBuf>,
     /// Working directory override (explicit `# raven: cd`)
     pub working_directory: Option<String>,
     /// Working directory inherited from parent via backward directive.
@@ -252,6 +263,27 @@ pub struct CrossFileMetadata {
     /// Detected `pkg::member` namespace references (issue #503).
     #[serde(default)]
     pub namespace_references: Vec<NamespaceReference>,
+}
+
+/// One statically recognized top-level `{targets}` `tar_source()` call.
+///
+/// `files` preserves the user's vector order. Expansion and first-occurrence
+/// deduplication are scoped to this request: separate calls that name the same
+/// script represent separate executions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+pub struct TarSourceRequest {
+    /// Statically resolved `files` argument, or `["R"]` when omitted.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// 0-based line of the call.
+    #[serde(default)]
+    pub line: u32,
+    /// 0-based UTF-16 column of the call.
+    #[serde(default)]
+    pub column: u32,
+    /// Static `change_directory = TRUE` value.
+    #[serde(default)]
+    pub change_directory: bool,
 }
 
 impl CrossFileMetadata {
@@ -371,6 +403,11 @@ pub struct ForwardSource {
     /// calling `resolve_path` (which can't handle true absolute paths outside
     /// the workspace). Set by `resolve_system_file_sources` for branch-2 hits.
     pub resolved_uri: Option<tower_lsp::lsp_types::Url>,
+    /// Ordered child index within one expanded `tar_source()` call.
+    ///
+    /// `Some` also identifies this source as tar-derived. The call identity is
+    /// `(line, column)` and the ordinal disambiguates members sharing it.
+    pub tar_source_ordinal: Option<u32>,
 }
 
 fn default_sys_source_global_env() -> bool {
@@ -409,6 +446,8 @@ struct ForwardSourceWire {
     system_file: Option<super::source_detect::SystemFileCall>,
     #[serde(default)]
     resolved_uri: Option<tower_lsp::lsp_types::Url>,
+    #[serde(default)]
+    tar_source_ordinal: Option<u32>,
 }
 
 impl Serialize for ForwardSource {
@@ -418,7 +457,7 @@ impl Serialize for ForwardSource {
     {
         let local = !self.is_sys_source && self.locality != SourceLocality::Global;
         let sys_source_global_env = !self.is_sys_source || self.locality == SourceLocality::Global;
-        let mut state = serializer.serialize_struct("ForwardSource", 15)?;
+        let mut state = serializer.serialize_struct("ForwardSource", 16)?;
         state.serialize_field("path", &self.path)?;
         state.serialize_field("line", &self.line)?;
         state.serialize_field("column", &self.column)?;
@@ -434,6 +473,7 @@ impl Serialize for ForwardSource {
         state.serialize_field("is_function_scoped", &self.is_function_scoped)?;
         state.serialize_field("system_file", &self.system_file)?;
         state.serialize_field("resolved_uri", &self.resolved_uri)?;
+        state.serialize_field("tar_source_ordinal", &self.tar_source_ordinal)?;
         state.end()
     }
 }
@@ -467,6 +507,7 @@ impl<'de> Deserialize<'de> for ForwardSource {
             is_function_scoped: wire.is_function_scoped,
             system_file: wire.system_file,
             resolved_uri: wire.resolved_uri,
+            tar_source_ordinal: wire.tar_source_ordinal,
         })
     }
 }

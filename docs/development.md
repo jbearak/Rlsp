@@ -164,11 +164,52 @@ Optional post-release packaging jobs are gated by repository variables:
 Cross-file awareness is implemented under `crates/raven/src/cross_file/`.
 
 Rough pipeline:
-1. Extract per-file metadata (directives + AST-detected `source()` + library calls)
-2. Update dependency graph edges (forward + backward)
-3. Compute per-file artifacts (exported interface, timeline, interface hash)
-4. Resolve scope at a position by traversing edges and applying call-site filtering
-5. Revalidate dependents on relevant changes (interface hash / edges / working directory changes)
+1. Extract per-file metadata (directives + AST-detected `source()` / `tar_source()` requests + library calls)
+2. Enrich inherited working directories and resolve `system.file()` sources
+3. Expand static `tar_source()` requests off-lock
+4. Compute per-file artifacts (exported interface, ordered timeline, interface hash)
+5. Update dependency graph edges (forward + backward)
+6. Resolve scope at a position by traversing edges and applying call-site filtering
+7. Revalidate dependents on relevant changes (interface hash / edges / working directory changes)
+
+`tar_source()` expansion is caller-owned and filesystem-backed; it has no
+process-global cache. A finalized record stores its ordered ordinal sources and
+every existing or potential watch root. `WorldState` derives a bidirectional
+parent/root registry only after successful analysis commits. Watcher delivery
+first advances a global monotonic event generation, closing the new-request /
+pre-registry race, then advances the monotonic identities of overlapping roots
+and looks up their parents. An affected open parent receives a per-URI
+latest-arrival refresh owner on the backend's tracked routing-task lifecycle:
+newer events update one desired-generation register while one coordinator
+serializes physical filesystem walks for that parent. Exact-basis conflicts
+retry with bounded backoff until commit, close/reopen, or shutdown. Coordinator
+retirement releases single-flight admission before re-reading desired work, so
+an event published during the exit window is either reclaimed or owned by a
+successor. This prevents both consumed-event loss during unrelated graph/config
+churn and bursts of uncancellable same-tree walks. `AnalysisBasis` validates
+both the global fence and
+the subject parent's captured root identities at the same write-lock commit
+that installs metadata, artifacts, graph edges, and the rebuilt registry.
+Removed roots remain generation tombstones; workspace replacement never resets
+or reuses an identity. Ordered execution is represented by one `TarBatch`
+timeline event, while dependency edges retain individual ordinals so a member's
+backward prefix contains exactly its earlier siblings. Batch members bypass
+URI-only forward/standalone caches because their rolling symbol, removal,
+package, and working-directory inputs are execution-specific. Descendant
+ordinary sources carry a two-valued "prefer supplied `PathContext`" resolution
+mode, never a call-site/ordinal occurrence identity; the forward-child memo
+keys that mode alongside the context fingerprint. This preserves scope for
+repeated members without multiplying graph or prefix-cache identities. The
+graph remains URI-global, so navigation, missing-file checks, and revalidation
+for nested context-dependent targets deliberately use its single winning edge.
+For `raven check`, a pure bounded collector walks `(provider URI,
+PathContext, lexical-first mode)` states from finalized tar members. The CLI
+materializes any external providers through the normal
+parse/enrich/`system.file()`/tar-finalize/artifact pipeline into its sole
+`WorkspaceIndex`, then passes only providers outside the graph neighborhood to
+the diagnostic snapshot's content-precollection seam. Context divergence or
+budget truncation disables the standalone-scope cache for that snapshot, but
+the collector never mutates graph edges or revisions.
 
 Package-state seeds follow the same snapshot/off-lock/install discipline as
 cross-file diagnostics. Callers snapshot the exact raw/derived/config/root

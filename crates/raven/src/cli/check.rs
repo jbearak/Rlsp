@@ -176,6 +176,8 @@ Exit codes:
 /// resolve — producing false undefined-variable positives and losing
 /// missing-file context. This mirrors `backend`'s did_open: extract masked
 /// metadata for the path, enrich it with the inherited working directory,
+/// resolve `system.file()` entries, finalize static `tar_source()` requests,
+/// install one coherent open-document record (text + metadata + artifacts),
 /// pre-collect parent content for any backward directives, then update the
 /// graph. The masked extraction reads chunk-body `source()`/`library()` calls
 /// only (never prose).
@@ -195,8 +197,6 @@ fn open_disk_fallback_target(
     // `file_type_from_language_id("rmd")` is `None`, so the `FileType` still
     // falls back to R via the URI — only the chunk masking differs.
     let language_id = if is_chunk_file(path) { "rmd" } else { "r" };
-    state.open_document_with_language_id(uri.clone(), text, Some(1), Some(language_id));
-
     let workspace_root = state.workspace_folders.first().cloned();
     let max_chain_depth = state.cross_file_config.max_chain_depth;
     let mut meta = crate::cross_file::extract_metadata_for_path(uri.path(), text);
@@ -216,6 +216,19 @@ fn open_disk_fallback_target(
         let lib_paths = state.package_library.lib_paths();
         crate::cross_file::resolve_system_file_sources(&mut meta, ws_name, ws_root, lib_paths);
     }
+    crate::cross_file::tar_source::finalize_tar_source_requests(
+        &mut meta,
+        uri,
+        workspace_root.as_ref(),
+    );
+    state.open_document_with_language_id_and_metadata(
+        uri.clone(),
+        text,
+        Some(1),
+        Some(language_id),
+        std::sync::Arc::new(meta.clone()),
+        None,
+    );
 
     // Pre-collect parent content for any backward directives (`# raven: sourced-by`
     // with `match=`/inference call sites) before the mutable `update_file`
@@ -246,6 +259,177 @@ fn open_disk_fallback_target(
         workspace_root.as_ref(),
         |parent_uri| parent_content.get(parent_uri).cloned(),
     );
+}
+
+#[derive(Debug, Default)]
+struct CliContextualProviderPlan {
+    extras: std::collections::HashSet<Url>,
+    divergence: bool,
+}
+
+/// Materialize and select context-sensitive tar providers for one CLI target.
+///
+/// Workspace members reuse the consolidated index. Providers outside the scan
+/// are parsed, enriched, finalized, and installed into that same index, then
+/// the pure traversal is repeated so their own finalized forward closure can
+/// be discovered. The returned extras supplement only snapshot content
+/// collection; no occurrence node or alternate graph edge is created.
+fn prepare_cli_contextual_providers(
+    state: &mut crate::state::WorldState,
+    uri: &Url,
+) -> CliContextualProviderPlan {
+    let workspace_root = state.workspace_folders.first().cloned();
+    let max_depth = state.cross_file_config.max_forward_depth;
+    let max_visited = state.cross_file_config.max_transitive_dependents_visited;
+
+    let mut collected = crate::cross_file::tar_source::ContextualTarProviders::default();
+    for _ in 0..max_depth.max(1) {
+        let Some(root_metadata) = state.get_enriched_metadata(uri) else {
+            break;
+        };
+        collected = crate::cross_file::tar_source::collect_contextual_tar_providers(
+            uri,
+            &root_metadata,
+            workspace_root.as_ref(),
+            max_depth,
+            max_visited,
+            &|provider_uri| state.get_enriched_metadata(provider_uri),
+            &|parent_uri, source| {
+                let target = state
+                    .cross_file_graph
+                    .get_dependencies(parent_uri)
+                    .into_iter()
+                    .find(|edge| {
+                        edge.call_site_line == Some(source.line)
+                            && edge.call_site_column == Some(source.column)
+                            && edge.tar_source_ordinal == source.tar_source_ordinal
+                    })
+                    .map(|edge| edge.to.clone());
+                crate::cross_file::tar_source::GraphPrefixEdgeLookup::Known(target)
+            },
+        );
+        let mut installed_any = false;
+        let mut attempted = std::collections::HashSet::new();
+        for execution in &collected.executions {
+            if state.get_enriched_metadata(&execution.uri).is_some()
+                || !attempted.insert(execution.uri.clone())
+            {
+                continue;
+            }
+            installed_any |=
+                materialize_cli_contextual_provider(state, execution, workspace_root.as_ref());
+        }
+        if !installed_any {
+            break;
+        }
+    }
+
+    let neighborhood: std::collections::HashSet<Url> = state
+        .cross_file_graph
+        .cached_neighborhood_subgraph(
+            uri,
+            state.cross_file_config.max_chain_depth,
+            state.cross_file_config.max_transitive_dependents_visited,
+        )
+        .neighborhood
+        .iter()
+        .cloned()
+        .collect();
+    CliContextualProviderPlan {
+        extras: collected
+            .providers
+            .into_iter()
+            .filter(|provider| !neighborhood.contains(provider))
+            .collect(),
+        divergence: collected.divergence,
+    }
+}
+
+fn materialize_cli_contextual_provider(
+    state: &mut crate::state::WorldState,
+    execution: &crate::cross_file::tar_source::ContextualProviderExecution,
+    workspace_root: Option<&Url>,
+) -> bool {
+    if state.is_project_excluded_uri(&execution.uri) {
+        return false;
+    }
+    let Ok(path) = execution.uri.to_file_path() else {
+        return false;
+    };
+    let Ok(content) = crate::state::read_source(&path) else {
+        return false;
+    };
+    let Ok(fs_metadata) = std::fs::metadata(&path) else {
+        return false;
+    };
+    let analysis = crate::cross_file::analysis_text_for_path(execution.uri.path(), &content);
+    let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None));
+    let mut metadata =
+        crate::cross_file::extract_metadata_with_tree(analysis.as_ref(), tree.as_ref());
+    if metadata.working_directory.is_none()
+        && metadata.inherited_working_directory.is_none()
+        && let Some(inherited) = execution.context.inherited_working_directory.as_ref()
+    {
+        metadata.inherited_working_directory = Some(inherited.to_string_lossy().into_owned());
+    }
+    if metadata.working_directory.is_none() && metadata.inherited_working_directory.is_none() {
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut metadata,
+            &execution.uri,
+            workspace_root,
+            |candidate| state.get_enriched_metadata(candidate),
+            state.cross_file_config.max_chain_depth,
+        );
+    }
+    {
+        let workspace = state.package_state.workspace();
+        crate::cross_file::resolve_system_file_sources(
+            &mut metadata,
+            workspace.map(|value| value.name.as_str()),
+            workspace.map(|value| value.root.as_path()),
+            state.package_library.lib_paths(),
+        );
+    }
+    crate::cross_file::tar_source::finalize_tar_source_requests(
+        &mut metadata,
+        &execution.uri,
+        workspace_root,
+    );
+    let artifacts = std::sync::Arc::new(match tree.as_ref() {
+        Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+            &execution.uri,
+            tree,
+            analysis.as_ref(),
+            Some(&metadata),
+        ),
+        None => crate::cross_file::scope::ScopeArtifacts::default(),
+    });
+    let snapshot =
+        crate::cross_file::file_cache::FileSnapshot::with_content_hash(&fs_metadata, &content);
+    let metadata = std::sync::Arc::new(metadata);
+    let entry = crate::workspace_index::IndexEntry {
+        contents: ropey::Rope::from_str(&content),
+        tree: tree.clone(),
+        loaded_packages: crate::state::extract_loaded_packages(&tree, analysis.as_ref()),
+        data_packages: crate::state::extract_data_packages(&tree, analysis.as_ref()),
+        snapshot: snapshot.clone(),
+        metadata: metadata.clone(),
+        artifacts,
+        indexed_at_version: state.workspace_index.version(),
+    };
+    state
+        .cross_file_file_cache
+        .insert(execution.uri.clone(), snapshot, content);
+    state.workspace_index.insert(execution.uri.clone(), entry);
+    let graph_metadata =
+        state.metadata_for_dependency_graph(&execution.uri, &metadata, workspace_root);
+    state.cross_file_graph.update_file(
+        &execution.uri,
+        graph_metadata.as_ref(),
+        workspace_root,
+        |_| None,
+    );
+    true
 }
 
 pub async fn run(args: CheckArgs) -> i32 {
@@ -1148,23 +1332,29 @@ fn format_nse_hint_footer(diags: &[(PathBuf, Diagnostic)]) -> Option<String> {
 /// inputs the async missing-file pass needs (`directive_meta`, severity). Split
 /// out so `raven check` can run this — the expensive part — across files in
 /// parallel (issue #479 WI3), then do the cheap async filesystem checks
-/// afterward. `open_documents` is the worker's one-entry overlay (see
-/// [`crate::handlers::DiagnosticsSnapshot::build_with_open_documents`]).
+/// afterward. `open_documents` is the worker's coherent one-entry store, while
+/// `contextual_providers` adds only provider content that a URI-global graph
+/// neighborhood cannot represent (see
+/// [`crate::handlers::DiagnosticsSnapshot::build_with_open_documents_and_extra_providers`]).
 fn compute_file_diagnostics_sync(
     state: &crate::state::WorldState,
     uri: &Url,
     open_documents: &impl crate::content_provider::OpenDocumentsView,
+    contextual_providers: &CliContextualProviderPlan,
 ) -> Option<(
     Vec<Diagnostic>,
     crate::cross_file::CrossFileMetadata,
     Option<DiagnosticSeverity>,
     crate::cross_file::CaseMismatchSeverity,
 )> {
-    let snapshot = crate::handlers::DiagnosticsSnapshot::build_with_open_documents(
-        state,
-        uri,
-        open_documents,
-    )?;
+    let snapshot =
+        crate::handlers::DiagnosticsSnapshot::build_with_open_documents_and_extra_providers(
+            state,
+            uri,
+            open_documents,
+            &contextual_providers.extras,
+            contextual_providers.divergence,
+        )?;
     let cancel = crate::handlers::DiagCancelToken::never();
     let sync_diags = crate::handlers::diagnostics_from_snapshot(&snapshot, uri, &cancel)?;
     let missing_file_severity = snapshot.cross_file_config.missing_file_severity;
@@ -1198,9 +1388,13 @@ async fn finalize_file_diagnostics(
     .await
 }
 
-async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -> Vec<Diagnostic> {
+async fn compute_file_diagnostics(
+    state: &mut crate::state::WorldState,
+    uri: &Url,
+) -> Vec<Diagnostic> {
+    let contextual_providers = prepare_cli_contextual_providers(state, uri);
     let Some((sync_diags, directive_meta, missing_file_severity, case_mismatch_severity)) =
-        compute_file_diagnostics_sync(state, uri, &state.documents)
+        compute_file_diagnostics_sync(state, uri, &state.documents, &contextual_providers)
     else {
         return Vec::new();
     };
@@ -1227,9 +1421,12 @@ async fn compute_file_diagnostics(state: &crate::state::WorldState, uri: &Url) -
 /// `state.documents` across workers would make each worker treat the others'
 /// targets as "open" and pull the wrong artifacts. We avoid that entirely:
 /// `state.documents` stays empty during the parallel region, and each worker
-/// passes a one-entry overlay holding only its target (see
+/// passes a coherent one-entry store holding only its target. Context-sensitive
+/// tar providers remain in the single finalized workspace index and are added
+/// to snapshot collection without changing graph edges (see
 /// `compute_file_diagnostics_sync` /
-/// `DiagnosticsSnapshot::build_with_open_documents`). This reproduces the
+/// `DiagnosticsSnapshot::build_with_open_documents_and_extra_providers`).
+/// This reproduces the
 /// sequential "exactly one open target" semantics per task, so output is
 /// byte-identical to a sequential run (asserted by
 /// `parallel_collection_matches_sequential`). The async on-disk missing-file
@@ -1269,6 +1466,16 @@ async fn collect_target_diagnostics(
     let mut all_diags: Vec<(PathBuf, Diagnostic)> = Vec::new();
     let mut reported_loaded_packages = std::collections::BTreeSet::new();
     let mut operator_error = false;
+    let mut contextual_provider_plans = std::collections::HashMap::new();
+    for path in targets {
+        let Ok(uri) = Url::from_file_path(path) else {
+            continue;
+        };
+        if state.workspace_index.contains(&uri) {
+            let plan = prepare_cli_contextual_providers(state, &uri);
+            contextual_provider_plans.insert(uri, plan);
+        }
+    }
 
     // Phase 1 (parallel, CPU-bound): indexed targets only. A target that is not
     // in the workspace index (disk-fallback) or whose path can't be a URL is
@@ -1286,10 +1493,18 @@ async fn collect_target_diagnostics(
                 crate::chunks::classify_chunk_document(uri.path()),
             );
             let loaded_packages: Vec<String> = doc.loaded_packages.to_vec();
-            let mut open_documents = std::collections::HashMap::new();
-            open_documents.insert(uri.clone(), doc);
+            let mut open_documents = crate::open_document_store::OpenDocumentStore::new();
+            open_documents.open_prepared(
+                uri.clone(),
+                doc,
+                entry.metadata.clone(),
+                entry.artifacts.clone(),
+                None,
+            );
+            let empty_plan = CliContextualProviderPlan::default();
+            let contextual_providers = contextual_provider_plans.get(&uri).unwrap_or(&empty_plan);
             let (sync_diags, directive_meta, missing_file_severity, case_mismatch_severity) =
-                compute_file_diagnostics_sync(state, &uri, &open_documents)?;
+                compute_file_diagnostics_sync(state, &uri, &open_documents, contextual_providers)?;
             Some(SyncResult {
                 path: path.clone(),
                 uri,
@@ -2820,7 +3035,13 @@ infixContinuationStyle = "indented"
                         &entry,
                         crate::chunks::classify_chunk_document(uri.path()),
                     );
-                    state.documents.insert(uri.clone(), doc);
+                    state.documents.open_prepared(
+                        uri.clone(),
+                        doc,
+                        entry.metadata.clone(),
+                        entry.artifacts.clone(),
+                        None,
+                    );
                 } else {
                     let text = crate::state::read_source(path).unwrap();
                     // Same disk-fallback path `run` uses, so production and test
@@ -2828,7 +3049,7 @@ infixContinuationStyle = "indented"
                     // parent_content map).
                     super::open_disk_fallback_target(&mut state, &uri, path, &text);
                 }
-                let diags = compute_file_diagnostics(&state, &uri).await;
+                let diags = compute_file_diagnostics(&mut state, &uri).await;
                 state.close_document(&uri);
                 for d in diags {
                     all.push((path.clone(), d));
@@ -2898,6 +3119,243 @@ infixContinuationStyle = "indented"
         assert!(
             !seq.iter().any(|(_, _, _, m)| m.contains("shared")),
             "shared() should resolve cross-file and not be flagged: {seq:?}"
+        );
+    }
+
+    #[test]
+    fn raven_check_tar_source_resolves_member_at_command_boundary() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("R")).unwrap();
+        fs::write(
+            workspace.path().join("R/functions.R"),
+            "helper_fn <- function() 1\n",
+        )
+        .unwrap();
+        let target = workspace.path().join("_targets.R");
+        fs::write(&target, "targets::tar_source(\"R\")\nhelper_fn()\n").unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.paths = vec![target];
+        assert_eq!(
+            run_blocking(args.clone()),
+            EXIT_OK,
+            "the real check command boundary must consume finalized tar artifacts"
+        );
+        let diagnostics = collect_diagnostics_blocking(&args);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|(_, diagnostic)| diagnostic.message == "helper_fn is not defined"),
+            "tar member symbols must be visible to the report: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn raven_check_materializes_external_tar_provider_in_consolidated_index() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        fs::create_dir_all(external.path().join("R")).unwrap();
+        fs::write(
+            external.path().join("R/functions.R"),
+            "external_helper <- function() 1\n",
+        )
+        .unwrap();
+        let target = external.path().join("_targets.R");
+        fs::write(&target, "targets::tar_source(\"R\")\nexternal_helper()\n").unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.paths = vec![target];
+        let diagnostics = collect_diagnostics_parallel_blocking(&args);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|(_, diagnostic)| diagnostic.message == "external_helper is not defined"),
+            "a disk-fallback target must materialize its external provider before diagnostics: \
+             {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn raven_check_repeated_tar_child_preserves_each_occurrence_path_context() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("runtime")).unwrap();
+        fs::write(workspace.path().join("child.R"), "source(\"config.R\")\n").unwrap();
+        fs::write(
+            workspace.path().join("runtime/config.R"),
+            "runtime_symbol <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("config.R"),
+            "root_symbol <- function() 1\n",
+        )
+        .unwrap();
+        let target = workspace.path().join("_targets.R");
+        fs::write(
+            &target,
+            "# raven: cd runtime\n\
+             targets::tar_source(\"../child.R\", change_directory = FALSE)\n\
+             targets::tar_source(\"../child.R\", change_directory = TRUE)\n\
+             runtime_symbol()\n\
+             root_symbol()\n",
+        )
+        .unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.paths = vec![target];
+        let diagnostics = collect_diagnostics_parallel_blocking(&args);
+        assert!(
+            !diagnostics.iter().any(|(_, diagnostic)| matches!(
+                diagnostic.message.as_str(),
+                "runtime_symbol is not defined" | "root_symbol is not defined"
+            )),
+            "both executions of one child must resolve nested sources against their own \
+             effective PathContext: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn raven_check_discovers_repeated_tar_context_below_ordinary_source() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("runtime")).unwrap();
+        fs::write(
+            workspace.path().join("main.R"),
+            "source(\"driver.R\")\nruntime_symbol()\nroot_symbol()\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("driver.R"),
+            "# raven: cd runtime\n\
+             targets::tar_source(\"../child.R\", change_directory = FALSE)\n\
+             targets::tar_source(\"../child.R\", change_directory = TRUE)\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("child.R"), "source(\"config.R\")\n").unwrap();
+        fs::write(
+            workspace.path().join("runtime/config.R"),
+            "runtime_symbol <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("config.R"),
+            "root_symbol <- function() 1\n",
+        )
+        .unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.paths = vec![workspace.path().join("main.R")];
+        let diagnostics = collect_diagnostics_parallel_blocking(&args);
+        assert!(
+            !diagnostics.iter().any(|(_, diagnostic)| matches!(
+                diagnostic.message.as_str(),
+                "runtime_symbol is not defined" | "root_symbol is not defined"
+            )),
+            "graph-prefix traversal must discover the downstream tar batch: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn raven_check_graph_prefix_uses_uri_global_edge_before_tar_batch() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("wd1")).unwrap();
+        fs::create_dir_all(workspace.path().join("wd2")).unwrap();
+        fs::write(
+            workspace.path().join("00_other.R"),
+            "# raven: cd wd1\nsource(\"../a.R\", chdir = FALSE)\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("zz_main.R"),
+            "# raven: cd wd2\n\
+             source(\"../a.R\", chdir = FALSE)\n\
+             wd1_symbol()\n\
+             root_symbol()\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("a.R"), "source(\"driver.R\")\n").unwrap();
+        fs::write(
+            workspace.path().join("driver.R"),
+            "# raven: cd wd1\n\
+             targets::tar_source(\"../child.R\", change_directory = FALSE)\n\
+             targets::tar_source(\"../child.R\", change_directory = TRUE)\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("wd2/driver.R"),
+            "# lexical alternate with no tar batch\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("child.R"), "source(\"config.R\")\n").unwrap();
+        fs::write(
+            workspace.path().join("wd1/config.R"),
+            "wd1_symbol <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("config.R"),
+            "root_symbol <- function() 1\n",
+        )
+        .unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.paths = vec![workspace.path().join("zz_main.R")];
+        let diagnostics = collect_diagnostics_parallel_blocking(&args);
+        assert!(
+            !diagnostics.iter().any(|(_, diagnostic)| matches!(
+                diagnostic.message.as_str(),
+                "wd1_symbol is not defined" | "root_symbol is not defined"
+            )),
+            "the planner must follow scope's URI-global a.R -> driver.R edge, not the queried \
+             caller's lexical wd2/driver.R alternate: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn raven_check_repeated_tar_context_survives_two_ordinary_source_hops() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("runtime")).unwrap();
+        fs::create_dir_all(workspace.path().join("shared")).unwrap();
+        fs::create_dir_all(workspace.path().join("common")).unwrap();
+        fs::write(
+            workspace.path().join("shared/child.R"),
+            "source(\"../common/helper.R\")\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("common/helper.R"),
+            "source(\"config.R\")\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("runtime/config.R"),
+            "runtime_deep <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("shared/config.R"),
+            "shared_deep <- function() 1\n",
+        )
+        .unwrap();
+        let target = workspace.path().join("_targets.R");
+        fs::write(
+            &target,
+            "# raven: cd runtime\n\
+             targets::tar_source(\"../shared/child.R\", change_directory = FALSE)\n\
+             targets::tar_source(\"../shared/child.R\", change_directory = TRUE)\n\
+             runtime_deep()\n\
+             shared_deep()\n",
+        )
+        .unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.paths = vec![target];
+        let diagnostics = collect_diagnostics_parallel_blocking(&args);
+        assert!(
+            !diagnostics.iter().any(|(_, diagnostic)| matches!(
+                diagnostic.message.as_str(),
+                "runtime_deep is not defined" | "shared_deep is not defined"
+            )),
+            "the occurrence PathContext must survive child -> helper -> config: {diagnostics:?}"
         );
     }
 

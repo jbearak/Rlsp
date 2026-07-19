@@ -19,7 +19,7 @@ If you are new to CI, start with [Automated checks in CI](ci.md). It explains wh
 
 Most language ecosystems have a CI checker that reads code without executing it — `cargo check`, `tsc`, `pyright`, `ruff`. R's tooling grew up around a different need: `R CMD check` and the CI ecosystem around it verify *packages*, which means installing every dependency and running code. There's little equivalent for *analysis repositories* — the scripts that make up most scientific and statistical work — and that gap is what these commands fill.
 
-Raven's core is static, semantic analysis with **position-aware scope**: it tracks what's defined at each point in a script — line by line, and inside each function — so it can flag an undefined variable, including one used before it's defined. Crucially for analysis repos, it follows `source()` chains, building a map of how your scripts depend on one another and resolving scope across them. No other R tool does this, and it's what makes `raven check` useful both for package development and for the analysis repositories the rest of the R tooling largely overlooks.
+Raven's core is static, semantic analysis with **position-aware scope**: it tracks what's defined at each point in a script — line by line, and inside each function — so it can flag an undefined variable, including one used before it's defined. Crucially for analysis repos, it follows `source()` chains and static `targets::tar_source()` batches, building a map of how your scripts depend on one another and resolving scope across them. No other R tool does this, and it's what makes `raven check` useful both for package development and for the analysis repositories the rest of the R tooling largely overlooks.
 
 If you aren't building a package, you usually don't want CI to *run* your scripts — and you certainly don't want to install every package they depend on just to check them. Raven finishes in about a second; compiling a dependency tree can take hours, which makes the check slow and expensive. At scale it would also push avoidable load onto CRAN mirrors and the wider ecosystem. So Raven runs **without R, and without your repo's packages installed**.
 
@@ -63,6 +63,15 @@ exclude = ["generated/**", "archive/**", "!generated/keep.R"]
 `[workspace].exclude` defaults to `[]`. Patterns are project-root-relative globs, matched against paths relative to the containing workspace root. `*` and `?` do not cross `/`; use `**` for recursive matches, such as `**/*.log` for `.log` files at any depth. They apply to the workspace index and to default `raven check` discovery. Directory globs like `generated/**` prune whole directories before the parallel parse/index phase; when any negated re-include pattern (`!pattern`) is present, Raven disables directory pruning for the list so a re-included file is never skipped early. The full ordered matcher still filters files, with the last matching pattern winning.
 
 Explicit file arguments bypass these exclusions: `raven check generated/one.R` still reports `generated/one.R` even if `generated/**` is excluded. Directory arguments are discovery walks, so exclusions apply inside them.
+
+Static `targets::tar_source()` batches retain their ordered execution context
+during CLI analysis, including when the same script is selected more than once
+with different working-directory behavior. `raven check` supplements the
+ordinary URI-based dependency neighborhood with a bounded, context-sensitive
+provider traversal; providers outside the initial workspace scan are parsed
+and finalized into the same workspace index before diagnostics run. This
+affects scope only: navigation, missing-file checks, and dependency
+revalidation continue to use one URI-global graph edge per source entry.
 
 ### Options
 
