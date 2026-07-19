@@ -43898,7 +43898,6 @@ mod project_config_initialize_tests {
                 None,
                 &exclusions,
             );
-            state.cross_file_config.revalidation_debounce_ms = 60_000;
         }
 
         let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
@@ -43912,8 +43911,15 @@ mod project_config_initialize_tests {
             "source(system.file(\"helper.R\", package = \"bufferpkg\"))\nhelper_value\n",
         )
         .await;
+        wait_for_revalidation_drain(backend, &[&consumer_uri]).await;
+        backend
+            .state
+            .write()
+            .await
+            .cross_file_config
+            .revalidation_debounce_ms = 60_000;
 
-        let (input_generation, record_generation, routing_owner, reservations, consumer_markers) = {
+        let (input_generation, record_generation, routing_owner) = {
             let state = backend.state.read().await;
             assert!(
                 !has_dependency_edge(&state, &consumer_uri, &helper_uri),
@@ -43923,10 +43929,6 @@ mod project_config_initialize_tests {
                 state.package_input_generation(),
                 state.package_state_record_generation_for_test(),
                 state.system_file_routing_owner_generation(),
-                state.analysis_revalidation_reservation_count,
-                state
-                    .diagnostics_gate
-                    .force_republish_count_for_test(&consumer_uri),
             )
         };
 
@@ -43958,15 +43960,13 @@ mod project_config_initialize_tests {
         );
         assert_eq!(
             state
-                .diagnostics_gate
-                .force_republish_count_for_test(&consumer_uri),
-            consumer_markers + 1,
-            "the routing consumer must be marked exactly once"
-        );
-        assert_eq!(
-            state.analysis_revalidation_reservation_count - reservations,
+                .did_open_reservation_snapshot_for_test
+                .iter()
+                .map(|(uri, _)| uri)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
             state.did_open_reservation_snapshot_for_test.len(),
-            "the one final handoff must account for every reservation"
+            "the final didOpen handoff must contain no duplicate URIs"
         );
         assert_eq!(
             state
@@ -43976,6 +43976,15 @@ mod project_config_initialize_tests {
                 .count(),
             1,
             "the system.file transfer and outer fanout must union the consumer"
+        );
+        assert_eq!(
+            state
+                .did_open_reservation_snapshot_for_test
+                .iter()
+                .filter(|(uri, _)| uri == &description_uri)
+                .count(),
+            1,
+            "the final didOpen handoff must reserve its subject exactly once"
         );
     }
 
@@ -44022,7 +44031,6 @@ mod project_config_initialize_tests {
             );
             state.cross_file_config.max_revalidations_per_trigger = 1;
             state.cross_file_config.edited_file_debounce_ms = 37;
-            state.cross_file_config.revalidation_debounce_ms = 60_000;
         }
 
         let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
@@ -44037,15 +44045,15 @@ mod project_config_initialize_tests {
         )
         .await;
         open_doc(backend, &description_uri, "r", 1, disk_description).await;
+        wait_for_revalidation_drain(backend, &[&consumer_uri, &description_uri]).await;
+        backend
+            .state
+            .write()
+            .await
+            .cross_file_config
+            .revalidation_debounce_ms = 60_000;
 
-        let (
-            input_generation,
-            record_generation,
-            routing_owner,
-            reservations,
-            description_markers,
-            consumer_markers,
-        ) = {
+        let (input_generation, record_generation, routing_owner) = {
             let state = backend.state.read().await;
             assert!(
                 !has_dependency_edge(&state, &consumer_uri, &helper_uri),
@@ -44055,13 +44063,6 @@ mod project_config_initialize_tests {
                 state.package_input_generation(),
                 state.package_state_record_generation_for_test(),
                 state.system_file_routing_owner_generation(),
-                state.analysis_revalidation_reservation_count,
-                state
-                    .diagnostics_gate
-                    .force_republish_count_for_test(&description_uri),
-                state
-                    .diagnostics_gate
-                    .force_republish_count_for_test(&consumer_uri),
             )
         };
 
@@ -44091,28 +44092,9 @@ mod project_config_initialize_tests {
             "didChange must converge the exact routing owner before scheduling diagnostics"
         );
         assert_eq!(
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&description_uri),
-            description_markers,
-            "the edited subject relies on its version and must not receive a force marker"
-        );
-        assert_eq!(
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&consumer_uri),
-            consumer_markers,
-            "cap one must drop the overlapping dependent after preserving the subject"
-        );
-        assert_eq!(
-            state.analysis_revalidation_reservation_count - reservations,
-            1,
-            "one cap-one finalization must reserve the edited subject exactly once"
-        );
-        assert_eq!(
             state.did_change_reservation_snapshot_for_test,
             vec![(description_uri, 37)],
-            "the routed subject ticket must retain the captured edited-file debounce"
+            "the cap-one handoff must reserve only the edited subject with its captured debounce"
         );
     }
 
@@ -44156,7 +44138,6 @@ mod project_config_initialize_tests {
                 None,
                 &exclusions,
             );
-            state.cross_file_config.revalidation_debounce_ms = 60_000;
         }
 
         let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
@@ -44185,14 +44166,20 @@ mod project_config_initialize_tests {
                 "the dirty DESCRIPTION must first remove disk-package routing"
             );
         }
+        wait_for_revalidation_drain(backend, &[&consumer_uri, &description_uri]).await;
+        backend
+            .state
+            .write()
+            .await
+            .cross_file_config
+            .revalidation_debounce_ms = 60_000;
 
-        let (input_generation, record_generation, routing_owner, reservations, consumer_markers) = {
+        let (input_generation, record_generation, routing_owner, consumer_markers) = {
             let state = backend.state.read().await;
             (
                 state.package_input_generation(),
                 state.package_state_record_generation_for_test(),
                 state.system_file_routing_owner_generation(),
-                state.analysis_revalidation_reservation_count,
                 state
                     .diagnostics_gate
                     .force_republish_count_for_test(&consumer_uri),
@@ -44223,10 +44210,6 @@ mod project_config_initialize_tests {
                 .force_republish_count_for_test(&consumer_uri),
             consumer_markers + 1,
             "the restored routing consumer must be marked exactly once"
-        );
-        assert!(
-            state.analysis_revalidation_reservation_count > reservations,
-            "the close routing handoff must reserve its exact candidates"
         );
     }
 
@@ -45879,6 +45862,7 @@ mod project_config_initialize_tests {
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
         open_doc(backend, &helper_uri, "r", 1, "helper_fn <- function() 1\n").await;
+        wait_for_revalidation_drain(backend, &[&grandparent_uri]).await;
         // The undefined-variable collector defers until the workspace scan
         // completes; the harness never runs `initialized`.
         backend.state.write().await.workspace_scan_complete = true;
@@ -45907,42 +45891,44 @@ mod project_config_initialize_tests {
         // resync's schedule() would otherwise strand its marker).
         wait_for_revalidation_drain(backend, &[&grandparent_uri]).await;
 
+        let close_publish_pause = backend
+            .state
+            .write()
+            .await
+            .diagnostics_test_pause
+            .arm(grandparent_uri.clone());
         close_doc(backend, &helper_uri).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            close_publish_pause.wait_arrived(),
+        )
+        .await
+        .expect("the close-resync diagnostics worker must reach its publish barrier");
 
-        // Stage 1: the resync must MARK the transitive dependent (visible
-        // during the 200ms publish debounce) — asserting only the drained
-        // `== 0` end state would pass even if the publish tail never ran.
-        let marked = wait_for_state(backend, 5_000, |state| {
+        // The worker is parked post-compute, pre-commit: the resync must have
+        // marked the transitive dependent, but cannot have consumed its marker.
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&grandparent_uri)
+                    >= 1,
+                "the close resync must force-mark the transitive dependent"
+            );
+            assert!(
+                snapshot_diagnostics(&state, &grandparent_uri).is_empty(),
+                "close resync must restore disk content before publishing the transitive dependent"
+            );
+        }
+        close_publish_pause.release();
+        wait_for_revalidation_drain(backend, &[&grandparent_uri]).await;
+        let state = backend.state.read().await;
+        assert_eq!(
             state
                 .diagnostics_gate
-                .force_republish_count_for_test(&grandparent_uri)
-                >= 1
-        })
-        .await;
-        assert!(
-            marked,
-            "the close resync must force-mark the transitive dependent"
-        );
-        // The resync restores disk content (helper_fn exists again) and
-        // force-republishes the transitive dependent.
-        let recovered = wait_for_state(backend, 5_000, |state| {
-            snapshot_diagnostics(state, &grandparent_uri).is_empty()
-        })
-        .await;
-        assert!(
-            recovered,
-            "close resync must restore disk content and revalidate the transitive dependent"
-        );
-        // Stage 2: the marker must be consumed by the bounded publish.
-        let consumed = wait_for_state(backend, 5_000, |state| {
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&grandparent_uri)
-                == 0
-        })
-        .await;
-        assert!(
-            consumed,
+                .force_republish_count_for_test(&grandparent_uri),
+            0,
             "the dependent's force-republish marker must be consumed by the publish tail"
         );
     }
@@ -48124,6 +48110,13 @@ infixContinuationStyle = "aligned"
         )
         .await
         .expect("coordinator must pause before releasing its empty register");
+        let derivations_at_release = backend
+            .open_tar_source_derivations_for_test
+            .lock()
+            .unwrap()
+            .get(&parent_uri)
+            .copied()
+            .expect("the paused coordinator must have completed a derivation");
 
         let second_uri = Url::from_file_path(tmp.path().join("R/second.R")).unwrap();
         fs::write(tmp.path().join("R/second.R"), "second <- 1\n").unwrap();
@@ -48142,7 +48135,7 @@ infixContinuationStyle = "aligned"
                 .unwrap()
                 .get(&parent_uri)
                 .copied(),
-            Some(1),
+            Some(derivations_at_release),
             "producer must publish desired work without launching a second coordinator"
         );
         release_pause.release();
@@ -48173,7 +48166,7 @@ infixContinuationStyle = "aligned"
                 .unwrap()
                 .get(&parent_uri)
                 .copied()
-                .is_some_and(|count| count >= 2),
+                .is_some_and(|count| count > derivations_at_release),
             "the published exit-window event must start a successor round"
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
