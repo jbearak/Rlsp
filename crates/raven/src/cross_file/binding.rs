@@ -495,6 +495,29 @@ fn bump_at_in_scope<'m, T>(
     node: Node,
     scope: Option<LexicalScope>,
 ) -> &'m mut Binding<T> {
+    record_binding_event_at_in_scope(collection, name, node, scope, BindingEvent::Shadow)
+}
+
+#[derive(Clone, Copy)]
+enum BindingEvent {
+    Shadow,
+    DefiniteKill,
+    NonRestoringKill,
+}
+
+/// Record one binding event while applying the shared generation, count, and
+/// first-offset accounting exactly once.
+///
+/// A shadow participates in ordered alias invalidation, a definite kill can
+/// restore a base alias after an earlier shadow, and a non-restoring kill only
+/// invalidates unique-candidate accounting because its branch may not run.
+fn record_binding_event_at_in_scope<'m, T>(
+    collection: &'m mut BindingCollection<T>,
+    name: &str,
+    node: Node,
+    scope: Option<LexicalScope>,
+    event: BindingEvent,
+) -> &'m mut Binding<T> {
     let offset = node.start_byte();
     let entry = collection
         .map
@@ -510,11 +533,19 @@ fn bump_at_in_scope<'m, T>(
             .first_offset
             .map_or(offset, |existing| existing.min(offset)),
     );
-    entry
-        .shadow_offsets_by_scope
-        .entry(scope)
-        .or_default()
-        .push(offset);
+    match event {
+        BindingEvent::Shadow => entry
+            .shadow_offsets_by_scope
+            .entry(scope)
+            .or_default()
+            .push(offset),
+        BindingEvent::DefiniteKill => entry
+            .kill_offsets_by_scope
+            .entry(scope)
+            .or_default()
+            .push(offset),
+        BindingEvent::NonRestoringKill => {}
+    }
     entry
 }
 
@@ -524,17 +555,7 @@ fn bump_kill_at_in_scope<'m, T>(
     node: Node,
     scope: Option<LexicalScope>,
 ) -> &'m mut Binding<T> {
-    let offset = node.start_byte();
-    let entry = bump_at_in_scope(collection, name, node, scope);
-    if let Some(offsets) = entry.shadow_offsets_by_scope.get_mut(&scope) {
-        offsets.pop();
-    }
-    entry
-        .kill_offsets_by_scope
-        .entry(scope)
-        .or_default()
-        .push(offset);
-    entry
+    record_binding_event_at_in_scope(collection, name, node, scope, BindingEvent::DefiniteKill)
 }
 
 /// Count a possible current-frame removal without allowing it to restore a
@@ -547,10 +568,13 @@ fn bump_non_restoring_kill_at_in_scope<T>(
     node: Node,
     scope: Option<LexicalScope>,
 ) {
-    let entry = bump_at_in_scope(collection, name, node, scope);
-    if let Some(offsets) = entry.shadow_offsets_by_scope.get_mut(&scope) {
-        offsets.pop();
-    }
+    record_binding_event_at_in_scope(
+        collection,
+        name,
+        node,
+        scope,
+        BindingEvent::NonRestoringKill,
+    );
 }
 
 fn record_assignment<'tree, T>(
@@ -796,7 +820,7 @@ fn record_mutation_call<'tree, T>(
                 &name,
                 BindingSite::AssignCall {
                     node,
-                    value: resolved.value,
+                    value: Some(resolved.value),
                     value_is_side_effect_free: actuals_are_side_effect_free,
                     helpers_trusted,
                 },
@@ -1329,7 +1353,7 @@ fn contains_explicit_error(node: Node) -> bool {
 /// or colliding named arguments would error are not bindings.
 pub(crate) struct ResolvedAssignArguments<'tree> {
     pub(crate) name: Node<'tree>,
-    pub(crate) value: Option<Node<'tree>>,
+    pub(crate) value: Node<'tree>,
     /// Destination relative to the frame evaluating the `assign()` call.
     pub(crate) destination: CaptureEvaluationFrame,
 }
@@ -1346,7 +1370,7 @@ pub(crate) fn resolve_assign_arguments<'tree>(
         return None;
     };
     let value = match matched[1]? {
-        CallActual::Value(value) => Some(value),
+        CallActual::Value(value) => value,
         CallActual::Missing => return None,
     };
     // At top level, omitted/missing `pos` and `envir` select the current frame.
@@ -2042,8 +2066,7 @@ fn mark_unknown_loaded_binding_in_scope<T>(
     node: Node,
     scope: Option<LexicalScope>,
 ) {
-    let binding = bump_at_in_scope(collection, UNKNOWN_LOADED_BINDING_KEY, node, scope);
-    binding.persistent_uncertainty = true;
+    bump_at_in_scope(collection, UNKNOWN_LOADED_BINDING_KEY, node, scope);
 }
 
 fn mark_unknown_named_binding<T>(collection: &mut BindingCollection<T>, node: Node) {
@@ -3758,6 +3781,67 @@ mod tests {
     }
 
     #[test]
+    fn binding_events_preserve_accounting_and_kill_semantics() {
+        let code = "x <- 1\nrm(x)\nrm(x)\ny <- 1\nrm(y)\nrm(z)\nprobe\n";
+        let tree = parse_r(code);
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let nodes: Vec<_> = root.named_children(&mut cursor).collect();
+        let mut collection = BindingCollection::<()>::default();
+
+        bump_at(&mut collection, "x", nodes[0]);
+        invalidate_existing_bindings(&mut collection);
+        invalidate_existing_bindings(&mut collection);
+        bump_kill_at_in_scope(&mut collection, "x", nodes[1], None);
+        bump_non_restoring_kill_at_in_scope(&mut collection, "x", nodes[2], None);
+
+        bump_at(&mut collection, "y", nodes[3]);
+        bump_non_restoring_kill_at_in_scope(&mut collection, "y", nodes[4], None);
+        bump_kill_at_in_scope(&mut collection, "z", nodes[5], None);
+
+        let x = collection.map.get("x").unwrap();
+        assert_eq!(x.count, 5);
+        assert_eq!(x.generation, 2);
+        assert_eq!(x.first_offset, Some(nodes[0].start_byte()));
+        assert_eq!(
+            x.shadow_offsets_by_scope.get(&None).map(Vec::as_slice),
+            Some(&[nodes[0].start_byte()][..])
+        );
+        assert_eq!(
+            x.kill_offsets_by_scope.get(&None).map(Vec::as_slice),
+            Some(&[nodes[1].start_byte()][..])
+        );
+        assert!(
+            !ordered_shadow_events_may_affect_use(x, nodes[6], false),
+            "the definite kill must restore the alias"
+        );
+
+        let y = collection.map.get("y").unwrap();
+        assert_eq!(y.count, 2);
+        assert_eq!(y.generation, 2);
+        assert_eq!(y.first_offset, Some(nodes[3].start_byte()));
+        assert_eq!(
+            y.shadow_offsets_by_scope.get(&None).map(Vec::as_slice),
+            Some(&[nodes[3].start_byte()][..])
+        );
+        assert!(!y.kill_offsets_by_scope.contains_key(&None));
+        assert!(
+            ordered_shadow_events_may_affect_use(y, nodes[6], false),
+            "the non-restoring kill must preserve the prior possible shadow"
+        );
+
+        let z = collection.map.get("z").unwrap();
+        assert_eq!(z.count, 1, "new entries ignore prior generations");
+        assert_eq!(z.generation, 2);
+        assert_eq!(z.first_offset, Some(nodes[5].start_byte()));
+        assert!(!z.shadow_offsets_by_scope.contains_key(&None));
+        assert_eq!(
+            z.kill_offsets_by_scope.get(&None).map(Vec::as_slice),
+            Some(&[nodes[5].start_byte()][..])
+        );
+    }
+
+    #[test]
     fn plain_argument_names_borrow_identifiers_and_own_literals() {
         let code = r#"f(identifier = 1, `backtick` = 2, "quoted" = 3, r"(raw)" = 4)"#;
         let tree = parse_r(code);
@@ -3775,6 +3859,32 @@ mod tests {
         assert!(matches!(names[1], Cow::Borrowed("backtick")));
         assert!(matches!(names[2], Cow::Owned(ref name) if name == "quoted"));
         assert!(matches!(names[3], Cow::Owned(ref name) if name == "raw"));
+    }
+
+    #[test]
+    fn resolved_assign_value_is_always_a_supplied_node() {
+        let value_text = |code: &str| {
+            let tree = parse_r(code);
+            let call = tree.root_node().named_child(0).unwrap();
+            let arguments = call.child_by_field_name("arguments").unwrap();
+            resolve_assign_arguments(arguments, code, true, true)
+                .map(|resolved| node_text(resolved.value, code).to_string())
+        };
+
+        for (code, expected) in [
+            (r#"assign("x", NULL)"#, "NULL"),
+            (r#"assign(value = NULL, x = "x")"#, "NULL"),
+            (r#"assign("x", val = NULL)"#, "NULL"),
+        ] {
+            assert_eq!(value_text(code).as_deref(), Some(expected), "{code}");
+        }
+        for code in [
+            r#"assign("x")"#,
+            r#"assign("x", )"#,
+            r#"assign("x", value = )"#,
+        ] {
+            assert_eq!(value_text(code), None, "{code}");
+        }
     }
 
     #[test]
@@ -3810,6 +3920,43 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn unknown_loaded_marker_uses_only_scoped_ordered_events() {
+        let code = "p <- \"good.R\"\nbase::load(\"state.RData\")\nsource(p)\n";
+        let tree = parse_r(code);
+        let root = tree.root_node();
+        let candidate = root.named_child(0).unwrap();
+        let loader = root.named_child(1).unwrap();
+        let use_node = root.named_child(2).unwrap();
+        let mut collection = BindingCollection::<()>::default();
+        for _ in 0..3 {
+            invalidate_existing_bindings(&mut collection);
+        }
+
+        mark_unknown_loaded_binding_in_scope(&mut collection, loader, None);
+
+        let marker = collection.map.get(UNKNOWN_LOADED_BINDING_KEY).unwrap();
+        assert_eq!(marker.count, 1);
+        assert_eq!(marker.generation, 3);
+        assert_eq!(marker.first_offset, Some(loader.start_byte()));
+        assert_eq!(
+            marker.shadow_offsets_by_scope.get(&None).map(Vec::as_slice),
+            Some(&[loader.start_byte()][..])
+        );
+        assert!(!marker.persistent_uncertainty);
+        assert!(unknown_loaded_names_may_affect_candidate(
+            &collection.map,
+            candidate.start_byte(),
+            use_node,
+            false
+        ));
+        assert!(unknown_loaded_names_may_shadow_at(
+            &collection.map,
+            use_node,
+            false
+        ));
     }
 
     #[test]
