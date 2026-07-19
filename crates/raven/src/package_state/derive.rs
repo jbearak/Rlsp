@@ -133,17 +133,10 @@ fn build_scope_contribution(
                     // transitive `source()` targets (issue #638), union them
                     // in (allocating only for preambles that actually source
                     // something).
-                    let sourced = inputs.preamble_sourced_symbols.get(path);
-                    let defs = match sourced.filter(|s| !s.is_empty()) {
-                        None => facts.top_level_defs.clone(),
-                        Some(harvested) => Arc::new(
-                            facts
-                                .top_level_defs
-                                .union(harvested)
-                                .cloned()
-                                .collect::<BTreeSet<String>>(),
-                        ),
-                    };
+                    let defs = union_or_share(
+                        &facts.top_level_defs,
+                        inputs.preamble_sourced_symbols.get(path),
+                    );
                     test_helper_symbols.insert(path.clone(), defs);
                     // Same for top-level `library()`/`require()` attaches — a
                     // helper/setup file's attaches propagate to sibling tests
@@ -152,20 +145,10 @@ fn build_scope_contribution(
                     // closure (issue #638). Skip the entry entirely when there
                     // are no attaches so the map stays sparse (most preamble
                     // files attach nothing).
-                    let sourced_attached = inputs
-                        .preamble_sourced_attached_packages
-                        .get(path)
-                        .filter(|s| !s.is_empty());
-                    let attached = match sourced_attached {
-                        None => facts.attached_packages.clone(),
-                        Some(harvested) => Arc::new(
-                            facts
-                                .attached_packages
-                                .union(harvested)
-                                .cloned()
-                                .collect::<BTreeSet<String>>(),
-                        ),
-                    };
+                    let attached = union_or_share(
+                        &facts.attached_packages,
+                        inputs.preamble_sourced_attached_packages.get(path),
+                    );
                     if !attached.is_empty() {
                         test_helper_attached_packages.insert(path.clone(), attached);
                     }
@@ -230,6 +213,20 @@ fn build_scope_contribution(
         rprofile_symbols: Arc::new(rprofile_symbols.clone()),
         rprofile_attached_packages: Arc::new(rprofile_attached_packages.clone()),
         rprofile_root,
+    }
+}
+
+/// Return the cached immutable set when adding `harvested` cannot change it.
+fn union_or_share(
+    cached: &Arc<BTreeSet<String>>,
+    harvested: Option<&BTreeSet<String>>,
+) -> Arc<BTreeSet<String>> {
+    match harvested {
+        None => Arc::clone(cached),
+        Some(harvested) if harvested.is_empty() || harvested.is_subset(cached) => {
+            Arc::clone(cached)
+        }
+        Some(harvested) => Arc::new(cached.union(harvested).cloned().collect()),
     }
 }
 
@@ -418,6 +415,89 @@ mod tests {
         let mut i = empty_inputs(mode);
         i.description = Some(DescriptionInput { text: text.into() });
         i
+    }
+
+    #[test]
+    fn union_or_share_reuses_cached_set_without_added_values() {
+        let cached = Arc::new(BTreeSet::from(["cached".to_string()]));
+        let empty = BTreeSet::new();
+
+        assert!(Arc::ptr_eq(&union_or_share(&cached, None), &cached));
+        assert!(Arc::ptr_eq(&union_or_share(&cached, Some(&empty)), &cached));
+    }
+
+    #[test]
+    fn union_or_share_allocates_complete_union_for_new_values() {
+        let cached = Arc::new(BTreeSet::from(["cached".to_string()]));
+        let harvested = BTreeSet::from(["added".to_string()]);
+        let merged = union_or_share(&cached, Some(&harvested));
+
+        assert!(!Arc::ptr_eq(&merged, &cached));
+        assert_eq!(
+            merged.as_ref(),
+            &BTreeSet::from(["added".to_string(), "cached".to_string()])
+        );
+    }
+
+    #[test]
+    fn contribution_reuses_cached_helper_defs_for_subset_closure() {
+        let helper_path: PathBuf = "/work/pkg/tests/testthat/helper-shared.R".into();
+        let helper_text: Arc<str> = "shared <- 1\n".into();
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            helper_path.clone(),
+            RFileInput {
+                kind: RFileKind::Test,
+                text: helper_text.clone(),
+                content_digest: ContentDigest::of(&helper_text),
+            },
+        );
+        inputs
+            .preamble_sourced_symbols
+            .insert(helper_path.clone(), BTreeSet::from(["shared".to_string()]));
+
+        let state = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        let cached = &state.r_file_facts[&helper_path].top_level_defs;
+        let contributed = &state.scope_contribution.test_helper_symbols[&helper_path];
+
+        assert!(Arc::ptr_eq(contributed, cached));
+        assert_eq!(
+            contributed.as_ref(),
+            &BTreeSet::from(["shared".to_string()])
+        );
+    }
+
+    #[test]
+    fn contribution_reuses_cached_helper_attaches_for_subset_closure() {
+        let helper_path: PathBuf = "/work/pkg/tests/testthat/helper-shared.R".into();
+        let helper_text: Arc<str> = "library(tidyr)\n".into();
+        let mut inputs = with_description(PackageMode::Auto, "Package: foo\n");
+        inputs.r_files.insert(
+            helper_path.clone(),
+            RFileInput {
+                kind: RFileKind::Test,
+                text: helper_text.clone(),
+                content_digest: ContentDigest::of(&helper_text),
+            },
+        );
+        inputs
+            .preamble_sourced_attached_packages
+            .insert(helper_path.clone(), BTreeSet::from(["tidyr".to_string()]));
+
+        let state = derive_package_state(
+            &PackageState::default(),
+            &inputs,
+            &PackageInputDelta::Initial,
+        );
+        let cached = &state.r_file_facts[&helper_path].attached_packages;
+        let contributed = &state.scope_contribution.test_helper_attached_packages[&helper_path];
+
+        assert!(Arc::ptr_eq(contributed, cached));
+        assert_eq!(contributed.as_ref(), &BTreeSet::from(["tidyr".to_string()]));
     }
 
     #[test]
