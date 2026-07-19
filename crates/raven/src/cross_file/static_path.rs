@@ -156,13 +156,20 @@ impl<'tree, 'text> StaticBindings<'tree, 'text> {
             return None; // cycle
         }
         let mut path_literals = Vec::new();
-        let mut record_literal = |literal| {
-            path_literals.push(literal);
-            on_path_literal(literal);
-        };
         let value =
-            fold_string_expr_with_path_literals(rhs, self.content, self, &mut record_literal);
+            fold_string_expr_with_path_literals_inner(rhs, self.content, self, &mut |literal| {
+                path_literals.push(literal)
+            });
         self.visiting.borrow_mut().remove(name);
+        if value.is_some() {
+            for literal in &path_literals {
+                on_path_literal(*literal);
+            }
+        } else {
+            // Intrinsic failures remain safe to memoize, but partial literals
+            // must never be replayed as if they belonged to a successful path.
+            path_literals.clear();
+        }
         self.memo.borrow_mut().insert(
             name.to_string(),
             MemoizedFold {
@@ -399,26 +406,50 @@ pub(crate) fn fold_string_expr<'tree>(
     content: &str,
     bindings: &StaticBindings<'tree, '_>,
 ) -> Option<String> {
-    fold_string_expr_with_path_literals(node, content, bindings, &mut |_| {})
+    fold_string_expr_with_path_literals_inner(node, content, bindings, &mut |_| {})
 }
 
 /// Fold a path-valued expression and report every accepted string literal that
 /// participates in the traversal.
 ///
 /// This is the policy-bearing fold used by both static source detection and
-/// computed-path navigation. The callback runs only for plain string literals
-/// reached through the same accepted branches as [`fold_string_expr`]; option
-/// literals and strings below rejected branches are never traversed. Memoized
-/// identifier folds replay their participating literals without changing the
-/// existing value memoization or cycle guard.
+/// computed-path navigation. The callback runs only after the complete outer
+/// fold succeeds, for plain string literals reached through the same accepted
+/// branches as [`fold_string_expr`]. Option literals and strings below rejected
+/// branches are never reported. Memoized identifier folds replay their
+/// participating literals into the same transaction without changing value
+/// memoization or the cycle guard.
 pub(crate) fn fold_string_expr_with_path_literals<'tree>(
     node: Node<'tree>,
     content: &str,
     bindings: &StaticBindings<'tree, '_>,
     on_path_literal: &mut dyn FnMut(Node<'tree>),
 ) -> Option<String> {
+    let mut path_literals = Vec::new();
+    let value =
+        fold_string_expr_with_path_literals_inner(node, content, bindings, &mut |literal| {
+            path_literals.push(literal)
+        });
+    if value.is_some() {
+        for literal in path_literals {
+            on_path_literal(literal);
+        }
+    }
+    value
+}
+
+/// Recursive implementation for one outer transactional literal fold.
+///
+/// Recursive calls use this helper so a successful inner expression cannot
+/// publish literals when a later sibling makes the outer fold fail.
+fn fold_string_expr_with_path_literals_inner<'tree>(
+    node: Node<'tree>,
+    content: &str,
+    bindings: &StaticBindings<'tree, '_>,
+    on_path_literal: &mut dyn FnMut(Node<'tree>),
+) -> Option<String> {
     match node.kind() {
-        "parenthesized_expression" => fold_string_expr_with_path_literals(
+        "parenthesized_expression" => fold_string_expr_with_path_literals_inner(
             node.named_child(0)?,
             content,
             bindings,
@@ -487,7 +518,7 @@ fn fold_file_path_call<'tree>(
             }
         } else {
             let value_node = child.child_by_field_name("value")?;
-            let part = fold_string_expr_with_path_literals(
+            let part = fold_string_expr_with_path_literals_inner(
                 value_node,
                 content,
                 bindings,
@@ -532,7 +563,7 @@ fn fold_normalize_path_call<'tree>(
     {
         return None;
     }
-    fold_string_expr_with_path_literals(path, content, bindings, on_path_literal)
+    fold_string_expr_with_path_literals_inner(path, content, bindings, on_path_literal)
 }
 
 fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
@@ -789,6 +820,57 @@ source(file.path(root, root, "helpers.R"))
                 "\"helpers.R\""
             ]
         );
+    }
+
+    #[test]
+    fn callback_discards_literals_when_direct_composite_fold_fails() {
+        let (folded, literals) =
+            fold_last_source_arg_with_literals(r#"source(file.path("dir", dynamic))"#);
+
+        assert_eq!(folded, None);
+        assert!(literals.is_empty());
+    }
+
+    #[test]
+    fn callback_discards_nested_success_when_outer_fold_fails() {
+        let code = r#"
+root <- file.path("scripts", "nested")
+source(file.path(root, dynamic))
+"#;
+        let (folded, literals) = fold_last_source_arg_with_literals(code);
+
+        assert_eq!(folded, None);
+        assert!(literals.is_empty());
+    }
+
+    #[test]
+    fn failed_binding_memo_does_not_replay_partial_literals() {
+        let code = r#"
+path <- file.path("dir", dynamic)
+source(path)
+source(path)
+"#;
+        let tree = parse(code);
+        let root = tree.root_node();
+        let bindings = StaticBindings::collect(root, code);
+        let source_call = root.named_child(2).unwrap();
+        let arguments = source_call.child_by_field_name("arguments").unwrap();
+        let value =
+            super::super::source_detect::source_call_file_value_node(&arguments, code, false)
+                .unwrap();
+        let mut literals = Vec::new();
+        let folded = fold_string_expr_with_path_literals(value, code, &bindings, &mut |literal| {
+            literals.push(code[literal.byte_range()].to_string())
+        });
+
+        assert_eq!(folded, None);
+        assert!(literals.is_empty());
+        let memo = bindings.memo.borrow();
+        let cached = memo
+            .get("path")
+            .expect("intrinsic failed fold should remain memoized");
+        assert_eq!(cached.value, None);
+        assert!(cached.path_literals.is_empty());
     }
 
     #[test]
