@@ -45430,14 +45430,7 @@ mod project_config_initialize_tests {
         // marker-consumed assertion below observes only the close resync's
         // mark/publish pair (a pending debounced publish cancelled by the
         // resync's schedule() would otherwise strand its marker).
-        let drained = wait_for_state(backend, 5_000, |state| {
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&grandparent_uri)
-                == 0
-        })
-        .await;
-        assert!(drained, "did_change's dependent fanout must drain");
+        wait_for_revalidation_drain(backend, &[&grandparent_uri]).await;
 
         close_doc(backend, &helper_uri).await;
 
