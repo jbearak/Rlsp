@@ -8195,7 +8195,6 @@ fn direct_body_assignment_effect(body: Node, text: &str, name: &str) -> Option<u
                 | "integer"
                 | "complex"
                 | "string"
-                | "raw_string_literal"
                 | "true"
                 | "false"
                 | "null"
@@ -58956,6 +58955,33 @@ source(\"helpers.R\")
             "a later body assignment cannot satisfy an already-forced default: {diagnostics:?}"
         );
         assert!(used_before[0].message.contains("line 5"));
+    }
+
+    #[test]
+    fn test_default_parameter_body_binding_before_force_suppresses_attribution() {
+        let diagnostics = default_source_diagnostics(
+            "f <- function(a = x) {\n  x <- 1\n  a\n}\nsource(\"helpers.R\")\n",
+            &[("helpers.R", "x <- 42\n")],
+        );
+        assert!(
+            used_before_source_for(&diagnostics, "x").is_empty(),
+            "a proven body binding before the force should suppress source attribution: \
+             {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_string_body_binding_before_force_suppresses_attribution() {
+        for rhs in [r#""ordinary""#, r#"r"(raw)""#] {
+            let code =
+                format!("f <- function(a = x) {{\n  x <- {rhs}\n  a\n}}\nsource(\"helpers.R\")\n");
+            let diagnostics = default_source_diagnostics(&code, &[("helpers.R", "x <- 42\n")]);
+            assert!(
+                used_before_source_for(&diagnostics, "x").is_empty(),
+                "ordinary and raw strings are both self-evaluating `string` nodes: \
+                 {diagnostics:?}"
+            );
+        }
     }
 
     #[test]

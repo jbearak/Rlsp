@@ -1090,66 +1090,46 @@ impl DependencyGraph {
 
                 // Check for directive-vs-AST conflict
                 if directive_from_to.contains(&pair) {
-                    // Find the directive edge for this (from, to) pair
-                    let directive_edge = directive_edges
+                    let mut found_matching_directive = false;
+                    let directive_covers_ast = directive_edges
                         .iter()
-                        .find(|e| e.directive_conflict_identity() == pair);
+                        .filter(|edge| edge.directive_conflict_identity() == pair)
+                        .any(|dir_edge| {
+                            found_matching_directive = true;
+                            let directive_call_site = dir_edge.call_site_identity();
 
-                    if let Some(dir_edge) = directive_edge {
-                        // Check if directive has a known call site
-                        let directive_call_site = dir_edge.call_site_identity();
-
-                        if directive_call_site.is_known_directive_call_site() {
-                            // Directive has known call site: only override AST edge at same call site
-                            // (Requirement 4.3)
-                            if directive_call_site == edge.call_site_identity() {
-                                // Case 1: Same call site - directive wins, skip AST edge
-                                // (Requirement 4.3)
-                                continue;
+                            if directive_call_site.is_known_directive_call_site() {
+                                // A known directive covers only an AST edge at
+                                // the same call site. All matching directives
+                                // participate because one relationship can
+                                // retain multiple distinct call sites.
+                                directive_call_site == edge.call_site_identity()
                             } else {
-                                // Case 2: Different call sites - keep both edges
-                                // (Requirement 4.4)
-                                ast_edges.push(edge);
-                                continue;
+                                // A directive without an explicit call site
+                                // covers an AST edge at the same or a later
+                                // line (Requirement 4.5).
+                                let directive_line = meta
+                                    .sources
+                                    .iter()
+                                    .find(|source| {
+                                        source.is_directive
+                                            && do_resolve(&source.path) == Some(to_uri.clone())
+                                    })
+                                    .map(|source| source.line);
+                                let ast_is_earlier = match directive_line {
+                                    Some(directive_line) => source.line < directive_line,
+                                    None => false,
+                                };
+                                !ast_is_earlier
                             }
-                        } else {
-                            // Directive has no explicit call site
-                            // (Requirement 4.5)
+                        });
 
-                            // Get the directive's line (where it appears in the file)
-                            let directive_line = meta
-                                .sources
-                                .iter()
-                                .find(|s| {
-                                    s.is_directive && do_resolve(&s.path) == Some(to_uri.clone())
-                                })
-                                .map(|s| s.line);
-
-                            // Check if AST edge is at an earlier line than the directive
-                            let ast_is_earlier = match directive_line {
-                                Some(dir_line) => source.line < dir_line,
-                                None => false, // If we can't determine directive line, don't treat AST as earlier
-                            };
-
-                            if ast_is_earlier {
-                                // Case 3: Directive without line=, AST at earlier line.
-                                // Keep AST edge (earliest call site wins). The
-                                // redundant-directive diagnostic is recomputed from
-                                // the snapshot graph by
-                                // `collect_redundant_directive_diagnostics_from_snapshot`,
-                                // not stored on this result. (Requirement 4.5, 6.2)
-                                ast_edges.push(edge);
-                                continue;
-                            } else {
-                                // AST is at same or later line than directive
-                                // Directive wins (it's earlier or at same position)
-                                // Skip AST edge
-                                continue;
-                            }
-                        }
+                    if directive_covers_ast || !found_matching_directive {
+                        // The index and edge list are populated together, so
+                        // the no-match case should be impossible. Preserve the
+                        // existing fail-closed behavior if they ever drift.
+                        continue;
                     }
-                    // No matching directive edge found (shouldn't happen), skip
-                    continue;
                 }
 
                 ast_edges.push(edge);
@@ -4977,6 +4957,55 @@ z <- 3
         assert!(
             result.diagnostics.is_empty(),
             "No diagnostics for different call sites"
+        );
+    }
+
+    /// Every directive for a relationship participates in conflict detection,
+    /// not only the first directive encountered.
+    #[test]
+    fn test_directive_vs_ast_second_matching_call_site_directive_wins() {
+        use super::super::types::ForwardSource;
+
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", "utils.R"]);
+        let main = temp_url(&temp_dir, "main.R");
+        let mut graph = DependencyGraph::new();
+        let meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "utils.R".to_string(),
+                    line: 5,
+                    column: 0,
+                    is_directive: true,
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "utils.R".to_string(),
+                    line: 10,
+                    column: 0,
+                    is_directive: true,
+                    chdir: true,
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "utils.R".to_string(),
+                    line: 10,
+                    column: 0,
+                    is_directive: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        graph.update_file(&main, &meta, Some(&workspace_url), |_| None);
+
+        let deps = graph.get_dependencies(&main);
+        assert_eq!(
+            deps.iter()
+                .map(|edge| (edge.call_site_line, edge.is_directive, edge.chdir))
+                .collect::<Vec<_>>(),
+            vec![(Some(5), true, false), (Some(10), true, true)],
+            "the second directive must suppress the AST edge at its call site"
         );
     }
 
