@@ -37244,7 +37244,8 @@ mod project_config_initialize_tests {
                     name: "t".into(),
                 }]),
                 initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
                 })),
                 ..Default::default()
             })
@@ -47078,11 +47079,24 @@ mod project_config_initialize_tests {
             "source(\"helper.R\")\nhelper_fn()\n",
         )
         .unwrap();
-        let (svc, parent_uri) =
-            open_in_workspace(&tmp, "parent.R", "r", "source(\"helper.R\")\nhelper_fn()\n").await;
+        let (svc, parent_uri) = open_in_quiescent_workspace(
+            &tmp,
+            "parent.R",
+            "r",
+            "source(\"helper.R\")\nhelper_fn()\n",
+        )
+        .await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
-        backend.state.write().await.workspace_scan_complete = true;
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            // The close continuation drains its transactional tickets before
+            // entering disk resync. Keep that invocation-owned handoff
+            // immediate so this fixture observes the target resync rather
+            // than timing unrelated diagnostics setup.
+            state.cross_file_config.revalidation_debounce_ms = 0;
+        }
 
         // Plant a STALE unified-index entry for helper.R, simulating a scan
         // snapshot taken before the file's current disk content (it defines
@@ -47130,14 +47144,37 @@ mod project_config_initialize_tests {
         // must drop the stale unified-index entry so the fresh disk commit
         // becomes visible to the dependent.
         open_doc(backend, &helper_uri, "r", 1, "helper_fn <- function() 1\n").await;
-        close_doc(backend, &helper_uri).await;
-
-        let recovered = wait_for_state(backend, 5_000, |state| {
-            snapshot_diagnostics(state, &parent_uri).is_empty()
-        })
+        let (_, resync, resync_handoff) = close_with_final_handoff_capture_timeout(
+            backend,
+            &helper_uri,
+            true,
+            std::time::Duration::from_secs(30),
+        )
         .await;
+        let (fresh_contents, diagnostics) = {
+            let state = backend.state.read().await;
+            (
+                state
+                    .workspace_index
+                    .get(&helper_uri)
+                    .map(|entry| entry.contents.to_string()),
+                snapshot_diagnostics(&state, &parent_uri),
+            )
+        };
+        resync_handoff
+            .expect("the target close resync handoff must remain paused")
+            .release();
         assert!(
-            recovered,
+            resync.iter().any(|consumer| consumer.uri() == &parent_uri),
+            "the target close resync must own the dependent revalidation"
+        );
+        assert_eq!(
+            fresh_contents.as_deref(),
+            Some("helper_fn <- function() 1\n"),
+            "close resync must replace the stale unified-index entry with current disk state"
+        );
+        assert!(
+            diagnostics.is_empty(),
             "close resync must invalidate the stale unified-index entry that shadows disk state"
         );
     }
@@ -50991,6 +51028,27 @@ infixContinuationStyle = "aligned"
             crate::state::FinalHandoffCaptureHandle<Vec<crate::state::CloseResyncConsumerForTest>>,
         >,
     ) {
+        close_with_final_handoff_capture_timeout(
+            backend,
+            uri,
+            capture_resync,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    }
+
+    async fn close_with_final_handoff_capture_timeout(
+        backend: &Backend,
+        uri: &Url,
+        capture_resync: bool,
+        resync_timeout: std::time::Duration,
+    ) -> (
+        Vec<crate::state::AnalysisRevalidationTicketFingerprint>,
+        Vec<crate::state::CloseResyncConsumerForTest>,
+        Option<
+            crate::state::FinalHandoffCaptureHandle<Vec<crate::state::CloseResyncConsumerForTest>>,
+        >,
+    ) {
         let (final_handoff, resync_handoff) = {
             let state = backend.state.read().await;
             (
@@ -51013,12 +51071,9 @@ infixContinuationStyle = "aligned"
         handler.await.unwrap();
 
         let (resync_payload, resync_handoff) = if let Some(resync_handoff) = resync_handoff {
-            let payload = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                resync_handoff.wait_payload(),
-            )
-            .await
-            .expect("didClose must reach its disk-resync final handoff");
+            let payload = tokio::time::timeout(resync_timeout, resync_handoff.wait_payload())
+                .await
+                .expect("didClose must reach its disk-resync final handoff");
             (payload, Some(resync_handoff))
         } else {
             (Vec::new(), None)
