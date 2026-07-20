@@ -1428,6 +1428,13 @@ subject is marker/prerequisite drainage may still poll that contract, but their
 timeout is only a deadlock watchdog and must report the target lifecycle,
 force/pending state, outstanding causal labels, and relevant permit state.
 
+When a test intercepts consecutive attempts at the same one-shot pause seam,
+it must arm the successor after observing arrival and before releasing the
+predecessor. `DiagnosticsPublishPause::rearm_before_release` enforces that
+ordering and rejects a handle from another registry or seam. Releasing one
+pause and arming its successor separately leaves an uninstrumented scheduling
+gap in which the worker can cross the seam.
+
 Use `open_in_quiescent_workspace` when workspace scanning and package routing
 are outside the test's subject. It disables those two startup authorities while
 preserving on-demand cross-file indexing. Keep separate tests with normal

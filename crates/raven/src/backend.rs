@@ -43241,14 +43241,15 @@ mod project_config_initialize_tests {
             !deletion.is_finished(),
             "delete-only handler skipped the first routing attempt"
         );
-        first_pause.release();
-
         let second_pause = backend
             .state
             .read()
             .await
             .system_file_pre_commit_test_pause
-            .arm(Url::parse("raven-test://system-file-pre-commit").unwrap());
+            .rearm_before_release(
+                Url::parse("raven-test://system-file-pre-commit").unwrap(),
+                first_pause,
+            );
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             second_pause.wait_arrived(),
@@ -43259,14 +43260,15 @@ mod project_config_initialize_tests {
             !deletion.is_finished(),
             "delete-only handler skipped the second routing attempt"
         );
-        second_pause.release();
-
         let deferred_pause = backend
             .state
             .read()
             .await
             .system_file_pre_commit_test_pause
-            .arm(Url::parse("raven-test://system-file-pre-commit").unwrap());
+            .rearm_before_release(
+                Url::parse("raven-test://system-file-pre-commit").unwrap(),
+                second_pause,
+            );
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             deferred_pause.wait_arrived(),
@@ -52057,6 +52059,7 @@ infixContinuationStyle = "aligned"
     ) -> String {
         let capture_status = capture.status();
         let state = backend.state.read().await;
+        let system_file_routing_owner_generation = state.system_file_routing_owner_generation();
         let target_state: Vec<_> = targets
             .iter()
             .map(|uri| {
@@ -52071,10 +52074,19 @@ infixContinuationStyle = "aligned"
                 )
             })
             .collect();
+        drop(state);
+        let routing_derivation_slot = library_routing_derivation_slot()
+            .lock()
+            .entry
+            .as_ref()
+            .map(|entry| (entry.id, entry.key));
         format!(
             "kind={kind} operation_id={} owner={:?} claimed={} recorded={} completed={} \
              outstanding={:?} abnormal_exits={:?} \
              targets=(uri,version,revision,epoch,force,pending){target_state:?} \
+             system_file_routing_owner_generation={system_file_routing_owner_generation} \
+             library_routing_derivation_available_permits={} \
+             library_routing_derivation_slot={routing_derivation_slot:?} \
              close_resync_available_permits={}",
             capture_status.operation_id,
             capture_status.owner,
@@ -52083,6 +52095,7 @@ infixContinuationStyle = "aligned"
             capture_status.completed,
             capture_status.outstanding,
             capture_status.abnormal_exits,
+            library_routing_derivation_gate().available_permits(),
             backend.close_resync_permits.available_permits(),
         )
     }

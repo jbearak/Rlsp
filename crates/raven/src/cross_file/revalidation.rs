@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::AtomicBool;
+
 use tokio_util::sync::CancellationToken;
 use tower_lsp::lsp_types::Url;
 
@@ -422,9 +425,20 @@ impl CrossFileDiagnosticsGate {
 /// pause's lifetime is tied to the backend under test and cannot leak into
 /// unrelated tests sharing the process.
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DiagnosticsPublishPause {
     gates: RwLock<HashMap<Url, std::sync::Arc<PauseGate>>>,
+    identity: std::sync::Arc<()>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for DiagnosticsPublishPause {
+    fn default() -> Self {
+        Self {
+            gates: RwLock::default(),
+            identity: std::sync::Arc::new(()),
+        }
+    }
 }
 
 /// One armed pause point. `arrived`/`release` are `Notify`s, so the
@@ -434,6 +448,7 @@ pub struct DiagnosticsPublishPause {
 pub struct PauseGate {
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    has_arrived: AtomicBool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -442,8 +457,55 @@ impl DiagnosticsPublishPause {
     /// wait for a worker to arrive at the pause point and later release it.
     pub fn arm(&self, uri: Url) -> PauseHandle {
         let gate = std::sync::Arc::new(PauseGate::default());
-        self.gates.write().unwrap().insert(uri, gate.clone());
-        PauseHandle { gate }
+        self.gates
+            .write()
+            .unwrap()
+            .insert(uri.clone(), gate.clone());
+        PauseHandle {
+            gate,
+            registry_identity: self.identity.clone(),
+            uri,
+        }
+    }
+
+    /// Arm the next one-shot pause before releasing an arrived predecessor.
+    ///
+    /// Repeated interceptions at the same seam must use this handoff instead
+    /// of releasing and then calling [`Self::arm`]. The latter leaves a
+    /// scheduler-visible gap in which the worker can cross the seam before the
+    /// successor exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `predecessor` has not arrived, belongs to another pause
+    /// registry or URI, or if another pause is already armed for `uri`.
+    pub fn rearm_before_release(&self, uri: Url, predecessor: PauseHandle) -> PauseHandle {
+        assert!(
+            predecessor.gate.has_arrived.load(Ordering::Acquire),
+            "a pause successor can only replace an arrived predecessor"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&self.identity, &predecessor.registry_identity),
+            "a pause successor must use its predecessor's registry"
+        );
+        assert_eq!(
+            uri, predecessor.uri,
+            "a pause successor must use its predecessor's URI"
+        );
+        let gate = std::sync::Arc::new(PauseGate::default());
+        let mut gates = self.gates.write().unwrap();
+        assert!(
+            !gates.contains_key(&uri),
+            "the arrived predecessor must already be consumed before rearming"
+        );
+        gates.insert(uri.clone(), gate.clone());
+        drop(gates);
+        predecessor.release();
+        PauseHandle {
+            gate,
+            registry_identity: self.identity.clone(),
+            uri,
+        }
     }
 
     /// Worker-side lookup, consuming the armed entry (one-shot so a respawn
@@ -459,6 +521,7 @@ impl DiagnosticsPublishPause {
 impl PauseGate {
     /// Worker side: signal arrival, then park until the test releases.
     pub async fn pause(&self) {
+        self.has_arrived.store(true, Ordering::Release);
         self.arrived.notify_one();
         self.release.notified().await;
     }
@@ -468,6 +531,8 @@ impl PauseGate {
 #[cfg(any(test, feature = "test-support"))]
 pub struct PauseHandle {
     gate: std::sync::Arc<PauseGate>,
+    registry_identity: std::sync::Arc<()>,
+    uri: Url,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -478,7 +543,7 @@ impl PauseHandle {
     }
 
     /// Release the parked worker.
-    pub fn release(&self) {
+    pub fn release(self) {
         self.gate.release.notify_one();
     }
 }
@@ -786,6 +851,81 @@ mod tests {
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///{}", name)).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pause_rearm_registers_successor_before_releasing_predecessor() {
+        let pauses = std::sync::Arc::new(DiagnosticsPublishPause::default());
+        let uri = test_uri("pause");
+        let first = pauses.arm(uri.clone());
+        let first_gate = pauses.take_armed(&uri).unwrap();
+        let worker_pauses = pauses.clone();
+        let worker_uri = uri.clone();
+        let first_worker = tokio::spawn(async move {
+            first_gate.pause().await;
+            let second_gate = worker_pauses
+                .take_armed(&worker_uri)
+                .expect("successor is visible before the predecessor resumes");
+            second_gate.pause().await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), first.wait_arrived())
+            .await
+            .expect("predecessor arrives");
+
+        let second = pauses.rearm_before_release(uri.clone(), first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), second.wait_arrived())
+            .await
+            .expect("successor arrives");
+        second.release();
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_worker)
+            .await
+            .expect("both pause generations finish")
+            .unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "a pause successor must use its predecessor's registry")]
+    fn pause_rearm_rejects_a_predecessor_from_another_registry() {
+        let pauses = DiagnosticsPublishPause::default();
+        let other = DiagnosticsPublishPause::default();
+        let uri = test_uri("pause");
+        let predecessor = other.arm(uri.clone());
+        predecessor.gate.has_arrived.store(true, Ordering::Release);
+
+        pauses.rearm_before_release(uri, predecessor);
+    }
+
+    #[test]
+    #[should_panic(expected = "a pause successor must use its predecessor's URI")]
+    fn pause_rearm_rejects_a_predecessor_from_another_uri() {
+        let pauses = DiagnosticsPublishPause::default();
+        let predecessor = pauses.arm(test_uri("first"));
+        predecessor.gate.has_arrived.store(true, Ordering::Release);
+
+        pauses.rearm_before_release(test_uri("second"), predecessor);
+    }
+
+    #[test]
+    #[should_panic(expected = "a pause successor can only replace an arrived predecessor")]
+    fn pause_rearm_rejects_a_predecessor_that_has_not_arrived() {
+        let pauses = DiagnosticsPublishPause::default();
+        let uri = test_uri("pause");
+        let predecessor = pauses.arm(uri.clone());
+
+        pauses.rearm_before_release(uri, predecessor);
+    }
+
+    #[test]
+    #[should_panic(expected = "the arrived predecessor must already be consumed before rearming")]
+    fn pause_rearm_rejects_an_occupied_seam() {
+        let pauses = DiagnosticsPublishPause::default();
+        let uri = test_uri("pause");
+        let predecessor = pauses.arm(uri.clone());
+        pauses.take_armed(&uri).unwrap();
+        predecessor.gate.has_arrived.store(true, Ordering::Release);
+        let _occupied = pauses.arm(uri.clone());
+
+        pauses.rearm_before_release(uri, predecessor);
     }
 
     // CrossFileRevalidationState tests
