@@ -563,6 +563,10 @@ struct DependencyInterfaceEdgeIdentity {
 }
 
 /// Complete edge projection whose changes invalidate revision-gated caches.
+///
+/// This structurally contains [`DependencyInterfaceEdgeIdentity`] and adds only
+/// lending policy. Comparing revision-identity sets must therefore detect every
+/// dependency-interface change as well as lending-only changes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EdgeRevisionIdentity {
     interface: DependencyInterfaceEdgeIdentity,
@@ -652,9 +656,11 @@ pub struct CycleDetection {
 pub struct UpdateResult {
     /// Diagnostics to emit (e.g., directive-vs-AST conflict warnings)
     pub diagnostics: Vec<Diagnostic>,
-    /// True if forward edges from this file changed (added/removed targets).
-    /// Used to trigger revalidation of dependents even when interface hash
-    /// doesn't change (e.g., commenting out a source() call breaks a cycle).
+    /// True if this file's forward or backward dependency interface changed.
+    ///
+    /// The interface includes targets, call sites, source semantics, and
+    /// directive provenance. Used to trigger dependent revalidation even when
+    /// the file's exported-symbol interface hash is unchanged.
     pub edges_changed: bool,
 }
 
@@ -727,9 +733,10 @@ pub struct DependencyGraph {
     forward: HashMap<Url, Vec<DependencyEdge>>,
     /// Reverse lookup: child URI -> edges from parents
     backward: HashMap<Url, Vec<DependencyEdge>>,
-    /// Monotonic counter bumped whenever `update_file` reports
-    /// `edges_changed`. Cached `detect_cycle` results are keyed on this so
-    /// they are invalidated as soon as forward edges change.
+    /// Monotonic counter bumped whenever any complete edge revision identity
+    /// changes, including backward edges and lending policy. Direct graph
+    /// mutators such as removal and non-lending conversion also bump it.
+    /// Revision-gated cycle and subgraph caches are invalidated by this value.
     edge_revision: std::sync::atomic::AtomicU64,
     /// Cache of `detect_cycle` results keyed by `uri` (and gated by
     /// `edge_revision` per slot). Bounded LRU so long-lived sessions
@@ -1209,13 +1216,17 @@ impl DependencyGraph {
             || old_backward_interface != new_backward_interface;
         let revision_identity_changed = old_forward_revision != new_forward_revision
             || old_backward_revision != new_backward_revision;
+        debug_assert!(
+            !result.edges_changed || revision_identity_changed,
+            "revision identity must contain dependency-interface identity"
+        );
 
         // Bump edge_revision so cycle/subgraph caches become stale for every
         // URI. detect_cycle and cached_neighborhood_subgraph then either
         // re-fill their slot or evict via the revision-mismatch check. A
         // non_lending flip invalidates those caches too, but deliberately does
         // not set `edges_changed`: lending policy is not a revalidation edge.
-        if result.edges_changed || revision_identity_changed {
+        if revision_identity_changed {
             self.edge_revision
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
@@ -2205,14 +2216,16 @@ impl DependencyGraph {
         payload
     }
 
-    /// Current global edge revision — a monotonic counter bumped on any
-    /// structural edge change (`update_file` reporting `edges_changed`,
-    /// `remove_file`) or lending-policy transition. Used as the
-    /// membership-pinning component of the cross-snapshot `StandaloneScopeCache`
-    /// key (issue #483): capture it from the *real* `WorldState` graph (a cloned
-    /// per-snapshot graph resets its own counter to 0), so it changes whenever a
-    /// `source()` edge is added, retargeted, moved, or switched between lending
-    /// and non-lending anywhere in the workspace.
+    /// Current global edge revision — a monotonic counter bumped whenever the
+    /// complete edge revision identity changes, including lending-policy
+    /// transitions, and by direct graph mutations such as file removal. Used
+    /// as the membership-pinning component of the cross-snapshot
+    /// `StandaloneScopeCache` key (issue #483): capture it from the *real*
+    /// `WorldState` graph (a cloned per-snapshot graph resets its own counter to
+    /// 0), so it changes whenever a `source()` edge is added, retargeted, moved,
+    /// removed, or switched between lending and non-lending anywhere in the
+    /// workspace. [`UpdateResult::edges_changed`] separately controls
+    /// dependent revalidation.
     pub fn edge_revision(&self) -> u64 {
         self.edge_revision
             .load(std::sync::atomic::Ordering::Acquire)
@@ -5220,6 +5233,11 @@ z <- 3
             base.dependency_interface_identity(),
             non_lending.dependency_interface_identity(),
             "lending policy is not a revalidation edge"
+        );
+        assert_eq!(
+            base.revision_identity().interface,
+            base.dependency_interface_identity(),
+            "revision identity must contain the complete dependency interface"
         );
         assert_ne!(
             base.revision_identity(),
