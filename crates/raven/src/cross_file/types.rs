@@ -227,7 +227,7 @@ pub struct CrossFileMetadata {
     /// flavor so an unused directive can be reported at its source.
     #[serde(default)]
     pub suppression_directives: Vec<SuppressionDirective>,
-    /// Detected library(), require(), loadNamespace() calls
+    /// Detected package-load calls, including static pacman `p_load()` forms.
     pub library_calls: Vec<LibraryCall>,
     /// Variables declared via `# raven: var` directives
     #[serde(default)]

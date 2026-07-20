@@ -710,6 +710,22 @@ pub(crate) fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<St
             }
         }
     }
+    // Add unconditional packages recognized by the canonical detector
+    // (apply/targets/qualified pacman included). `Document.loaded_packages`
+    // also feeds CLI reporting, so conditional bare `p_load()` targets must
+    // stay out until a graph-aware scope query proves their prerequisite.
+    // Backend edit-time prefetching deliberately keeps its separate permissive
+    // warm set; that path cannot affect semantic or user-visible package state.
+    if text.contains("p_load") {
+        packages.extend(
+            crate::cross_file::source_detect::detect_library_calls(tree, text)
+                .into_iter()
+                .filter(|call| call.requires_attached.is_none())
+                .map(|call| call.package),
+        );
+    }
+    packages.sort();
+    packages.dedup();
     packages
 }
 
@@ -14315,6 +14331,27 @@ mod tests {
                 "one didChange batch must rebuild the analysis tree once"
             );
         });
+    }
+
+    #[test]
+    fn document_loaded_packages_excludes_conditional_bare_p_load() {
+        let generic = Document::new("p_load <- function(...) NULL\np_load(not_a_package)", None);
+        assert!(
+            generic.loaded_packages.is_empty(),
+            "a locally defined p_load must not contribute package metadata"
+        );
+
+        let inactive = Document::new("p_load(not_a_package)", None);
+        assert!(inactive.loaded_packages.is_empty());
+
+        let active = Document::new("library(pacman)\np_load(dplyr)", None);
+        assert_eq!(active.loaded_packages, vec!["pacman"]);
+
+        let ordered = Document::new("p_load(before)\nlibrary(pacman)\np_load(after)", None);
+        assert_eq!(ordered.loaded_packages, vec!["pacman"]);
+
+        let qualified = Document::new("pacman::p_load(ggplot2)", None);
+        assert_eq!(qualified.loaded_packages, vec!["ggplot2"]);
     }
 
     #[test]

@@ -471,10 +471,11 @@ events do not mutate alias topology: only the uniquely keyed opened spelling
 can have been retargeted, so one event affects at most one open record.
 
 The package-state-local static-source closure walker in `package_state/mod.rs`
-owns the traversal mechanics shared by `.Rprofile` and testthat preambles: LIFO
-order, visited/routing deduplication, rich forward path resolution, and the common
-depth/file budgets. Caller policies only decide root harvesting, open-buffer text
-overrides, exclusions, and the `.Rprofile` `renv/activate.R` exception. Accepted
+owns the traversal mechanics shared by `.Rprofile` and testthat preambles:
+depth-first execution frames, rich forward path resolution, active-stack cycle
+rejection, and the common depth/file/replay budgets. Caller policies only decide
+root harvesting, open-buffer text overrides, exclusions, and the `.Rprofile`
+`renv/activate.R` exception. Accepted
 missing or unreadable targets remain in the routing closure so a later create or
 recreate watcher event can rescan them.
 
@@ -546,9 +547,42 @@ The cached/streaming parent prefix is seeded with the queried URI at `(u32::MAX,
 
 The hash is deterministic and includes:
 - Exported symbols — each hashed through `impl Hash for ScopedSymbol`, which covers that type's full identity field set (`name`, `kind`, `source_uri`, `defined_line`, `defined_column`, `signature`, `is_declared`) and deliberately excludes only `defined_end_column` (positional highlight metadata). `Hash` must mirror `PartialEq` field-for-field: a field present in one but not the other makes the hash blind to that kind of edit. The `signature` inclusion (issue #482) is what makes a formals-only edit (`f <- function(a)` → `f <- function(a, b)`) bust the hash and revalidate dependents; `scoped_symbol_hash_eq_field_parity` pins the two impls' field sets together.
-- Loaded packages (from `library()` / `require()` / `loadNamespace()`)
+- Loaded packages (from `library()` / `require()` / `loadNamespace()` and
+  static `pacman::p_load()` calls), including whether each event actually
+  attaches the package and any attachment prerequisite on a conditional bare
+  helper call. Scope results retain a separate attached-package fact because
+  `loadNamespace()` remains available for namespace-aware analysis but must not
+  enable attachment-sensitive helpers.
 - Declared symbols (from `# raven: var` / `# raven: func` directives)
 - Source-edge inputs, including precise `SourceLocality`, call site, path, `chdir`, function scope, and resolved URI. `CurrentFrame` and `NonInheriting` remain distinct runtime/hash values even though old serialized readers see the same lossy `local = true` compatibility projection for regular `source()` calls.
+
+Conditional or inherited package state is also kept out of Raven's immutable
+function-scope tree. A bare Shiny deferred helper whose attachment is not
+provable from preceding local loads is recorded as a sidecar candidate, not an
+unconditional `FunctionScope` event. Recursive and streaming resolution
+activate that candidate only when their ordered attached-package projection
+contains `shiny` immediately before the helper call. The projection interleaves
+source/tar contributions with package events, retains the owning recursion
+depth and ancestor cycle guard, and keys reused source contributions by the
+inherited attachment set. Inside a function it uses the completed top-level
+projection (R late binding); at top level it never admits a later attachment.
+This preserves the authoritative timeline for inactive calls while allowing a
+later global attachment inside an enclosing function, conditional
+`p_load(shiny)`, or an inherited attachment to enable the same deferred-body
+isolation in both resolvers.
+
+Package-state `.Rprofile` and test-preamble closure scans replay their static
+top-level source and package events in execution order. Sourced children mutate
+the same bounded attachment environment before the parent resumes, so a
+preceding `library(pacman)` can enable a child's bare `p_load()` and a child
+attachment can enable a later parent call. A completed routing path executes
+again only after the monotonic environment gains a package required by a known
+conditional call; duplicate source calls at the same attachment generation
+collapse. Active-stack cycle rejection, the depth/distinct-file budgets, and a
+fixed per-file replay multiplier are deterministic completion boundaries.
+Missing or unreadable cap-boundary targets remain watcher-routed. Test preamble
+roots share this environment in lexical order; incremental rescans replay later
+roots only until the new cumulative environment converges with the prior one.
 
 The backend uses `old_interface_hash` vs `new_interface_hash` to decide whether to revalidate dependents.
 

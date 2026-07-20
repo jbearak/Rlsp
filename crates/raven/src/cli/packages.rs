@@ -692,11 +692,63 @@ fn scan_workspace_referenced_packages(root: &std::path::Path) -> Vec<String> {
         return Vec::new();
     };
     let index = crate::state::scan_workspace(std::slice::from_ref(&workspace_url), 0);
+    let mut graph = crate::cross_file::dependency::DependencyGraph::new();
+    for (uri, doc) in &index {
+        graph.update_file(uri, &doc.metadata, Some(&workspace_url), |target| {
+            index.get(target).map(|entry| entry.contents.to_string())
+        });
+    }
     let mut names = std::collections::BTreeSet::new();
     for doc in index.values() {
         if let Some(tree) = &doc.tree {
             let text = doc.contents.to_string();
             collect_referenced_packages(tree, &text, &mut names);
+        }
+    }
+    let get_artifacts =
+        |uri: &tower_lsp::lsp_types::Url| index.get(uri).map(|entry| entry.artifacts.clone());
+    let get_metadata =
+        |uri: &tower_lsp::lsp_types::Url| index.get(uri).map(|entry| entry.metadata.clone());
+    let mut activation_cache: std::collections::HashMap<
+        (tower_lsp::lsp_types::Url, u32, u32, String),
+        bool,
+    > = std::collections::HashMap::new();
+    for (uri, doc) in &index {
+        for call in &doc.metadata.library_calls {
+            let Some(required) = call.requires_attached.as_deref() else {
+                continue;
+            };
+            let (line, column) = if call.column > 0 {
+                (call.line, call.column - 1)
+            } else if call.line > 0 {
+                (call.line - 1, u32::MAX)
+            } else {
+                (0, 0)
+            };
+            let key = (uri.clone(), line, column, required.to_string());
+            let active = *activation_cache.entry(key).or_insert_with(|| {
+                crate::cross_file::scope::scope_at_position_with_graph(
+                    uri,
+                    line,
+                    column,
+                    &get_artifacts,
+                    &get_metadata,
+                    &graph,
+                    Some(&workspace_url),
+                    10,
+                    &std::collections::HashSet::new(),
+                    true,
+                    crate::cross_file::config::BackwardDependencyMode::Auto,
+                    &|| false,
+                    None,
+                    None,
+                )
+                .attached_packages
+                .contains(required)
+            });
+            if active && is_valid_package_name(&call.package) {
+                names.insert(call.package.clone());
+            }
         }
     }
     names.into_iter().collect()
@@ -714,6 +766,20 @@ fn collect_referenced_packages(
     text: &str,
     out: &mut std::collections::BTreeSet<String>,
 ) {
+    let detected_loads = crate::cross_file::source_detect::detect_library_calls(tree, text);
+    for call in detected_loads {
+        // Conditional bare p_load calls require graph-aware scope at the call
+        // site. The workspace pass below adds only the active ones; a flat
+        // per-file fold would let a function-body library(pacman) enable an
+        // unrelated top-level call merely because it appears earlier in text.
+        if call.requires_attached.is_some() {
+            continue;
+        }
+        if is_valid_package_name(&call.package) {
+            out.insert(call.package);
+        }
+    }
+
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         match node.kind() {
@@ -1722,6 +1788,79 @@ mod tests {
         assert!(
             !out.contains("bare_var"),
             "bare identifier must not be collected, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn collect_referenced_packages_handles_p_load_without_generic_false_match() {
+        let parse = |source: &str| {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_r::LANGUAGE.into())
+                .expect("load R grammar");
+            parser.parse(source, None).expect("parse R snippet")
+        };
+
+        let source = "pacman::p_load(alpha, \"beta\")\nlibrary(pacman)\np_load(gamma)";
+        let mut packages = std::collections::BTreeSet::new();
+        super::collect_referenced_packages(&parse(source), source, &mut packages);
+        for expected in ["pacman", "alpha", "beta"] {
+            assert!(packages.contains(expected), "got {packages:?}");
+        }
+        assert!(
+            !packages.contains("gamma"),
+            "conditional bare calls are admitted by the graph-aware workspace pass"
+        );
+
+        let generic = "p_load <- function(...) NULL\np_load(not_a_package)";
+        let mut packages = std::collections::BTreeSet::new();
+        super::collect_referenced_packages(&parse(generic), generic, &mut packages);
+        assert!(!packages.contains("not_a_package"), "got {packages:?}");
+    }
+
+    #[test]
+    fn workspace_package_discovery_activates_bare_p_load_only_through_source_context() {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        std::fs::write(
+            root.path().join("parent.R"),
+            "library(pacman)\np_load(localpkg)\nsource(\"child.R\")",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("child.R"), "p_load(inheritedpkg)").unwrap();
+        std::fs::write(
+            root.path().join("namespace-parent.R"),
+            "loadNamespace(pacman)\nsource(\"namespace-child.R\")",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("namespace-child.R"),
+            "p_load(namespace_only_pkg)",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("unrelated.R"), "p_load(generic_pkg)").unwrap();
+        std::fs::write(
+            root.path().join("function-only.R"),
+            "f <- function() library(pacman)\np_load(function_false_pkg)",
+        )
+        .unwrap();
+
+        let packages = super::scan_workspace_referenced_packages(root.path());
+        assert!(packages.contains(&"localpkg".to_string()), "{packages:?}");
+        assert!(
+            packages.contains(&"inheritedpkg".to_string()),
+            "{packages:?}"
+        );
+        assert!(
+            !packages.contains(&"namespace_only_pkg".to_string()),
+            "{packages:?}"
+        );
+        assert!(
+            !packages.contains(&"generic_pkg".to_string()),
+            "{packages:?}"
+        );
+        assert!(
+            !packages.contains(&"function_false_pkg".to_string()),
+            "{packages:?}"
         );
     }
 

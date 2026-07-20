@@ -915,8 +915,10 @@ pub(crate) fn diagnostics_from_snapshot(
     collect_missing_file_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
 
     // Missing package diagnostics
-    collect_missing_package_diagnostics_from_snapshot(
+    collect_missing_package_diagnostics_from_snapshot_for_uri(
         snapshot,
+        Some(uri),
+        cancel,
         &mut diagnostics,
         if track_unused {
             Some(&mut suppressed_pairs)
@@ -5975,8 +5977,10 @@ fn collect_missing_file_diagnostics_from_snapshot(
     }
 }
 
-fn collect_missing_package_diagnostics_from_snapshot(
+fn collect_missing_package_diagnostics_from_snapshot_for_uri(
     snapshot: &DiagnosticsSnapshot,
+    uri: Option<&Url>,
+    cancel: &DiagCancelToken,
     diagnostics: &mut Vec<Diagnostic>,
     mut suppressed_out: Option<&mut Vec<(u32, String)>>,
 ) {
@@ -5999,8 +6003,18 @@ fn collect_missing_package_diagnostics_from_snapshot(
         return;
     };
     let mut reported_outside_active = HashSet::new();
+    let mut activation_cache = LibraryActivationCache::new();
 
     for lib_call in &snapshot.directive_meta.library_calls {
+        if !library_call_activation_satisfied(
+            snapshot,
+            uri,
+            lib_call,
+            cancel,
+            &mut activation_cache,
+        ) {
+            continue;
+        }
         // Confirm the package is actually missing *before* consulting the
         // suppression directive, so the `unused-suppression` sweep records a
         // hit only when there was a real diagnostic to suppress (F2 Step 3).
@@ -6091,6 +6105,59 @@ fn collect_missing_package_diagnostics_from_snapshot(
             ..Default::default()
         });
     }
+}
+
+#[cfg(test)]
+fn collect_missing_package_diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+    suppressed_out: Option<&mut Vec<(u32, String)>>,
+) {
+    collect_missing_package_diagnostics_from_snapshot_for_uri(
+        snapshot,
+        None,
+        &DiagCancelToken::never(),
+        diagnostics,
+        suppressed_out,
+    );
+}
+
+/// Whether a conditional loader's prerequisite is present in resolved scope
+/// immediately before its effect position.
+///
+/// `None` is used only by focused legacy unit tests that do not retain their
+/// query URI; unconditional calls remain active and conditional calls fail
+/// closed. Production diagnostics always provide the URI.
+type LibraryActivationCache = HashMap<(Url, u32, u32, String), bool>;
+
+fn library_call_activation_satisfied(
+    snapshot: &DiagnosticsSnapshot,
+    uri: Option<&Url>,
+    call: &crate::cross_file::LibraryCall,
+    cancel: &DiagCancelToken,
+    cache: &mut LibraryActivationCache,
+) -> bool {
+    let Some(required) = call.requires_attached.as_deref() else {
+        return true;
+    };
+    let Some(uri) = uri else {
+        return false;
+    };
+    let key = (uri.clone(), call.line, call.column, required.to_string());
+    if let Some(active) = cache.get(&key) {
+        return *active;
+    }
+    let (line, column) = if call.column > 0 {
+        (call.line, call.column - 1)
+    } else if call.line > 0 {
+        (call.line - 1, u32::MAX)
+    } else {
+        (0, 0)
+    };
+    let scope = snapshot.get_scope(uri, line, column, cancel);
+    let active = scope.attached_packages.contains(required);
+    cache.insert(key, active);
+    active
 }
 
 fn missing_package_message(package: &str, outside_active_renv: bool) -> String {
@@ -6769,7 +6836,17 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<String> {
     let mut packages: HashSet<String> = HashSet::new();
     let mut attached_packages_for_meta: HashSet<String> = HashSet::new();
+    let mut activation_cache = LibraryActivationCache::new();
     for call in &snapshot.directive_meta.library_calls {
+        if !library_call_activation_satisfied(
+            snapshot,
+            Some(uri),
+            call,
+            &DiagCancelToken::never(),
+            &mut activation_cache,
+        ) {
+            continue;
+        }
         // Note: `loadNamespace` calls are intentionally included here. Unlike a
         // bare *function* call (e.g. Shiny's `reactive`/`render*`, which require
         // an attach — see `LibraryCall::attaches`), the NSE surfaces gated by
@@ -6809,10 +6886,19 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
         let max_depth = snapshot.cross_file_config.max_chain_depth;
         let max_visited = snapshot.cross_file_config.max_transitive_dependents_visited;
 
-        let collect_libraries_from =
+        let mut collect_libraries_from =
             |meta_uri: &Url, packages: &mut HashSet<String>, attached: &mut HashSet<String>| {
                 if let Some(meta) = snapshot.metadata_map.get(meta_uri) {
                     for call in &meta.library_calls {
+                        if !library_call_activation_satisfied(
+                            snapshot,
+                            Some(meta_uri),
+                            call,
+                            &DiagCancelToken::never(),
+                            &mut activation_cache,
+                        ) {
+                            continue;
+                        }
                         if call.package.is_empty() {
                             continue;
                         }
@@ -7434,6 +7520,7 @@ fn collect_undefined_variables_from_snapshot(
 
     // Reusable buffer for position-aware packages; avoids per-iteration allocation.
     let mut position_aware_packages_buf: Vec<String> = Vec::new();
+    let mut library_activation_cache = LibraryActivationCache::new();
 
     for (idx, (name, usage_node)) in used.into_iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
@@ -7683,8 +7770,14 @@ fn collect_undefined_variables_from_snapshot(
             }
         } else {
             let has_prior_library_call = snapshot.directive_meta.library_calls.iter().any(|call| {
-                call.line < usage_line
-                    || (call.line == usage_line && call.column <= usage_col_utf16)
+                library_call_activation_satisfied(
+                    snapshot,
+                    Some(uri),
+                    call,
+                    &DiagCancelToken::never(),
+                    &mut library_activation_cache,
+                ) && (call.line < usage_line
+                    || (call.line == usage_line && call.column <= usage_col_utf16))
             });
             let has_prior_library_call = has_prior_library_call
                 || has_prior_package_loader_call(
@@ -26106,6 +26199,104 @@ result <- "#;
                 );
             } else {
                 panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    #[test]
+    fn pacman_p_load_exports_flow_to_completion() {
+        use crate::package_library::PackageInfo;
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new();
+            state
+                .package_library
+                .insert_package(PackageInfo::new(
+                    "syntheticpkg".to_string(),
+                    ["synthetic_export".to_string()].into_iter().collect(),
+                ))
+                .await;
+            state
+                .package_library
+                .insert_package(PackageInfo::new(
+                    "pacman".to_string(),
+                    ["p_load".to_string()].into_iter().collect(),
+                ))
+                .await;
+
+            let code = "pacman::p_load(syntheticpkg)\nresult <- synthetic_export";
+            let uri = Url::parse("file:///pacman-completion.R").unwrap();
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+
+            let completions = super::completion(&state, &uri, Position::new(1, 20), None);
+            let Some(CompletionResponse::Array(items)) = completions else {
+                panic!("expected completion array");
+            };
+            assert!(
+                items.iter().any(|item| {
+                    item.label == "synthetic_export"
+                        && item
+                            .detail
+                            .as_deref()
+                            .is_some_and(|detail| detail.contains("{syntheticpkg}"))
+                }),
+                "p_load package export missing from completions: {items:?}"
+            );
+
+            let hover = super::hover(&state, &uri, Position::new(1, 12))
+                .await
+                .expect("p_load package export hover");
+            let HoverContents::Markup(markup) = hover.contents else {
+                panic!("expected markdown hover");
+            };
+            assert!(
+                markup.value.contains("from {syntheticpkg}"),
+                "p_load package attribution missing from hover: {}",
+                markup.value
+            );
+
+            let snapshot =
+                DiagnosticsSnapshot::build(&state, &uri).expect("p_load diagnostic snapshot");
+            let diagnostics = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+                .expect("p_load diagnostics");
+            for name in ["syntheticpkg", "synthetic_export"] {
+                assert!(
+                    diagnostics.iter().all(|diagnostic| {
+                        diagnostic.code
+                            != Some(NumberOrString::String(
+                                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                            ))
+                            || !diagnostic.message.contains(name)
+                    }),
+                    "qualified p_load argument/export {name} was reported undefined: {diagnostics:?}"
+                );
+            }
+
+            let bare_code =
+                "library(pacman)\np_load(syntheticpkg)\nresult <- synthetic_export";
+            state
+                .documents
+                .insert(uri.clone(), Document::new(bare_code, None));
+            let snapshot =
+                DiagnosticsSnapshot::build(&state, &uri).expect("bare p_load diagnostic snapshot");
+            let diagnostics = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+                .expect("bare p_load diagnostics");
+            for name in ["syntheticpkg", "synthetic_export"] {
+                assert!(
+                    diagnostics.iter().all(|diagnostic| {
+                        diagnostic.code
+                            != Some(NumberOrString::String(
+                                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                            ))
+                            || !diagnostic.message.contains(name)
+                    }),
+                    "active bare p_load argument/export {name} was reported undefined: {diagnostics:?}"
+                );
             }
         });
     }
@@ -54135,6 +54326,62 @@ result <- helper_with_spaces(42)"#;
         );
         assert!(diagnostics[0].message.contains("No installed package"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
+    fn p_load_missing_package_diagnostics_honor_the_bare_call_precondition() {
+        let lib_root = tempfile::tempdir().expect("temporary package library");
+        std::fs::create_dir(lib_root.path().join("pacman")).expect("fake installed pacman");
+
+        let code = "\
+p_load(__inactive_package__)
+library(pacman)
+p_load(__active_missing_package__)
+pacman::p_load(__qualified_missing_package__)";
+        let main_url = Url::parse("file:///workspace/pacman-missing.R").unwrap();
+
+        let mut state = WorldState::new();
+        state.package_library_ready = true;
+        let mut package_library = crate::package_library::PackageLibrary::new_empty();
+        package_library.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        state.package_library = Arc::new(package_library);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for pacman file");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot_for_uri(
+            &snapshot,
+            Some(&main_url),
+            &DiagCancelToken::never(),
+            &mut diagnostics,
+            None,
+        );
+
+        let messages: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("__active_missing_package__")),
+            "enabled bare p_load missing package was not reported: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("__qualified_missing_package__")),
+            "qualified p_load missing package was not reported: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("__inactive_package__")),
+            "bare p_load before pacman attachment must stay inactive: {messages:?}"
+        );
     }
 
     #[tokio::test]

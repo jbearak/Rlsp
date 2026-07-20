@@ -531,6 +531,90 @@ bquote(expr = .(library(dplyr)), where = { rm(x); parent.frame() })
     }
 
     #[test]
+    fn p_load_in_source_closure_inherits_attachments_in_execution_order() {
+        for (name, root, child, expected) in [
+            (
+                "parent-before-child",
+                "library(pacman)\nsource(\"setup.R\")\n",
+                "p_load(profileChildPackage)\n",
+                "profileChildPackage",
+            ),
+            (
+                "child-before-parent",
+                "source(\"setup.R\")\np_load(profileRootPackage)\n",
+                "library(pacman)\n",
+                "profileRootPackage",
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            fs::write(tmp.path().join("setup.R"), child).unwrap();
+            fs::write(tmp.path().join(".Rprofile"), root).unwrap();
+            let scan = scan_workspace_rprofile(tmp.path());
+            assert!(
+                scan.attached_packages.contains(expected),
+                "{name} must replay source and package effects in execution order: {:?}",
+                scan.attached_packages
+            );
+        }
+    }
+
+    #[test]
+    fn later_parent_attachment_does_not_retroactively_enable_child_p_load() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("setup.R"),
+            "p_load(tooEarlyProfilePackage)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "source(\"setup.R\")\nlibrary(pacman)\n",
+        )
+        .unwrap();
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(!scan.attached_packages.contains("tooEarlyProfilePackage"));
+    }
+
+    #[test]
+    fn repeated_source_replays_after_pacman_attaches() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("setup.R"),
+            "p_load(replayedProfilePackage)\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            concat!(
+                "source(\"setup.R\")\n",
+                "library(pacman)\n",
+                "source(\"setup.R\")\n",
+            ),
+        )
+        .unwrap();
+
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(scan.attached_packages.contains("replayedProfilePackage"));
+    }
+
+    #[test]
+    fn sourced_load_namespace_does_not_enable_parent_p_load() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("setup.R"), "loadNamespace(\"pacman\")\n").unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "source(\"setup.R\")\np_load(namespaceOnlyProfilePackage)\n",
+        )
+        .unwrap();
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(
+            !scan
+                .attached_packages
+                .contains("namespaceOnlyProfilePackage")
+        );
+    }
+
+    #[test]
     fn skips_renv_activate() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir(tmp.path().join("renv")).unwrap();

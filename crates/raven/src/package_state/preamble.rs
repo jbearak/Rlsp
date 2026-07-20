@@ -1,12 +1,11 @@
 //! Static (never-executed) scan of testthat preamble files
 //! (`tests/testthat/helper*.R` / `setup*.R`) into per-preamble harvested
-//! symbol/attach sets: the top-level defs and `library()`/`require()` attaches
-//! of each file the preamble transitively `source()`s (issue #638). The
-//! preamble file's OWN defs/attaches are deliberately NOT harvested here —
-//! they come from the live `RFileFacts` pipeline (`derive_r_file_facts`),
-//! which stays fresh on unsaved buffer edits; this scan covers only the
-//! sourced closure, which lives outside the tracked package inputs (e.g.
-//! `scripts/helpers.R`).
+//! symbol/attach sets. Symbols are the top-level defs of each file the
+//! preamble transitively `source()`s (issue #638); the preamble's own defs come
+//! from the live `RFileFacts` pipeline. Attachment sets are instead the
+//! execution delta of the preamble root plus its sourced closure, because a
+//! root `p_load()` may depend on an earlier preamble's attachment environment.
+//! Packages already attached on entry are excluded from that root's delta.
 //!
 //! Directly mirrors the `.Rprofile` prelude scan (`rprofile.rs`): synchronous,
 //! best-effort, bounded, and suppressive-only — over-harvesting can mask a
@@ -22,8 +21,11 @@
 //!
 //! Freshness: results enter `PackageInputs` (`preamble_sourced_*`) and are
 //! refreshed when a preamble file or any file in `preamble_sourced_files`
-//! changes in an open buffer or on disk. The per-preamble source-file index
-//! lets watched changes rescan only closures that contain the affected path.
+//! changes in an open buffer or on disk. Preamble roots execute in lexical
+//! filename order against one monotonic attachment environment. The
+//! per-preamble source-file index finds directly affected roots. Later roots
+//! are replayed only while their incoming attachment environment differs from
+//! the previous scan, then incremental isolation resumes once it converges.
 
 use ropey::Rope;
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,7 +50,8 @@ pub(crate) struct PreambleSnapshot {
     /// Per-preamble: top-level symbol names harvested from its transitive
     /// `source()` targets (NOT the preamble's own defs).
     pub(crate) symbols: BTreeMap<PathBuf, BTreeSet<String>>,
-    /// Per-preamble: packages attached by its transitive `source()` targets.
+    /// Per-preamble attachment execution delta from the root and its transitive
+    /// sources, excluding packages already attached by earlier roots.
     pub(crate) attached_packages: BTreeMap<PathBuf, BTreeSet<String>>,
     /// Sourced-target routing closure for each preamble.
     pub(crate) sourced_files_by_preamble: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
@@ -93,7 +96,8 @@ pub struct PreambleScan {
     /// Per-preamble: top-level symbol names harvested from its transitive
     /// `source()` targets (NOT the preamble's own defs).
     pub symbols: BTreeMap<PathBuf, BTreeSet<String>>,
-    /// Per-preamble: packages attached by its transitive `source()` targets.
+    /// Per-preamble attachment execution delta from the root and its transitive
+    /// sources, excluding packages already attached by earlier roots.
     pub attached_packages: BTreeMap<PathBuf, BTreeSet<String>>,
     /// Routing paths of all static `source()` targets from any preamble,
     /// including targets that are currently missing or unreadable (preamble
@@ -179,14 +183,16 @@ pub(crate) fn scan_testthat_preambles_with_overrides_and_exclusions(
     preamble_paths.sort();
     preamble_paths.dedup();
 
+    let mut attached_environment = BTreeSet::new();
     for preamble_path in preamble_paths {
-        scan_preamble_into(
+        attached_environment = scan_preamble_into(
             &mut snapshot,
             preamble_path,
             workspace_url.as_ref(),
             overrides,
             exclusions,
             true,
+            &attached_environment,
         );
     }
     snapshot.into_scan()
@@ -202,21 +208,27 @@ pub(crate) fn scan_testthat_preambles_from_captured_texts_and_exclusions(
 ) -> PreambleScan {
     let mut snapshot = PreambleSnapshot::default();
     let workspace_url = Url::from_file_path(workspace_root).ok();
+    let mut preamble_paths = preamble_paths;
+    preamble_paths.sort();
+    preamble_paths.dedup();
+    let mut attached_environment = BTreeSet::new();
     for preamble_path in preamble_paths {
-        scan_preamble_into(
+        attached_environment = scan_preamble_into(
             &mut snapshot,
             preamble_path,
             workspace_url.as_ref(),
             overrides,
             exclusions,
             false,
+            &attached_environment,
         );
     }
     snapshot.into_scan()
 }
 
-/// Refresh only preambles whose root or prior sourced closure intersects an
-/// affected path, retaining the prior results for all unrelated preambles.
+/// Refresh preambles whose root or prior sourced closure intersects an affected
+/// path, plus lexically later roots while their incoming attachment environment
+/// differs from the prior scan.
 /// Consumes a keyed-only [`PreambleSnapshot`] and returns a complete
 /// [`PreambleScan`] whose `sourced_files` union is populated.
 ///
@@ -274,20 +286,56 @@ pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
         }
     }
 
-    for preamble_path in &affected_preambles {
-        snapshot.symbols.remove(preamble_path);
-        snapshot.attached_packages.remove(preamble_path);
-        snapshot.sourced_files_by_preamble.remove(preamble_path);
-        scan_preamble_into(
-            &mut snapshot,
-            preamble_path.clone(),
-            workspace_url.as_ref(),
-            overrides,
-            exclusions,
-            true,
-        );
+    let mut all_preambles: BTreeSet<PathBuf> =
+        std::fs::read_dir(workspace_root.join("tests").join("testthat"))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .filter_map(|path| lexical_testthat_preamble_path(&path, workspace_root))
+            .collect();
+    all_preambles.extend(
+        overrides
+            .keys()
+            .filter_map(|path| lexical_testthat_preamble_path(path, workspace_root)),
+    );
+    all_preambles.extend(snapshot.symbols.keys().cloned());
+    all_preambles.extend(snapshot.attached_packages.keys().cloned());
+    all_preambles.extend(snapshot.sourced_files_by_preamble.keys().cloned());
+    all_preambles.extend(affected_preambles.iter().cloned());
+
+    let directly_affected = affected_preambles;
+    let mut rescanned = BTreeSet::new();
+    let mut old_attached_environment = BTreeSet::new();
+    let mut new_attached_environment = BTreeSet::new();
+    for preamble_path in all_preambles {
+        let old_delta = snapshot
+            .attached_packages
+            .get(&preamble_path)
+            .cloned()
+            .unwrap_or_default();
+        let incoming_environment_changed = old_attached_environment != new_attached_environment;
+        if directly_affected.contains(&preamble_path) || incoming_environment_changed {
+            snapshot.symbols.remove(&preamble_path);
+            snapshot.attached_packages.remove(&preamble_path);
+            snapshot.sourced_files_by_preamble.remove(&preamble_path);
+            new_attached_environment = scan_preamble_into(
+                &mut snapshot,
+                preamble_path.clone(),
+                workspace_url.as_ref(),
+                overrides,
+                exclusions,
+                true,
+                &new_attached_environment,
+            );
+            rescanned.insert(preamble_path);
+        } else {
+            new_attached_environment.extend(old_delta.iter().cloned());
+        }
+        old_attached_environment.extend(old_delta);
     }
-    (snapshot.into_scan(), affected_preambles)
+    (snapshot.into_scan(), rescanned)
 }
 
 /// Apply the `rescanned` preambles' entries from `scan` directly to live
@@ -393,21 +441,23 @@ fn scan_preamble_into(
     overrides: &PreambleTextOverrides,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
     allow_disk_fallback: bool,
-) {
+    initial_attached: &BTreeSet<String>,
+) -> BTreeSet<String> {
     if !exclusions.is_empty() && exclusions.is_excluded_path(&preamble_path) {
-        return;
+        return initial_attached.clone();
     }
     let Some(text) = read_source_with_overrides(&preamble_path, overrides, allow_disk_fallback)
     else {
-        return;
+        return initial_attached.clone();
     };
-    let (symbols, attached, sourced) = scan_one_preamble(
+    let (symbols, attached, sourced, final_attached) = scan_one_preamble(
         &preamble_path,
         text,
         workspace_url,
         overrides,
         exclusions,
         allow_disk_fallback,
+        initial_attached.clone(),
     );
     if !symbols.is_empty() {
         snapshot.symbols.insert(preamble_path.clone(), symbols);
@@ -422,6 +472,7 @@ fn scan_preamble_into(
             .sourced_files_by_preamble
             .insert(preamble_path, sourced);
     }
+    final_attached
 }
 
 fn read_source_with_overrides(
@@ -467,9 +518,11 @@ pub(crate) fn canonicalize_for_routing(path: &Path) -> PathBuf {
     }
 }
 
-/// Follow one preamble file's transitive static `source()` targets, harvesting
-/// top-level defs and attaches from each target (but not from the preamble
-/// itself) through the shared package-state closure walker.
+/// Execute one preamble's static package/source event stream.
+///
+/// Sourced targets contribute top-level definitions. The returned attachment
+/// delta covers the root plus its closure, while the final environment carries
+/// the incoming packages forward to the next lexical preamble root.
 fn scan_one_preamble(
     preamble_path: &Path,
     preamble_text: String,
@@ -477,7 +530,13 @@ fn scan_one_preamble(
     overrides: &PreambleTextOverrides,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
     allow_disk_fallback: bool,
-) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<PathBuf>) {
+    initial_attached: BTreeSet<String>,
+) -> (
+    BTreeSet<String>,
+    BTreeSet<String>,
+    BTreeSet<PathBuf>,
+    BTreeSet<String>,
+) {
     let mut policy = PreambleClosurePolicy {
         overrides,
         exclusions,
@@ -485,9 +544,19 @@ fn scan_one_preamble(
         symbols: BTreeSet::new(),
         attached: BTreeSet::new(),
     };
-    let closure =
-        super::walk_static_source_closure(preamble_path, preamble_text, workspace_url, &mut policy);
-    (policy.symbols, policy.attached, closure.sourced_files)
+    let closure = super::walk_static_source_closure_with_initial_attached(
+        preamble_path,
+        preamble_text,
+        workspace_url,
+        initial_attached,
+        &mut policy,
+    );
+    (
+        policy.symbols,
+        policy.attached,
+        closure.sourced_files,
+        closure.final_attached_packages,
+    )
 }
 
 struct PreambleClosurePolicy<'a> {
@@ -513,6 +582,10 @@ impl super::StaticSourceClosurePolicy for PreambleClosurePolicy<'_> {
 
     fn harvest(&mut self, facts: &crate::cross_file::source_detect::StaticScriptFacts) {
         super::merge_static_script_prelude(facts, &mut self.symbols, &mut self.attached);
+    }
+
+    fn harvest_root_attached(&mut self, attached_packages: &BTreeSet<String>) {
+        self.attached.extend(attached_packages.iter().cloned());
     }
 }
 
@@ -1103,6 +1176,136 @@ bquote(expr = .(library(dplyr)), where = { rm(x); parent.frame() })
             symbols.contains("b_def"),
             "transitive source() chain must be followed (scripts/b.R resolves \
              via the workspace-root fallback from scripts/a.R)"
+        );
+    }
+
+    #[test]
+    fn p_load_in_preamble_closure_inherits_attachments_in_execution_order() {
+        for (name, root_text, child_text, expected) in [
+            (
+                "root-before-child",
+                "library(pacman)\nsource(\"../../scripts/setup.R\")\n",
+                "p_load(preambleChildPackage)\n",
+                "preambleChildPackage",
+            ),
+            (
+                "child-before-root",
+                "source(\"../../scripts/setup.R\")\np_load(preambleRootPackage)\n",
+                "library(pacman)\n",
+                "preambleRootPackage",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+            std::fs::create_dir_all(root.join("scripts")).unwrap();
+            std::fs::write(root.join("scripts/setup.R"), child_text).unwrap();
+            let preamble = root.join(format!("tests/testthat/helper-{name}.R"));
+            std::fs::write(&preamble, root_text).unwrap();
+            let scan = scan_testthat_preambles_with_exclusions(root, &no_exclusions());
+            assert!(
+                scan.attached_packages
+                    .get(&preamble)
+                    .is_some_and(|packages| packages.contains(expected)),
+                "{name}: {:?}",
+                scan.attached_packages
+            );
+        }
+    }
+
+    #[test]
+    fn preamble_roots_share_attachments_in_lexical_execution_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        let first = root.join("tests/testthat/helper-a.R");
+        let second = root.join("tests/testthat/helper-b.R");
+        std::fs::write(&first, "library(pacman)\n").unwrap();
+        std::fs::write(&second, "p_load(laterPreamblePackage)\n").unwrap();
+
+        let scan = scan_testthat_preambles_with_exclusions(root, &no_exclusions());
+        assert!(
+            scan.attached_packages
+                .get(&second)
+                .is_some_and(|packages| packages.contains("laterPreamblePackage"))
+        );
+
+        std::fs::write(&first, "p_load(tooEarlyPreamblePackage)\n").unwrap();
+        std::fs::write(&second, "library(pacman)\n").unwrap();
+        let reversed = scan_testthat_preambles_with_exclusions(root, &no_exclusions());
+        assert!(
+            !reversed
+                .attached_packages
+                .values()
+                .any(|packages| packages.contains("tooEarlyPreamblePackage"))
+        );
+    }
+
+    #[test]
+    fn repeated_preamble_source_replays_after_pacman_attaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        let preamble = root.join("tests/testthat/helper-repeat.R");
+        std::fs::write(
+            &preamble,
+            concat!(
+                "source(\"../../scripts/setup.R\")\n",
+                "library(pacman)\n",
+                "source(\"../../scripts/setup.R\")\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("scripts/setup.R"),
+            "p_load(replayedPreamblePackage)\n",
+        )
+        .unwrap();
+
+        let scan = scan_testthat_preambles_with_exclusions(root, &no_exclusions());
+        assert!(
+            scan.attached_packages
+                .get(&preamble)
+                .is_some_and(|packages| packages.contains("replayedPreamblePackage"))
+        );
+    }
+
+    #[test]
+    fn earlier_preamble_change_replays_later_dependents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        let first = root.join("tests/testthat/helper-a.R");
+        let second = root.join("tests/testthat/helper-b.R");
+        std::fs::write(&first, "library(pacman)\n").unwrap();
+        std::fs::write(&second, "p_load(incrementalPreamblePackage)\n").unwrap();
+        let initial = scan_testthat_preambles_with_exclusions(root, &no_exclusions());
+        let mut inputs = crate::package_state::PackageInputs::default();
+        inputs.preamble_sourced_symbols = initial.symbols;
+        inputs.preamble_sourced_attached_packages = initial.attached_packages;
+        inputs.preamble_sourced_files = initial.sourced_files;
+        inputs.preamble_sourced_files_by_preamble = initial.sourced_files_by_preamble;
+
+        std::fs::write(&first, "# pacman removed\n").unwrap();
+        let (scan, rescanned) = rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+            root,
+            PreambleSnapshot::from_inputs(&inputs),
+            std::slice::from_ref(&first),
+            &PreambleTextOverrides::new(),
+            &no_exclusions(),
+        );
+
+        assert_eq!(
+            rescanned,
+            BTreeSet::from([first, second]),
+            "all lexically later preambles depend on the earlier attachment environment"
+        );
+        assert!(
+            !scan
+                .attached_packages
+                .values()
+                .any(|packages| packages.contains("incrementalPreamblePackage"))
         );
     }
 

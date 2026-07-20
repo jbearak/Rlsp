@@ -214,6 +214,34 @@ impl<'tree, 'text> StaticBindings<'tree, 'text> {
         )
     }
 
+    pub(crate) fn named_local_binding_may_shadow_at(
+        &self,
+        name: &str,
+        use_node: Node,
+        deferred_use: bool,
+    ) -> bool {
+        super::binding::named_local_binding_may_shadow_lexically_at(
+            &self.bindings,
+            name,
+            use_node,
+            deferred_use,
+        )
+    }
+
+    pub(crate) fn named_local_binding_may_shadow_without_helper_uncertainty(
+        &self,
+        name: &str,
+        use_node: Node,
+        deferred_use: bool,
+    ) -> bool {
+        super::binding::named_local_binding_may_shadow_without_helper_uncertainty(
+            &self.bindings,
+            name,
+            use_node,
+            deferred_use,
+        )
+    }
+
     pub(crate) fn named_alias_may_shadow_at(
         &self,
         name: &str,

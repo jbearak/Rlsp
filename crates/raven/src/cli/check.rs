@@ -997,6 +997,14 @@ fn reported_packages_to_warm(
             .iter()
             .cloned(),
     );
+    packages.extend(
+        state
+            .package_state
+            .scope_contribution()
+            .rprofile_attached_packages
+            .iter()
+            .cloned(),
+    );
     // Package mode: packages attached by testthat preamble files
     // (`helper*.R`/`setup*.R`) via `library()`/`require()` propagate to sibling
     // test files (issue #432), so warm their exports too — the undefined-
@@ -1018,6 +1026,21 @@ fn reported_packages_to_warm(
         };
         if let Some(entry) = state.workspace_index.get(&uri) {
             packages.extend(entry.loaded_packages.iter().cloned());
+            // Conditional bare `p_load()` targets are deliberately absent
+            // from `IndexEntry.loaded_packages`: flat extraction cannot prove
+            // their attachment prerequisite. Warming metadata is permissive
+            // and cannot attach a package, so include every validated
+            // metadata-derived target here. Semantic scope still decides
+            // whether its exports are visible, while an active target is no
+            // longer diagnosed before its installed export metadata is ready.
+            packages.extend(
+                entry
+                    .metadata
+                    .library_calls
+                    .iter()
+                    .filter(|call| call.requires_attached.is_some())
+                    .map(|call| call.package.clone()),
+            );
             // Issue #429: warm packages named in `data(..., package = "pkg")`
             // so the diagnostics-time `data()` alias expansion can resolve the
             // dataset object names. Unlike `library()` these are not attached,
@@ -1036,10 +1059,99 @@ fn reported_packages_to_warm(
                     crate::state::Document::new_with_language_id(&text, Some(1), &uri, Some("rmd"));
                 packages.extend(doc.loaded_packages.iter().cloned());
                 packages.extend(doc.data_packages.iter().cloned());
+                packages.extend(
+                    crate::cross_file::extract_metadata(&doc.analysis_text())
+                        .library_calls
+                        .into_iter()
+                        .filter(|call| call.requires_attached.is_some())
+                        .map(|call| call.package),
+                );
             }
         }
     }
     packages
+}
+
+/// Graph-aware conditional package targets active at their call sites in one
+/// indexed file. Unlike the permissive warm set, this is suitable for
+/// user-facing missing-metadata reporting.
+fn active_conditional_packages_for_uri(state: &crate::state::WorldState, uri: &Url) -> Vec<String> {
+    let metadata = state
+        .documents
+        .get_record(uri)
+        .map(|record| record.metadata().clone())
+        .or_else(|| state.workspace_index.get_metadata(uri));
+    let Some(metadata) = metadata else {
+        return Vec::new();
+    };
+    let get_artifacts = |target: &Url| {
+        state
+            .documents
+            .get_record(target)
+            .map(|record| record.artifacts().clone())
+            .or_else(|| {
+                state
+                    .workspace_index
+                    .get(target)
+                    .map(|item| item.artifacts.clone())
+            })
+    };
+    let get_metadata = |target: &Url| {
+        state
+            .documents
+            .get_record(target)
+            .map(|record| record.metadata().clone())
+            .or_else(|| state.workspace_index.get_metadata(target))
+    };
+    let workspace_root = state
+        .workspace_folders
+        .iter()
+        .find(|root| uri.path().starts_with(root.path()));
+    let mut active = Vec::new();
+    let mut attachment_cache = std::collections::HashMap::new();
+    let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
+    let package_contribution = state.package_state.scope_contribution();
+    let base_exports = if state.package_library_ready {
+        state.package_library.base_exports().as_ref()
+    } else {
+        crate::handlers::empty_base_exports().as_ref()
+    };
+    for call in &metadata.library_calls {
+        let Some(required) = call.requires_attached.as_deref() else {
+            continue;
+        };
+        let (line, column) = if call.column > 0 {
+            (call.line, call.column - 1)
+        } else if call.line > 0 {
+            (call.line - 1, u32::MAX)
+        } else {
+            (0, 0)
+        };
+        let attached_packages = attachment_cache.entry((line, column)).or_insert_with(|| {
+            crate::cross_file::scope::scope_at_position_with_graph_cached(
+                uri,
+                line,
+                column,
+                &get_artifacts,
+                &get_metadata,
+                &state.cross_file_graph,
+                workspace_root,
+                state.cross_file_config.max_chain_depth,
+                base_exports,
+                state.cross_file_config.hoist_globals_in_functions,
+                state.cross_file_config.backward_dependencies,
+                &|| false,
+                &mut prefix_cache,
+                Some(package_contribution),
+                None,
+            )
+            .attached_packages
+        });
+        if attached_packages.contains(required) {
+            active.push(call.package.clone());
+        }
+    }
+    active
 }
 
 fn has_package_metadata_sensitive_undefined_diagnostic(
@@ -1472,13 +1584,18 @@ async fn collect_target_diagnostics(
     let mut reported_loaded_packages = std::collections::BTreeSet::new();
     let mut operator_error = false;
     let mut contextual_provider_plans = std::collections::HashMap::new();
+    let mut active_conditional_packages = std::collections::HashMap::new();
     for path in targets {
         let Ok(uri) = Url::from_file_path(path) else {
             continue;
         };
         if state.workspace_index.contains(&uri) {
             let plan = prepare_cli_contextual_providers(state, &uri);
-            contextual_provider_plans.insert(uri, plan);
+            contextual_provider_plans.insert(uri.clone(), plan);
+            active_conditional_packages.insert(
+                uri.clone(),
+                active_conditional_packages_for_uri(state, &uri),
+            );
         }
     }
 
@@ -1497,7 +1614,10 @@ async fn collect_target_diagnostics(
                 &entry,
                 crate::chunks::classify_chunk_document(uri.path()),
             );
-            let loaded_packages: Vec<String> = doc.loaded_packages.to_vec();
+            let mut loaded_packages: Vec<String> = doc.loaded_packages.to_vec();
+            if let Some(active) = active_conditional_packages.get(&uri) {
+                loaded_packages.extend(active.iter().cloned());
+            }
             let mut open_documents = crate::open_document_store::OpenDocumentStore::new();
             open_documents.open_prepared(
                 uri.clone(),
@@ -1575,9 +1695,13 @@ async fn collect_target_diagnostics(
             }
         };
         open_disk_fallback_target(state, &uri, path, &text);
-        if let Some(doc) = state.documents.get(&uri) {
-            reported_loaded_packages.extend(doc.loaded_packages.iter().cloned());
-        }
+        let mut loaded_packages = state
+            .documents
+            .get(&uri)
+            .map(|doc| doc.loaded_packages.clone())
+            .unwrap_or_default();
+        loaded_packages.extend(active_conditional_packages_for_uri(state, &uri));
+        reported_loaded_packages.extend(loaded_packages);
         let diags = compute_file_diagnostics(state, &uri).await;
         state.close_document(&uri);
         for d in diags {
@@ -3433,6 +3557,66 @@ infixContinuationStyle = "indented"
     }
 
     #[test]
+    fn warming_includes_conditional_p_load_target_from_indexed_r_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("analysis.R"),
+            "library(pacman)\np_load(syntheticPackage)\nexported_value\n",
+        )
+        .unwrap();
+        let warm = warm_set_for(tmp.path());
+        assert!(
+            warm.contains("syntheticPackage"),
+            "conditional p_load targets must be warmed without making them semantically active: \
+             {warm:?}"
+        );
+    }
+
+    #[test]
+    fn warming_includes_rprofile_p_load_target() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "library(pacman)\np_load(profileSyntheticPackage)\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("analysis.R"), "profile_export\n").unwrap();
+        let warm = warm_set_for(tmp.path());
+        assert!(
+            warm.contains("profileSyntheticPackage"),
+            "Rprofile attachment contributions must participate in permissive CLI warming: \
+             {warm:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_p_load_reporting_remains_active_only() {
+        let tmp = TempDir::new().unwrap();
+        let active_path = tmp.path().join("active.R");
+        let inactive_path = tmp.path().join("inactive.R");
+        fs::write(
+            &active_path,
+            "library(pacman)\np_load(activeSyntheticPackage)\n",
+        )
+        .unwrap();
+        fs::write(&inactive_path, "p_load(inactiveSyntheticPackage)\n").unwrap();
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        let workspace_url = Url::from_file_path(&canon).unwrap();
+        let state = build_indexed_state(&canon, &workspace_url, true, None, &canon).unwrap();
+        let active_uri = Url::from_file_path(std::fs::canonicalize(active_path).unwrap()).unwrap();
+        let inactive_uri =
+            Url::from_file_path(std::fs::canonicalize(inactive_path).unwrap()).unwrap();
+        assert_eq!(
+            active_conditional_packages_for_uri(&state, &active_uri),
+            vec!["activeSyntheticPackage"]
+        );
+        assert!(
+            active_conditional_packages_for_uri(&state, &inactive_uri).is_empty(),
+            "permissive warming must not make an inactive conditional package report as loaded"
+        );
+    }
+
+    #[test]
     fn warming_includes_data_package_from_chunk_file() {
         // Chunk files are outside the R-only index, so the chunk-file branch of
         // `reported_packages_to_warm` reads them from disk and masks the body.
@@ -3447,6 +3631,42 @@ infixContinuationStyle = "indented"
             warm.contains("survival"),
             "data(lung, package = \"survival\") in an Rmd chunk must contribute \
              `survival` to the warm set: {warm:?}"
+        );
+    }
+
+    #[test]
+    fn warming_includes_conditional_p_load_target_from_chunk_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("report.qmd"),
+            "# Report\n\n```{r}\nlibrary(pacman)\np_load(chunkSyntheticPackage)\n```\n",
+        )
+        .unwrap();
+        let warm = warm_set_for(tmp.path());
+        assert!(
+            warm.contains("chunkSyntheticPackage"),
+            "conditional p_load targets in masked R chunks must be warmed: {warm:?}"
+        );
+    }
+
+    #[test]
+    fn chunk_conditional_p_load_reporting_remains_active_only() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("report.Rmd");
+        fs::write(
+            &path,
+            "# Report\n\n```{r}\nlibrary(pacman)\np_load(chunkActivePackage)\n```\n",
+        )
+        .unwrap();
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        let workspace_url = Url::from_file_path(&canon).unwrap();
+        let mut state = build_indexed_state(&canon, &workspace_url, true, None, &canon).unwrap();
+        let uri = Url::from_file_path(std::fs::canonicalize(&path).unwrap()).unwrap();
+        let text = crate::state::read_source(&path).unwrap();
+        open_disk_fallback_target(&mut state, &uri, &path, &text);
+        assert_eq!(
+            active_conditional_packages_for_uri(&state, &uri),
+            vec!["chunkActivePackage"]
         );
     }
 

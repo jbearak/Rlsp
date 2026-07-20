@@ -308,6 +308,18 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
             "setkey" | "setorder" | "setindex" => ArgPolicy::per_formal(&["x", "..."], &[], true),
             _ => return None,
         },
+        "pacman" => match name {
+            // p_load(..., char, install, update, character.only): ordinary dots
+            // are captured as package spellings, while exact controls are
+            // evaluated normally. Keep this aligned with the static attachment
+            // detector in cross_file/source_detect.rs.
+            "p_load" => ArgPolicy::per_formal(
+                &["...", "char", "install", "update", "character.only"],
+                &[],
+                true,
+            ),
+            _ => return None,
+        },
         "targets" => targets_policy(name)?,
         "gt" => gt_policy(name)?,
         "gtsummary" => gtsummary_policy(name)?,
@@ -2220,6 +2232,26 @@ mod tests {
             package_policy("dplyr", "data_frame"),
             package_policy("tibble", "data_frame")
         );
+    }
+
+    #[test]
+    fn pacman_p_load_captures_dots_but_evaluates_exact_controls() {
+        let policy = package_policy("pacman", "p_load").unwrap();
+        let mask = suppressed_arguments(
+            &policy,
+            &labels(&[
+                None,
+                None,
+                Some("char"),
+                Some("install"),
+                Some("update"),
+                Some("character.only"),
+                Some("unknown.dot"),
+            ]),
+            false,
+        );
+        assert_eq!(mask, vec![true, true, false, false, false, false, true]);
+        assert!(package_policy("pacman", "p_load_gh").is_none());
     }
 
     #[test]
