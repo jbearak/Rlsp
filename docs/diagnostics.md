@@ -36,6 +36,7 @@ are governed only by their severity settings). The suppressible analyzer codes a
 | `source-path-case-mismatch` | A `source()` / forward-directive **or** backward-directive (`# raven: sourced-by` etc.) path that resolves only by a case difference from the real filename (`templates.r` vs `templates.R`) | No |
 | `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
 | `package-not-installed` | `library()` / `require()` of a package that is not installed (also fires on `pkg::member` / `pkg:::member` when `pkg` is not installed) | Yes |
+| `package-outside-active-library` | A package exists in a vanilla system/user library but is unavailable in the active renv project library; child of `package-not-installed` | Yes |
 | `namespace-member-not-found` | `pkg::member` where a *complete* package export set has no such exported object (never for `pkg:::member`) | Yes |
 | `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below | No |
 
@@ -177,7 +178,8 @@ Two opt-out settings turn off this descent and restore blanket suppression for h
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
-| Missing package | warning | `library()`/`require()`, or `pkg::member` / `pkg:::member`, references a package not installed on the system |
+| Missing package | warning | `library()`/`require()`, or `pkg::member` / `pkg:::member`, references a package unavailable in the active library paths |
+| Package outside active renv library | warning | A referenced package is installed in a vanilla R library that the active renv project removed from `.libPaths()` |
 | Namespace member not found | warning | `pkg::member` where `pkg`'s *complete* export set has no such exported object (never for `pkg:::member`) |
 
 ### Package names vs. install status
@@ -192,9 +194,24 @@ Raven can resolve a package's **export names** from three sources, consulted in 
 | | Export resolution | Missing-package ("not installed") |
 |---|---|---|
 | **Language server (interactive)** | tiers 1→2→3 (prevents an undefined-variable storm when R is absent and Tier 2 metadata or the Tier 3 database covers the package) | Fires when install state is known and the package is absent — regardless of the database. Export metadata stops the symbol storm when coverage exists but never masks the "install this dependency" nudge. |
-| **`raven check` (CI)** | tiers 1→2→3 | **Suppressed by default** (CI deliberately omits installation). Re-enable with [`--report-uninstalled`](cli.md#missing-package-reporting-in-ci). |
+| **`raven check` (CI)** | tiers 1→2→3 | Generic absence is **suppressed by default** (CI deliberately omits installation). The actionable `package-outside-active-library` subtype remains enabled. Re-enable generic absence with [`--report-uninstalled`](cli.md#missing-package-reporting-in-ci). |
 
 When enabled, `--report-uninstalled` reports `library()` calls **not present in the local library paths** — *not* relative to the Tier 2/Tier 3 export metadata. Reach for it when a `library(X)` call must really succeed at runtime: CI that installs packages (e.g. `renv::restore()`) and wants to catch failures, or CI that **actually runs your R scripts** after `raven check` (e.g. R-package development), where an uninstalled package is a real error. Gate-only CI that never executes the scripts wants the default.
+
+When Raven successfully activates an explicit workspace's `renv/activate.R`, it
+also compares the vanilla and active library paths. If a referenced package
+exists only in a path removed by activation, Raven reports
+`package-outside-active-library` and suggests restoring or installing it into
+the project library. Raven reports this project-level setup problem at most once
+per package per document, even when that document contains many qualified
+references. This names-only evidence never makes the package available for
+exports, completion, `system.file()`, or package loading. Packages installed
+after startup are recognized when the library is rebuilt (for example with
+`raven.refreshPackages`); changes made only in an outside vanilla library are
+picked up by the next refresh rather than watched continuously. Suppressing
+`package-not-installed` also suppresses this child code. Multi-root editor
+sessions fail closed to no subtype because package routing has no unambiguous
+single-project renv identity there.
 
 #### Accepted gap
 

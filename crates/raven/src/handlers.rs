@@ -5998,6 +5998,7 @@ fn collect_missing_package_diagnostics_from_snapshot(
     let Some(severity) = snapshot.cross_file_config.packages_missing_package_severity else {
         return;
     };
+    let mut reported_outside_active = HashSet::new();
 
     for lib_call in &snapshot.directive_meta.library_calls {
         // Confirm the package is actually missing *before* consulting the
@@ -6006,17 +6007,30 @@ fn collect_missing_package_diagnostics_from_snapshot(
         if snapshot.package_library.package_exists(&lib_call.package) {
             continue;
         }
+        let outside_active = package_available_outside_active_renv(snapshot, &lib_call.package);
+        if !outside_active
+            && !snapshot
+                .cross_file_config
+                .packages_report_generic_uninstalled
+        {
+            continue;
+        }
+        let code = if outside_active {
+            crate::diagnostic_code::PACKAGE_OUTSIDE_ACTIVE_LIBRARY
+        } else {
+            crate::diagnostic_code::PACKAGE_NOT_INSTALLED
+        };
         if crate::cross_file::directive::is_line_ignored_for_code(
             &snapshot.directive_meta,
             lib_call.line,
-            Some(crate::diagnostic_code::PACKAGE_NOT_INSTALLED),
+            Some(code),
         ) {
             if let Some(out) = suppressed_out.as_deref_mut() {
-                out.push((
-                    lib_call.line,
-                    crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
-                ));
+                out.push((lib_call.line, code.to_string()));
             }
+            continue;
+        }
+        if outside_active && !reported_outside_active.insert(lib_call.package.as_str()) {
             continue;
         }
         diagnostics.push(Diagnostic {
@@ -6025,10 +6039,8 @@ fn collect_missing_package_diagnostics_from_snapshot(
                 end: Position::new(lib_call.line, lib_call.column),
             },
             severity: Some(severity),
-            message: format!("No installed package named '{}'", lib_call.package),
-            code: Some(NumberOrString::String(
-                crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
-            )),
+            message: missing_package_message(&lib_call.package, outside_active),
+            code: Some(NumberOrString::String(code.to_string())),
             ..Default::default()
         });
     }
@@ -6038,18 +6050,31 @@ fn collect_missing_package_diagnostics_from_snapshot(
         if snapshot.package_library.package_exists(&ns_ref.package) {
             continue;
         }
+        let outside_active = package_available_outside_active_renv(snapshot, &ns_ref.package);
+        if !outside_active
+            && !snapshot
+                .cross_file_config
+                .packages_report_generic_uninstalled
+        {
+            continue;
+        }
+        let code = if outside_active {
+            crate::diagnostic_code::PACKAGE_OUTSIDE_ACTIVE_LIBRARY
+        } else {
+            crate::diagnostic_code::PACKAGE_NOT_INSTALLED
+        };
         let line = ns_ref.package_range.start_line;
         if crate::cross_file::directive::is_line_ignored_for_code(
             &snapshot.directive_meta,
             line,
-            Some(crate::diagnostic_code::PACKAGE_NOT_INSTALLED),
+            Some(code),
         ) {
             if let Some(out) = suppressed_out.as_deref_mut() {
-                out.push((
-                    line,
-                    crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
-                ));
+                out.push((line, code.to_string()));
             }
+            continue;
+        }
+        if outside_active && !reported_outside_active.insert(ns_ref.package.as_str()) {
             continue;
         }
         diagnostics.push(Diagnostic {
@@ -6061,13 +6086,34 @@ fn collect_missing_package_diagnostics_from_snapshot(
                 ),
             },
             severity: Some(severity),
-            message: format!("No installed package named '{}'", ns_ref.package),
-            code: Some(NumberOrString::String(
-                crate::diagnostic_code::PACKAGE_NOT_INSTALLED.to_string(),
-            )),
+            message: missing_package_message(&ns_ref.package, outside_active),
+            code: Some(NumberOrString::String(code.to_string())),
             ..Default::default()
         });
     }
+}
+
+fn missing_package_message(package: &str, outside_active_renv: bool) -> String {
+    if outside_active_renv {
+        format!(
+            "Package '{package}' is available outside this active renv project library, \
+             but is unavailable here; run renv::restore() or install it into the project library"
+        )
+    } else {
+        format!("No installed package named '{package}'")
+    }
+}
+
+/// Return whether `package` is installed outside the active renv library.
+///
+/// Package routing is process-global and currently activates only the first
+/// workspace root. In a multi-root session the overlay has no unambiguous
+/// owner for another root, including a nested root, so this fails closed.
+fn package_available_outside_active_renv(snapshot: &DiagnosticsSnapshot, package: &str) -> bool {
+    snapshot.workspace_folders.len() == 1
+        && snapshot
+            .package_library
+            .package_available_outside_active_renv(package)
 }
 
 /// Emit `namespace-member-not-found` for `pkg::member` references whose package
@@ -6098,6 +6144,9 @@ fn collect_namespace_member_diagnostics_from_snapshot(
     for ns_ref in &snapshot.directive_meta.namespace_references {
         if ns_ref.internal {
             continue; // never validate `:::`
+        }
+        if package_available_outside_active_renv(snapshot, &ns_ref.package) {
+            continue;
         }
         let Some(member) = &ns_ref.member else {
             continue;
@@ -54086,6 +54135,123 @@ result <- helper_with_spaces(42)"#;
         );
         assert!(diagnostics[0].message.contains("No installed package"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[tokio::test]
+    async fn renv_outside_active_package_reports_actionable_child_without_generic_cli_policy() {
+        let code = "library(plotpkg)\nplotpkg::missing_member\n";
+        let main_url = Url::parse("file:///synthetic-project/main.R").unwrap();
+
+        let mut state = WorldState::new();
+        state
+            .workspace_folders
+            .push(Url::parse("file:///synthetic-project").unwrap());
+        state.package_library_ready = true;
+        state.cross_file_config.packages_report_generic_uninstalled = false;
+        let mut package_library = crate::package_library::PackageLibrary::new_empty();
+        package_library.set_lib_paths(vec![std::path::PathBuf::from(
+            "/nonexistent-active-library",
+        )]);
+        package_library.set_renv_outside_active_packages_for_test(
+            std::path::PathBuf::from("/synthetic-project"),
+            HashSet::from(["plotpkg".to_string()]),
+        );
+        let mut info = crate::package_library::PackageInfo::with_details(
+            "plotpkg".to_string(),
+            HashSet::from(["known_member".to_string()]),
+            vec![],
+            vec![],
+        );
+        info.exports_completeness = crate::package_library::MemberCompleteness::Complete;
+        package_library.insert_package(info).await;
+        state.package_library = Arc::new(package_library);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
+        collect_namespace_member_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "the renv setup problem is reported once per package per document; got: {diagnostics:?}"
+        );
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.code
+                == Some(NumberOrString::String(
+                    crate::diagnostic_code::PACKAGE_OUTSIDE_ACTIVE_LIBRARY.to_string(),
+                ))
+        }));
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.message.contains("active renv project library")
+                && diagnostic.message.contains("renv::restore()")
+        }));
+    }
+
+    #[test]
+    fn renv_outside_active_package_fails_closed_in_multi_root_session() {
+        let code = "library(plotpkg)\n";
+        let main_url = Url::parse("file:///synthetic-project/nested/main.R").unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![
+            Url::parse("file:///synthetic-project").unwrap(),
+            Url::parse("file:///synthetic-project/nested").unwrap(),
+        ];
+        state.package_library_ready = true;
+        state.cross_file_config.packages_report_generic_uninstalled = false;
+        let mut package_library = crate::package_library::PackageLibrary::new_empty();
+        package_library.set_lib_paths(vec![std::path::PathBuf::from(
+            "/nonexistent-active-library",
+        )]);
+        package_library.set_renv_outside_active_packages_for_test(
+            std::path::PathBuf::from("/synthetic-project"),
+            HashSet::from(["plotpkg".to_string()]),
+        );
+        state.package_library = Arc::new(package_library);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+    }
+
+    #[test]
+    fn package_not_installed_umbrella_suppresses_renv_outside_child() {
+        let code = "library(plotpkg) # raven: ignore[package-not-installed]\n";
+        let main_url = Url::parse("file:///synthetic-project/main.R").unwrap();
+
+        let mut state = WorldState::new();
+        state
+            .workspace_folders
+            .push(Url::parse("file:///synthetic-project").unwrap());
+        state.package_library_ready = true;
+        let mut package_library = crate::package_library::PackageLibrary::new_empty();
+        package_library.set_lib_paths(vec![std::path::PathBuf::from(
+            "/nonexistent-active-library",
+        )]);
+        package_library.set_renv_outside_active_packages_for_test(
+            std::path::PathBuf::from("/synthetic-project"),
+            HashSet::from(["plotpkg".to_string()]),
+        );
+        state.package_library = Arc::new(package_library);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
     }
 
     #[test]
