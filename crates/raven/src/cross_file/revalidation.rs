@@ -2163,7 +2163,6 @@ mod tests {
         let parent = affected_url("parent.R");
         let child = affected_url("child.R");
         let mut meta = make_meta_with_source("child.R", 1);
-        meta.sources[0].locality = crate::cross_file::types::SourceLocality::CurrentFrame;
         meta.sources[0].locality = SourceLocality::CurrentFrame;
         graph.update_file(&parent, &meta, Some(&affected_workspace_root()), |_| None);
 
