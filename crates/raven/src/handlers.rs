@@ -6104,10 +6104,12 @@ fn missing_package_message(package: &str, outside_active_renv: bool) -> String {
     }
 }
 
+/// Return whether `package` is installed outside the active renv library.
+///
+/// Package routing is process-global and currently activates only the first
+/// workspace root. In a multi-root session the overlay has no unambiguous
+/// owner for another root, including a nested root, so this fails closed.
 fn package_available_outside_active_renv(snapshot: &DiagnosticsSnapshot, package: &str) -> bool {
-    // Package routing is process-global and currently activates only the first
-    // workspace root. In a multi-root session that overlay has no unambiguous
-    // ownership for another root (including nested roots), so fail closed.
     snapshot.workspace_folders.len() == 1
         && snapshot
             .package_library
