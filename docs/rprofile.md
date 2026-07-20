@@ -28,20 +28,19 @@ The startup prelude contributes:
   `if (interactive()) helper <- function() {}`;
 - packages attached by top-level `library(pkg)` or `require(pkg)`, making their
   exports available by bare name;
-- top-level definitions reachable through literal `source("path")` calls,
-  followed transitively through those files' own literal `source()` calls.
+- top-level definitions reachable through `source()` and `sys.source()` calls
+  whose paths are literal or can be statically folded to literal paths,
+  followed transitively through those files' own such calls.
 
-Raven ignores dynamic `source()` paths, `source()` calls inside function bodies,
-and calls that do not put symbols into the global script scope. For `source()`,
-omitted `local`, `FALSE`, an unshadowed `F`, and the unshadowed forms
-`.GlobalEnv` and `globalenv()` are global; `TRUE` and an unshadowed `T` are not.
-For `sys.source()`, only an unshadowed `.GlobalEnv` or `globalenv()` supplied as
-`envir` is global. Shadowed aliases or environment names, and other dynamic
-expressions, are treated conservatively as non-global and are not followed.
-For `chdir`, Raven recognizes `TRUE`/`FALSE` and unshadowed `T`/`F`; shadowed or
-dynamic values are not assumed to enable it. Raven also recognizes `renv`'s
-`source("renv/activate.R")` line and does not follow it, since that file
-activates the project library rather than defining user globals.
+Top-level `source()` and `sys.source()` calls use the same `local`/`envir`
+classification as [Automatic `source()` Detection](cross-file.md#automatic-source-detection).
+Only calls whose sourced symbols enter the global script scope contribute to
+the prelude. Calls inside function bodies are ignored because Raven does not
+execute or model function calls while statically scanning `.Rprofile`.
+
+Raven also recognizes `renv`'s `source("renv/activate.R")` line and does not
+follow it, since that file activates the project library rather than defining
+user globals.
 
 ## `devtools::load_all()` in `.Rprofile`
 
