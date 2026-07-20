@@ -1396,6 +1396,64 @@ cargo test -p raven --test package_corpus -- --ignored --nocapture
 - Bun tests (`tests/bun/`) cover TypeScript extension logic: plot viewer, data viewer, help viewer, send-to-R, config validation.
 - VS Code extension tests (`editors/vscode/src/test/`) use `@vscode/test-cli` with Mocha.
 
+### Async handler completion in backend tests
+
+An LSP handler returning is not generally a completion boundary. Watched-file
+finalization, `didClose` disk resync, and diagnostic workers can continue in
+finite spawned tasks. Tests for those paths must arm the typed
+`FinalHandoffCapture` immediately before the target handler, inspect its typed
+handoff payload, release it, and await its causal completion receipt before
+asserting durable state. The first finalizer to record owns the receipt.
+Detached and recursive diagnostic spawn boundaries register a labeled token
+before spawn; bounded-fanout workers instead inherit the causal context and
+remain owned by the aggregate parent that joins them. The receipt completes
+only after the root closes admission and all tokens and joined fanouts finish.
+An abnormal token drop records cancellation/panic instead of silently looking
+successful. A multi-root `didClose` owns one aggregate resync-phase root with
+one pre-registered child per root; its typed payload still describes the first
+final handoff, while completion spans every root. Quiescent didOpen/didChange
+setup uses the same receipt around its exact analysis-revalidation tickets.
+Diagnostic causal context crosses the bounded-fanout spawn boundary. When a
+receipt-owned worker supersedes an older worker, it registers ownership of
+that predecessor before cancellation; if the predecessor loses the
+cancel-vs-gate-consume race, it transfers that ownership to the recursively
+spawned `diagnostics-backstop-respawn` child before spawning. This accounting
+is test-only and does not alter production scheduling or publication.
+
+Do not use `force_republish_count_for_test`, the pending-revalidation map, a
+shared “latest” snapshot, or a sleep as a generic proxy for invocation
+completion. Those are backend-wide bookkeeping surfaces: overlapping current
+work may legitimately consume or leave one force marker. Tests whose explicit
+subject is marker/prerequisite drainage may still poll that contract, but their
+timeout is only a deadlock watchdog and must report the target lifecycle,
+force/pending state, outstanding causal labels, and relevant permit state.
+
+Use `open_in_quiescent_workspace` when workspace scanning and package routing
+are outside the test's subject. It disables those two startup authorities while
+preserving on-demand cross-file indexing. Keep separate tests with normal
+initialization for startup/package behavior; quiescent setup is isolation, not
+a replacement for that coverage. Tests that assert a later operation's exact
+force-marker or pending-worker state must also settle `didOpen` through its
+exact analysis-revalidation receipt before arming the target operation. The
+`open_in_settled_package_workspace` helper provides that boundary while
+keeping package routing enabled when package routing is the test subject.
+
+Close-resync concurrency is bounded by an `Arc<Semaphore>` owned by `Backend`.
+Clones of one server share its four permits, while independent `LspService`
+instances do not contend. The `system.file()` derivation gate remains
+process-wide because it bounds a physical CPU worker and its exact global slot;
+tests that exercise package routing must use its causal owner/receipt rather
+than assume uncontended admission.
+
+Two nearby fail-closed behaviors are deliberately not completion-harness
+mechanisms. `did_close_second_ancillary_invalidation_stops_after_one_retry`
+pins the two-attempt close CAS ceiling (the document remains open after a
+second ancillary invalidation), while
+`close_resync_pre_commit_rejects_changed_disk_snapshot` pins rejection of a
+stale disk parse without an in-invocation retry. Changes to eventual retry
+policy belong in a separate correctness design and must preserve reopen/disk
+snapshot vetoes.
+
 ### Native lint parity audit
 
 `crates/raven/src/linting/lintr_parity.rs` is the cross-rule compatibility
