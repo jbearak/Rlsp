@@ -672,58 +672,18 @@ pub(crate) fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<St
         return Vec::new();
     };
 
-    let mut packages = Vec::new();
-    let mut stack = Vec::new();
-    stack.push(tree.root_node());
-
-    while let Some(node) = stack.pop() {
-        if node.kind() == "call" {
-            // Check if this is a library/require/loadNamespace call
-            if let Some(func_node) = node.child_by_field_name("function") {
-                let func_text = &text[func_node.byte_range()];
-
-                if func_text == "library" || func_text == "require" || func_text == "loadNamespace"
-                {
-                    // Extract the first argument
-                    if let Some(args_node) = node.child_by_field_name("arguments") {
-                        for i in 0..args_node.child_count() {
-                            if let Some(child) = args_node.child(i as u32)
-                                && child.kind() == "argument"
-                                && let Some(value_node) = child.child_by_field_name("value")
-                            {
-                                let value_text = &text[value_node.byte_range()];
-                                let pkg_name =
-                                    value_text.trim_matches(|c: char| c == '"' || c == '\'');
-                                packages.push(pkg_name.to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let child_count = node.child_count();
-        for i in (0..child_count).rev() {
-            if let Some(child) = node.child(i as u32) {
-                stack.push(child);
-            }
-        }
-    }
-    // Add unconditional packages recognized by the canonical detector
-    // (apply/targets/qualified pacman included). `Document.loaded_packages`
+    // Use the canonical detector for direct, apply-family, loop, targets, and
+    // pacman package loads. `Document.loaded_packages`
     // also feeds CLI reporting, so conditional bare `p_load()` targets must
     // stay out until a graph-aware scope query proves their prerequisite.
     // Backend edit-time prefetching deliberately keeps its separate permissive
     // warm set; that path cannot affect semantic or user-visible package state.
-    if text.contains("p_load") {
-        packages.extend(
-            crate::cross_file::source_detect::detect_library_calls(tree, text)
-                .into_iter()
-                .filter(|call| call.requires_attached.is_none())
-                .map(|call| call.package),
-        );
-    }
+    let mut packages: Vec<String> =
+        crate::cross_file::source_detect::detect_library_calls(tree, text)
+            .into_iter()
+            .filter(|call| call.requires_attached.is_none())
+            .map(|call| call.package)
+            .collect();
     packages.sort();
     packages.dedup();
     packages
@@ -14352,6 +14312,22 @@ mod tests {
 
         let qualified = Document::new("pacman::p_load(ggplot2)", None);
         assert_eq!(qualified.loaded_packages, vec!["ggplot2"]);
+    }
+
+    #[test]
+    fn document_loaded_packages_uses_static_loop_packages_not_iterator_name() {
+        let document = Document::new(
+            "packages <- c(\"alpha\", \"beta\", NULL)\n\
+             for (package in packages) library(package, character.only = TRUE)",
+            None,
+        );
+        assert_eq!(document.loaded_packages, ["alpha", "beta"]);
+
+        let dynamic = Document::new(
+            "for (package in packages) library(package, character.only = TRUE)",
+            None,
+        );
+        assert!(dynamic.loaded_packages.is_empty());
     }
 
     #[test]

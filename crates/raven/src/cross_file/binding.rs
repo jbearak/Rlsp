@@ -185,6 +185,24 @@ impl<T> Binding<T> {
         (*offset < before_byte).then_some((candidate, *offset))
     }
 
+    /// Resolve against the collector state immediately before an effect node.
+    ///
+    /// Unlike [`Self::resolved_with_offset_before`], this uses the current
+    /// generation before whole-file finalization. It is intended only for
+    /// checkpoints taken synchronously by the binding walk, before the current
+    /// node installs its mutation barrier.
+    pub(crate) fn resolved_at_generation_before(
+        &self,
+        before_byte: usize,
+        generation: u32,
+    ) -> Option<(&T, usize)> {
+        if self.effective_count(generation) != 1 {
+            return None;
+        }
+        let (candidate, offset) = self.candidate.as_ref()?;
+        (*offset < before_byte).then_some((candidate, *offset))
+    }
+
     fn has_safe_eager_value_before(&self, before_byte: usize, generation: u32) -> bool {
         self.effective_count(generation) == 1
             && self
@@ -238,10 +256,28 @@ impl<T> Default for BindingCollection<T> {
 /// provides a payload; binding counting is independent of that decision. In
 /// particular, callers can share exact binding semantics without widening their
 /// distinct payload policies.
+#[cfg(test)]
 pub(crate) fn collect_bindings<'tree, T>(
     root: Node<'tree>,
     content: &str,
     mut candidate_for: impl FnMut(BindingSite<'tree>) -> Option<T>,
+) -> HashMap<String, Binding<T>> {
+    collect_bindings_with_checkpoints(root, content, &mut candidate_for, &mut |_, _, _| {})
+}
+
+/// Collect bindings while exposing immediate `for` pre-effect checkpoints.
+///
+/// The checkpoint runs after the loop sequence's preceding syntax has been
+/// collected but before the loop installs its unknown-mutation barrier. This
+/// lets consumers snapshot facts needed to interpret the sequence without
+/// weakening the barrier seen by every later use. Checkpoints are limited to
+/// ordinary top-level execution and proven eager/evaluated contexts; deferred
+/// function bodies do not receive one.
+pub(crate) fn collect_bindings_with_checkpoints<'tree, T>(
+    root: Node<'tree>,
+    content: &str,
+    candidate_for: &mut impl FnMut(BindingSite<'tree>) -> Option<T>,
+    checkpoint: &mut impl FnMut(Node<'tree>, &HashMap<String, Binding<T>>, u32),
 ) -> HashMap<String, Binding<T>> {
     let mut collection = BindingCollection {
         // Almost every document has no `readLines` call. Avoid the additional
@@ -256,7 +292,8 @@ pub(crate) fn collect_bindings<'tree, T>(
         root,
         content,
         &mut collection,
-        &mut candidate_for,
+        candidate_for,
+        checkpoint,
         &mut visited_effect_nodes,
         BindingVisitState {
             current_frame_kills_are_definite: true,
@@ -287,6 +324,14 @@ const UNKNOWN_LOADED_BINDING_KEY: &str = "\0raven-unknown-loaded-binding";
 const ASSIGN_FORMALS: [&str; 6] = ["x", "value", "pos", "envir", "inherits", "immediate"];
 const LOAD_FORMALS: [&str; 3] = ["file", "envir", "verbose"];
 const SYS_LOAD_IMAGE_FORMALS: [&str; 2] = ["name", "quiet"];
+
+/// Whether the in-progress binding walk has seen a persistent unknown
+/// mutation that finalization will apply to every candidate.
+pub(crate) fn has_pending_persistent_invalidation<T>(
+    bindings: &HashMap<String, Binding<T>>,
+) -> bool {
+    bindings.contains_key(UNKNOWN_BINDING_KEY)
+}
 
 /// Whether recognized syntax in the document may create a binding for `name`.
 ///
@@ -368,6 +413,15 @@ fn document_may_bind_name(root: Node, content: &str, name: &str) -> bool {
     visit(root, content, name, bare_assign_trusted)
 }
 
+/// Whether syntax in `root` may create or replace the named binding.
+///
+/// This deliberately preserves [`document_may_bind_name`]'s conservative
+/// nested-scope and dynamic-assignment policy. Consumers use it only as a
+/// fail-closed guard, never to create a static fact.
+pub(crate) fn subtree_may_bind_name(root: Node, content: &str, name: &str) -> bool {
+    document_may_bind_name(root, content, name)
+}
+
 fn call_may_bind_name(
     function: Node,
     call: Node,
@@ -443,6 +497,7 @@ fn visit_bindings<'tree, T>(
     content: &str,
     collection: &mut BindingCollection<T>,
     candidate_for: &mut impl FnMut(BindingSite<'tree>) -> Option<T>,
+    checkpoint: &mut impl FnMut(Node<'tree>, &HashMap<String, Binding<T>>, u32),
     visited_effect_nodes: &mut HashSet<Node<'tree>>,
     state: BindingVisitState,
 ) {
@@ -494,6 +549,7 @@ fn visit_bindings<'tree, T>(
                         content,
                         collection,
                         candidate_for,
+                        checkpoint,
                         visited_effect_nodes,
                         BindingVisitState {
                             current_frame_kills_are_definite: state
@@ -534,6 +590,10 @@ fn visit_bindings<'tree, T>(
                 return;
             }
             if first_effect_visit && state.evaluation_frame.is_caller_or_global() {
+                if state.effective_immediate_binding_context() || state.eager_assignment_value_root
+                {
+                    checkpoint(node, &collection.map, collection.immediate_generation);
+                }
                 // The sequence is evaluated eagerly and the body may execute;
                 // either can mutate unrelated bindings through indirect calls.
                 invalidate_unknown_mutation_in_context(
@@ -565,6 +625,7 @@ fn visit_bindings<'tree, T>(
             content,
             collection,
             candidate_for,
+            checkpoint,
             visited_effect_nodes,
             BindingVisitState {
                 current_frame_kills_are_definite: state.current_frame_kills_are_definite,
@@ -3940,6 +4001,59 @@ pub(crate) fn extract_bare_c_plain_strings<'tree>(
     }
 }
 
+/// Extract a bare `c()` package vector containing plain strings and optional
+/// literal `NULL` entries.
+///
+/// Base `c()` drops `NULL`, so accepting it here preserves the exact package
+/// sequence that a loader loop or apply-family call receives. All arguments
+/// must remain positional and syntactically complete; named, missing,
+/// malformed, or other non-string entries are rejected. At least one package
+/// string is required.
+pub(crate) fn extract_bare_c_package_strings<'tree>(
+    node: Node<'tree>,
+    content: &str,
+) -> Option<Vec<(String, Node<'tree>)>> {
+    if node.kind() != "call"
+        || node
+            .child_by_field_name("function")
+            .is_none_or(|function| node_text(function, content) != "c")
+    {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    if arguments.has_error() {
+        return None;
+    }
+    let mut strings = Vec::new();
+    let mut argument_count = 0usize;
+    let mut comma_count = 0usize;
+    let mut cursor = arguments.walk();
+    for child in arguments.children(&mut cursor) {
+        if child.kind() == "comma" {
+            comma_count += 1;
+            continue;
+        }
+        if child.kind() != "argument" {
+            continue;
+        }
+        if child.child_by_field_name("name").is_some() {
+            return None;
+        }
+        let value = child.child_by_field_name("value")?;
+        argument_count += 1;
+        match value.kind() {
+            "string" => strings.push((extract_plain_string(value, content)?, value)),
+            "null" => {}
+            _ => return None,
+        }
+    }
+    if strings.is_empty() || comma_count + 1 != argument_count {
+        None
+    } else {
+        Some(strings)
+    }
+}
+
 pub(crate) fn extract_plain_string(node: Node, content: &str) -> Option<String> {
     let text = node_text(node, content);
     if let Some(raw) = crate::config_file::lintr_loader::parse_r_raw_string_literal(text) {
@@ -4224,6 +4338,35 @@ mod tests {
             let tree = parse_r(code);
             let call = tree.root_node().named_child(0).unwrap();
             assert!(extract_bare_c_plain_strings(call, code).is_none(), "{code}");
+        }
+    }
+
+    #[test]
+    fn package_c_strings_drop_literal_null_but_reject_other_dynamic_shapes() {
+        let code = "c(\"alpha\", NULL, 'beta')";
+        let tree = parse_r(code);
+        let call = tree.root_node().named_child(0).unwrap();
+        let pairs = extract_bare_c_package_strings(call, code).unwrap();
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|(package, _)| package.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+
+        for code in [
+            "c(NULL)",
+            "c(\"alpha\", dynamic)",
+            "c(package = \"alpha\", NULL)",
+            "c(\"alpha\",)",
+        ] {
+            let tree = parse_r(code);
+            let call = tree.root_node().named_child(0).unwrap();
+            assert!(
+                extract_bare_c_package_strings(call, code).is_none(),
+                "{code}"
+            );
         }
     }
 

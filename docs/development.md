@@ -489,7 +489,7 @@ Key files under `crates/raven/src/cross_file/`:
 - `path_resolve.rs` — Path resolution (forward vs backward invariant)
 - `revalidation.rs` — Real-time updates, diagnostics gating, debounce
 - `source_detect.rs` — AST-based detection of `source()`, `sys.source()`, and related calls
-- `binding.rs` — Shared conservative binding-count and `assign()` argument-matching walk used by static path and package-vector inference. Its bounded bare-helper policy recognizes exact local shadowing rather than attempting runtime search-path resolution; the `readLines` direct-effect classification uses a whole-document precheck so later or nested recognized bindings cannot make results traversal-order-dependent
+- `binding.rs` — Shared conservative binding-count and `assign()` argument-matching walk used by static path and package-vector inference. Its bounded bare-helper policy recognizes exact local shadowing rather than attempting runtime search-path resolution; the `readLines` direct-effect classification uses a whole-document precheck so later or nested recognized bindings cannot make results traversal-order-dependent. Eager `for` nodes expose a pre-effect checkpoint before installing their unknown-mutation barrier, allowing deterministic loop consumers to snapshot an immutable shared package vector while every post-loop query still sees the barrier; pending persistent invalidations suppress the checkpoint
 - `static_path.rs` — Strict folding of computed `source()` path expressions
 - `directive.rs` — Parsing of `# raven:` / `@lsp-` directive comments
 - `types.rs` — Shared types (`CrossFileMetadata`, `SymbolKind`, etc.)
