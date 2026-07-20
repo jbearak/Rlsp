@@ -1348,15 +1348,17 @@ committed.
 
 **Ownership and locking:** Capture clones the exact routing/library/package, index, graph, configuration, and open-record authorities under a short read lock. Resolution, external reads/parsing, and graph derivation run on owned data in a blocking worker with no `WorldState` guard. Every external candidate is opened and read once; its valid/missing/invalid identity and any parsed artifacts come from those same bytes. Existing dynamically indexed targets are refreshed in the same atomic transaction when a still-referenced URI has a different valid snapshot; open-authoritative, workspace-owned, pending, missing, invalid, and unchanged targets retain their current owner/content. A refreshed target replaces its full record, artifacts, outgoing graph node, and interface-change fanout even when the resolved URI itself is unchanged. Immediately before the central CAS, Raven rereads and compares every identity, then validates all central authorities and final open targets before mutating any tier. Index admission receives the pin set derived from the prepared graph, not the pre-transaction graph, so a tight LRU cap cannot evict newly reachable external targets before their graph edges commit. Raw file-cache contents are inputs only, never freshness authority. `raven check` retains one explicitly named CLI compatibility writer until CLI index installation is migrated as a separate ownership family; LSP callers and lifecycle tests do not use it.
 
-`system.file()` graph derivation has one process-wide physical slot. After
-deadline-bounded semaphore admission, Raven installs an exact `(worker id,
-derivation key)` slot and starts a dedicated standard thread. The waiter owns a
-shared result/notification object independent of the global slot. The thread's
-completion guard stores and notifies the result (including caught unwind),
-compare-clears only its exact slot, then releases the sole permit last; a stale
-completion token therefore cannot clear a successor, and immediate back-to-back
-work never depends on asynchronous `JoinHandle::is_finished()` bookkeeping.
-Thread-spawn failure synchronously clears the exact slot and releases capacity.
+`system.file()` graph derivation has one process-wide production execution
+lane. Its semaphore and exact `(worker id, derivation key)` slot are one
+ownership unit. After deadline-bounded admission, Raven installs the slot and
+starts a dedicated standard thread. The waiter owns a shared
+result/notification object, while the thread's completion guard retains the
+exact lane, stores and notifies the result (including caught unwind),
+compare-clears only its slot, then releases the sole permit last. A stale
+completion token therefore cannot clear a successor, and immediate
+back-to-back work never depends on asynchronous `JoinHandle::is_finished()`
+bookkeeping. Thread-spawn failure synchronously clears the exact slot and
+releases capacity.
 
 Watched closed-file batches normally rederive every prepared peer against one whole-workspace overlay and commit atomically. If that overlay exceeds the configured traversal budget, the narrow fallback first commits any paired package projection under its exact watched CAS, then replays the prepared closed mutations in deterministic event order through the existing single-item immediate transaction. The fallback never acknowledges a watched generation by returning without a commit or durable retry.
 
@@ -1420,6 +1422,15 @@ cancel-vs-gate-consume race, it transfers that ownership to the recursively
 spawned `diagnostics-backstop-respawn` child before spawning. This accounting
 is test-only and does not alter production scheduling or publication.
 
+Watched-file retries and deferred routing share a last-owner claim lineage.
+Ordinary finalization records a `Finalized` payload; if the entire lineage is
+retired by shutdown, supersession, or a terminal veto before reaching that
+handoff, its last owner records an empty `RetiredBeforeFinalHandoff` payload.
+Tests expecting real diagnostic ownership must assert `Finalized`. Tests whose
+subject is terminal retirement may assert the retired outcome, which closes
+the receipt without treating it as a normal finalization. A panic during
+last-owner retirement still records an abnormal causal-root exit.
+
 Do not use `force_republish_count_for_test`, the pending-revalidation map, a
 shared “latest” snapshot, or a sleep as a generic proxy for invocation
 completion. Those are backend-wide bookkeeping surfaces: overlapping current
@@ -1437,20 +1448,40 @@ gap in which the worker can cross the seam.
 
 Use `open_in_quiescent_workspace` when workspace scanning and package routing
 are outside the test's subject. It disables those two startup authorities while
-preserving on-demand cross-file indexing. Keep separate tests with normal
-initialization for startup/package behavior; quiescent setup is isolation, not
-a replacement for that coverage. Tests that assert a later operation's exact
-force-marker or pending-worker state must also settle `didOpen` through its
-exact analysis-revalidation receipt before arming the target operation. The
-`open_in_settled_package_workspace` helper provides that boundary while
-keeping package routing enabled when package routing is the test subject.
+preserving on-demand cross-file indexing, and asserts that the fixture started
+no host package initialization. Direct `LspService` fixtures that must preserve
+their own workspace-index configuration still set `packages.enabled = false`
+explicitly before their first `didOpen`; production-default package discovery
+is not neutral test setup. Package-input tests use
+`open_in_synthetic_package_workspace`: package mode remains enabled, but an
+explicit empty ready build outcome is routed through the production package
+commit before `didOpen` derives the document, so those tests cannot contend on
+host R, provider loading, or library-path watchers. Tests
+that assert a later operation's exact force-marker or pending-worker state must
+also settle `didOpen` through its exact analysis-revalidation receipt before
+arming the target operation. `open_in_settled_package_workspace` combines that
+receipt with the synthetic package fixture. Actual R/provider behavior stays
+in the package-library and R-subprocess suites; a backend ordering or rebuild
+test may inject a one-shot synthetic build outcome only at the external
+builder-result seam, leaving its coordinator, CAS, routing, and handoff
+production-real.
+
+Libpath prearm pause hooks are journal-scoped and return invocation-owned
+arrival and worker-completion signals. A cancellation test must release and
+await the exact blocking worker after the async owner retires. Do not infer
+pause locality from a real watcher completing inside a fixed timeout:
+FSEvents/thread startup is host-load-sensitive, while two journal-owned
+arrival barriers prove that one invocation did not consume another's hook.
 
 Close-resync concurrency is bounded by an `Arc<Semaphore>` owned by `Backend`.
 Clones of one server share its four permits, while independent `LspService`
-instances do not contend. The `system.file()` derivation gate remains
-process-wide because it bounds a physical CPU worker and its exact global slot;
-tests that exercise package routing must use its causal owner/receipt rather
-than assume uncontended admission.
+instances do not contend. Production keeps the `system.file()` derivation lane
+process-wide because it bounds a physical CPU worker and its exact slot. Unit
+test `WorldState`s instead own independent lanes: unrelated concurrent test
+invocations cannot spend one another's fixed routing deadlines, while retries
+within one invocation still serialize through one exact lane. Dedicated
+physical-lifetime tests construct a lane explicitly and verify slot clearing
+before permit release.
 
 Two nearby fail-closed behaviors are deliberately not completion-harness
 mechanisms. `did_close_second_ancillary_invalidation_stops_after_one_retry`

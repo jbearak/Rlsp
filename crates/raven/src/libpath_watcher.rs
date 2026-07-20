@@ -343,12 +343,17 @@ impl LibpathWatchJournal {
     }
 
     #[cfg(test)]
-    fn pause_prearm_setup_for_test(&self) {
+    fn pause_prearm_setup_for_test(&self) -> Option<PrearmSetupTestCompletion> {
         let pause = self.prearm_setup_pause.lock().take();
         if let Some(pause) = pause {
-            let _ = pause.arrived.send(());
+            let _ = pause.arrived.send(pause.owner);
             let _ = pause.release.recv();
+            return Some(PrearmSetupTestCompletion {
+                owner: pause.owner,
+                completed: Some(pause.completed),
+            });
         }
+        None
     }
 }
 
@@ -925,7 +930,7 @@ pub(crate) async fn prearm_watcher(
     let mut worker = tokio::task::spawn_blocking(move || {
         let mut close_guard = LibpathJournalSetupCloseGuard::new(Arc::clone(&setup_journal));
         #[cfg(test)]
-        setup_journal.pause_prearm_setup_for_test();
+        let _setup_completion = setup_journal.pause_prearm_setup_for_test();
         if !setup_journal.is_buffering() {
             return None;
         }
@@ -963,8 +968,25 @@ pub(crate) async fn prearm_watcher(
 
 #[cfg(test)]
 struct PrearmSetupTestPause {
-    arrived: std::sync::mpsc::Sender<()>,
+    owner: &'static str,
+    arrived: tokio::sync::oneshot::Sender<&'static str>,
     release: std::sync::mpsc::Receiver<()>,
+    completed: tokio::sync::oneshot::Sender<&'static str>,
+}
+
+#[cfg(test)]
+struct PrearmSetupTestCompletion {
+    owner: &'static str,
+    completed: Option<tokio::sync::oneshot::Sender<&'static str>>,
+}
+
+#[cfg(test)]
+impl Drop for PrearmSetupTestCompletion {
+    fn drop(&mut self) {
+        if let Some(completed) = self.completed.take() {
+            let _ = completed.send(self.owner);
+        }
+    }
 }
 
 struct LibpathJournalSetupCloseGuard {
@@ -1331,40 +1353,61 @@ mod watcher_tests {
     async fn cancelling_prearm_after_setup_starts_closes_buffering_journal() {
         let valid = tempdir().unwrap();
         let journal = LibpathWatchJournal::new_buffering();
-        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         journal.arm_prearm_setup_pause_for_test(PrearmSetupTestPause {
+            owner: "cancelled-owner",
             arrived: arrived_tx,
             release: release_rx,
+            completed: completed_tx,
         });
 
-        let task = tokio::spawn(prearm_watcher(
+        let mut task = tokio::spawn(prearm_watcher(
             vec![valid.path().to_path_buf()],
             Duration::from_millis(50),
             Arc::clone(&journal),
             tokio_util::sync::CancellationToken::new(),
         ));
-        tokio::task::spawn_blocking(move || arrived_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        assert_eq!(arrived_rx.await.unwrap(), "cancelled-owner");
 
         // The pause belongs only to this journal. An unrelated prearm must
-        // complete instead of stealing or waiting on its setup hook.
+        // reach its own invocation-owned barrier instead of stealing or
+        // waiting on this setup hook. No wall-clock timeout is involved.
         let unrelated = tempdir().unwrap();
         let unrelated_journal = LibpathWatchJournal::new_buffering();
-        let unrelated_handle = tokio::time::timeout(
-            Duration::from_secs(10),
-            prearm_watcher(
-                vec![unrelated.path().to_path_buf()],
-                Duration::from_millis(50),
-                Arc::clone(&unrelated_journal),
-                tokio_util::sync::CancellationToken::new(),
-            ),
-        )
-        .await
-        .expect("unrelated journal has no prearm pause")
-        .expect("unrelated path attaches");
+        let (unrelated_arrived_tx, unrelated_arrived_rx) = tokio::sync::oneshot::channel();
+        let (unrelated_release_tx, unrelated_release_rx) = std::sync::mpsc::channel();
+        let (unrelated_completed_tx, unrelated_completed_rx) = tokio::sync::oneshot::channel();
+        unrelated_journal.arm_prearm_setup_pause_for_test(PrearmSetupTestPause {
+            owner: "unrelated-owner",
+            arrived: unrelated_arrived_tx,
+            release: unrelated_release_rx,
+            completed: unrelated_completed_tx,
+        });
+        let unrelated_task = tokio::spawn(prearm_watcher(
+            vec![unrelated.path().to_path_buf()],
+            Duration::from_millis(50),
+            Arc::clone(&unrelated_journal),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        tokio::pin!(unrelated_arrived_rx);
+        tokio::select! {
+            owner = &mut unrelated_arrived_rx => {
+                assert_eq!(owner.unwrap(), "unrelated-owner");
+            }
+            _ = &mut task => {
+                panic!(
+                    "cancelled-owner crossed its held pause while unrelated-owner was starting"
+                );
+            }
+        }
+        unrelated_release_tx.send(()).unwrap();
+        assert_eq!(unrelated_completed_rx.await.unwrap(), "unrelated-owner");
+        let unrelated_handle = unrelated_task
+            .await
+            .unwrap()
+            .expect("unrelated path attaches");
         drop(unrelated_handle);
 
         task.abort();
@@ -1377,6 +1420,7 @@ mod watcher_tests {
             "async-side guard closes before detached setup is released"
         );
         release_tx.send(()).unwrap();
+        assert_eq!(completed_rx.await.unwrap(), "cancelled-owner");
         assert!(journal.claim().await.is_none());
     }
 
@@ -1384,11 +1428,14 @@ mod watcher_tests {
     async fn shutdown_cancels_paused_prospective_prearm_and_closes_journal() {
         let valid = tempdir().unwrap();
         let journal = LibpathWatchJournal::new_buffering();
-        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         journal.arm_prearm_setup_pause_for_test(PrearmSetupTestPause {
+            owner: "shutdown-owner",
             arrived: arrived_tx,
             release: release_rx,
+            completed: completed_tx,
         });
         let shutdown = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn(prearm_watcher(
@@ -1397,21 +1444,13 @@ mod watcher_tests {
             Arc::clone(&journal),
             shutdown.clone(),
         ));
-        tokio::task::spawn_blocking(move || arrived_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        assert_eq!(arrived_rx.await.unwrap(), "shutdown-owner");
 
         shutdown.cancel();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), task)
-                .await
-                .expect("shutdown wins while blocking setup remains paused")
-                .unwrap()
-                .is_none()
-        );
+        assert!(task.await.unwrap().is_none());
         assert!(journal.is_closed_for_test());
         release_tx.send(()).unwrap();
+        assert_eq!(completed_rx.await.unwrap(), "shutdown-owner");
     }
 }
 

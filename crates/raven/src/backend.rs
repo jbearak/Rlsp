@@ -2042,7 +2042,25 @@ impl Backend {
             };
         }
 
-        let (library, ready, load_notes, init_error) = if force_not_ready {
+        #[cfg(test)]
+        let synthetic_build = self
+            .state
+            .write()
+            .await
+            .package_library_build_outcome_for_test
+            .take();
+        let (library, ready, load_notes, init_error) = if let Some((library, ready)) = {
+            #[cfg(test)]
+            {
+                synthetic_build
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        } {
+            (library, ready, Vec::new(), None)
+        } else if force_not_ready {
             (
                 Arc::new(crate::package_library::PackageLibrary::new_empty()),
                 false,
@@ -4555,7 +4573,7 @@ async fn run_system_file_convergence_transaction_owned(
             state.system_file_routing_owner_identity()
         }
     };
-    let derivation_key = {
+    let (derivation_key, derivation_lane) = {
         let Ok(state) = deadline
             .wait("system.file derivation key read", state_arc.read())
             .await
@@ -4563,7 +4581,10 @@ async fn run_system_file_convergence_transaction_owned(
             return SystemFileOwnerOutcome::Deferred;
         };
         let library = state.package_library.clone();
-        LibraryRoutingDerivationKey::convergence(&library, owner)
+        (
+            LibraryRoutingDerivationKey::convergence(&library, owner),
+            library_routing_derivation_lane(&state),
+        )
     };
     let owner_is_current = |state: &WorldState| {
         state.system_file_routing_owner_identity() == owner
@@ -4618,7 +4639,7 @@ async fn run_system_file_convergence_transaction_owned(
         let permit = match deadline
             .wait(
                 "system.file convergence derivation gate",
-                Arc::clone(library_routing_derivation_gate()).acquire_owned(),
+                Arc::clone(&derivation_lane.gate).acquire_owned(),
             )
             .await
         {
@@ -4630,7 +4651,9 @@ async fn run_system_file_convergence_transaction_owned(
             captured,
             dispatch_on_tokio_for_test,
         };
-        let Some(worker) = spawn_library_routing_derivation(request, permit) else {
+        let Some(worker) =
+            spawn_library_routing_derivation(Arc::clone(&derivation_lane), request, permit)
+        else {
             log::warn!(
                 "system.file convergence derivation slot remained occupied after \
                  permit acquisition; refusing to spawn a successor"
@@ -4849,6 +4872,7 @@ struct DeferredLibraryRouting {
     basis: crate::state::LibraryRoutingBasis,
     replacement_guard: Option<crate::state::PendingLibraryReplacementGuard>,
     pre_seal: Option<LibraryRoutingPreSealObligation>,
+    derivation_lane: Arc<LibraryRoutingDerivationLane>,
     derivation_key: LibraryRoutingDerivationKey,
     prospective: crate::state::ProspectiveLibraryRouting,
     watcher: crate::state::PreparedLibpathWatcherInstall,
@@ -4986,16 +5010,6 @@ impl LibraryRoutingDeadline {
     }
 }
 
-/// Global bound for the two package-routing `system.file()` derivation
-/// workers. The permit is moved into a finite, pure-CPU closure: that closure
-/// must never perform filesystem I/O, mmap, process spawning, or other
-/// potentially unbounded syscalls. A timed-out waiter remains owned by its
-/// routing driver while the permit prevents any successor worker from spawning.
-fn library_routing_derivation_gate() -> &'static Arc<tokio::sync::Semaphore> {
-    static GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-}
-
 type LibraryRoutingDerivationResult = std::result::Result<
     crate::state::PreparedSystemFileDraft,
     Box<dyn std::any::Any + Send + 'static>,
@@ -5014,6 +5028,74 @@ struct LibraryRoutingDerivationSlotEntry {
 #[derive(Default)]
 struct LibraryRoutingDerivationSlot {
     entry: Option<LibraryRoutingDerivationSlotEntry>,
+}
+
+/// One exact execution lane for package-routing `system.file()` derivations.
+///
+/// The single permit and exact worker slot are one ownership unit: a permit
+/// from one lane must never be paired with another lane's slot. The completion
+/// guard retains this lane until it has cleared the exact slot and only then
+/// releases capacity, including after a caller abandons a timed-out worker.
+///
+/// Production uses one process-global lane to bound CPU work. Unit-test
+/// `WorldState`s own independent lanes so unrelated concurrent test
+/// invocations cannot spend each other's routing deadlines. The derivation is
+/// finite and pure CPU; dedicated physical-lifetime tests exercise an explicit
+/// lane directly.
+pub(crate) struct LibraryRoutingDerivationLane {
+    gate: Arc<tokio::sync::Semaphore>,
+    slot: parking_lot::Mutex<LibraryRoutingDerivationSlot>,
+}
+
+impl LibraryRoutingDerivationLane {
+    pub(crate) fn new() -> Self {
+        Self {
+            gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            slot: parking_lot::Mutex::new(LibraryRoutingDerivationSlot::default()),
+        }
+    }
+
+    fn clear_slot_exact(&self, id: u64, key: LibraryRoutingDerivationKey) -> bool {
+        let mut slot = self.slot.lock();
+        if slot
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.id == id && entry.key == key)
+        {
+            slot.entry = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn slot_snapshot(&self) -> Option<(u64, LibraryRoutingDerivationKey)> {
+        self.slot
+            .lock()
+            .entry
+            .as_ref()
+            .map(|entry| (entry.id, entry.key))
+    }
+}
+
+#[cfg(not(test))]
+fn global_library_routing_derivation_lane() -> &'static Arc<LibraryRoutingDerivationLane> {
+    static LANE: std::sync::OnceLock<Arc<LibraryRoutingDerivationLane>> =
+        std::sync::OnceLock::new();
+    LANE.get_or_init(|| Arc::new(LibraryRoutingDerivationLane::new()))
+}
+
+fn library_routing_derivation_lane(state: &WorldState) -> Arc<LibraryRoutingDerivationLane> {
+    #[cfg(test)]
+    {
+        Arc::clone(&state.library_routing_derivation_lane_for_test)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = state;
+        Arc::clone(global_library_routing_derivation_lane())
+    }
 }
 
 struct LibraryRoutingDerivationWaiter {
@@ -5055,29 +5137,10 @@ impl LibraryRoutingDerivationWaiter {
     }
 }
 
-fn library_routing_derivation_slot() -> &'static parking_lot::Mutex<LibraryRoutingDerivationSlot> {
-    static SLOT: std::sync::OnceLock<parking_lot::Mutex<LibraryRoutingDerivationSlot>> =
-        std::sync::OnceLock::new();
-    SLOT.get_or_init(|| parking_lot::Mutex::new(LibraryRoutingDerivationSlot::default()))
-}
-
-fn clear_library_routing_derivation_slot_exact(id: u64, key: LibraryRoutingDerivationKey) -> bool {
-    let mut slot = library_routing_derivation_slot().lock();
-    if slot
-        .entry
-        .as_ref()
-        .is_some_and(|entry| entry.id == id && entry.key == key)
-    {
-        slot.entry = None;
-        true
-    } else {
-        false
-    }
-}
-
 struct LibraryRoutingDerivationCompletion {
     id: u64,
     key: LibraryRoutingDerivationKey,
+    lane: Arc<LibraryRoutingDerivationLane>,
     shared: Arc<LibraryRoutingDerivationShared>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     published: bool,
@@ -5093,7 +5156,7 @@ impl LibraryRoutingDerivationCompletion {
 
 impl Drop for LibraryRoutingDerivationCompletion {
     fn drop(&mut self) {
-        if !clear_library_routing_derivation_slot_exact(self.id, self.key) {
+        if !self.lane.clear_slot_exact(self.id, self.key) {
             log::warn!(
                 "stale library-routing derivation completion {} ({:?}) could not clear its slot",
                 self.id,
@@ -5126,6 +5189,7 @@ fn complete_library_routing_derivation(
 }
 
 fn spawn_library_routing_derivation(
+    lane: Arc<LibraryRoutingDerivationLane>,
     request: LibraryRoutingDerivationRequest,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Option<LibraryRoutingDerivationWaiter> {
@@ -5135,7 +5199,7 @@ fn spawn_library_routing_derivation(
         captured,
         dispatch_on_tokio_for_test,
     } = request;
-    let mut slot = library_routing_derivation_slot().lock();
+    let mut slot = lane.slot.lock();
     if let Some(entry) = slot.entry.as_ref() {
         log::error!(
             "library-routing derivation slot {} ({:?}) remained occupied after \
@@ -5161,6 +5225,7 @@ fn spawn_library_routing_derivation(
     let completion = LibraryRoutingDerivationCompletion {
         id,
         key,
+        lane,
         shared: Arc::clone(&shared),
         permit: Some(permit),
         published: false,
@@ -5376,7 +5441,7 @@ async fn run_library_routing_transaction_with_delivery(
                 .deadline
                 .wait(
                     "system.file derivation gate",
-                    Arc::clone(library_routing_derivation_gate()).acquire_owned(),
+                    Arc::clone(&deferred.derivation_lane.gate).acquire_owned(),
                 )
                 .await
             {
@@ -5390,7 +5455,11 @@ async fn run_library_routing_transaction_with_delivery(
                 captured,
                 dispatch_on_tokio_for_test,
             };
-            let Some(receiver) = spawn_library_routing_derivation(request, permit) else {
+            let Some(receiver) = spawn_library_routing_derivation(
+                Arc::clone(&deferred.derivation_lane),
+                request,
+                permit,
+            ) else {
                 log::warn!(
                     "library-routing derivation slot remained occupied after \
                      permit acquisition; refusing to spawn a successor"
@@ -5646,11 +5715,13 @@ async fn prepare_library_routing_driver(
     options: LibraryRoutingDriverOptions,
 ) -> Option<DeferredLibraryRouting> {
     let deadline = options.deadline;
-    let mut prospective = deadline
+    let state = deadline
         .wait("library-routing preparation read", state_arc.read())
         .await
-        .ok()?
-        .prospective_library_routing(&basis, &library);
+        .ok()?;
+    let derivation_lane = library_routing_derivation_lane(&state);
+    let mut prospective = state.prospective_library_routing(&basis, &library);
+    drop(state);
     if prospective.is_none() && basis.is_replacement() {
         let current = deadline
             .wait("library-routing preparation current", state_arc.read())
@@ -5686,6 +5757,7 @@ async fn prepare_library_routing_driver(
     )
     .await;
     Some(DeferredLibraryRouting {
+        derivation_lane,
         derivation_key: LibraryRoutingDerivationKey::capture(&basis),
         basis,
         replacement_guard,
@@ -12184,7 +12256,7 @@ struct WatchedResyncBatch {
     attempts_remaining: usize,
     #[cfg(test)]
     final_handoff_test_capture:
-        Option<crate::state::FinalHandoffCaptureClaim<crate::state::WatchedFinalHandoffForTest>>,
+        Option<crate::state::FinalHandoffClaimLineage<crate::state::WatchedFinalHandoffForTest>>,
 }
 
 struct WatchedClosedBatchOverlay {
@@ -13384,20 +13456,22 @@ struct WatchedFinalizationBundle {
     reserved_tickets: Vec<crate::state::AnalysisRevalidationTicket>,
     #[cfg(test)]
     final_handoff_test_capture:
-        Option<crate::state::FinalHandoffCaptureClaim<crate::state::WatchedFinalHandoffForTest>>,
+        Option<crate::state::FinalHandoffClaimLineage<crate::state::WatchedFinalHandoffForTest>>,
 }
 
 #[cfg(test)]
 async fn record_watched_final_handoff_for_test(
     capture: &Option<
-        crate::state::FinalHandoffCaptureClaim<crate::state::WatchedFinalHandoffForTest>,
+        crate::state::FinalHandoffClaimLineage<crate::state::WatchedFinalHandoffForTest>,
     >,
     reserved: &[crate::state::AnalysisRevalidationTicket],
     transferred: &[crate::state::AnalysisRevalidationTicket],
 ) -> Option<crate::state::FinalHandoffCompletionToken<crate::state::WatchedFinalHandoffForTest>> {
     if let Some(capture) = capture {
         return capture
+            .claim()
             .record_and_pause(crate::state::WatchedFinalHandoffForTest {
+                outcome: crate::state::WatchedFinalHandoffOutcome::Finalized,
                 reserved: reserved.iter().map(Into::into).collect(),
                 transferred: transferred.iter().map(Into::into).collect(),
             })
@@ -13561,7 +13635,8 @@ async fn run_watched_resync_batch(
         .read()
         .await
         .watched_final_handoff_test_capture
-        .claim();
+        .claim()
+        .map(crate::state::FinalHandoffClaimLineage::new);
     run_watched_resync_batch_owned(
         state_arc,
         client,
@@ -17470,7 +17545,10 @@ impl LanguageServer for Backend {
         let (final_handoff_test_capture, config_reload_publish_test_capture) = {
             let state = self.state.read().await;
             (
-                state.watched_final_handoff_test_capture.claim(),
+                state
+                    .watched_final_handoff_test_capture
+                    .claim()
+                    .map(crate::state::FinalHandoffClaimLineage::new),
                 state.config_reload_publish_test_capture.claim(),
             )
         };
@@ -21758,6 +21836,22 @@ async fn try_rebuild_package_library(
     };
     drop(state);
 
+    #[cfg(test)]
+    let synthetic_build = if packages_enabled {
+        deadline
+            .wait("package rebuild synthetic outcome", state_arc.write())
+            .await
+            .map_err(|LibraryRoutingDeadlineElapsed(phase)| anyhow::anyhow!("{phase}"))?
+            .package_library_build_outcome_for_test
+            .take()
+    } else {
+        None
+    };
+    #[cfg(test)]
+    if let Some((library, ready)) = synthetic_build {
+        return Ok((library, ready));
+    }
+
     let build = crate::package_library::try_build_package_library(
         packages_r_path,
         &additional_paths,
@@ -22744,11 +22838,12 @@ mod tests {
     use tower_lsp::lsp_types::Url;
 
     async fn run_empty_library_routing_derivation(
+        lane: &Arc<super::LibraryRoutingDerivationLane>,
         key: super::LibraryRoutingDerivationKey,
     ) -> super::LibraryRoutingDerivationResult {
         let permit = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            Arc::clone(super::library_routing_derivation_gate()).acquire_owned(),
+            Arc::clone(&lane.gate).acquire_owned(),
         )
         .await
         .expect("derivation capacity becomes available")
@@ -22759,7 +22854,7 @@ mod tests {
             captured,
             dispatch_on_tokio_for_test: false,
         };
-        let waiter = super::spawn_library_routing_derivation(request, permit)
+        let waiter = super::spawn_library_routing_derivation(Arc::clone(lane), request, permit)
             .expect("an acquired exclusive permit always has a free exact slot");
         tokio::time::timeout(std::time::Duration::from_secs(5), waiter.wait())
             .await
@@ -22768,40 +22863,59 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn library_routing_derivations_spawn_back_to_back_after_exact_completion() {
+        let lane = Arc::new(super::LibraryRoutingDerivationLane::new());
         let key = super::LibraryRoutingDerivationKey {
             library_address: 1,
             cache_operation_epoch: 2,
             routing_owner_hash: 3,
         };
-        run_empty_library_routing_derivation(key)
+        run_empty_library_routing_derivation(&lane, key)
             .await
             .expect("first derivation succeeds");
-        run_empty_library_routing_derivation(key)
+        run_empty_library_routing_derivation(&lane, key)
             .await
             .expect("immediate successor derivation succeeds");
 
         let permit = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            Arc::clone(super::library_routing_derivation_gate()).acquire_owned(),
+            Arc::clone(&lane.gate).acquire_owned(),
         )
         .await
         .expect("successor releases derivation capacity")
         .expect("derivation semaphore remains open");
         assert!(
-            super::library_routing_derivation_slot()
-                .lock()
-                .entry
-                .is_none(),
+            lane.slot.lock().entry.is_none(),
             "permit release is ordered after exact slot clearing"
         );
         drop(permit);
     }
 
     #[tokio::test]
+    async fn independent_test_worlds_do_not_share_derivation_capacity() {
+        let first = super::WorldState::new();
+        let second = super::WorldState::new();
+        assert!(
+            !Arc::ptr_eq(
+                &first.library_routing_derivation_lane_for_test,
+                &second.library_routing_derivation_lane_for_test,
+            ),
+            "unit-test worlds must not spend one another's routing deadlines"
+        );
+
+        let _first_permit = Arc::clone(&first.library_routing_derivation_lane_for_test.gate)
+            .try_acquire_owned()
+            .expect("first world owns its derivation capacity");
+        let _second_permit = Arc::clone(&second.library_routing_derivation_lane_for_test.gate)
+            .try_acquire_owned()
+            .expect("second world has independent derivation capacity");
+    }
+
+    #[tokio::test]
     async fn stale_library_routing_derivation_tokens_cannot_clear_current_slot() {
+        let lane = Arc::new(super::LibraryRoutingDerivationLane::new());
         let permit = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            Arc::clone(super::library_routing_derivation_gate()).acquire_owned(),
+            Arc::clone(&lane.gate).acquire_owned(),
         )
         .await
         .expect("derivation capacity becomes available")
@@ -22813,7 +22927,7 @@ mod tests {
             routing_owner_hash: u64::MAX,
         };
         {
-            let mut slot = super::library_routing_derivation_slot().lock();
+            let mut slot = lane.slot.lock();
             assert!(slot.entry.is_none());
             slot.entry = Some(super::LibraryRoutingDerivationSlotEntry {
                 id: current_id,
@@ -22822,7 +22936,7 @@ mod tests {
         }
 
         assert!(
-            !super::clear_library_routing_derivation_slot_exact(current_id - 1, current_key),
+            !lane.clear_slot_exact(current_id - 1, current_key),
             "a stale worker identity cannot clear its successor"
         );
         let stale_key = super::LibraryRoutingDerivationKey {
@@ -22830,21 +22944,18 @@ mod tests {
             ..current_key
         };
         assert!(
-            !super::clear_library_routing_derivation_slot_exact(current_id, stale_key),
+            !lane.clear_slot_exact(current_id, stale_key),
             "a stale derivation key cannot clear current work even with the same identity"
         );
         assert_eq!(
-            super::library_routing_derivation_slot()
+            lane.slot
                 .lock()
                 .entry
                 .as_ref()
                 .map(|entry| (entry.id, entry.key)),
             Some((current_id, current_key))
         );
-        assert!(super::clear_library_routing_derivation_slot_exact(
-            current_id,
-            current_key
-        ));
+        assert!(lane.clear_slot_exact(current_id, current_key));
         drop(permit);
     }
 
@@ -23808,7 +23919,7 @@ mod tests {
         let backend = service.inner();
         let library_root = tempfile::tempdir().unwrap();
         let uri = Url::parse("file:///replacement-seed-consumer.R").unwrap();
-        {
+        let watcher_debounce = {
             let mut world = backend.state.write().await;
             world.cross_file_config.packages_enabled = true;
             world.cross_file_config.packages_watch_library_paths = true;
@@ -23816,7 +23927,22 @@ mod tests {
             world
                 .begin_open_document_diagnostic_lifecycle(&uri)
                 .unwrap();
-        }
+            std::time::Duration::from_millis(world.cross_file_config.packages_watch_debounce_ms)
+        };
+        // Complete host watcher setup before the routing invocation owns its
+        // foreground deadline. The test mutates the prepared watcher between
+        // driver construction and execution; including that external setup in
+        // the driver's budget makes unrelated FSEvents load consume the
+        // transaction's first and only CAS attempt.
+        let journal = super::new_seeded_libpath_journal();
+        let handle = crate::libpath_watcher::prearm_watcher(
+            vec![library_root.path().to_path_buf()],
+            watcher_debounce,
+            Arc::clone(&journal),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         let (basis, replacement_guard, pre_seal) = super::capture_library_routing_basis(
             &backend.state,
             crate::state::LibraryRoutingMutation::Replacement,
@@ -23853,15 +23979,6 @@ mod tests {
         .await
         .unwrap();
 
-        let journal = super::new_seeded_libpath_journal();
-        let handle = crate::libpath_watcher::prearm_watcher(
-            vec![library_root.path().to_path_buf()],
-            std::time::Duration::from_millis(driver.basis.watcher_debounce_ms()),
-            Arc::clone(&journal),
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .unwrap();
         driver.watcher = crate::state::PreparedLibpathWatcherInstall::Active {
             handle: Arc::new(handle),
             journal: Arc::clone(&journal),
@@ -23895,12 +24012,9 @@ mod tests {
             .read()
             .await
             .package_library_content_generation_for_test();
-        let probe_lease = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            replacement_library.routing_lease(),
-        )
-        .await
-        .expect("replacement publication must release every cache-operation lease");
+        let probe_lease = replacement_library.try_routing_lease_for_test().expect(
+            "replacement publication must synchronously release every cache-operation lease",
+        );
         drop(probe_lease);
         let mut seed = journal.claim().await.unwrap();
         assert!(matches!(
@@ -31795,6 +31909,10 @@ mod refresh_packages_tests {
                     Some("dplyr"),
                     Some("retained help".to_string()),
                 );
+                state.package_library_build_outcome_for_test = Some((
+                    Arc::new(crate::package_library::PackageLibrary::new_empty()),
+                    false,
+                ));
                 state.library_routing_test_reject_remaining = usize::MAX;
                 (
                     state.libpath_watcher_owner(),
@@ -34724,6 +34842,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -34804,6 +34925,9 @@ mod project_config_initialize_tests {
                         uri: root,
                         name: "t".into(),
                     }]),
+                    initialization_options: Some(serde_json::json!({
+                        "packages": { "enabled": false }
+                    })),
                     ..Default::default()
                 })
                 .unwrap(),
@@ -34873,6 +34997,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -34950,6 +35077,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -35004,27 +35134,11 @@ mod project_config_initialize_tests {
         fs::create_dir_all(&pkg_dir).unwrap();
         fs::write(pkg_dir.join("helper.R"), "helper_value <- 1\n").unwrap();
 
-        let root = Url::from_file_path(tmp.path()).unwrap();
         let helper_uri = Url::from_file_path(pkg_dir.join("helper.R")).unwrap();
         let excluded_uri = Url::from_file_path(tmp.path().join("generated").join("use.R")).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: root,
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "packages": {
-                        "watchLibraryPaths": false
-                    }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
 
         open_doc(
             backend,
@@ -36029,6 +36143,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -36333,6 +36450,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -36400,6 +36520,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -36477,6 +36600,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -36567,6 +36693,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -36627,6 +36756,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -36728,6 +36860,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -36821,6 +36956,9 @@ mod project_config_initialize_tests {
                     uri: root,
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -37167,25 +37305,9 @@ mod project_config_initialize_tests {
         let root_path = tmp.path().to_path_buf();
         // Disk `.Rprofile` defines helper_a; the disk file is never changed.
         fs::write(root_path.join(".Rprofile"), "helper_a <- function() 1\n").unwrap();
-        let root = Url::from_file_path(&root_path).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: root,
-                    name: "t".into(),
-                }]),
-                // `indexWorkspace: false` prevents a background workspace-scan
-                // task that would otherwise race this test's prelude assertions.
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
 
         // Seed the package inputs the live refresh depends on, then establish
         // the baseline prelude from the disk `.Rprofile` (helper_a). (initialize
@@ -37528,23 +37650,9 @@ mod project_config_initialize_tests {
         let root_path = tmp.path().to_path_buf();
         // Disk `.Rprofile` defines helper_a.
         fs::write(root_path.join(".Rprofile"), "helper_a <- function() 1\n").unwrap();
-        let root = Url::from_file_path(&root_path).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: root,
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
 
         // Baseline: seed the prelude from disk (helper_a).
         {
@@ -37595,21 +37703,8 @@ mod project_config_initialize_tests {
         fs::write(root_path.join("script.R"), "helper_b()\n").unwrap();
         std::os::unix::fs::symlink(&root_path, &link_path).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace_at(&root_path).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(&root_path).unwrap(),
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
 
         {
             let mut state = backend.state.write().await;
@@ -37706,21 +37801,8 @@ mod project_config_initialize_tests {
         std::os::unix::fs::symlink(&root_path, &link_a_path).unwrap();
         std::os::unix::fs::symlink(&root_path, &link_b_path).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace_at(&root_path).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(&root_path).unwrap(),
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
 
         {
             let mut state = backend.state.write().await;
@@ -38078,21 +38160,8 @@ mod project_config_initialize_tests {
         std::os::unix::fs::symlink("shared.R", &alias_a).unwrap();
         std::os::unix::fs::symlink("shared.R", &alias_b).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(&root).unwrap(),
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         {
             let mut state = backend.state.write().await;
             state.workspace_scan_complete = true;
@@ -38150,18 +38219,8 @@ mod project_config_initialize_tests {
         fs::create_dir_all(root.join("R")).unwrap();
         let candidate = root.join("R/candidate.R");
         let candidate_uri = Url::from_file_path(&candidate).unwrap();
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(&root).unwrap(),
-                    name: "t".into(),
-                }]),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         {
             let mut state = backend.state.write().await;
             state.workspace_scan_complete = true;
@@ -38221,18 +38280,8 @@ mod project_config_initialize_tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         let uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(&root).unwrap(),
-                    name: "t".into(),
-                }]),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         {
             let mut state = backend.state.write().await;
             state.workspace_scan_complete = true;
@@ -38279,21 +38328,8 @@ mod project_config_initialize_tests {
         fs::write(&helper_a_path, "disk_a <- 1\n").unwrap();
         fs::write(&helper_b_path, "disk_b <- 1\n").unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(&root_path).unwrap(),
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         {
             let mut state = backend.state.write().await;
             initialize_package_inputs_from_state_with_exclusions(
@@ -38400,7 +38436,8 @@ mod project_config_initialize_tests {
                     name: "t".into(),
                 }]),
                 initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
                 })),
                 ..Default::default()
             })
@@ -41399,7 +41436,8 @@ mod project_config_initialize_tests {
                     name: "t".into(),
                 }]),
                 initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
                 })),
                 ..Default::default()
             })
@@ -41614,23 +41652,9 @@ mod project_config_initialize_tests {
         let tmp = TempDir::new().unwrap();
         let root_path = tmp.path().to_path_buf();
         fs::write(root_path.join(".Rprofile"), "helper_a <- function() 1\n").unwrap();
-        let root = Url::from_file_path(&root_path).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: root,
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         {
             let mut state = backend.state.write().await;
             state.package_inputs.workspace_root = Some(root_path.clone());
@@ -41709,21 +41733,8 @@ mod project_config_initialize_tests {
         .unwrap();
         std::os::unix::fs::symlink(&root_path, &link_path).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace_at(&root_path).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(&root_path).unwrap(),
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
 
         {
             let mut state = backend.state.write().await;
@@ -42899,7 +42910,8 @@ mod project_config_initialize_tests {
         )
         .unwrap();
         let (svc, main_uri) =
-            open_in_workspace(&tmp, "main.R", "r", "source(\"helper.R\")\nhelper_fn()\n").await;
+            open_in_quiescent_workspace(&tmp, "main.R", "r", "source(\"helper.R\")\nhelper_fn()\n")
+                .await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
@@ -43028,6 +43040,10 @@ mod project_config_initialize_tests {
             .await;
         handler.await.unwrap();
 
+        assert_eq!(
+            handoff.outcome,
+            crate::state::WatchedFinalHandoffOutcome::Finalized
+        );
         assert!(
             handoff.reserved.is_empty(),
             "the central watched deletion must transfer its unmarked fanout"
@@ -43086,7 +43102,7 @@ mod project_config_initialize_tests {
         fs::write(&child_path, "child_value <- 1\n").unwrap();
         let parent = "source(\"child.R\")\nchild_value\n";
         fs::write(tmp.path().join("parent.R"), parent).unwrap();
-        let (svc, _parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let (svc, _parent_uri) = open_in_quiescent_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let child_uri = Url::from_file_path(&child_path).unwrap();
 
@@ -43299,6 +43315,10 @@ mod project_config_initialize_tests {
             &[&consumer_uri],
         )
         .await;
+        assert_eq!(
+            handoff.outcome,
+            crate::state::WatchedFinalHandoffOutcome::Finalized
+        );
         assert!(
             handoff.reserved.is_empty(),
             "deferred package deletion must transfer, not duplicate, its diagnostic ownership"
@@ -43326,7 +43346,20 @@ mod project_config_initialize_tests {
         let state = backend.state.read().await;
         assert_eq!(state.system_file_test_commit_attempts, attempt_baseline + 3);
         assert!(state.package_state.workspace().is_none());
-        assert!(!has_dependency_edge(&state, &consumer_uri, &helper_uri));
+        assert!(
+            !has_dependency_edge(&state, &consumer_uri, &helper_uri),
+            "deleted package routing retained helper edge; workspace={:?}, sources={:?}, \
+             dependencies={:?}, routing_owner_generation={}, package_ready={}, lib_paths={:?}",
+            state.package_state.workspace(),
+            state
+                .documents
+                .get_record(&consumer_uri)
+                .map(|record| &record.metadata().sources),
+            state.cross_file_graph.get_dependencies(&consumer_uri),
+            state.system_file_routing_owner_generation(),
+            state.package_library_ready,
+            state.package_library.lib_paths()
+        );
         assert_eq!(
             state
                 .diagnostics_gate
@@ -43340,7 +43373,7 @@ mod project_config_initialize_tests {
     async fn watched_duplicate_uri_events_use_final_event_once() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let (svc, _) = open_in_quiescent_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
 
         for (name, events, exists) in [
@@ -43423,7 +43456,7 @@ mod project_config_initialize_tests {
         let parent = "source(\"child.r\")\nchild_fn()\nlive_fn()\n";
         fs::write(tmp.path().join("parent.R"), parent).unwrap();
 
-        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let (svc, parent_uri) = open_in_quiescent_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let child_real_uri = Url::from_file_path(tmp.path().join("child.r")).unwrap();
         let child_alias_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
@@ -43495,7 +43528,7 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("child.r"), "child_fn <- function() 1\n").unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
         let (svc, _parent_uri) =
-            open_in_workspace(&tmp, "parent.R", "r", "source(\"child.r\")\n").await;
+            open_in_quiescent_workspace(&tmp, "parent.R", "r", "source(\"child.r\")\n").await;
         let backend = svc.inner();
         let child_real_uri = Url::from_file_path(tmp.path().join("child.r")).unwrap();
         let child_alias_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
@@ -43558,7 +43591,7 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("child.r"), "child_fn <- function() 1\n").unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
         let (svc, _parent_uri) =
-            open_in_workspace(&tmp, "parent.R", "r", "source(\"child.r\")\n").await;
+            open_in_quiescent_workspace(&tmp, "parent.R", "r", "source(\"child.r\")\n").await;
         let backend = svc.inner();
         let child_real_uri = Url::from_file_path(tmp.path().join("child.r")).unwrap();
         let child_alias_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
@@ -43634,7 +43667,8 @@ mod project_config_initialize_tests {
         fs::write(&second, "second_disk <- 1\n").unwrap();
         fs::write(&extra, "extra <- 1\n").unwrap();
         std::os::unix::fs::symlink("first.R", &link).unwrap();
-        let (svc, _seed_uri) = open_in_workspace(&tmp, "extra.R", "r", "extra <- 1\n").await;
+        let (svc, _seed_uri) =
+            open_in_quiescent_workspace(&tmp, "extra.R", "r", "extra <- 1\n").await;
         let backend = svc.inner();
         let link_uri = Url::from_file_path(&link).unwrap();
         let first_uri = Url::from_file_path(&first).unwrap();
@@ -43701,7 +43735,8 @@ mod project_config_initialize_tests {
         let link_b = tmp.path().join("link-b.R");
         std::os::unix::fs::symlink("first.R", &link_a).unwrap();
         std::os::unix::fs::symlink("first.R", &link_b).unwrap();
-        let (svc, _seed_uri) = open_in_workspace(&tmp, "a-extra.R", "r", "a_extra <- 1\n").await;
+        let (svc, _seed_uri) =
+            open_in_quiescent_workspace(&tmp, "a-extra.R", "r", "a_extra <- 1\n").await;
         let backend = svc.inner();
         let link_a_uri = Url::from_file_path(&link_a).unwrap();
         let link_b_uri = Url::from_file_path(&link_b).unwrap();
@@ -43764,7 +43799,8 @@ mod project_config_initialize_tests {
         }
         let link = tmp.path().join("link.R");
         std::os::unix::fs::symlink("first.R", &link).unwrap();
-        let (svc, _seed_uri) = open_in_workspace(&tmp, "first.R", "r", "first_live <- 1\n").await;
+        let (svc, _seed_uri) =
+            open_in_quiescent_workspace(&tmp, "first.R", "r", "first_live <- 1\n").await;
         let backend = svc.inner();
         let link_uri = Url::from_file_path(&link).unwrap();
         let first_uri = Url::from_file_path(tmp.path().join("first.R")).unwrap();
@@ -43842,7 +43878,8 @@ mod project_config_initialize_tests {
     async fn same_uri_open_change_close_keeps_alias_map_empty() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("helper.R"), "x <- 1\n").unwrap();
-        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
+        let (svc, helper_uri) =
+            open_in_quiescent_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
 
         {
@@ -43880,7 +43917,7 @@ mod project_config_initialize_tests {
         let parent = "source(\"child.R\")\nchild_fn()\nlive_fn()\n";
         fs::write(tmp.path().join("parent.R"), parent).unwrap();
 
-        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let (svc, parent_uri) = open_in_quiescent_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
         let link_uri = Url::from_file_path(tmp.path().join("link.R")).unwrap();
@@ -44187,7 +44224,8 @@ mod project_config_initialize_tests {
         let sibling = "disk_only()\n";
         fs::write(r_dir.join("sibling.R"), sibling).unwrap();
 
-        let (svc, sibling_uri) = open_in_workspace(&tmp, "R/sibling.R", "r", sibling).await;
+        let (svc, sibling_uri) =
+            open_in_synthetic_package_workspace(&tmp, "R/sibling.R", "r", sibling).await;
         let backend = svc.inner();
         let canonical_path = r_dir.join("foo.r");
         let alias_path = r_dir.join("foo.R");
@@ -44257,21 +44295,8 @@ mod project_config_initialize_tests {
         let alias_path = r_dir.join("child.r");
         let alias_uri = Url::from_file_path(&alias_path).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(tmp.path()).unwrap(),
-                    name: "pkg".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         {
             let disk_seed = collect_package_r_file_inputs_from_disk(tmp.path());
             let mut state = backend.state.write().await;
@@ -44345,21 +44370,8 @@ mod project_config_initialize_tests {
         let alias_path = r_dir.join("child-link.R");
         let alias_uri = Url::from_file_path(&alias_path).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(tmp.path()).unwrap(),
-                    name: "pkg".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         {
             let disk_seed = collect_package_r_file_inputs_from_disk(tmp.path());
             let mut state = backend.state.write().await;
@@ -44433,21 +44445,8 @@ mod project_config_initialize_tests {
         let link_uri = Url::from_file_path(&link_path).unwrap();
         let outside_uri = Url::from_file_path(outside_target.canonicalize().unwrap()).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace_at(&pkg).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(&pkg).unwrap(),
-                    name: "pkg".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         {
             let disk_seed = collect_package_r_file_inputs_from_disk(&pkg);
             let mut state = backend.state.write().await;
@@ -44499,21 +44498,8 @@ mod project_config_initialize_tests {
         fs::write(r_dir.join("sibling.R"), "live_alias2()\n").unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace_at(&real).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(&real).unwrap(),
-                    name: "pkg".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false }
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
 
         {
             let disk_seed = collect_package_r_file_inputs_from_disk(&real);
@@ -44598,23 +44584,17 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("DESCRIPTION"), disk_description).unwrap();
         fs::write(r_dir.join("sibling.R"), "sibling <- function() 1\n").unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(tmp.path()).unwrap(),
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false },
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         let sibling_uri = Url::from_file_path(r_dir.join("sibling.R")).unwrap();
-        open_doc(backend, &sibling_uri, "r", 1, "sibling <- function() 1\n").await;
+        open_doc_with_revalidation_handoff(
+            backend,
+            &sibling_uri,
+            "r",
+            1,
+            "sibling <- function() 1\n",
+        )
+        .await;
         {
             let disk_seed = collect_package_r_file_inputs_from_disk(tmp.path());
             let mut state = backend.state.write().await;
@@ -44685,21 +44665,8 @@ mod project_config_initialize_tests {
         .unwrap();
         fs::write(tmp.path().join("inst/helper.R"), "helper_value <- 1\n").unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(tmp.path()).unwrap(),
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false },
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
         {
             let mut state = backend.state.write().await;
@@ -44718,7 +44685,7 @@ mod project_config_initialize_tests {
         let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
         let consumer_uri = Url::from_file_path(tmp.path().join("R/consumer.R")).unwrap();
         let helper_uri = Url::from_file_path(tmp.path().join("inst/helper.R")).unwrap();
-        open_doc(
+        open_doc_with_revalidation_handoff(
             backend,
             &consumer_uri,
             "r",
@@ -44726,7 +44693,6 @@ mod project_config_initialize_tests {
             "source(system.file(\"helper.R\", package = \"bufferpkg\"))\nhelper_value\n",
         )
         .await;
-        wait_for_revalidation_drain(backend, &[&consumer_uri]).await;
         backend
             .state
             .write()
@@ -44816,21 +44782,8 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("DESCRIPTION"), disk_description).unwrap();
         fs::write(tmp.path().join("inst/helper.R"), "helper_value <- 1\n").unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(tmp.path()).unwrap(),
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false },
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
         {
             let mut state = backend.state.write().await;
@@ -44851,7 +44804,7 @@ mod project_config_initialize_tests {
         let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
         let consumer_uri = Url::from_file_path(tmp.path().join("R/consumer.R")).unwrap();
         let helper_uri = Url::from_file_path(tmp.path().join("inst/helper.R")).unwrap();
-        open_doc(
+        open_doc_with_revalidation_handoff(
             backend,
             &consumer_uri,
             "r",
@@ -44859,8 +44812,8 @@ mod project_config_initialize_tests {
             "source(system.file(\"helper.R\", package = \"bufferpkg\"))\nhelper_value\n",
         )
         .await;
-        open_doc(backend, &description_uri, "r", 1, disk_description).await;
-        wait_for_revalidation_drain(backend, &[&consumer_uri, &description_uri]).await;
+        open_doc_with_revalidation_handoff(backend, &description_uri, "r", 1, disk_description)
+            .await;
         backend
             .state
             .write()
@@ -44925,21 +44878,8 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("DESCRIPTION"), disk_description).unwrap();
         fs::write(tmp.path().join("inst/helper.R"), "helper_value <- 1\n").unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(tmp.path()).unwrap(),
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false },
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
         {
             let mut state = backend.state.write().await;
@@ -44958,7 +44898,7 @@ mod project_config_initialize_tests {
         let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
         let consumer_uri = Url::from_file_path(tmp.path().join("R/consumer.R")).unwrap();
         let helper_uri = Url::from_file_path(tmp.path().join("inst/helper.R")).unwrap();
-        open_doc(
+        open_doc_with_revalidation_handoff(
             backend,
             &consumer_uri,
             "r",
@@ -44966,7 +44906,7 @@ mod project_config_initialize_tests {
             "source(system.file(\"helper.R\", package = \"diskpkg\"))\nhelper_value\n",
         )
         .await;
-        open_doc(
+        open_doc_with_revalidation_handoff(
             backend,
             &description_uri,
             "r",
@@ -44981,7 +44921,6 @@ mod project_config_initialize_tests {
                 "the dirty DESCRIPTION must first remove disk-package routing"
             );
         }
-        wait_for_revalidation_drain(backend, &[&consumer_uri, &description_uri]).await;
         backend
             .state
             .write()
@@ -45042,21 +44981,8 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("DESCRIPTION"), disk_description).unwrap();
         fs::write(tmp.path().join("inst/helper.R"), "helper_value <- 1\n").unwrap();
 
-        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let svc = service_in_synthetic_package_workspace(&tmp).await;
         let backend = svc.inner();
-        backend
-            .initialize(InitializeParams {
-                workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(tmp.path()).unwrap(),
-                    name: "t".into(),
-                }]),
-                initialization_options: Some(serde_json::json!({
-                    "crossFile": { "indexWorkspace": false },
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
         {
             let mut state = backend.state.write().await;
@@ -45201,7 +45127,7 @@ mod project_config_initialize_tests {
         std::os::unix::fs::symlink(tmp.path().join("child.R"), tmp.path().join("link.R")).unwrap();
 
         let (svc, child_uri) =
-            open_in_workspace(&tmp, "child.R", "r", "child_fn <- function() 1\n").await;
+            open_in_quiescent_workspace(&tmp, "child.R", "r", "child_fn <- function() 1\n").await;
         let backend = svc.inner();
         let link_uri = Url::from_file_path(tmp.path().join("link.R")).unwrap();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
@@ -45253,7 +45179,8 @@ mod project_config_initialize_tests {
         std::os::unix::fs::symlink(tmp.path().join("child.R"), tmp.path().join("link-b.R"))
             .unwrap();
 
-        let (svc, _driver_uri) = open_in_workspace(&tmp, "driver.R", "r", "driver <- 1\n").await;
+        let (svc, _driver_uri) =
+            open_in_quiescent_workspace(&tmp, "driver.R", "r", "driver <- 1\n").await;
         let backend = svc.inner();
         let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
         let link_a_uri = Url::from_file_path(tmp.path().join("link-a.R")).unwrap();
@@ -45317,7 +45244,8 @@ mod project_config_initialize_tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("helper.R"), "x <- 1\n").unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
-        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
+        let (svc, helper_uri) =
+            open_in_quiescent_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
 
@@ -45371,7 +45299,7 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join(".Rprofile"), "options(digits = 3)\n").unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
         let (svc, rprofile_uri) =
-            open_in_workspace(&tmp, ".Rprofile", "r", "options(digits = 3)\n").await;
+            open_in_quiescent_workspace(&tmp, ".Rprofile", "r", "options(digits = 3)\n").await;
         let backend = svc.inner();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
 
@@ -45433,7 +45361,8 @@ mod project_config_initialize_tests {
         let child_disk = "# raven: sourced-by ../parent.R\nsource(\"helper.R\")\n";
         fs::write(tmp.path().join("scripts").join("child.R"), child_disk).unwrap();
 
-        let (svc, child_uri) = open_in_workspace(&tmp, "scripts/child.R", "r", child_disk).await;
+        let (svc, child_uri) =
+            open_in_quiescent_workspace(&tmp, "scripts/child.R", "r", child_disk).await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(tmp.path().join("data").join("helper.R")).unwrap();
 
@@ -45492,7 +45421,7 @@ mod project_config_initialize_tests {
         let disk = "source(\"extra.R\")\nx <- 1\n";
         fs::write(tmp.path().join("helper.R"), disk).unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
-        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", disk).await;
+        let (svc, helper_uri) = open_in_quiescent_workspace(&tmp, "helper.R", "r", disk).await;
         let backend = svc.inner();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
 
@@ -45538,7 +45467,8 @@ mod project_config_initialize_tests {
         // Disk has a source() edge; the open buffer does NOT.
         fs::write(tmp.path().join("helper.R"), "source(\"extra.R\")\nx <- 1\n").unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
-        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
+        let (svc, helper_uri) =
+            open_in_quiescent_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
 
@@ -45574,7 +45504,7 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("parent.R"), parent).unwrap();
         fs::write(tmp.path().join("helper.R"), "helper_value <- 1\n").unwrap();
 
-        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let (svc, parent_uri) = open_in_quiescent_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
         let excluded_uri = Url::from_file_path(tmp.path().join("excluded.R")).unwrap();
@@ -45663,7 +45593,7 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("helper.R"), "source(\"extra.R\")\nx <- 1\n").unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
         fs::write(tmp.path().join("other.R"), "y <- 1\n").unwrap();
-        let (svc, _other_uri) = open_in_workspace(&tmp, "other.R", "r", "y <- 1\n").await;
+        let (svc, _other_uri) = open_in_quiescent_workspace(&tmp, "other.R", "r", "y <- 1\n").await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
@@ -45727,7 +45657,7 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("helper.R"), "x <- 1\n").unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
         fs::write(tmp.path().join("other.R"), "y <- 1\n").unwrap();
-        let (svc, _other) = open_in_workspace(&tmp, "other.R", "r", "y <- 1\n").await;
+        let (svc, _other) = open_in_quiescent_workspace(&tmp, "other.R", "r", "y <- 1\n").await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
@@ -45786,7 +45716,7 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("child.R"), "child_fn <- function() 1\n").unwrap();
         let parent = "source(\"child.R\")\nchild_fn()\n";
         fs::write(tmp.path().join("parent.R"), parent).unwrap();
-        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let (svc, parent_uri) = open_in_quiescent_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
         {
@@ -45835,7 +45765,8 @@ mod project_config_initialize_tests {
         let r_dir = tmp.path().join("R");
         fs::create_dir(&r_dir).unwrap();
         fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let (svc, _main_uri) =
+            open_in_synthetic_package_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
         backend.state.write().await.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
 
@@ -45892,7 +45823,7 @@ mod project_config_initialize_tests {
         );
         fs::write(tmp.path().join("main.R"), main).unwrap();
 
-        let (svc, main_uri) = open_in_workspace(&tmp, "main.R", "r", main).await;
+        let (svc, main_uri) = open_in_synthetic_package_workspace(&tmp, "main.R", "r", main).await;
         let backend = svc.inner();
         let sibling_uri = Url::from_file_path(tmp.path().join("R/sibling.R")).unwrap();
         open_doc(backend, &sibling_uri, "r", 1, "sibling <- 1\n").await;
@@ -46008,6 +45939,10 @@ mod project_config_initialize_tests {
                 state.watched_batch_test_commit_attempts,
             )
         };
+        assert_eq!(
+            final_handoff.outcome,
+            crate::state::WatchedFinalHandoffOutcome::Finalized
+        );
         assert_ne!(
             routing_after, routing_before,
             "DESCRIPTION package-name installation must own routing convergence"
@@ -46064,7 +45999,7 @@ mod project_config_initialize_tests {
         fs::write(&helper_path, helper).unwrap();
         let main = "source(\"R/helper.R\")\nhelper_fn()\n";
         fs::write(tmp.path().join("main.R"), main).unwrap();
-        let (svc, main_uri) = open_in_workspace(&tmp, "main.R", "r", main).await;
+        let (svc, main_uri) = open_in_synthetic_package_workspace(&tmp, "main.R", "r", main).await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(&helper_path).unwrap();
         backend.state.write().await.workspace_scan_complete = true;
@@ -46122,7 +46057,8 @@ mod project_config_initialize_tests {
         fs::write(&helper_path, old_helper).unwrap();
         let parent = "source(\"R/helper.R\")\nhelper_fn()\n";
         fs::write(tmp.path().join("parent.R"), parent).unwrap();
-        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let (svc, parent_uri) =
+            open_in_synthetic_package_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(&helper_path).unwrap();
         close_doc(backend, &parent_uri).await;
@@ -46169,7 +46105,8 @@ mod project_config_initialize_tests {
         fs::write(&desc_path, new_desc).unwrap();
         let main = "x <- 1\n";
         fs::write(tmp.path().join("R").join("main.R"), main).unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "R/main.R", "r", main).await;
+        let (svc, _main_uri) =
+            open_in_synthetic_package_workspace(&tmp, "R/main.R", "r", main).await;
         let backend = svc.inner();
         let desc_uri = Url::from_file_path(&desc_path).unwrap();
         seed_package_description_input(backend, tmp.path(), old_desc).await;
@@ -46225,7 +46162,8 @@ mod project_config_initialize_tests {
         let desc_path = tmp.path().join("DESCRIPTION");
         fs::write(&desc_path, [0x78u8, 0x80, 0x79]).unwrap();
         fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let (svc, _main_uri) =
+            open_in_synthetic_package_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
         let desc_uri = Url::from_file_path(&desc_path).unwrap();
         seed_package_description_input(backend, tmp.path(), old_desc).await;
@@ -46275,7 +46213,8 @@ mod project_config_initialize_tests {
         let desc_path = tmp.path().join("DESCRIPTION");
         fs::write(&desc_path, new_desc).unwrap();
         fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let (svc, _main_uri) =
+            open_in_synthetic_package_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
         let desc_uri = Url::from_file_path(&desc_path).unwrap();
         seed_package_description_input(backend, tmp.path(), old_desc).await;
@@ -46333,7 +46272,8 @@ mod project_config_initialize_tests {
         let desc_path = tmp.path().join("DESCRIPTION");
         fs::write(&desc_path, [0x78u8, 0x80, 0x79]).unwrap();
         fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let (svc, _main_uri) =
+            open_in_synthetic_package_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
         let desc_uri = Url::from_file_path(&desc_path).unwrap();
         seed_package_description_input(backend, tmp.path(), old_desc).await;
@@ -46393,7 +46333,8 @@ mod project_config_initialize_tests {
         fs::write(&helper_path, old_helper).unwrap();
         let parent = "source(\"R/helper.R\")\nhelper_fn()\n";
         fs::write(tmp.path().join("parent.R"), parent).unwrap();
-        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let (svc, parent_uri) =
+            open_in_synthetic_package_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(&helper_path).unwrap();
         let install = resync_file_from_disk(
@@ -46493,7 +46434,8 @@ mod project_config_initialize_tests {
         fs::write(&helper_path, old_helper).unwrap();
         let parent = "source(\"R/helper.R\")\nhelper_fn()\n";
         fs::write(tmp.path().join("parent.R"), parent).unwrap();
-        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let (svc, parent_uri) =
+            open_in_synthetic_package_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(&helper_path).unwrap();
         seed_package_r_file_input(backend, tmp.path(), "R/helper.R", old_helper).await;
@@ -46603,7 +46545,7 @@ mod project_config_initialize_tests {
         let content = "source(\"extra.R\")\nx <- 1\n";
         fs::write(tmp.path().join("helper.R"), content).unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
-        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", content).await;
+        let (svc, helper_uri) = open_in_quiescent_workspace(&tmp, "helper.R", "r", content).await;
         let backend = svc.inner();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
 
@@ -46646,7 +46588,8 @@ mod project_config_initialize_tests {
         // Disk has NO source() edge; the reopened buffer adds one (unsaved).
         fs::write(tmp.path().join("helper.R"), "x <- 1\n").unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
-        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
+        let (svc, helper_uri) =
+            open_in_quiescent_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
 
@@ -47011,8 +46954,13 @@ mod project_config_initialize_tests {
             "source(\"helper.R\")\nhelper_fn()\n",
         )
         .unwrap();
-        let (svc, parent_uri) =
-            open_in_workspace(&tmp, "parent.R", "r", "source(\"helper.R\")\nhelper_fn()\n").await;
+        let (svc, parent_uri) = open_in_quiescent_workspace(
+            &tmp,
+            "parent.R",
+            "r",
+            "source(\"helper.R\")\nhelper_fn()\n",
+        )
+        .await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
         open_doc(backend, &helper_uri, "r", 1, "helper_fn <- function() 1\n").await;
@@ -47061,7 +47009,7 @@ mod project_config_initialize_tests {
         let content = "source(\"extra.R\")\nx <- 1\n";
         fs::write(tmp.path().join("helper.R"), content).unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
-        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", content).await;
+        let (svc, helper_uri) = open_in_quiescent_workspace(&tmp, "helper.R", "r", content).await;
         let backend = svc.inner();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
         {
@@ -47118,7 +47066,8 @@ mod project_config_initialize_tests {
             "```\n",
         );
         fs::write(tmp.path().join("report.md"), content).unwrap();
-        let (svc, report_uri) = open_in_workspace(&tmp, "report.md", "rmd", content).await;
+        let (svc, report_uri) =
+            open_in_quiescent_workspace(&tmp, "report.md", "rmd", content).await;
         let backend = svc.inner();
         let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
         let decoy_uri = Url::from_file_path(tmp.path().join("prose_decoy.R")).unwrap();
@@ -47186,7 +47135,8 @@ mod project_config_initialize_tests {
             "```\n",
         );
         fs::write(tmp.path().join("report.md"), report_v1).unwrap();
-        let (svc, report_uri) = open_in_workspace(&tmp, "report.md", "rmd", report_v1).await;
+        let (svc, report_uri) =
+            open_in_quiescent_workspace(&tmp, "report.md", "rmd", report_v1).await;
         let backend = svc.inner();
         let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
@@ -47271,7 +47221,7 @@ mod project_config_initialize_tests {
             "```\n",
         );
         fs::write(tmp.path().join("report.md"), report).unwrap();
-        let (svc, report_uri) = open_in_workspace(&tmp, "report.md", "rmd", report).await;
+        let (svc, report_uri) = open_in_quiescent_workspace(&tmp, "report.md", "rmd", report).await;
         let backend = svc.inner();
 
         close_doc(backend, &report_uri).await;
@@ -47380,7 +47330,7 @@ mod project_config_initialize_tests {
             "```\n",
         );
         fs::write(tmp.path().join("report.md"), report).unwrap();
-        let (svc, report_uri) = open_in_workspace(&tmp, "report.md", "rmd", report).await;
+        let (svc, report_uri) = open_in_quiescent_workspace(&tmp, "report.md", "rmd", report).await;
         let backend = svc.inner();
 
         close_doc(backend, &report_uri).await;
@@ -47438,7 +47388,7 @@ mod project_config_initialize_tests {
         // Package-only sibling: open R/ file with NO edge to a.R.
         let c_disk = "c_fn <- function() 3\n";
         fs::write(tmp.path().join("R").join("c.R"), c_disk).unwrap();
-        let (svc, b_uri) = open_in_workspace(&tmp, "R/b.R", "r", b_disk).await;
+        let (svc, b_uri) = open_in_synthetic_package_workspace(&tmp, "R/b.R", "r", b_disk).await;
         let backend = svc.inner();
         let a_uri = Url::from_file_path(tmp.path().join("R").join("a.R")).unwrap();
         let c_uri = Url::from_file_path(tmp.path().join("R").join("c.R")).unwrap();
@@ -47533,7 +47483,7 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("child.R"), "child_fn <- function() 1\n").unwrap();
         let parent = "source(\"child.R\")\nchild_fn()\n";
         fs::write(tmp.path().join("parent.R"), parent).unwrap();
-        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let (svc, parent_uri) = open_in_quiescent_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
         {
@@ -47604,7 +47554,7 @@ mod project_config_initialize_tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("helper.R"), "helper_fn <- function() 1\n").unwrap();
         let (svc, helper_uri) =
-            open_in_workspace(&tmp, "helper.R", "r", "helper_fn <- function() 1\n").await;
+            open_in_quiescent_workspace(&tmp, "helper.R", "r", "helper_fn <- function() 1\n").await;
         let backend = svc.inner();
 
         backend
@@ -47640,7 +47590,7 @@ mod project_config_initialize_tests {
         let content = "source(\"extra.R\")\nx <- 1\n";
         fs::write(tmp.path().join("helper.R"), content).unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
-        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", content).await;
+        let (svc, helper_uri) = open_in_quiescent_workspace(&tmp, "helper.R", "r", content).await;
         let backend = svc.inner();
         {
             let state = backend.state.read().await;
@@ -47703,7 +47653,7 @@ mod project_config_initialize_tests {
             "```\n",
         );
         fs::write(tmp.path().join("analysis.Rmd"), rmd_v1).unwrap();
-        let (svc, rmd_uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd_v1).await;
+        let (svc, rmd_uri) = open_in_quiescent_workspace(&tmp, "analysis.Rmd", "rmd", rmd_v1).await;
         let backend = svc.inner();
         let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
@@ -47798,7 +47748,8 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("R").join("a.R"), "a_fn <- function() 1\n").unwrap();
         let analysis = "devtools::load_all()\na_fn()\n";
         fs::write(tmp.path().join("analysis.R"), analysis).unwrap();
-        let (svc, analysis_uri) = open_in_workspace(&tmp, "analysis.R", "r", analysis).await;
+        let (svc, analysis_uri) =
+            open_in_synthetic_package_workspace(&tmp, "analysis.R", "r", analysis).await;
         let backend = svc.inner();
         let a_uri = Url::from_file_path(tmp.path().join("R").join("a.R")).unwrap();
         open_doc(backend, &a_uri, "r", 1, "a_fn <- function() 1\n").await;
@@ -47849,7 +47800,8 @@ mod project_config_initialize_tests {
         fs::create_dir(tmp.path().join("R")).unwrap();
         let disk = "pkg_fn <- function() 1\n";
         fs::write(tmp.path().join("R").join("helper.R"), disk).unwrap();
-        let (svc, helper_uri) = open_in_workspace(&tmp, "R/helper.R", "r", disk).await;
+        let (svc, helper_uri) =
+            open_in_synthetic_package_workspace(&tmp, "R/helper.R", "r", disk).await;
         let backend = svc.inner();
         let helper_path = tmp.path().join("R").join("helper.R");
 
@@ -47904,7 +47856,8 @@ mod project_config_initialize_tests {
         fs::create_dir(tmp.path().join("R")).unwrap();
         let disk = "pkg_fn <- function() 1\n";
         fs::write(tmp.path().join("R").join("helper.R"), disk).unwrap();
-        let (svc, helper_uri) = open_in_workspace(&tmp, "R/helper.R", "r", disk).await;
+        let (svc, helper_uri) =
+            open_in_synthetic_package_workspace(&tmp, "R/helper.R", "r", disk).await;
         let backend = svc.inner();
         let helper_path = tmp.path().join("R").join("helper.R");
 
@@ -47952,7 +47905,8 @@ mod project_config_initialize_tests {
         .unwrap();
         let disk = "excluded_fn <- function() 1\n";
         fs::write(tmp.path().join("R").join("generated.R"), disk).unwrap();
-        let (svc, generated_uri) = open_in_workspace(&tmp, "R/generated.R", "r", disk).await;
+        let (svc, generated_uri) =
+            open_in_synthetic_package_workspace(&tmp, "R/generated.R", "r", disk).await;
         let backend = svc.inner();
         let generated_path = tmp.path().join("R").join("generated.R");
 
@@ -48126,7 +48080,8 @@ mod project_config_initialize_tests {
             "```\n",
         );
         fs::write(tmp.path().join("analysis.Rmd"), rmd_disk).unwrap();
-        let (svc, rmd_uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd_disk).await;
+        let (svc, rmd_uri) =
+            open_in_quiescent_workspace(&tmp, "analysis.Rmd", "rmd", rmd_disk).await;
         let backend = svc.inner();
         let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
@@ -48192,7 +48147,8 @@ mod project_config_initialize_tests {
             "Prose calls source(\"prose_decoy.R\") but that is not R.\n",
         );
         fs::write(tmp.path().join("analysis.Rmd"), rmd_disk).unwrap();
-        let (svc, rmd_uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd_disk).await;
+        let (svc, rmd_uri) =
+            open_in_quiescent_workspace(&tmp, "analysis.Rmd", "rmd", rmd_disk).await;
         let backend = svc.inner();
 
         // Unsaved buffer edit adds a chunk with a real source() edge.
@@ -48239,7 +48195,7 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("b.R"), "b_fn <- function() 2\n").unwrap();
         let main = "source(\"a.R\")\nsource(\"b.R\")\na_fn()\nb_fn()\n";
         fs::write(tmp.path().join("main.R"), main).unwrap();
-        let (svc, main_uri) = open_in_workspace(&tmp, "main.R", "r", main).await;
+        let (svc, main_uri) = open_in_quiescent_workspace(&tmp, "main.R", "r", main).await;
         let backend = svc.inner();
         let a_uri = Url::from_file_path(tmp.path().join("a.R")).unwrap();
         let b_uri = Url::from_file_path(tmp.path().join("b.R")).unwrap();
@@ -48386,14 +48342,25 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("helper.R"), "source(\"extra.R\")\nx <- 1\n").unwrap();
         fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
         fs::write(tmp.path().join("other.R"), "y <- 1\n").unwrap();
-        // Open an unrelated file so the backend is initialized the usual way.
-        let (svc, _other_uri) = open_in_workspace(&tmp, "other.R", "r", "y <- 1\n").await;
+        // Startup scanning and package routing are outside this test's subject.
+        let (svc, _other_uri) = open_in_quiescent_workspace(&tmp, "other.R", "r", "y <- 1\n").await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
 
-        // Fire the watched event (async disk read spawns), then immediately
-        // open the file with buffer content that has NO edge.
+        // Pause after the watched transaction prepares stale disk state but
+        // before its commit, then open a buffer with no edge.
+        let (pre_commit, final_handoff) = {
+            let state = backend.state.read().await;
+            (
+                state
+                    .watched_package_pre_commit_test_pause
+                    .arm(Url::parse(WATCHED_PACKAGE_PRE_COMMIT_PAUSE_URI).unwrap()),
+                state
+                    .watched_final_handoff_test_capture
+                    .arm_for(helper_uri.as_str()),
+            )
+        };
         backend
             .did_change_watched_files(DidChangeWatchedFilesParams {
                 changes: vec![FileEvent {
@@ -48402,11 +48369,32 @@ mod project_config_initialize_tests {
                 }],
             })
             .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), pre_commit.wait_arrived())
+            .await
+            .expect("watched transaction must reach the pre-commit boundary");
         open_doc(backend, &helper_uri, "r", 1, "x <- 1\n").await;
+        pre_commit.release();
 
-        // Whichever side wins the race, the open buffer's (edge-free)
-        // topology must be the settled state.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let handoff = wait_final_handoff_payload(
+            backend,
+            &final_handoff,
+            "watched-reopen-during-read",
+            &[&helper_uri],
+        )
+        .await;
+        assert_eq!(
+            handoff.outcome,
+            crate::state::WatchedFinalHandoffOutcome::RetiredBeforeFinalHandoff
+        );
+        assert!(handoff.reserved.is_empty());
+        assert!(handoff.transferred.is_empty());
+        release_and_wait_final_handoff(
+            backend,
+            &final_handoff,
+            "watched-reopen-during-read",
+            &[&helper_uri],
+        )
+        .await;
         let state = backend.state.read().await;
         assert!(
             !state
@@ -48493,6 +48481,9 @@ lineLength = 200
                     uri: Url::from_file_path(tmp.path()).unwrap(),
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -48562,6 +48553,9 @@ lineLength = 200
                     uri: Url::from_file_path(tmp.path()).unwrap(),
                     name: "t".into(),
                 }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
                 ..Default::default()
             })
             .await
@@ -48611,7 +48605,7 @@ lineLength = 200
     async fn open_rmd(content: &str) -> (tower_lsp::LspService<Backend>, Url, TempDir) {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("report.Rmd"), content).unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "report.Rmd", "rmd", content).await;
+        let (svc, uri) = open_in_quiescent_workspace(&tmp, "report.Rmd", "rmd", content).await;
         (svc, uri, tmp)
     }
 
@@ -48652,7 +48646,7 @@ lineLength = 200
         let tmp = TempDir::new().unwrap();
         let content = "result <-\n";
         fs::write(tmp.path().join("script.R"), content).unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "script.R", "r", content).await;
+        let (svc, uri) = open_in_quiescent_workspace(&tmp, "script.R", "r", content).await;
 
         let edits = svc
             .inner()
@@ -48675,7 +48669,7 @@ lineLength = 200
         let tmp = TempDir::new().unwrap();
         let content = "text <- \"first\nstill open\n";
         fs::write(tmp.path().join("script.R"), content).unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "script.R", "r", content).await;
+        let (svc, uri) = open_in_quiescent_workspace(&tmp, "script.R", "r", content).await;
 
         let edits = svc
             .inner()
@@ -48691,7 +48685,7 @@ lineLength = 200
         let tmp = TempDir::new().unwrap();
         let content = "result <-\n";
         fs::write(tmp.path().join("script.R"), content).unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "script.R", "r", content).await;
+        let (svc, uri) = open_in_quiescent_workspace(&tmp, "script.R", "r", content).await;
         let backend = svc.inner();
 
         {
@@ -48743,7 +48737,8 @@ infixContinuationStyle = "aligned"
         let base_path = tmp.path().join("script.R");
         fs::write(&override_path, content).unwrap();
         fs::write(&base_path, content).unwrap();
-        let (svc, override_uri) = open_in_workspace(&tmp, "R/script.R", "r", content).await;
+        let (svc, override_uri) =
+            open_in_quiescent_workspace(&tmp, "R/script.R", "r", content).await;
         let backend = svc.inner();
         let base_uri = Url::from_file_path(base_path).unwrap();
         open_doc(backend, &base_uri, "r", 1, content).await;
@@ -48825,28 +48820,16 @@ infixContinuationStyle = "aligned"
     // consumers.
     // ====================================================================
 
-    /// Open an arbitrary file (by path under a freshly-initialized workspace)
-    /// through the real `did_open` path. Returns the live `LspService`, the
-    /// document URI, and the backing `TempDir`. The `TempDir` must already
-    /// contain the workspace fixtures; `path` is relative to it.
-    async fn open_in_workspace(
-        tmp: &TempDir,
-        rel_path: &str,
-        language_id: &str,
-        content: &str,
-    ) -> (tower_lsp::LspService<Backend>, Url) {
-        open_in_workspace_with_options(tmp, rel_path, language_id, content, None).await
-    }
-
-    /// Variant for tests whose CAS/graph preconditions require a quiescent
-    /// backend instance with no startup workspace scan or package routing.
+    /// Open through the real `didOpen` path without workspace scanning or
+    /// package routing. Package assertions fail by construction; use an
+    /// explicit synthetic-package fixture when package mode is under test.
     async fn open_in_quiescent_workspace(
         tmp: &TempDir,
         rel_path: &str,
         language_id: &str,
         content: &str,
     ) -> (tower_lsp::LspService<Backend>, Url) {
-        open_in_workspace_with_options(
+        let opened = open_in_workspace_with_options(
             tmp,
             rel_path,
             language_id,
@@ -48856,7 +48839,39 @@ infixContinuationStyle = "aligned"
                 "packages": { "enabled": false }
             })),
         )
-        .await
+        .await;
+        assert_eq!(
+            opened
+                .0
+                .inner()
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire),
+            0,
+            "quiescent fixtures must never invoke host package initialization"
+        );
+        opened
+    }
+
+    /// Open with package mode enabled and an explicitly installed synthetic
+    /// ready library. This preserves package-input/routing behavior without
+    /// consulting host R, provider databases, or filesystem watchers.
+    async fn open_in_synthetic_package_workspace(
+        tmp: &TempDir,
+        rel_path: &str,
+        language_id: &str,
+        content: &str,
+    ) -> (tower_lsp::LspService<Backend>, Url) {
+        let svc = service_in_synthetic_package_workspace(tmp).await;
+        let uri = Url::from_file_path(tmp.path().join(rel_path)).unwrap();
+        open_doc(svc.inner(), &uri, language_id, 1, content).await;
+        assert_eq!(
+            svc.inner()
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire),
+            1,
+            "synthetic package fixtures must run one routed build and never fall through to host R"
+        );
+        (svc, uri)
     }
 
     /// Package-aware fixture whose `didOpen` diagnostic transaction has
@@ -48876,19 +48891,16 @@ infixContinuationStyle = "aligned"
         language_id: &str,
         content: &str,
     ) -> (tower_lsp::LspService<Backend>, Url) {
-        let svc = service_in_workspace_with_options(
-            tmp,
-            Some(serde_json::json!({
-                "crossFile": { "indexWorkspace": false },
-                "packages": {
-                    "enabled": true,
-                    "watchLibraryPaths": false
-                }
-            })),
-        )
-        .await;
+        let svc = service_in_synthetic_package_workspace(tmp).await;
         let uri = Url::from_file_path(tmp.path().join(rel_path)).unwrap();
         open_doc_with_revalidation_handoff(svc.inner(), &uri, language_id, 1, content).await;
+        assert_eq!(
+            svc.inner()
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire),
+            1,
+            "settled synthetic package fixtures must run one routed build and never fall through to host R"
+        );
         (svc, uri)
     }
 
@@ -49502,12 +49514,19 @@ infixContinuationStyle = "aligned"
         tmp: &TempDir,
         initialization_options: Option<serde_json::Value>,
     ) -> tower_lsp::LspService<Backend> {
+        service_in_workspace_with_options_at(tmp.path(), initialization_options).await
+    }
+
+    async fn service_in_workspace_with_options_at(
+        workspace_root: &std::path::Path,
+        initialization_options: Option<serde_json::Value>,
+    ) -> tower_lsp::LspService<Backend> {
         let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
         let backend = svc.inner();
         backend
             .initialize(InitializeParams {
                 workspace_folders: Some(vec![WorkspaceFolder {
-                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    uri: Url::from_file_path(workspace_root).unwrap(),
                     name: "t".into(),
                 }]),
                 initialization_options,
@@ -49518,8 +49537,41 @@ infixContinuationStyle = "aligned"
         svc
     }
 
+    async fn service_in_synthetic_package_workspace(
+        tmp: &TempDir,
+    ) -> tower_lsp::LspService<Backend> {
+        service_in_synthetic_package_workspace_at(tmp.path()).await
+    }
+
+    /// Path-taking form for fixtures whose package workspace is nested below
+    /// the owning `TempDir` or reached through a symlink spelling.
+    async fn service_in_synthetic_package_workspace_at(
+        workspace_root: &std::path::Path,
+    ) -> tower_lsp::LspService<Backend> {
+        let svc = service_in_workspace_with_options_at(
+            workspace_root,
+            Some(serde_json::json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": {
+                    "enabled": true,
+                    "watchLibraryPaths": false
+                }
+            })),
+        )
+        .await;
+        {
+            let library_path = workspace_root.join(".raven-test-library");
+            fs::create_dir_all(&library_path).unwrap();
+            let mut package_library = crate::package_library::PackageLibrary::new_empty();
+            package_library.add_library_paths(&[library_path]);
+            let mut state = svc.inner().state.write().await;
+            state.package_library_build_outcome_for_test = Some((Arc::new(package_library), true));
+        }
+        svc
+    }
+
     /// Open `uri` on an already-initialized backend (the `did_open` half of
-    /// `open_in_workspace`, for second and reopened documents).
+    /// the workspace fixture helpers, for second and reopened documents).
     async fn open_doc(backend: &Backend, uri: &Url, language_id: &str, version: i32, text: &str) {
         use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
         backend
@@ -49621,7 +49673,7 @@ infixContinuationStyle = "aligned"
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let (svc, uri) = open_in_workspace(
+        let (svc, uri) = open_in_quiescent_workspace(
             &tmp,
             "report.Rmd",
             "rmd",
@@ -49783,8 +49835,13 @@ infixContinuationStyle = "aligned"
     async fn did_change_accepts_zero_and_one_transitive_visit_budgets() {
         for (index, budget) in [0, 1].into_iter().enumerate() {
             let tmp = tempfile::TempDir::new().unwrap();
-            let (svc, uri) =
-                open_in_workspace(&tmp, &format!("budget-{index}.R"), "r", "before <- 1\n").await;
+            let (svc, uri) = open_in_quiescent_workspace(
+                &tmp,
+                &format!("budget-{index}.R"),
+                "r",
+                "before <- 1\n",
+            )
+            .await;
             let backend = svc.inner();
             backend
                 .state
@@ -49908,7 +49965,8 @@ infixContinuationStyle = "aligned"
     #[tokio::test]
     async fn did_change_overflow_retries_once_after_unrelated_authority_change() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "retry-overflow.R", "r", "before <- 1\n").await;
+        let (svc, uri) =
+            open_in_quiescent_workspace(&tmp, "retry-overflow.R", "r", "before <- 1\n").await;
         let backend = svc.inner();
         let first_pause = {
             let mut state = backend.state.write().await;
@@ -50082,7 +50140,7 @@ infixContinuationStyle = "aligned"
     async fn did_change_overflow_second_invalidation_stops_without_partial_effects() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (svc, uri) =
-            open_in_workspace(&tmp, "twice-stale-overflow.R", "r", "before <- 1\n").await;
+            open_in_quiescent_workspace(&tmp, "twice-stale-overflow.R", "r", "before <- 1\n").await;
         let backend = svc.inner();
         let first_pause = {
             let mut state = backend.state.write().await;
@@ -50144,7 +50202,7 @@ infixContinuationStyle = "aligned"
     async fn did_change_overflow_target_generation_change_never_overwrites() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (svc, uri) =
-            open_in_workspace(&tmp, "superseded-overflow.R", "r", "before <- 1\n").await;
+            open_in_quiescent_workspace(&tmp, "superseded-overflow.R", "r", "before <- 1\n").await;
         let backend = svc.inner();
         let pause = {
             let mut state = backend.state.write().await;
@@ -51029,21 +51087,44 @@ infixContinuationStyle = "aligned"
             })
             .await
             .unwrap();
-        {
+        let package_init_pause = {
+            let mut package_library = crate::package_library::PackageLibrary::new_empty();
+            package_library.add_library_paths(std::slice::from_ref(&library));
             let mut state = backend.state.write().await;
             state.workspace_scan_complete = true;
             state.cross_file_config.packages_enabled = true;
+            state.cross_file_config.packages_watch_library_paths = false;
             state.cross_file_config.packages_additional_library_paths = vec![library];
             state.package_library_ready = false;
-        }
-        open_doc(
+            state.package_library_build_outcome_for_test = Some((Arc::new(package_library), true));
+            state
+                .package_init_pre_commit_test_pause
+                .arm(Url::parse("raven-test://package-library-init").unwrap())
+        };
+        let handler = open_doc(
             backend,
             &subject,
             "r",
             1,
             "source(system.file(\"helper.R\", package = \"fakepkg\"))\n",
-        )
-        .await;
+        );
+        tokio::pin!(handler);
+        tokio::select! {
+            _ = package_init_pause.wait_arrived() => {}
+            _ = &mut handler => {
+                panic!("didOpen derived the document before package initialization committed")
+            }
+        }
+        {
+            let state = backend.state.read().await;
+            assert!(!state.package_library_ready);
+            assert!(
+                !state.documents.contains_key(&subject),
+                "OpenInstall must not commit while package initialization is paused"
+            );
+        }
+        package_init_pause.release();
+        handler.await;
 
         let state = backend.state.read().await;
         assert!(state.package_library_ready);
@@ -51587,7 +51668,7 @@ infixContinuationStyle = "aligned"
     async fn did_close_target_metadata_replacement_is_terminal() {
         let tmp = TempDir::new().unwrap();
         let (svc, uri) =
-            open_in_workspace(&tmp, "close-metadata-owner.R", "r", "owner <- 1\n").await;
+            open_in_quiescent_workspace(&tmp, "close-metadata-owner.R", "r", "owner <- 1\n").await;
         let backend = svc.inner();
         let pause = backend
             .state
@@ -51631,7 +51712,8 @@ infixContinuationStyle = "aligned"
     #[tokio::test]
     async fn did_close_duplicate_open_is_terminal() {
         let tmp = TempDir::new().unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "close-duplicate.R", "r", "first <- 1\n").await;
+        let (svc, uri) =
+            open_in_quiescent_workspace(&tmp, "close-duplicate.R", "r", "first <- 1\n").await;
         let backend = svc.inner();
         let pause = backend
             .state
@@ -51670,7 +51752,8 @@ infixContinuationStyle = "aligned"
     #[tokio::test]
     async fn did_close_second_ancillary_invalidation_stops_after_one_retry() {
         let tmp = TempDir::new().unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "close-retry-cap.R", "r", "owner <- 1\n").await;
+        let (svc, uri) =
+            open_in_quiescent_workspace(&tmp, "close-retry-cap.R", "r", "owner <- 1\n").await;
         let backend = svc.inner();
         let first_pause = backend
             .state
@@ -51712,7 +51795,8 @@ infixContinuationStyle = "aligned"
     #[tokio::test]
     async fn stale_did_close_cannot_remove_same_version_reopen_aba() {
         let tmp = TempDir::new().unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "close-aba.R", "r", "first <- 1\n").await;
+        let (svc, uri) =
+            open_in_quiescent_workspace(&tmp, "close-aba.R", "r", "first <- 1\n").await;
         let backend = svc.inner();
         let pause = backend
             .state
@@ -51746,7 +51830,8 @@ infixContinuationStyle = "aligned"
     #[tokio::test]
     async fn did_close_commit_is_all_or_none_before_empty_publish() {
         let tmp = TempDir::new().unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "close-atomic.R", "r", "live <- 1\n").await;
+        let (svc, uri) =
+            open_in_quiescent_workspace(&tmp, "close-atomic.R", "r", "live <- 1\n").await;
         let backend = svc.inner();
         let pause = backend
             .state
@@ -51914,7 +51999,8 @@ infixContinuationStyle = "aligned"
     async fn close_no_shadow_undecodable_disk_still_commits_remove() {
         let tmp = TempDir::new().unwrap();
         let (svc, uri) =
-            open_in_workspace(&tmp, "no-shadow-invalid.R", "r", "source(\"old.R\")\n").await;
+            open_in_quiescent_workspace(&tmp, "no-shadow-invalid.R", "r", "source(\"old.R\")\n")
+                .await;
         let backend = svc.inner();
         fs::write(tmp.path().join("no-shadow-invalid.R"), [0x78u8, 0x80, 0x79]).unwrap();
 
@@ -52067,6 +52153,7 @@ infixContinuationStyle = "aligned"
         let capture_status = capture.status();
         let state = backend.state.read().await;
         let system_file_routing_owner_generation = state.system_file_routing_owner_generation();
+        let routing_derivation_lane = library_routing_derivation_lane(&state);
         let target_state: Vec<_> = targets
             .iter()
             .map(|uri| {
@@ -52082,11 +52169,7 @@ infixContinuationStyle = "aligned"
             })
             .collect();
         drop(state);
-        let routing_derivation_slot = library_routing_derivation_slot()
-            .lock()
-            .entry
-            .as_ref()
-            .map(|entry| (entry.id, entry.key));
+        let routing_derivation_slot = routing_derivation_lane.slot_snapshot();
         format!(
             "kind={kind} operation_id={} owner={:?} claimed={} recorded={} completed={} \
              outstanding={:?} abnormal_exits={:?} \
@@ -52102,7 +52185,7 @@ infixContinuationStyle = "aligned"
             capture_status.completed,
             capture_status.outstanding,
             capture_status.abnormal_exits,
-            library_routing_derivation_gate().available_permits(),
+            routing_derivation_lane.gate.available_permits(),
             backend.close_resync_permits.available_permits(),
         )
     }
@@ -52401,7 +52484,7 @@ infixContinuationStyle = "aligned"
         );
         fs::write(tmp.path().join("analysis.Rmd"), rmd).unwrap();
 
-        let (svc, uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
+        let (svc, uri) = open_in_quiescent_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
         let backend = svc.inner();
         let state = backend.state.read().await;
 
@@ -52454,7 +52537,7 @@ infixContinuationStyle = "aligned"
             "```\n",
         );
         fs::write(tmp.path().join("analysis.Rmd"), rmd).unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
+        let (svc, uri) = open_in_quiescent_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
         let backend = svc.inner();
 
         // Reproduce publish_diagnostics_inner Phase 1-3 exactly (the production
@@ -52567,7 +52650,7 @@ infixContinuationStyle = "aligned"
             "```\n",
         );
         fs::write(tmp.path().join("analysis.Rmd"), rmd).unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
+        let (svc, uri) = open_in_quiescent_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
         let backend = svc.inner();
         let state = backend.state.read().await;
 
@@ -52612,7 +52695,7 @@ infixContinuationStyle = "aligned"
         let tmp = TempDir::new().unwrap();
         let rmd = "# prose\n\n```{r}\nz <- 1\n```\n";
         fs::write(tmp.path().join("analysis.Rmd"), rmd).unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
+        let (svc, uri) = open_in_quiescent_workspace(&tmp, "analysis.Rmd", "rmd", rmd).await;
         let backend = svc.inner();
         let state = backend.state.read().await;
 
@@ -52651,7 +52734,7 @@ infixContinuationStyle = "aligned"
         let helper = concat!("# @lsp-sourced-by analysis.Rmd\n", "x <- helper_fn()\n",);
         fs::write(tmp.path().join("helpers.R"), helper).unwrap();
 
-        let (svc, helper_uri) = open_in_workspace(&tmp, "helpers.R", "r", helper).await;
+        let (svc, helper_uri) = open_in_quiescent_workspace(&tmp, "helpers.R", "r", helper).await;
         let backend = svc.inner();
         let state = backend.state.read().await;
 
@@ -53485,7 +53568,8 @@ infixContinuationStyle = "aligned"
         fs::write(tmp.path().join("grand.R"), "grand_value <- 1\n").unwrap();
         let parent_text = "source(\"child.R\")\nparent_value <- child_value\n";
         fs::write(tmp.path().join("parent.R"), parent_text).unwrap();
-        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent_text).await;
+        let (svc, parent_uri) =
+            open_in_quiescent_workspace(&tmp, "parent.R", "r", parent_text).await;
         let backend = svc.inner();
         let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
         let new_content = "child_value <- 2\nsource(\"grand.R\")\n";
@@ -53526,6 +53610,10 @@ infixContinuationStyle = "aligned"
         ));
         let final_handoff =
             wait_final_handoff_payload(backend, &handoff, "watched-retry", &[&parent_uri]).await;
+        assert_eq!(
+            final_handoff.outcome,
+            crate::state::WatchedFinalHandoffOutcome::Finalized
+        );
         assert!(final_handoff.reserved.is_empty());
         assert_eq!(
             final_handoff
@@ -53570,7 +53658,7 @@ infixContinuationStyle = "aligned"
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("DESCRIPTION"), "Package: deferred\n").unwrap();
         fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let (svc, _main_uri) = open_in_quiescent_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
         let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
         let (generation, attempts) = {
@@ -53622,7 +53710,7 @@ infixContinuationStyle = "aligned"
         let description_path = tmp.path().join("DESCRIPTION");
         fs::write(&description_path, "Package: candidate\n").unwrap();
         fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let (svc, _main_uri) = open_in_quiescent_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
         let backend = svc.inner();
         let description_uri = Url::from_file_path(&description_path).unwrap();
         seed_package_description_input(backend, tmp.path(), "Package: baseline\nVersion: 1.0.0\n")
@@ -53825,7 +53913,8 @@ infixContinuationStyle = "aligned"
         let consumer_text =
             "source(system.file(\"helper.R\", package = \"newpkg\"))\nhelper_value\n";
         fs::write(tmp.path().join("consumer.R"), consumer_text).unwrap();
-        let (svc, consumer) = open_in_workspace(&tmp, "consumer.R", "r", consumer_text).await;
+        let (svc, consumer) =
+            open_in_synthetic_package_workspace(&tmp, "consumer.R", "r", consumer_text).await;
         let backend = svc.inner();
         close_doc(backend, &consumer).await;
         assert!(
@@ -54730,6 +54819,10 @@ infixContinuationStyle = "aligned"
         ));
         let final_handoff =
             wait_final_handoff_payload(backend, &handoff, "watched-transfer", &[&parent_uri]).await;
+        assert_eq!(
+            final_handoff.outcome,
+            crate::state::WatchedFinalHandoffOutcome::Finalized
+        );
         assert!(
             final_handoff.reserved.is_empty(),
             "the central watched batch transfers its unmarked fanout"
@@ -54814,6 +54907,10 @@ infixContinuationStyle = "aligned"
         ));
         let final_handoff =
             wait_final_handoff_payload(backend, &handoff, "watched-reopen", &[&uri]).await;
+        assert_eq!(
+            final_handoff.outcome,
+            crate::state::WatchedFinalHandoffOutcome::Finalized
+        );
 
         let state = backend.state.read().await;
         assert_eq!(
