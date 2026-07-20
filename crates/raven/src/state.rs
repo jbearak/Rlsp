@@ -957,6 +957,9 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) config_reload_publish_test_capture: FinalHandoffCapture<ConfigReloadPublishForTest>,
     #[cfg(test)]
+    pub(crate) analysis_revalidation_final_handoff_test_capture:
+        FinalHandoffCapture<Vec<AnalysisRevalidationTicketFingerprint>>,
+    #[cfg(test)]
     pub(crate) did_close_final_handoff_test_capture:
         FinalHandoffCapture<Vec<AnalysisRevalidationTicketFingerprint>>,
     #[cfg(test)]
@@ -3206,19 +3209,51 @@ impl CloseResyncConsumerForTest {
 #[cfg(test)]
 struct FinalHandoffCaptureGate<T> {
     payload: std::sync::Mutex<Option<T>>,
+    operation_id: u64,
+    owner: String,
+    claimed: AtomicBool,
     recorded: AtomicBool,
+    completed: AtomicBool,
+    outstanding: std::sync::Mutex<std::collections::BTreeMap<u64, &'static str>>,
+    abnormal_exits: std::sync::Mutex<Vec<(u64, &'static str)>>,
+    next_child_id: AtomicU64,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    completion: tokio::sync::Notify,
 }
 
 #[cfg(test)]
-impl<T> Default for FinalHandoffCaptureGate<T> {
-    fn default() -> Self {
+impl<T> FinalHandoffCaptureGate<T> {
+    fn new(operation_id: u64, owner: String) -> Self {
         Self {
             payload: std::sync::Mutex::new(None),
+            operation_id,
+            owner,
+            claimed: AtomicBool::new(false),
             recorded: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
+            outstanding: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            abnormal_exits: std::sync::Mutex::new(Vec::new()),
+            next_child_id: AtomicU64::new(1),
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            completion: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn register(self: &Arc<Self>, label: &'static str) -> FinalHandoffCompletionToken<T> {
+        let id = self.next_child_id.fetch_add(1, Ordering::Relaxed);
+        let mut outstanding = self.outstanding.lock().unwrap();
+        assert!(
+            !self.completed.load(Ordering::Acquire),
+            "cannot register a child after causal completion"
+        );
+        let previous = outstanding.insert(id, label);
+        debug_assert!(previous.is_none());
+        drop(outstanding);
+        FinalHandoffCompletionToken {
+            gate: Arc::clone(self),
+            id: Some(id),
         }
     }
 }
@@ -3236,6 +3271,13 @@ impl<T> Default for FinalHandoffCaptureGate<T> {
 /// undecodable watched-file retry, belongs to a new invocation and does not
 /// inherit the claim. If cloned finalizers race, only the first records and
 /// pauses; later calls return without replacing the payload.
+///
+/// The winning recorder also receives the causal root token. It registers
+/// labeled finite descendants synchronously before spawn, finishes the root
+/// only after admission closes, and lets the last token durably signal
+/// completion. Dropping an unfinished token records an abnormal exit so task
+/// cancellation or unwind cannot masquerade as success. Payload arrival and
+/// causal completion are separate boundaries.
 #[cfg(test)]
 pub(crate) struct FinalHandoffCapture<T> {
     armed: std::sync::Mutex<Option<Arc<FinalHandoffCaptureGate<T>>>>,
@@ -3253,7 +3295,13 @@ impl<T> Default for FinalHandoffCapture<T> {
 #[cfg(test)]
 impl<T> FinalHandoffCapture<T> {
     pub(crate) fn arm(&self) -> FinalHandoffCaptureHandle<T> {
-        let gate = Arc::new(FinalHandoffCaptureGate::default());
+        self.arm_for("")
+    }
+
+    pub(crate) fn arm_for(&self, owner: impl Into<String>) -> FinalHandoffCaptureHandle<T> {
+        static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+        let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+        let gate = Arc::new(FinalHandoffCaptureGate::new(operation_id, owner.into()));
         let replaced = self.armed.lock().unwrap().replace(gate.clone());
         assert!(
             replaced.is_none(),
@@ -3263,11 +3311,10 @@ impl<T> FinalHandoffCapture<T> {
     }
 
     pub(crate) fn claim(&self) -> Option<FinalHandoffCaptureClaim<T>> {
-        self.armed
-            .lock()
-            .unwrap()
-            .take()
-            .map(|gate| FinalHandoffCaptureClaim { gate })
+        self.armed.lock().unwrap().take().map(|gate| {
+            gate.claimed.store(true, Ordering::Release);
+            FinalHandoffCaptureClaim { gate }
+        })
     }
 }
 
@@ -3279,7 +3326,42 @@ pub(crate) struct FinalHandoffCaptureClaim<T> {
 
 #[cfg(test)]
 impl<T> FinalHandoffCaptureClaim<T> {
-    pub(crate) async fn record_and_pause(&self, payload: T) {
+    fn record(&self, payload: T) -> Option<FinalHandoffCompletionToken<T>> {
+        if self.gate.recorded.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let root = self.gate.register("root");
+        *self.gate.payload.lock().unwrap() = Some(payload);
+        self.gate.arrived.notify_one();
+        Some(root)
+    }
+
+    /// Record the first final handoff and return its causal root token.
+    ///
+    /// The caller must register every finite child before spawning it, then
+    /// drop the returned root only after no more children can be admitted.
+    /// Cloned finalizers that lose the first-record race receive `None` and
+    /// cannot complete the winning invocation.
+    pub(crate) async fn record_and_pause(
+        &self,
+        payload: T,
+    ) -> Option<FinalHandoffCompletionToken<T>> {
+        let root = self.record(payload)?;
+        self.gate.release.notified().await;
+        Some(root)
+    }
+
+    /// Open a causal phase before its first typed handoff is known.
+    ///
+    /// The caller must register every phase child before dropping this root.
+    /// Use [`Self::record_and_pause_in_phase`] for the first payload; cloned
+    /// finalizers may call it, but only the winner records and pauses.
+    pub(crate) fn begin_causal_phase(&self) -> FinalHandoffCompletionToken<T> {
+        self.gate.register("root")
+    }
+
+    /// Record the first typed handoff under an already-open causal phase.
+    pub(crate) async fn record_and_pause_in_phase(&self, payload: T) {
         if self.gate.recorded.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -3287,6 +3369,77 @@ impl<T> FinalHandoffCaptureClaim<T> {
         self.gate.arrived.notify_one();
         self.gate.release.notified().await;
     }
+
+    /// Record an owned empty/no-op handoff that has no asynchronous tail.
+    pub(crate) fn record_completed(&self, payload: T) {
+        if let Some(root) = self.record(payload) {
+            root.finish();
+        }
+    }
+}
+
+/// Panic- and cancellation-safe ownership of one finite descendant of a
+/// captured handler invocation.
+///
+/// Registration is synchronous and happens before the descendant is spawned.
+/// Dropping the last token durably completes the capture and wakes receipt
+/// waiters. A label remains visible in timeout diagnostics until that exact
+/// descendant exits.
+#[cfg(test)]
+pub(crate) struct FinalHandoffCompletionToken<T> {
+    gate: Arc<FinalHandoffCaptureGate<T>>,
+    id: Option<u64>,
+}
+
+#[cfg(test)]
+impl<T> FinalHandoffCompletionToken<T> {
+    pub(crate) fn child(&self, label: &'static str) -> Self {
+        self.gate.register(label)
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.release(false);
+    }
+
+    fn release(&mut self, abnormal: bool) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        let mut outstanding = self.gate.outstanding.lock().unwrap();
+        let label = outstanding
+            .remove(&id)
+            .expect("causal completion token must own one registered child");
+        if abnormal {
+            self.gate.abnormal_exits.lock().unwrap().push((id, label));
+        }
+        let completed = outstanding.is_empty();
+        if completed {
+            self.gate.completed.store(true, Ordering::Release);
+        }
+        drop(outstanding);
+        if completed {
+            self.gate.completion.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T> Drop for FinalHandoffCompletionToken<T> {
+    fn drop(&mut self) {
+        self.release(true);
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FinalHandoffCaptureStatus {
+    pub(crate) operation_id: u64,
+    pub(crate) owner: String,
+    pub(crate) claimed: bool,
+    pub(crate) recorded: bool,
+    pub(crate) completed: bool,
+    pub(crate) outstanding: Vec<(u64, &'static str)>,
+    pub(crate) abnormal_exits: Vec<(u64, &'static str)>,
 }
 
 #[cfg(test)]
@@ -3307,6 +3460,35 @@ impl<T: Clone> FinalHandoffCaptureHandle<T> {
 
     pub(crate) fn release(&self) {
         self.gate.release.notify_one();
+    }
+
+    pub(crate) async fn wait_completed(&self) {
+        loop {
+            let notified = self.gate.completion.notified();
+            if self.gate.completed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn status(&self) -> FinalHandoffCaptureStatus {
+        FinalHandoffCaptureStatus {
+            operation_id: self.gate.operation_id,
+            owner: self.gate.owner.clone(),
+            claimed: self.gate.claimed.load(Ordering::Acquire),
+            recorded: self.gate.recorded.load(Ordering::Acquire),
+            completed: self.gate.completed.load(Ordering::Acquire),
+            outstanding: self
+                .gate
+                .outstanding
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, label)| (*id, *label))
+                .collect(),
+            abnormal_exits: self.gate.abnormal_exits.lock().unwrap().clone(),
+        }
     }
 }
 
@@ -6452,6 +6634,8 @@ impl WorldState {
             watched_final_handoff_test_capture: FinalHandoffCapture::default(),
             #[cfg(test)]
             config_reload_publish_test_capture: FinalHandoffCapture::default(),
+            #[cfg(test)]
+            analysis_revalidation_final_handoff_test_capture: FinalHandoffCapture::default(),
             #[cfg(test)]
             did_close_final_handoff_test_capture: FinalHandoffCapture::default(),
             #[cfg(test)]
@@ -12017,6 +12201,150 @@ fn is_stat_model_extension(path: &Path) -> bool {
 mod tests {
     use super::*;
     use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+
+    #[tokio::test]
+    async fn final_handoff_completion_is_durable_before_waiter_arrives() {
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm_for("durable");
+        let claim = capture.claim().unwrap();
+        let recorder = tokio::spawn(async move {
+            claim.record_and_pause(7_u8).await.unwrap().finish();
+        });
+        assert_eq!(handle.wait_payload().await, 7);
+        handle.release();
+        recorder.await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            handle.wait_completed(),
+        )
+        .await
+        .expect("completion recorded before the waiter must remain observable");
+        assert!(handle.status().completed);
+    }
+
+    #[tokio::test]
+    async fn final_handoff_child_keeps_receipt_open_after_root_finishes() {
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm();
+        let claim = capture.claim().unwrap();
+        let recorder = tokio::spawn(async move { claim.record_and_pause(()).await.unwrap() });
+        handle.wait_payload().await;
+        handle.release();
+        let root = recorder.await.unwrap();
+        let child = root.child("child");
+        root.finish();
+        assert!(!handle.status().completed);
+        assert_eq!(handle.status().outstanding.len(), 1);
+        child.finish();
+        handle.wait_completed().await;
+        assert!(handle.status().abnormal_exits.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_handoff_concurrent_last_children_complete_once() {
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm();
+        let claim = capture.claim().unwrap();
+        let recorder = tokio::spawn(async move { claim.record_and_pause(()).await.unwrap() });
+        handle.wait_payload().await;
+        handle.release();
+        let root = recorder.await.unwrap();
+        let left = root.child("left");
+        let right = root.child("right");
+        root.finish();
+        let (left, right) = tokio::join!(
+            tokio::spawn(async move { left.finish() }),
+            tokio::spawn(async move { right.finish() }),
+        );
+        left.unwrap();
+        right.unwrap();
+        handle.wait_completed().await;
+        assert!(handle.status().outstanding.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_handoff_abnormal_drop_is_reported() {
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm();
+        let claim = capture.claim().unwrap();
+        let recorder = tokio::spawn(async move { claim.record_and_pause(()).await.unwrap() });
+        handle.wait_payload().await;
+        handle.release();
+        drop(recorder.await.unwrap());
+        handle.wait_completed().await;
+        assert_eq!(handle.status().abnormal_exits, vec![(1, "root")]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_handoff_spawn_abort_and_panic_are_reported() {
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm();
+        let claim = capture.claim().unwrap();
+        let recorder = tokio::spawn(async move { claim.record_and_pause(()).await.unwrap() });
+        handle.wait_payload().await;
+        handle.release();
+        let root = recorder.await.unwrap();
+        let aborted = root.child("aborted-child");
+        root.finish();
+        let task = tokio::spawn(async move {
+            let _completion = aborted;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        handle.wait_completed().await;
+        assert_eq!(handle.status().abnormal_exits, vec![(2, "aborted-child")]);
+
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm();
+        let claim = capture.claim().unwrap();
+        let recorder = tokio::spawn(async move { claim.record_and_pause(()).await.unwrap() });
+        handle.wait_payload().await;
+        handle.release();
+        let root = recorder.await.unwrap();
+        let panicked = root.child("panicked-child");
+        root.finish();
+        let task = tokio::spawn(async move {
+            let _completion = panicked;
+            panic!("intentional descendant panic");
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        handle.wait_completed().await;
+        assert_eq!(handle.status().abnormal_exits, vec![(2, "panicked-child")]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_handoff_cloned_finalizers_have_one_completion_owner() {
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm();
+        let claim = capture.claim().unwrap();
+        let other = claim.clone();
+        let first = tokio::spawn(async move { claim.record_and_pause(1_u8).await });
+        let second = tokio::spawn(async move { other.record_and_pause(2_u8).await });
+        let payload = handle.wait_payload().await;
+        assert!(payload == 1 || payload == 2);
+        handle.release();
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert_eq!(
+            usize::from(first.is_some()) + usize::from(second.is_some()),
+            1
+        );
+        first.into_iter().chain(second).next().unwrap().finish();
+        handle.wait_completed().await;
+    }
+
+    #[tokio::test]
+    async fn final_handoff_empty_payload_is_still_a_completed_handoff() {
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm();
+        let claim = capture.claim().unwrap();
+        claim.record_completed(Vec::<u8>::new());
+        assert!(handle.wait_payload().await.is_empty());
+        handle.wait_completed().await;
+        assert!(handle.status().completed);
+    }
 
     fn full_change(text: &str) -> TextDocumentContentChangeEvent {
         TextDocumentContentChangeEvent {
