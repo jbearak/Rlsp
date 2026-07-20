@@ -824,6 +824,69 @@ fn targets_policy(name: &str) -> Option<ArgPolicy> {
             &["name", "command", "pattern"],
             false,
         ),
+        "tar_make" => ArgPolicy::per_formal(
+            &[
+                "names",
+                "shortcut",
+                "reporter",
+                "seconds_meta_append",
+                "seconds_meta_upload",
+                "seconds_reporter",
+                "seconds_interval",
+                "callr_function",
+                "callr_arguments",
+                "envir",
+                "script",
+                "store",
+                "garbage_collection",
+                "use_crew",
+                "terminate_controller",
+                "as_job",
+            ],
+            &["names"],
+            false,
+        ),
+        "tar_make_future" => ArgPolicy::per_formal(
+            &[
+                "names",
+                "shortcut",
+                "reporter",
+                "seconds_meta_append",
+                "seconds_meta_upload",
+                "seconds_reporter",
+                "seconds_interval",
+                "workers",
+                "callr_function",
+                "callr_arguments",
+                "envir",
+                "script",
+                "store",
+                "garbage_collection",
+            ],
+            &["names"],
+            false,
+        ),
+        "tar_make_clustermq" => ArgPolicy::per_formal(
+            &[
+                "names",
+                "shortcut",
+                "reporter",
+                "seconds_meta_append",
+                "seconds_meta_upload",
+                "seconds_reporter",
+                "seconds_interval",
+                "workers",
+                "log_worker",
+                "callr_function",
+                "callr_arguments",
+                "envir",
+                "script",
+                "store",
+                "garbage_collection",
+            ],
+            &["names"],
+            false,
+        ),
         "tar_read" => {
             ArgPolicy::per_formal(&["name", "branches", "meta", "store"], &["name"], false)
         }
@@ -2051,7 +2114,41 @@ mod tests {
     }
 
     #[test]
-    fn targets_read_load_family_capture_target_names() {
+    fn targets_selector_policies_capture_target_names() {
+        for name in ["tar_make", "tar_make_future", "tar_make_clustermq"] {
+            let p = package_policy("targets", name).unwrap();
+            assert_eq!(
+                suppressed_arguments(&p, &labels(&[None]), false),
+                vec![true],
+                "targets::{name} positional names"
+            );
+            assert_eq!(
+                suppressed_arguments(&p, &labels(&[Some("names")]), false),
+                vec![true],
+                "targets::{name} named names"
+            );
+        }
+        let p = package_policy("targets", "tar_make").unwrap();
+        assert_eq!(
+            suppressed_arguments(
+                &p,
+                &labels(&[None, Some("shortcut"), Some("reporter")]),
+                false
+            ),
+            vec![true, false, false]
+        );
+        for (name, control) in [
+            ("tar_make_future", "workers"),
+            ("tar_make_clustermq", "log_worker"),
+        ] {
+            let p = package_policy("targets", name).unwrap();
+            assert_eq!(
+                suppressed_arguments(&p, &labels(&[None, Some(control)]), false),
+                vec![true, false],
+                "targets::{name} evaluates {control}"
+            );
+        }
+
         // tar_read(my_target): name suppressed.
         let p = package_policy("targets", "tar_read").unwrap();
         assert_eq!(
@@ -2330,6 +2427,9 @@ mod tests {
             ("data.table", "setindex", PerFormal),
             ("data.table", "fread", None),
             ("targets", "tar_target", PerFormal),
+            ("targets", "tar_make", PerFormal),
+            ("targets", "tar_make_future", PerFormal),
+            ("targets", "tar_make_clustermq", PerFormal),
             ("targets", "tar_read", PerFormal),
             ("targets", "tar_load", PerFormal),
             ("targets", "tar_delete", None),
