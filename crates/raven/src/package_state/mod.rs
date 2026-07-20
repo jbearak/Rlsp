@@ -195,6 +195,11 @@ pub(crate) trait StaticSourceClosurePolicy {
     fn read_source(&mut self, resolved: &Path) -> Option<String>;
 
     fn harvest(&mut self, facts: &crate::cross_file::source_detect::StaticScriptFacts);
+
+    /// Root preamble files are normally harvested elsewhere, but conditional
+    /// attachment effects established only after a sourced child executes must
+    /// still be retained.
+    fn harvest_root_attached(&mut self, _attached_packages: &BTreeSet<String>) {}
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -202,33 +207,63 @@ pub(crate) struct StaticSourceClosureResult {
     /// Routing spellings of every accepted static target, including targets that
     /// are currently missing or unreadable. The root itself is not included.
     pub(crate) sourced_files: BTreeSet<PathBuf>,
+    /// Attachment environment after the root and every executed source frame.
+    ///
+    /// Callers that execute several startup files in order use this as the
+    /// seed for the next file. Per-root harvested attachment sets remain
+    /// deltas, so package-input ownership stays keyed to the contributing root.
+    pub(crate) final_attached_packages: BTreeSet<String>,
 }
 
 /// Walk a bounded transitive closure of static global `source()` targets.
 ///
 /// This is the single owner of the traversal mechanics shared by `.Rprofile`
-/// and testthat-preamble scans: a LIFO worklist, root-counting visited set,
-/// metadata-free forward path contexts (including workspace fallback), and the
-/// package-wide static-source depth/file budgets. A popped file is harvested
-/// before its depth is checked. A newly discovered target is retained for
-/// watcher routing before either the file-budget check or source read, so the
-/// cap-boundary target and missing/unreadable targets can trigger a later rescan.
+/// and testthat-preamble scans: depth-first execution frames, a root-counting
+/// visited set, metadata-free forward path contexts (including workspace
+/// fallback), and the package-wide static-source depth/file budgets. Package
+/// and source effects are replayed in call order against one attachment
+/// environment, so a sourced child's attachments affect later parent calls.
+/// A cached source may execute again only after a newly attached package
+/// satisfies a known conditional-call prerequisite; one execution per routing
+/// path/generation plus a fixed replay multiplier bounds total frame work.
+/// A completed file is harvested even at the depth boundary. A newly
+/// discovered target is retained for watcher routing before either the
+/// file-budget check or source read, so the cap-boundary target and
+/// missing/unreadable targets can trigger a later rescan.
 pub(crate) fn walk_static_source_closure<P: StaticSourceClosurePolicy>(
     root_path: &Path,
     root_text: String,
     workspace_url: Option<&tower_lsp::lsp_types::Url>,
     policy: &mut P,
 ) -> StaticSourceClosureResult {
-    walk_static_source_closure_with_limits(
+    walk_static_source_closure_with_initial_attached(
+        root_path,
+        root_text,
+        workspace_url,
+        BTreeSet::new(),
+        policy,
+    )
+}
+
+pub(crate) fn walk_static_source_closure_with_initial_attached<P: StaticSourceClosurePolicy>(
+    root_path: &Path,
+    root_text: String,
+    workspace_url: Option<&tower_lsp::lsp_types::Url>,
+    initial_attached: BTreeSet<String>,
+    policy: &mut P,
+) -> StaticSourceClosureResult {
+    walk_static_source_closure_with_limits_and_initial_attached(
         root_path,
         root_text,
         workspace_url,
         crate::cross_file::source_detect::STATIC_SOURCE_MAX_DEPTH,
         crate::cross_file::source_detect::STATIC_SOURCE_MAX_FILES,
+        initial_attached,
         policy,
     )
 }
 
+#[cfg(test)]
 fn walk_static_source_closure_with_limits<P: StaticSourceClosurePolicy>(
     root_path: &Path,
     root_text: String,
@@ -237,53 +272,214 @@ fn walk_static_source_closure_with_limits<P: StaticSourceClosurePolicy>(
     max_files: usize,
     policy: &mut P,
 ) -> StaticSourceClosureResult {
+    walk_static_source_closure_with_limits_and_initial_attached(
+        root_path,
+        root_text,
+        workspace_url,
+        max_depth,
+        max_files,
+        BTreeSet::new(),
+        policy,
+    )
+}
+
+fn walk_static_source_closure_with_limits_and_initial_attached<P: StaticSourceClosurePolicy>(
+    root_path: &Path,
+    root_text: String,
+    workspace_url: Option<&tower_lsp::lsp_types::Url>,
+    max_depth: usize,
+    max_files: usize,
+    initial_attached: BTreeSet<String>,
+    policy: &mut P,
+) -> StaticSourceClosureResult {
     let mut result = StaticSourceClosureResult::default();
     let mut visited = BTreeSet::from([preamble::canonicalize_for_routing(root_path)]);
-    let mut worklist = vec![(root_path.to_path_buf(), root_text, 0usize, true)];
+    struct ExecutionFrame {
+        path: PathBuf,
+        routing_path: PathBuf,
+        facts: crate::cross_file::source_detect::StaticScriptFacts,
+        next_event: usize,
+        depth: usize,
+        is_root: bool,
+        attached_before: BTreeSet<String>,
+    }
 
-    while let Some((path, text, depth, is_root)) = worklist.pop() {
-        let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(&text);
-        if !is_root || policy.harvest_root() {
-            policy.harvest(&facts);
-        }
-        if depth >= max_depth || visited.len() >= max_files {
-            continue;
-        }
-        let Ok(file_uri) = tower_lsp::lsp_types::Url::from_file_path(&path) else {
+    let mut attached_environment = initial_attached.clone();
+    let mut attachment_generation = 0usize;
+    // A routing path is re-executed only after an attachment that a known
+    // conditional package call actually requires. This admits
+    // source-before-attach-source startup idioms without replaying the graph
+    // for every ordinary package. Duplicate source calls and wide DAGs at one
+    // generation collapse to one execution per routing path.
+    let mut last_entry_generation = BTreeMap::new();
+    const MAX_REPLAYS_PER_FILE: usize = 8;
+    let max_executions = max_files.saturating_mul(MAX_REPLAYS_PER_FILE);
+    let mut executions = 1usize;
+    let root_routing = preamble::canonicalize_for_routing(root_path);
+    let mut facts_cache = BTreeMap::new();
+    let root_facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(&root_text);
+    let mut known_replay_triggers: BTreeSet<String> = root_facts
+        .prelude_events
+        .iter()
+        .filter_map(|event| match event {
+            crate::cross_file::source_detect::StaticPreludeEvent::Attach(call) => {
+                call.requires_attached.clone()
+            }
+            crate::cross_file::source_detect::StaticPreludeEvent::Source(_) => None,
+        })
+        .collect();
+    facts_cache.insert(root_routing.clone(), root_facts.clone());
+    let mut stack = vec![ExecutionFrame {
+        path: root_path.to_path_buf(),
+        routing_path: root_routing,
+        facts: root_facts,
+        next_event: 0,
+        depth: 0,
+        is_root: true,
+        attached_before: initial_attached,
+    }];
+
+    while !stack.is_empty() {
+        let event = {
+            let frame = stack.last_mut().expect("stack is not empty");
+            let event = frame.facts.prelude_events.get(frame.next_event).cloned();
+            if event.is_some() {
+                frame.next_event += 1;
+            }
+            event
+        };
+        let Some(event) = event else {
+            let mut completed = stack.pop().expect("last_mut proved a frame exists");
+            let attached_delta: BTreeSet<String> = attached_environment
+                .difference(&completed.attached_before)
+                .cloned()
+                .collect();
+            completed.facts.attached_packages = attached_delta.clone();
+            if completed.facts.calls_dev_load_all {
+                attached_environment.insert(crate::package_library::LOAD_ALL_SENTINEL.to_string());
+                completed
+                    .facts
+                    .attached_packages
+                    .insert(crate::package_library::LOAD_ALL_SENTINEL.to_string());
+            }
+            if !completed.is_root || policy.harvest_root() {
+                policy.harvest(&completed.facts);
+            } else {
+                policy.harvest_root_attached(&attached_delta);
+            }
             continue;
         };
-        // Package startup/test-preamble scans intentionally ignore `# raven: cd`.
-        // Empty-metadata forward semantics still provide the implicit testthat WD
-        // and workspace-root fallback used by ordinary static source detection.
-        let Some(context) = crate::cross_file::path_resolve::PathContext::forward_without_metadata(
-            &file_uri,
-            workspace_url,
-        ) else {
-            continue;
-        };
-
-        for target in facts.source_targets {
-            let Some(resolved) =
-                crate::cross_file::path_resolve::resolve_source_path_rich(&target, &context).path
-            else {
-                continue;
-            };
-            let routing_path = preamble::canonicalize_for_routing(&resolved);
-            if !policy.accept_target(&resolved, &routing_path)
-                || !visited.insert(routing_path.clone())
-            {
-                continue;
+        match event {
+            crate::cross_file::source_detect::StaticPreludeEvent::Attach(call) => {
+                if call.attaches
+                    && !call.package.is_empty()
+                    && call
+                        .requires_attached
+                        .as_ref()
+                        .is_none_or(|required| attached_environment.contains(required))
+                {
+                    let package = call.package;
+                    if attached_environment.insert(package.clone())
+                        && known_replay_triggers.contains(&package)
+                    {
+                        attachment_generation = attachment_generation.saturating_add(1);
+                    }
+                }
             }
-            result.sourced_files.insert(routing_path);
-            if visited.len() >= max_files {
-                break;
-            }
-            if let Some(sourced_text) = policy.read_source(&resolved) {
-                worklist.push((resolved, sourced_text, depth + 1, false));
+            crate::cross_file::source_detect::StaticPreludeEvent::Source(source) => {
+                let (frame_path, frame_depth) = {
+                    let frame = stack.last().expect("event came from an active frame");
+                    (frame.path.clone(), frame.depth)
+                };
+                if frame_depth >= max_depth {
+                    continue;
+                }
+                let Ok(file_uri) = tower_lsp::lsp_types::Url::from_file_path(&frame_path) else {
+                    continue;
+                };
+                // Package startup/test-preamble scans intentionally ignore
+                // `# raven: cd`. Empty-metadata forward semantics still
+                // provide the implicit testthat WD and workspace-root fallback.
+                let Some(context) =
+                    crate::cross_file::path_resolve::PathContext::forward_without_metadata(
+                        &file_uri,
+                        workspace_url,
+                    )
+                else {
+                    continue;
+                };
+                let Some(resolved) = crate::cross_file::path_resolve::resolve_source_path_rich(
+                    &source.path,
+                    &context,
+                )
+                .path
+                else {
+                    continue;
+                };
+                let routing_path = preamble::canonicalize_for_routing(&resolved);
+                if !policy.accept_target(&resolved, &routing_path) {
+                    continue;
+                }
+                if stack
+                    .iter()
+                    .any(|active| active.routing_path == routing_path)
+                {
+                    continue;
+                }
+                if !visited.contains(&routing_path) && visited.len() >= max_files {
+                    continue;
+                }
+                let is_new = visited.insert(routing_path.clone());
+                if is_new {
+                    result.sourced_files.insert(routing_path.clone());
+                }
+                if executions >= max_executions {
+                    continue;
+                }
+                if last_entry_generation.get(&routing_path) == Some(&attachment_generation) {
+                    continue;
+                }
+                let facts = if let Some(cached) = facts_cache.get(&routing_path) {
+                    Some(cached.clone())
+                } else if !is_new || visited.len() >= max_files {
+                    None
+                } else {
+                    policy.read_source(&resolved).map(|sourced_text| {
+                        let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(
+                            &sourced_text,
+                        );
+                        known_replay_triggers.extend(facts.prelude_events.iter().filter_map(
+                            |event| match event {
+                                crate::cross_file::source_detect::StaticPreludeEvent::Attach(
+                                    call,
+                                ) => call.requires_attached.clone(),
+                                crate::cross_file::source_detect::StaticPreludeEvent::Source(_) => {
+                                    None
+                                }
+                            },
+                        ));
+                        facts_cache.insert(routing_path.clone(), facts.clone());
+                        facts
+                    })
+                };
+                if let Some(facts) = facts {
+                    last_entry_generation.insert(routing_path.clone(), attachment_generation);
+                    executions += 1;
+                    stack.push(ExecutionFrame {
+                        path: resolved,
+                        routing_path,
+                        facts,
+                        next_event: 0,
+                        depth: frame_depth + 1,
+                        is_root: false,
+                        attached_before: attached_environment.clone(),
+                    });
+                }
             }
         }
     }
 
+    result.final_attached_packages = attached_environment;
     result
 }
 
@@ -331,8 +527,9 @@ pub struct PackageInputs {
     /// merged with the preamble's own `top_level_defs` into
     /// `PackageScopeContribution::test_helper_symbols` at derive time.
     pub preamble_sourced_symbols: BTreeMap<PathBuf, BTreeSet<String>>,
-    /// Per-preamble-file packages attached by its transitive `source()`
-    /// targets (same keying as `preamble_sourced_symbols`).
+    /// Per-preamble attachment execution delta from the root and its transitive
+    /// sources, excluding packages already attached by earlier lexical roots
+    /// (same keying as `preamble_sourced_symbols`).
     pub preamble_sourced_attached_packages: BTreeMap<PathBuf, BTreeSet<String>>,
     /// Routing paths of static `source()` targets from any preamble (from
     /// `PreambleScan::sourced_files`), including currently missing targets.
@@ -425,7 +622,7 @@ mod static_source_closure_tests {
     }
 
     #[test]
-    fn static_source_closure_uses_lifo_sibling_order_and_root_policy() {
+    fn static_source_closure_uses_execution_order_and_root_policy() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().join("root.R");
         let a = tmp.path().join("a.R");
@@ -445,7 +642,7 @@ mod static_source_closure_tests {
             &mut policy,
         );
 
-        assert_eq!(policy.harvested, ["b_def", "a_def"]);
+        assert_eq!(policy.harvested, ["a_def", "b_def"]);
         assert!(!policy.harvested.iter().any(|name| name == "root_def"));
         assert_eq!(
             closure.sourced_files,
@@ -557,6 +754,63 @@ mod static_source_closure_tests {
             !closure
                 .sourced_files
                 .contains(&preamble::canonicalize_for_routing(&root))
+        );
+    }
+
+    #[test]
+    fn static_source_closure_replays_after_relevant_attachment_growth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root.R");
+        let child = tmp.path().join("child.R");
+        let workspace_url = tower_lsp::lsp_types::Url::from_file_path(tmp.path()).unwrap();
+        let mut policy = policy(true, [(child, "p_load(replayedPackage)\n")]);
+
+        let closure = walk_static_source_closure_with_limits(
+            &root,
+            concat!(
+                "source(\"child.R\")\n",
+                "library(pacman)\n",
+                "source(\"child.R\")\n",
+            )
+            .to_string(),
+            Some(&workspace_url),
+            8,
+            8,
+            &mut policy,
+        );
+
+        assert!(closure.final_attached_packages.contains("replayedPackage"));
+    }
+
+    #[test]
+    fn static_source_closure_caps_replay_work() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root.R");
+        let child = tmp.path().join("child.R");
+        let workspace_url = tower_lsp::lsp_types::Url::from_file_path(tmp.path()).unwrap();
+        let mut policy = policy(true, [(child, "child_def <- 1\n")]);
+        let mut root_text = String::new();
+        for index in 0..100 {
+            root_text.push_str(&format!("library(package{index})\nsource(\"child.R\")\n"));
+        }
+
+        let _closure = walk_static_source_closure_with_limits(
+            &root,
+            root_text,
+            Some(&workspace_url),
+            8,
+            3,
+            &mut policy,
+        );
+
+        assert_eq!(
+            policy
+                .harvested
+                .iter()
+                .filter(|name| name.as_str() == "child_def")
+                .count(),
+            1,
+            "irrelevant attachment growth must not replay a cached source"
         );
     }
 }

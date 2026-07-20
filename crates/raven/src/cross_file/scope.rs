@@ -734,6 +734,13 @@ pub enum ScopeEvent {
         column: u32,
         /// Package name
         package: String,
+        /// Whether this call attaches the package search path, as opposed to
+        /// merely loading its namespace.
+        attaches: bool,
+        /// Package that must already be attached before this load takes
+        /// effect. Used by bare `pacman::p_load` syntax; qualified calls and
+        /// ordinary loaders have no precondition.
+        requires_attached: Option<String>,
         runtime_function_scope: RuntimeFunctionScope,
         /// Function scope if inside a function (None = global)
         function_scope: Option<FunctionScopeInterval>,
@@ -780,6 +787,12 @@ pub struct DevLoadAllSite {
     runtime_function_scope: RuntimeFunctionScope,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConditionalShinyDeferredScope {
+    interval: FunctionScopeInterval,
+    call_position: Position,
+}
+
 /// Per-file scope artifacts
 #[derive(Debug, Clone)]
 pub struct ScopeArtifacts {
@@ -802,6 +815,11 @@ pub struct ScopeArtifacts {
     pub interface_hash: u64,
     /// Interval tree for O(log n) function scope queries
     pub function_scope_tree: FunctionScopeTree,
+    /// Bare Shiny deferred-body intervals whose activation is not provable
+    /// from preceding local package loads. They stay out of the authoritative
+    /// timeline/tree until graph-aware package scope proves Shiny attached at
+    /// the helper call, including through inherited or conditional state.
+    pub conditional_shiny_deferred_scopes: Vec<ConditionalShinyDeferredScope>,
     /// `true` when this file contains a non-quoted `devtools::load_all()` /
     /// `pkgload::load_all()` / bare `load_all()` call site (including one that
     /// lives only inside a function body).
@@ -846,6 +864,7 @@ impl Default for ScopeArtifacts {
             timeline: Vec::new(),
             interface_hash: 0,
             function_scope_tree: FunctionScopeTree::default(),
+            conditional_shiny_deferred_scopes: Vec::new(),
             calls_dev_load_all: false,
             dev_load_all_sites: Vec::new(),
         }
@@ -883,6 +902,12 @@ pub struct ScopeAtPosition {
     /// Combined with inherited_packages, this gives all packages available at the position.
     /// Requirements 8.1, 8.3: Position-aware package loading for diagnostics
     pub loaded_packages: HashSet<String>,
+    /// Packages known to be attached to the R search path at this position.
+    ///
+    /// This is intentionally narrower than `loaded_packages`, which preserves
+    /// Raven's existing namespace-awareness for `loadNamespace()`. Attachment-
+    /// sensitive helpers such as bare `pacman::p_load()` must consult this set.
+    pub attached_packages: HashSet<String>,
     /// Per-package origin tracking: maps each package name to the set of file
     /// URIs that loaded the package. Populated whenever a package is added to
     /// `inherited_packages` or `loaded_packages`. Used at cross-file merge
@@ -1027,6 +1052,23 @@ fn merge_child_source_packages(
         }
         dst_packages.insert(pkg.clone());
         propagate_package_origins(child_origins, pkg, dst_origins);
+    }
+}
+
+fn merge_child_source_attachments(
+    child_attached: &HashSet<String>,
+    child_loaded: Option<&HashSet<String>>,
+    child_origins: &HashMap<String, HashSet<Arc<Url>>>,
+    queried_uri: &Url,
+    dst_attached: &mut HashSet<String>,
+) {
+    for package in child_attached {
+        if child_loaded.is_some_and(|loaded| !loaded.contains(package))
+            || package_only_origin_is_uri(child_origins, package, queried_uri)
+        {
+            continue;
+        }
+        dst_attached.insert(package.clone());
     }
 }
 
@@ -1298,9 +1340,13 @@ where
 ///   workspace-root fallback applies). The whole `PathContext` is hashed, not
 ///   just the effective dir, so two parents with the same effective directory
 ///   but different explicit-vs-inherited working dirs do not collide.
-/// - `pkg_fp`: order-independent hash of the attached package set passed into
-///   the child. The set feeds bare `data(stem)` symbol binding and
-///   `package_origins` attribution, so it is a real input to the child's scope.
+/// - `pkg_fp`: order-independent hash of the loaded package set passed into
+///   the child. The set feeds package exports and `package_origins`
+///   attribution, so it is a real input to the child's scope.
+/// - `attached_pkg_fp`: order-independent hash of the separately attached
+///   package set. A namespace loaded with `loadNamespace()` must not satisfy a
+///   bare loader's attachment prerequisite in the child, and two executions of
+///   the same child can legitimately differ only in this set.
 /// - `provider_fp`: identity of the `DataAliasProvider` in effect (its pointer
 ///   address, or 0 for `None`). Within ONE query two provider states coexist:
 ///   the backward parent walk resolves children with `None` (the prefix is
@@ -1318,6 +1364,7 @@ struct ForwardChildKey {
     child_uri: Url,
     path_fp: u64,
     pkg_fp: u64,
+    attached_pkg_fp: u64,
     provider_fp: usize,
     prefer_supplied_path_context: bool,
 }
@@ -1432,6 +1479,7 @@ fn resolve_forward_child_memoized(
     prefer_supplied_path_context: bool,
     child_depth: usize,
     packages_for_child: &HashSet<String>,
+    attached_packages_for_child: &HashSet<String>,
     is_cancelled: &dyn Fn() -> bool,
     compute: impl FnOnce() -> ScopeAtPosition,
 ) -> ScopeAtPosition {
@@ -1443,10 +1491,20 @@ fn resolve_forward_child_memoized(
         bump_forward_child_compute_count();
         return compute();
     }
+    let pkg_fp = package_set_fingerprint(packages_for_child);
+    let attached_pkg_fp = if packages_for_child == attached_packages_for_child {
+        // `library()` / `require()` are overwhelmingly the common case: every
+        // loaded package is attached. Reuse the already deterministic hash
+        // instead of sorting and hashing an identical set a second time.
+        pkg_fp
+    } else {
+        package_set_fingerprint(attached_packages_for_child)
+    };
     let key = ForwardChildKey {
         child_uri: child_uri.clone(),
         path_fp,
-        pkg_fp: package_set_fingerprint(packages_for_child),
+        pkg_fp,
+        attached_pkg_fp,
         provider_fp,
         prefer_supplied_path_context,
     };
@@ -1647,6 +1705,208 @@ fn is_same_or_descendant_function_scope(
             if ancestor_scope.start <= scope.start && scope.end <= ancestor_scope.end
     )
 }
+
+/// Whether a conditional package-load effect may run against the package
+/// environment immediately preceding it.
+fn package_load_requirement_satisfied(
+    requires_attached: Option<&str>,
+    attached_packages: &HashSet<String>,
+) -> bool {
+    requires_attached.is_none_or(|required| attached_packages.contains(required))
+}
+
+fn package_load_requirement_satisfied_at_query(
+    requires_attached: Option<&str>,
+    attached_packages: &HashSet<String>,
+) -> bool {
+    package_load_requirement_satisfied(requires_attached, attached_packages)
+}
+
+fn shiny_attached_at_position(
+    artifacts: &ScopeArtifacts,
+    seed_attached_packages: &HashSet<String>,
+    active_function_scopes: &HashSet<FunctionScopeInterval>,
+    line: u32,
+    column: u32,
+    query_inside_function: bool,
+) -> bool {
+    let mut attached = seed_attached_packages.clone();
+    for event in &artifacts.timeline {
+        let ScopeEvent::PackageLoad {
+            line: package_line,
+            column: package_column,
+            package,
+            attaches,
+            requires_attached,
+            function_scope,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let passes_position = (*package_line, *package_column) <= (line, column);
+        if !passes_position && !query_inside_function {
+            continue;
+        }
+        let applies = match function_scope {
+            None => true,
+            Some(package_scope) => {
+                passes_position && active_function_scopes.contains(package_scope)
+            }
+        };
+        if applies
+            && package_load_requirement_satisfied_at_query(requires_attached.as_deref(), &attached)
+            && *attaches
+        {
+            attached.insert(package.clone());
+        }
+    }
+    attached.contains("shiny")
+}
+
+fn active_conditional_shiny_scopes(
+    artifacts: &ScopeArtifacts,
+    top_level_seed: &HashSet<String>,
+    in_function_seed: &HashSet<String>,
+    hoist_globals: bool,
+) -> HashSet<FunctionScopeInterval> {
+    let mut active = HashSet::new();
+    for candidate in &artifacts.conditional_shiny_deferred_scopes {
+        let call = candidate.call_position;
+        let ordinary_active_scopes =
+            active_function_scopes_at(&artifacts.function_scope_tree, call.line, call.column);
+        let query_inside_function = hoist_globals && !ordinary_active_scopes.is_empty();
+        let seed = if query_inside_function {
+            in_function_seed
+        } else {
+            top_level_seed
+        };
+        if shiny_attached_at_position(
+            artifacts,
+            seed,
+            &ordinary_active_scopes,
+            call.line,
+            call.column,
+            query_inside_function,
+        ) {
+            active.insert(candidate.interval);
+        }
+    }
+    active
+}
+
+fn single_file_attachment_projection(
+    artifacts: &ScopeArtifacts,
+    line: u32,
+    column: u32,
+    hoist_globals: bool,
+) -> (HashSet<FunctionScopeInterval>, HashSet<String>) {
+    let ordinary_scopes = active_function_scopes_at(&artifacts.function_scope_tree, line, column);
+    let needs_late_conditional_load = hoist_globals
+        && !ordinary_scopes.is_empty()
+        && artifacts.timeline.iter().any(|event| {
+            matches!(
+                event,
+                ScopeEvent::PackageLoad {
+                    requires_attached: Some(_),
+                    function_scope: Some(function_scope),
+                    ..
+                } if ordinary_scopes.contains(function_scope)
+            )
+        });
+    if artifacts.conditional_shiny_deferred_scopes.is_empty() && !needs_late_conditional_load {
+        return (HashSet::new(), HashSet::new());
+    }
+
+    let uri = Url::parse("file:///__raven_single_file_scope__.R")
+        .expect("static single-file scope URI is valid");
+    let artifacts = Arc::new(artifacts.clone());
+    let get_artifacts = |target: &Url| (target == &uri).then(|| artifacts.clone());
+    let get_metadata =
+        |_target: &Url| -> Option<std::sync::Arc<super::types::CrossFileMetadata>> { None };
+    let graph = super::dependency::DependencyGraph::new();
+    let base_exports = HashSet::new();
+    let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+    let Some(mut stream) = ScopeStream::new_with_standalone_cache_and_package_query_uri(
+        &uri,
+        &get_artifacts,
+        &get_metadata,
+        &graph,
+        None,
+        usize::MAX,
+        &base_exports,
+        hoist_globals,
+        super::config::BackwardDependencyMode::Auto,
+        &|| false,
+        &prefix_cache,
+        None,
+        None,
+        None,
+        None,
+    ) else {
+        return (HashSet::new(), HashSet::new());
+    };
+    stream.advance_to(line, column);
+    let active = stream.active_conditional_shiny_scopes.clone();
+    let query_inside = hoist_globals
+        && (!active_function_scopes_at(&artifacts.function_scope_tree, line, column).is_empty()
+            || active
+                .iter()
+                .any(|scope| scope.contains(Position::new(line, column))));
+    let mut late_attached = HashSet::new();
+    if query_inside {
+        stream.ensure_global_late_frame();
+        if let Some(global_late) = &stream.global_late_frame {
+            late_attached.extend(global_late.attached_packages.iter().cloned());
+        }
+    }
+    (active, late_attached)
+}
+
+fn innermost_effective_scope(
+    active_conditional_scopes: &HashSet<FunctionScopeInterval>,
+    line: u32,
+    column: u32,
+    ordinary_scope: Option<FunctionScopeInterval>,
+) -> Option<FunctionScopeInterval> {
+    if active_conditional_scopes.is_empty() {
+        return ordinary_scope;
+    }
+
+    let position = Position::new(line, column);
+    active_conditional_scopes
+        .iter()
+        .filter(|scope| scope.contains(position))
+        .copied()
+        .chain(ordinary_scope)
+        .max_by_key(|scope| scope.start)
+}
+
+fn active_effective_scopes_at<'a>(
+    ordinary_scopes: &'a HashSet<FunctionScopeInterval>,
+    active_conditional_scopes: &HashSet<FunctionScopeInterval>,
+    line: u32,
+    column: u32,
+) -> std::borrow::Cow<'a, HashSet<FunctionScopeInterval>> {
+    if active_conditional_scopes.is_empty() {
+        return std::borrow::Cow::Borrowed(ordinary_scopes);
+    }
+
+    let query = Position::new(line, column);
+    std::borrow::Cow::Owned(
+        ordinary_scopes
+            .iter()
+            .copied()
+            .chain(
+                active_conditional_scopes
+                    .iter()
+                    .filter(|scope| scope.contains(query))
+                    .copied(),
+            )
+            .collect(),
+    )
+}
+
 /// Remove the given symbols from a computed scope when the removal applies.
 ///
 /// If `removal_scope` is `None`, this removes all listed `symbols` from `scope.symbols`.
@@ -1901,6 +2161,8 @@ fn push_dev_load_all_events(artifacts: &mut ScopeArtifacts) {
             line: site.line,
             column: site.column,
             package: crate::package_library::LOAD_ALL_SENTINEL.to_string(),
+            attaches: true,
+            requires_attached: None,
             runtime_function_scope: site.runtime_function_scope,
             function_scope: None,
         });
@@ -2287,6 +2549,8 @@ pub fn compute_artifacts_with_metadata(
             line: detected.call.line,
             column: detected.call.column,
             package: detected.call.package,
+            attaches: detected.call.attaches,
+            requires_attached: detected.call.requires_attached,
             runtime_function_scope: detected.runtime_function_scope,
             function_scope: None,
         });
@@ -2345,6 +2609,7 @@ pub fn compute_artifacts_with_metadata(
         &removal_refs,
         &data_loads,
         &declarations,
+        &artifacts.conditional_shiny_deferred_scopes,
         &source_interfaces,
         metadata.is_some_and(|m| m.standalone),
     );
@@ -2385,6 +2650,19 @@ pub fn scope_at_position(
     // When hoisting is enabled and we're inside a function body, global definitions
     // are visible regardless of position (R has late-binding semantics).
     let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
+    let (active_conditional_shiny_scopes, in_function_attachment_seed) =
+        single_file_attachment_projection(artifacts, line, column, hoist_globals);
+    let query_inside_function = query_inside_function
+        || (hoist_globals
+            && active_conditional_shiny_scopes
+                .iter()
+                .any(|scope| scope.contains(Position::new(line, column))));
+    let active_effective_scopes = active_effective_scopes_at(
+        &active_function_scopes,
+        &active_conditional_shiny_scopes,
+        line,
+        column,
+    );
 
     // Process events and apply function scope filtering.
     // Use the def event's `visible_from` position for visibility checks; the
@@ -2393,17 +2671,25 @@ pub fn scope_at_position(
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def {
+                line: def_line,
+                column: def_column,
                 visible_from_line,
                 visible_from_column,
                 symbol,
                 function_scope,
                 ..
             } => {
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
+                    *def_line,
+                    *def_column,
+                    *function_scope,
+                );
                 if is_symbol_visible(
                     *visible_from_line,
                     *visible_from_column,
-                    *function_scope,
-                    &active_function_scopes,
+                    effective_scope,
+                    &active_effective_scopes,
                     line,
                     column,
                     query_inside_function,
@@ -2440,12 +2726,18 @@ pub fn scope_at_position(
                 function_scope,
                 ..
             } => {
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
+                    *rm_line,
+                    *rm_col,
+                    *function_scope,
+                );
                 let passes_position = (*rm_line, *rm_col) < (line, column);
                 if passes_position || query_inside_function {
                     // For hoisted removals, only apply global ones
                     if !passes_position {
                         // Hoisted path: only apply if this is a global removal
-                        if function_scope.is_none() {
+                        if effective_scope.is_none() {
                             for sym_name in symbols {
                                 scope.symbols.remove(sym_name.as_str());
                             }
@@ -2453,8 +2745,8 @@ pub fn scope_at_position(
                     } else {
                         apply_removal(
                             &mut scope,
-                            &active_function_scopes,
-                            *function_scope,
+                            &active_effective_scopes,
+                            effective_scope,
                             symbols,
                         );
                     }
@@ -2464,25 +2756,48 @@ pub fn scope_at_position(
                 line: pkg_line,
                 column: pkg_col,
                 package,
+                attaches,
+                requires_attached,
                 function_scope,
                 ..
             } => {
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
+                    *pkg_line,
+                    *pkg_col,
+                    *function_scope,
+                );
                 let passes_position = (*pkg_line, *pkg_col) <= (line, column);
                 if passes_position || query_inside_function {
                     // Check function scope compatibility
-                    let should_include = match function_scope {
+                    let should_include = match effective_scope {
                         None => true, // Global package load - include (hoisted or positional)
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if positional AND in same function
-                            passes_position && active_function_scopes.contains(pkg_scope)
+                            passes_position && active_effective_scopes.contains(&pkg_scope)
                         }
                     };
 
-                    if should_include {
+                    let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
+                        requires_attached.as_deref(),
+                        &scope.attached_packages,
+                    );
+                    let late_requirement_satisfied = effective_scope.is_some()
+                        && query_inside_function
+                        && package_load_requirement_satisfied(
+                            requires_attached.as_deref(),
+                            &in_function_attachment_seed,
+                        );
+                    if should_include
+                        && (running_requirement_satisfied || late_requirement_satisfied)
+                    {
                         // No URI to record as origin in this single-file path —
                         // there is no cross-file recursion in `scope_at_position`,
                         // so origin tracking is not needed for leak detection.
                         scope.loaded_packages.insert(package.clone());
+                        if *attaches {
+                            scope.attached_packages.insert(package.clone());
+                        }
                     }
                 }
             }
@@ -2493,11 +2808,17 @@ pub fn scope_at_position(
                 function_scope,
                 ..
             } => {
-                if is_symbol_visible(
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
                     *decl_line,
                     *decl_col,
                     *function_scope,
-                    &active_function_scopes,
+                );
+                if is_symbol_visible(
+                    *decl_line,
+                    *decl_col,
+                    effective_scope,
+                    &active_effective_scopes,
                     line,
                     column,
                     query_inside_function,
@@ -2595,6 +2916,19 @@ where
     // When hoisting is enabled and we're inside a function body, global definitions
     // are visible regardless of position (R has late-binding semantics).
     let query_inside_function = hoist_globals && !active_function_scopes.is_empty();
+    let (active_conditional_shiny_scopes, in_function_attachment_seed) =
+        single_file_attachment_projection(artifacts, line, column, hoist_globals);
+    let query_inside_function = query_inside_function
+        || (hoist_globals
+            && active_conditional_shiny_scopes
+                .iter()
+                .any(|scope| scope.contains(Position::new(line, column))));
+    let active_effective_scopes = active_effective_scopes_at(
+        &active_function_scopes,
+        &active_conditional_shiny_scopes,
+        line,
+        column,
+    );
 
     // Process events and apply function scope filtering.
     // Use the def event's `visible_from` position for visibility checks.
@@ -2604,17 +2938,25 @@ where
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def {
+                line: def_line,
+                column: def_column,
                 visible_from_line,
                 visible_from_column,
                 symbol,
                 function_scope,
                 ..
             } => {
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
+                    *def_line,
+                    *def_column,
+                    *function_scope,
+                );
                 if is_symbol_visible(
                     *visible_from_line,
                     *visible_from_column,
-                    *function_scope,
-                    &active_function_scopes,
+                    effective_scope,
+                    &active_effective_scopes,
                     line,
                     column,
                     query_inside_function,
@@ -2651,11 +2993,17 @@ where
                 function_scope,
                 ..
             } => {
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
+                    *rm_line,
+                    *rm_col,
+                    *function_scope,
+                );
                 let passes_position = (*rm_line, *rm_col) < (line, column);
                 if passes_position || query_inside_function {
                     if !passes_position {
                         // Hoisted path: only apply global removals
-                        if function_scope.is_none() {
+                        if effective_scope.is_none() {
                             for sym_name in symbols {
                                 scope.symbols.remove(sym_name.as_str());
                             }
@@ -2663,8 +3011,8 @@ where
                     } else {
                         apply_removal(
                             &mut scope,
-                            &active_function_scopes,
-                            *function_scope,
+                            &active_effective_scopes,
+                            effective_scope,
                             symbols,
                         );
                     }
@@ -2674,26 +3022,51 @@ where
                 line: pkg_line,
                 column: pkg_col,
                 package,
+                attaches,
+                requires_attached,
                 function_scope,
                 ..
             } => {
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
+                    *pkg_line,
+                    *pkg_col,
+                    *function_scope,
+                );
                 let passes_position = (*pkg_line, *pkg_col) <= (line, column);
                 if passes_position || query_inside_function {
-                    let should_include = match function_scope {
+                    let should_include = match effective_scope {
                         None => true, // Global package load - include (hoisted or positional)
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if positional AND in same function
-                            passes_position && active_function_scopes.contains(pkg_scope)
+                            passes_position && active_effective_scopes.contains(&pkg_scope)
                         }
                     };
 
-                    if should_include {
+                    let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
+                        requires_attached.as_deref(),
+                        &scope.attached_packages,
+                    );
+                    let late_requirement_satisfied = effective_scope.is_some()
+                        && query_inside_function
+                        && package_load_requirement_satisfied(
+                            requires_attached.as_deref(),
+                            &in_function_attachment_seed,
+                        );
+                    if should_include
+                        && (running_requirement_satisfied || late_requirement_satisfied)
+                    {
                         if package.is_empty()
                             || package.contains('/')
                             || package.contains('\\')
                             || package.contains(char::is_whitespace)
                         {
                             continue;
+                        }
+
+                        scope.loaded_packages.insert(package.clone());
+                        if *attaches {
+                            scope.attached_packages.insert(package.clone());
                         }
 
                         let exports = get_package_exports(package);
@@ -2736,11 +3109,17 @@ where
                 function_scope,
                 ..
             } => {
-                if is_symbol_visible(
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
                     *decl_line,
                     *decl_col,
                     *function_scope,
-                    &active_function_scopes,
+                );
+                if is_symbol_visible(
+                    *decl_line,
+                    *decl_col,
+                    effective_scope,
+                    &active_effective_scopes,
                     line,
                     column,
                     query_inside_function,
@@ -3287,9 +3666,9 @@ fn visit_runtime_reachable_scope_syntax<'tree>(
     node: Node<'tree>,
     content: &str,
     capture_bindings: &mut LazyStaticBindings<'tree, '_>,
-    visit: &mut impl FnMut(Node<'tree>),
+    visit: &mut impl FnMut(Node<'tree>, &mut LazyStaticBindings<'tree, '_>),
 ) {
-    visit(node);
+    visit(node, capture_bindings);
     if node.kind() == "call"
         && let Some(kind) = capture_bindings.capturing_call_kind_at(node)
     {
@@ -3375,15 +3754,29 @@ fn push_shiny_deferred_scopes<'tree, 'text>(
     // helpers (`reactive`, `render*`, …) into scope. `loadNamespace("shiny")`
     // loads the namespace for qualified `shiny::` access only, so it must not
     // enable bare-helper semantics — see `LibraryCall::attaches`.
-    let shiny_in_play = library_calls
-        .iter()
-        .any(|detected| detected.call.package == "shiny" && detected.call.attaches);
+    let mut attached_packages = HashSet::new();
+    for detected in library_calls {
+        if detected.call.attaches
+            && detected
+                .call
+                .requires_attached
+                .as_ref()
+                .is_none_or(|required| attached_packages.contains(required.as_str()))
+        {
+            attached_packages.insert(detected.call.package.as_str());
+        }
+    }
+    let shiny_in_play = attached_packages.contains("shiny");
     // Cheap pre-filter: skip the walk only when the file cannot contain a
     // trigger. Any `library(shiny)`/`require(shiny)` sets `shiny_in_play`; a
-    // `shiny::`-qualified call must contain the substring "shiny". A bare
-    // "shiny" superset keeps this sound even with whitespace (`shiny :: f`),
-    // where the AST recognizer in `call_is_shiny_deferred` is the real gate.
-    if !shiny_in_play && !content.contains("shiny") {
+    // `shiny::`-qualified call contains "shiny"; dormant bare helpers may be
+    // activated by a parent file's attachment, so their name families are
+    // also cheap prefilter triggers. The AST recognizers remain the real gate.
+    let may_contain_bare_helper = content.contains("reactive")
+        || content.contains("Reactive")
+        || content.contains("observe")
+        || content.contains("render");
+    if !shiny_in_play && !content.contains("shiny") && !may_contain_bare_helper {
         return;
     }
     // `exported_interface` is read for shadow detection while `timeline` is
@@ -3391,16 +3784,46 @@ fn push_shiny_deferred_scopes<'tree, 'text>(
     // than buffering events in a temporary Vec.
     let local_defs = &artifacts.exported_interface;
     let events = &mut artifacts.timeline;
-    visit_runtime_reachable_scope_syntax(root, content, capture_bindings, &mut |node| {
-        collect_shiny_deferred_scope_at_node(
-            node,
-            content,
-            line_index,
-            shiny_in_play,
-            local_defs,
-            events,
-        );
+    visit_runtime_reachable_scope_syntax(root, content, capture_bindings, &mut |node, _| {
+        collect_shiny_deferred_scope_at_node(node, content, line_index, false, local_defs, events);
     });
+    // Bare helpers require position-aware attachment. Record an authoritative
+    // scope only when the local package timeline proves Shiny attached at the
+    // helper call; otherwise retain a dormant sidecar candidate for graph-aware
+    // activation from inherited or conditional package state.
+    let real_scope_tree = FunctionScopeTree::from_scopes(
+        &events
+            .iter()
+            .filter_map(|event| match event {
+                ScopeEvent::FunctionScope {
+                    start_line,
+                    start_column,
+                    end_line,
+                    end_column,
+                    ..
+                } => Some((*start_line, *start_column, *end_line, *end_column)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+    );
+    visit_runtime_reachable_scope_syntax(
+        root,
+        content,
+        capture_bindings,
+        &mut |node, lexical_bindings| {
+            collect_bare_shiny_deferred_scope_at_node(
+                node,
+                content,
+                line_index,
+                local_defs,
+                lexical_bindings,
+                library_calls,
+                &real_scope_tree,
+                events,
+                &mut artifacts.conditional_shiny_deferred_scopes,
+            );
+        },
+    );
 }
 
 /// Walk `node`, appending a parameterless `FunctionScope` event for each
@@ -3440,20 +3863,129 @@ fn collect_shiny_deferred_scope_at_node(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn collect_bare_shiny_deferred_scope_at_node(
+    node: Node,
+    text: &str,
+    line_index: &LineIndex,
+    local_defs: &HashMap<Arc<str>, ScopedSymbol>,
+    lexical_bindings: &mut LazyStaticBindings,
+    library_calls: &[FramedLibraryCall],
+    real_scope_tree: &FunctionScopeTree,
+    events: &mut Vec<ScopeEvent>,
+    scopes: &mut Vec<ConditionalShinyDeferredScope>,
+) {
+    if node.kind() != "call" {
+        return;
+    }
+    let Some(function) = node.child_by_field_name("function") else {
+        return;
+    };
+    if function.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(function, text);
+    let deferred = !super::binding::is_known_immediate_context(node);
+    if !crate::nse::is_shiny_deferred_helper(name)
+        || local_defs.contains_key(name)
+        || lexical_bindings
+            .get()
+            .named_local_binding_may_shadow_without_helper_uncertainty(name, node, deferred)
+    {
+        return;
+    }
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let call_start = node.start_position();
+    let call_position = Position::new(
+        call_start.row as u32,
+        byte_offset_to_utf16_column(line_index.get_line(call_start.row), call_start.column),
+    );
+    let mut cursor = arguments.walk();
+    for argument in arguments
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        if argument.child_by_field_name("name").is_some() {
+            continue;
+        }
+        let Some(value) = argument.child_by_field_name("value") else {
+            continue;
+        };
+        if value.kind() != "braced_expression" {
+            continue;
+        }
+        let scope_event = braced_body_scope_event(value, line_index);
+        if shiny_statically_attached_at_call(library_calls, real_scope_tree, call_position) {
+            events.push(scope_event);
+        } else if let ScopeEvent::FunctionScope {
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+            ..
+        } = scope_event
+        {
+            scopes.push(ConditionalShinyDeferredScope {
+                interval: FunctionScopeInterval::new(
+                    Position::new(start_line, start_column),
+                    Position::new(end_line, end_column),
+                ),
+                call_position,
+            });
+        }
+    }
+}
+
+/// Fold local package calls that can affect a bare helper at `call_position`.
+///
+/// Top-level helpers see only preceding top-level loads. Helpers inside a real
+/// function also see global loads through R's late binding and preceding loads
+/// in their containing function. Anything not provable here remains a dormant
+/// graph-aware sidecar candidate.
+fn shiny_statically_attached_at_call(
+    library_calls: &[FramedLibraryCall],
+    real_scope_tree: &FunctionScopeTree,
+    call_position: Position,
+) -> bool {
+    let helper_scope = real_scope_tree.query_innermost(call_position);
+    let mut attached = HashSet::new();
+    for detected in library_calls {
+        let package_position = Position::new(detected.call.line, detected.call.column);
+        let package_scope = real_scope_tree.query_innermost(package_position);
+        let applies = match helper_scope {
+            None => package_scope.is_none() && package_position <= call_position,
+            Some(helper_scope) => {
+                package_scope.is_none()
+                    || (package_position <= call_position
+                        && package_scope.is_some_and(|scope| {
+                            is_same_or_descendant_function_scope(Some(helper_scope), scope)
+                        }))
+            }
+        };
+        if applies
+            && package_load_requirement_satisfied(
+                detected.call.requires_attached.as_deref(),
+                &attached,
+            )
+            && detected.call.attaches
+        {
+            attached.insert(detected.call.package.clone());
+        }
+    }
+    attached.contains("shiny")
+}
+
 /// Whether a `call`'s callee node is a recognized Shiny deferred-expression
 /// helper. `shiny::<helper>` qualified calls are always recognized; a bare
 /// `<helper>` requires Shiny in play and must not be shadowed by a top-level
 /// definition (`local_defs`).
 ///
-/// Shadow detection is deliberately **top-level only**, like the diagnostics
-/// side (`handlers::collect_nse_facts`), which also excludes nested definitions
-/// to avoid mis-shadowing sibling callees under global hoisting. A helper
-/// redefined inside a function is therefore still treated as Shiny's — a rare
-/// boundary noted in `docs/diagnostics.md`, not an oversight. (The two top-level
-/// sets are not identical — this consults every top-level binding via
-/// `exported_interface`, whereas `collect_nse_facts` tracks only top-level
-/// function definitions — but they diverge only for a non-function binding that
-/// collides with a helper name, and never toward a false positive.)
+/// Bare-helper shadow detection combines the exported top-level interface with
+/// Raven's lexical binding model. Function formals and local assignments
+/// therefore suppress a dormant Shiny candidate even when a parent file
+/// attaches Shiny; qualified `shiny::<helper>` calls remain authoritative.
 ///
 /// This is the *scope* side of Shiny deferred recognition (it isolates the
 /// body's definitions). Its twin is the *diagnostics* side in
@@ -3524,7 +4056,7 @@ fn push_foreach_iterator_scopes<'tree, 'text>(
         return;
     }
     let events = &mut artifacts.timeline;
-    visit_runtime_reachable_scope_syntax(root, content, capture_bindings, &mut |node| {
+    visit_runtime_reachable_scope_syntax(root, content, capture_bindings, &mut |node, _| {
         collect_foreach_iterator_scope_at_node(node, content, line_index, uri, events);
     });
 }
@@ -5137,7 +5669,14 @@ fn extract_top_level_declarations(timeline: &[ScopeEvent]) -> Vec<(Arc<str>, u32
 /// (top-level and function-scoped); over-including only widens invalidation,
 /// never admits a stale cache hit (the WI2b standalone-scope cache, #483, relies
 /// on this completeness).
-type PackageLoadKey = (String, u32, u32, Option<FunctionScopeInterval>);
+type PackageLoadKey = (
+    String,
+    u32,
+    u32,
+    Option<FunctionScopeInterval>,
+    bool,
+    Option<String>,
+);
 
 fn extract_package_load_positions(timeline: &[ScopeEvent]) -> Vec<PackageLoadKey> {
     timeline
@@ -5148,8 +5687,17 @@ fn extract_package_load_positions(timeline: &[ScopeEvent]) -> Vec<PackageLoadKey
                 line,
                 column,
                 function_scope,
+                attaches,
+                requires_attached,
                 ..
-            } => Some((package.clone(), *line, *column, *function_scope)),
+            } => Some((
+                package.clone(),
+                *line,
+                *column,
+                *function_scope,
+                *attaches,
+                requires_attached.clone(),
+            )),
             _ => None,
         })
         .collect()
@@ -5164,6 +5712,7 @@ fn compute_interface_hash(
     top_level_removals: &[TopLevelRemoval<'_>],
     data_loads: &[DataCallInfo],
     declarations: &[(Arc<str>, u32)],
+    conditional_shiny_deferred_scopes: &[ConditionalShinyDeferredScope],
     sources: &[FinalizedSourceInterface],
     standalone: bool,
 ) -> u64 {
@@ -5201,11 +5750,13 @@ fn compute_interface_hash(
     // declared symbols below.
     let mut sorted_packages: Vec<_> = package_loads.iter().collect();
     sorted_packages.sort_by(|a, b| (&a.0, a.1, a.2).cmp(&(&b.0, b.1, b.2)));
-    for (package, line, column, function_scope) in sorted_packages {
+    for (package, line, column, function_scope, attaches, requires_attached) in sorted_packages {
         package.hash(&mut hasher);
         line.hash(&mut hasher);
         column.hash(&mut hasher);
         function_scope.hash(&mut hasher);
+        attaches.hash(&mut hasher);
+        requires_attached.hash(&mut hasher);
     }
 
     // Include declared symbols in the hash (sorted for determinism)
@@ -5279,6 +5830,25 @@ fn compute_interface_hash(
     for (name, line) in sorted_declarations {
         name.hash(&mut hasher);
         line.hash(&mut hasher);
+    }
+
+    // Conditional Shiny deferred scopes change whether definitions inside a
+    // candidate body can escape when graph-aware package state activates it.
+    // They deliberately stay out of the immutable function-scope tree, so hash
+    // their sorted intervals explicitly to invalidate dependents and scope
+    // caches when a bare helper becomes (or stops being) a candidate.
+    let mut sorted_conditional_scopes = conditional_shiny_deferred_scopes.to_vec();
+    sorted_conditional_scopes.sort_by_key(|candidate| {
+        (
+            candidate.interval.start,
+            candidate.interval.end,
+            candidate.call_position,
+        )
+    });
+    for candidate in sorted_conditional_scopes {
+        candidate.interval.start.hash(&mut hasher);
+        candidate.interval.end.hash(&mut hasher);
+        candidate.call_position.hash(&mut hasher);
     }
 
     // Source edges affect the resolved interface of this file even when its own
@@ -5523,6 +6093,8 @@ where
         0,
         &mut visited,
         &empty_packages,
+        &empty_packages,
+        false,
         base_exports,
         hoist_globals,
         backward_dep_mode,
@@ -5840,6 +6412,8 @@ where
         0,
         &mut visited,
         &empty_packages,
+        &empty_packages,
+        false,
         base_exports,
         hoist_globals,
         backward_dep_mode,
@@ -5876,6 +6450,7 @@ pub(crate) struct ParentPrefix {
     // filter, so a separate `loaded_packages` field on `ParentPrefix` would
     // always be empty and was removed in I2.
     pub inherited_packages: HashSet<String>,
+    pub attached_packages: HashSet<String>,
     pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
 }
 
@@ -5896,6 +6471,7 @@ impl ParentPrefix {
             visible_positions,
             depth_exceeded,
             inherited_packages,
+            attached_packages,
             package_origins,
         } = self;
         symbols.is_empty()
@@ -5903,6 +6479,7 @@ impl ParentPrefix {
             && visible_positions.is_empty()
             && depth_exceeded.is_empty()
             && inherited_packages.is_empty()
+            && attached_packages.is_empty()
             && package_origins.is_empty()
     }
 }
@@ -6149,6 +6726,8 @@ where
             current_depth + 1,
             visited,
             &empty_packages, // Parent collects its own inherited packages
+            &empty_packages, // Parent collects its own attachment state
+            false,
             base_exports,
             hoist_globals,
             backward_dep_mode,
@@ -6242,6 +6821,9 @@ where
                     &mut parent_scope.package_origins,
                 );
             }
+            parent_scope
+                .attached_packages
+                .extend(contribution.attached_packages);
         }
 
         // Merge parent symbols (they are available at the START of this file).
@@ -6301,6 +6883,24 @@ where
             (call_site_line, call_site_col)
         };
         if let Some(parent_artifacts) = get_artifacts(&edge.from) {
+            // Seed this parent's execution independently of every other edge.
+            // Origins not equal to this parent represent attachments inherited
+            // before its own timeline starts. Local attaches are replayed below
+            // in order, so an earlier conditional load cannot borrow a later
+            // attach (or an attach from an unrelated parent).
+            let mut edge_attached_packages: HashSet<String> = parent_scope
+                .attached_packages
+                .iter()
+                .filter(|package| {
+                    parent_scope
+                        .package_origins
+                        .get(*package)
+                        .is_none_or(|origins| {
+                            origins.iter().any(|origin| origin.as_ref() != &edge.from)
+                        })
+                })
+                .cloned()
+                .collect();
             // EOF widens the package-position cutoff for late binding, but the
             // invocation-frame compatibility check must use the real source call
             // site rather than the EOF sentinel.
@@ -6315,6 +6915,8 @@ where
                     line: pkg_line,
                     column: pkg_col,
                     package,
+                    attaches,
+                    requires_attached,
                     function_scope,
                     ..
                 } = event
@@ -6334,8 +6936,17 @@ where
                             }
                         };
 
-                        if should_propagate {
+                        if should_propagate
+                            && package_load_requirement_satisfied(
+                                requires_attached.as_deref(),
+                                &edge_attached_packages,
+                            )
+                        {
                             prefix.inherited_packages.insert(package.clone());
+                            if *attaches {
+                                edge_attached_packages.insert(package.clone());
+                                prefix.attached_packages.insert(package.clone());
+                            }
                             // Record the parent file as origin so downstream
                             // merge sites can apply the same-file leak filter.
                             record_package_origin(&mut prefix.package_origins, package, &edge.from);
@@ -6385,6 +6996,11 @@ where
                 &mut prefix.package_origins,
             );
         }
+        for pkg in &parent_scope.attached_packages {
+            if !package_only_origin_is_uri(&parent_scope.package_origins, pkg, uri) {
+                prefix.attached_packages.insert(pkg.clone());
+            }
+        }
     }
 
     prefix
@@ -6433,6 +7049,7 @@ where
         .chain(initial_scope.loaded_packages.iter())
         .cloned()
         .collect();
+    let mut rolling_attached_packages = initial_scope.attached_packages.clone();
     let mut rolling_origins = initial_scope.package_origins.clone();
 
     for source in members {
@@ -6477,6 +7094,7 @@ where
             Arc::new(ParentPrefix {
                 symbols: rolling_symbols.clone(),
                 inherited_packages: rolling_packages.clone(),
+                attached_packages: rolling_attached_packages.clone(),
                 package_origins: rolling_origins.clone(),
                 ..ParentPrefix::default()
             })
@@ -6505,6 +7123,8 @@ where
             current_depth + 1,
             &mut member_visited,
             &empty_packages,
+            &empty_packages,
+            false,
             base_exports,
             hoist_globals,
             backward_dep_mode,
@@ -6565,6 +7185,11 @@ where
                 &mut contribution.package_origins,
             );
         }
+        for package in member_scope.attached_packages {
+            if rolling_attached_packages.insert(package.clone()) {
+                contribution.attached_packages.insert(package);
+            }
+        }
     }
 
     let member_chain = std::mem::take(&mut contribution.chain);
@@ -6618,6 +7243,12 @@ fn scope_at_position_with_graph_recursive<F, G>(
     current_depth: usize,
     visited: &mut HashMap<Url, (u32, u32)>,
     inherited_packages: &HashSet<String>,
+    inherited_attached_packages: &HashSet<String>,
+    // A real forward invocation supplies the caller's exact attachment state.
+    // Parent-prefix discovery can still lend symbols and loaded namespaces,
+    // but must not replace that invocation-owned attached set with the union
+    // over other call sites that happen to source the same child.
+    inherited_attached_packages_authoritative: bool,
     base_exports: &HashSet<String>,
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
@@ -6665,8 +7296,8 @@ fn scope_at_position_with_graph_recursive<F, G>(
     prefer_supplied_path_context: bool,
     // Per-query memo of forward-sourced child EOF scopes (issue #472). Threaded
     // through STEP 1's parent walk and STEP 2's forward children so each
-    // distinct `(child, path context, package set)` is resolved once per
-    // top-level query. See [`ForwardChildMemo`].
+    // distinct `(child, path context, loaded package set, attached package
+    // set)` is resolved once per top-level query. See [`ForwardChildMemo`].
     forward_child_memo: &std::cell::RefCell<ForwardChildMemo>,
 ) -> ScopeAtPosition
 where
@@ -6713,6 +7344,7 @@ where
         && data_alias_provider.is_none()
         && package_contribution.is_none()
         && inherited_packages.is_empty()
+        && inherited_attached_packages.is_empty()
         && pre_computed_prefix.is_none_or(|p| p.is_empty())
     {
         // Cheap presence check first (no Arc clone): only the diagnostics path
@@ -6779,6 +7411,7 @@ where
     // Requirements 5.1, 5.2: Packages inherited from parent files are available from position (0, 0)
     let mut scope = ScopeAtPosition {
         inherited_packages: inherited_packages.clone(),
+        attached_packages: inherited_attached_packages.clone(),
         ..Default::default()
     };
 
@@ -6915,6 +7548,11 @@ where
                 for pkg in &prefix.inherited_packages {
                     scope.inherited_packages.insert(pkg.clone());
                 }
+                if !inherited_attached_packages_authoritative {
+                    scope
+                        .attached_packages
+                        .extend(prefix.attached_packages.iter().cloned());
+                }
                 for (pkg, origins) in &prefix.package_origins {
                     scope
                         .package_origins
@@ -6959,6 +7597,9 @@ where
                 for pkg in prefix.inherited_packages {
                     scope.inherited_packages.insert(pkg);
                 }
+                if !inherited_attached_packages_authoritative {
+                    scope.attached_packages.extend(prefix.attached_packages);
+                }
                 for (pkg, origins) in prefix.package_origins {
                     scope
                         .package_origins
@@ -6978,6 +7619,111 @@ where
         }
     } // end if !is_revisit (STEP 1)
 
+    // Attachments established before this file executes must participate in
+    // position-aware timeline evaluation. Phase 5a still appends their package
+    // exports and symbols after the timeline so local definitions retain
+    // precedence, but conditional loaders such as bare `p_load()` need the
+    // attachment fact before their event is visited.
+    if current_depth == 0
+        && let Some(contrib) = package_contribution
+    {
+        let contribution_uri = package_query_uri.unwrap_or(uri);
+        seed_pre_execution_attached_packages(
+            &mut scope.attached_packages,
+            contribution_uri,
+            contrib,
+        );
+    }
+    let needs_attachment_projection = !artifacts.conditional_shiny_deferred_scopes.is_empty()
+        || (query_inside_function
+            && artifacts.timeline.iter().any(|event| {
+                matches!(
+                    event,
+                    ScopeEvent::PackageLoad {
+                        requires_attached: Some(_),
+                        function_scope: Some(function_scope),
+                        ..
+                    } if active_function_scopes.contains(function_scope)
+                )
+            }));
+    // Ordinary files have no conditional helper/load semantics. Keep their
+    // seeds allocation-free instead of cloning the full inherited attachment
+    // set twice at every recursive depth.
+    let top_level_attachment_seed = if needs_attachment_projection {
+        scope.attached_packages.clone()
+    } else {
+        HashSet::new()
+    };
+    let mut in_function_attachment_seed = top_level_attachment_seed.clone();
+    let projected_conditional_shiny_scopes = if needs_attachment_projection {
+        // Conditional helper activation needs the package environment at the
+        // helper call, including attachments produced by earlier source/tar
+        // events. For a function-body query it additionally needs the final
+        // top-level environment, because the function runs only after the
+        // file's top level completes. Reuse the streaming resolver as the
+        // invocation-owned ordered projection: it shares source/tar
+        // contribution caches within the probe, evaluates helper candidates at
+        // their call positions, and is configured with this invocation's
+        // actual depth/ancestor path so a recursive child projection cannot
+        // restart the source budget or escape the cycle guard.
+        let probe_prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        if let Some(mut probe) = ScopeStream::new_attachment_projection(
+            uri,
+            get_artifacts,
+            get_metadata,
+            graph,
+            workspace_root,
+            max_depth,
+            base_exports,
+            hoist_globals,
+            backward_dep_mode,
+            is_cancelled,
+            &probe_prefix_cache,
+            data_alias_provider,
+            current_depth,
+            forward_visited_base.as_ref().unwrap_or(visited),
+            &top_level_attachment_seed,
+        ) {
+            probe.advance_to(line, column);
+            let projected_scopes = probe.active_conditional_shiny_scopes.clone();
+            let projected_query_inside = query_inside_function
+                || projected_scopes
+                    .iter()
+                    .any(|scope| scope.contains(Position::new(line, column)));
+            if projected_query_inside {
+                probe.ensure_global_late_frame();
+                if let Some(global_late) = &probe.global_late_frame {
+                    in_function_attachment_seed
+                        .extend(global_late.attached_packages.iter().cloned());
+                }
+            }
+            Some(projected_scopes)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let active_conditional_shiny_scopes = projected_conditional_shiny_scopes.unwrap_or_else(|| {
+        active_conditional_shiny_scopes(
+            &artifacts,
+            &top_level_attachment_seed,
+            &in_function_attachment_seed,
+            hoist_globals,
+        )
+    });
+    let query_inside_function = query_inside_function
+        || (hoist_globals
+            && active_conditional_shiny_scopes
+                .iter()
+                .any(|scope| scope.contains(Position::new(line, column))));
+    let active_effective_scopes = active_effective_scopes_at(
+        &active_function_scopes,
+        &active_conditional_shiny_scopes,
+        line,
+        column,
+    );
+
     // STEP 2: Process timeline events (local definitions and forward sources)
     // Second pass: process events and apply function scope filtering.
     // Use the def event's `visible_from` position so that the binding from
@@ -6995,17 +7741,25 @@ where
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def {
+                line: def_line,
+                column: def_column,
                 visible_from_line,
                 visible_from_column,
                 symbol,
                 function_scope,
                 ..
             } => {
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
+                    *def_line,
+                    *def_column,
+                    *function_scope,
+                );
                 if is_symbol_visible(
                     *visible_from_line,
                     *visible_from_column,
-                    *function_scope,
-                    &active_function_scopes,
+                    effective_scope,
+                    &active_effective_scopes,
                     line,
                     column,
                     query_inside_function,
@@ -7022,14 +7776,20 @@ where
                 function_scope,
                 ..
             } => {
+                let effective_function_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
+                    *src_line,
+                    *src_col,
+                    *function_scope,
+                );
                 // Include source() if before position, or if hoisting and it's a global source()
                 let passes_position = (*src_line, *src_col) < (line, column);
-                if let Some(src_scope) = function_scope
-                    && !active_function_scopes.contains(src_scope)
+                if let Some(src_scope) = effective_function_scope
+                    && !active_effective_scopes.contains(&src_scope)
                 {
                     continue;
                 }
-                let is_global_source = query_inside_function && function_scope.is_none();
+                let is_global_source = query_inside_function && effective_function_scope.is_none();
                 if passes_position || is_global_source {
                     let package_effects_only =
                         source.locality == super::types::SourceLocality::NonInheriting;
@@ -7038,7 +7798,7 @@ where
                     // but its orderable package-attachment side effects still apply
                     // to R's process search path after the call.
                     if should_apply_local_scoping(source)
-                        && function_scope.is_none()
+                        && effective_function_scope.is_none()
                         && !package_effects_only
                     {
                         continue;
@@ -7095,9 +7855,10 @@ where
                         // file's own library() calls before the source()), and loaded_packages
                         // (packages from previously-sourced sibling files).
                         // Get the function scope of the source() call for filtering function-scoped packages
-                        let source_function_scope = *function_scope;
+                        let source_function_scope = effective_function_scope;
 
                         let mut extra_packages: HashSet<String> = HashSet::new();
+                        let mut extra_attached_packages: HashSet<String> = HashSet::new();
 
                         // Collect packages from this file's timeline that are loaded before the source() call
                         for pkg_event in &artifacts.timeline {
@@ -7105,6 +7866,8 @@ where
                                 line: pkg_line,
                                 column: pkg_col,
                                 package,
+                                attaches,
+                                requires_attached,
                                 function_scope,
                                 ..
                             } = pkg_event
@@ -7112,7 +7875,13 @@ where
                                 // Only include packages loaded before the source() call
                                 if (*pkg_line, *pkg_col) < (*src_line, *src_col) {
                                     // Check function scope compatibility
-                                    let should_include = match function_scope {
+                                    let package_function_scope = innermost_effective_scope(
+                                        &active_conditional_shiny_scopes,
+                                        *pkg_line,
+                                        *pkg_col,
+                                        *function_scope,
+                                    );
+                                    let should_include = match package_function_scope {
                                         None => true, // Global package load - always include
                                         Some(pkg_scope) => {
                                             // Function-scoped package load - only include if:
@@ -7120,14 +7889,24 @@ where
                                             // 2. The source() call is nested within the package's function scope
                                             is_same_or_descendant_function_scope(
                                                 source_function_scope,
-                                                *pkg_scope,
+                                                pkg_scope,
                                             )
                                         }
                                     };
 
-                                    if should_include && !scope.inherited_packages.contains(package)
+                                    let requirement_satisfied =
+                                        requires_attached.as_ref().is_none_or(|required| {
+                                            scope.attached_packages.contains(required)
+                                                || extra_attached_packages.contains(required)
+                                        });
+                                    if should_include
+                                        && requirement_satisfied
+                                        && !scope.inherited_packages.contains(package)
                                     {
                                         extra_packages.insert(package.clone());
+                                        if *attaches {
+                                            extra_attached_packages.insert(package.clone());
+                                        }
                                     }
                                 }
                             }
@@ -7169,6 +7948,36 @@ where
                                 .collect();
                             &owned_packages
                         };
+                        let attached_union_matches_packages =
+                            packages_for_child.iter().all(|package| {
+                                scope.attached_packages.contains(package)
+                                    || extra_attached_packages.contains(package)
+                            }) && scope
+                                .attached_packages
+                                .iter()
+                                .chain(extra_attached_packages.iter())
+                                .all(|package| packages_for_child.contains(package));
+                        let owned_attached_packages: HashSet<String>;
+                        let attached_packages_for_child: &HashSet<String> =
+                            if child_is_standalone || package_effects_only {
+                                &empty_packages_for_child
+                            } else if attached_union_matches_packages {
+                                // Reuse only after proving set equality in both
+                                // directions. A one-way loaded ⊆ attached check
+                                // is unsound because pre-execution attachments
+                                // may not yet appear in the loaded-package set.
+                                packages_for_child
+                            } else if extra_attached_packages.is_empty() {
+                                &scope.attached_packages
+                            } else {
+                                owned_attached_packages = scope
+                                    .attached_packages
+                                    .iter()
+                                    .chain(extra_attached_packages.iter())
+                                    .cloned()
+                                    .collect();
+                                &owned_attached_packages
+                            };
 
                         // Build child PathContext, respecting chdir flag. A
                         // standalone callee (part 2) uses its OWN context,
@@ -7218,6 +8027,7 @@ where
                                 child_prefer_supplied_path_context,
                                 current_depth + 1,
                                 packages_for_child,
+                                attached_packages_for_child,
                                 is_cancelled,
                                 || {
                                     // Clone the ancestor snapshot taken before
@@ -7241,6 +8051,8 @@ where
                                         current_depth + 1,
                                         &mut child_visited,
                                         packages_for_child, // Pass inherited packages to child
+                                        attached_packages_for_child,
+                                        true,
                                         base_exports,
                                         hoist_globals,
                                         backward_dep_mode,
@@ -7269,6 +8081,8 @@ where
                                 current_depth + 1,
                                 visited,
                                 packages_for_child, // Pass inherited packages to child
+                                attached_packages_for_child,
+                                true,
                                 base_exports,
                                 hoist_globals,
                                 backward_dep_mode,
@@ -7367,6 +8181,13 @@ where
                             &mut scope.loaded_packages,
                             &mut scope.package_origins,
                         );
+                        merge_child_source_attachments(
+                            &child_scope.attached_packages,
+                            package_effects_only.then_some(&child_scope.loaded_packages),
+                            &child_scope.package_origins,
+                            uri,
+                            &mut scope.attached_packages,
+                        );
                     }
                 }
             }
@@ -7433,6 +8254,9 @@ where
                         &mut scope.package_origins,
                     );
                 }
+                scope
+                    .attached_packages
+                    .extend(contribution.attached_packages);
             }
             ScopeEvent::FunctionScope {
                 start_line,
@@ -7462,11 +8286,17 @@ where
                 function_scope,
                 ..
             } => {
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
+                    *rm_line,
+                    *rm_col,
+                    *function_scope,
+                );
                 let passes_position = (*rm_line, *rm_col) < (line, column);
                 if passes_position || query_inside_function {
                     if !passes_position {
                         // Hoisted path: only apply global removals
-                        if function_scope.is_none() {
+                        if effective_scope.is_none() {
                             for sym_name in symbols {
                                 scope.symbols.remove(sym_name.as_str());
                             }
@@ -7474,8 +8304,8 @@ where
                     } else {
                         apply_removal(
                             &mut scope,
-                            &active_function_scopes,
-                            *function_scope,
+                            &active_effective_scopes,
+                            effective_scope,
                             symbols,
                         );
                     }
@@ -7485,21 +8315,44 @@ where
                 line: pkg_line,
                 column: pkg_col,
                 package,
+                attaches,
+                requires_attached,
                 function_scope,
                 ..
             } => {
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
+                    *pkg_line,
+                    *pkg_col,
+                    *function_scope,
+                );
                 let passes_position = (*pkg_line, *pkg_col) <= (line, column);
                 if passes_position || query_inside_function {
-                    let should_include = match function_scope {
+                    let should_include = match effective_scope {
                         None => true, // Global package load - include (hoisted or positional)
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if positional AND in same function
-                            passes_position && active_function_scopes.contains(pkg_scope)
+                            passes_position && active_effective_scopes.contains(&pkg_scope)
                         }
                     };
 
-                    if should_include {
+                    let running_requirement_satisfied = package_load_requirement_satisfied_at_query(
+                        requires_attached.as_deref(),
+                        &scope.attached_packages,
+                    );
+                    let late_requirement_satisfied = effective_scope.is_some()
+                        && query_inside_function
+                        && package_load_requirement_satisfied(
+                            requires_attached.as_deref(),
+                            &in_function_attachment_seed,
+                        );
+                    if should_include
+                        && (running_requirement_satisfied || late_requirement_satisfied)
+                    {
                         scope.loaded_packages.insert(package.clone());
+                        if *attaches {
+                            scope.attached_packages.insert(package.clone());
+                        }
                         record_package_origin(&mut scope.package_origins, package, uri);
                     }
                 }
@@ -7511,11 +8364,17 @@ where
                 function_scope,
                 ..
             } => {
-                if is_symbol_visible(
+                let effective_scope = innermost_effective_scope(
+                    &active_conditional_shiny_scopes,
                     *decl_line,
                     *decl_col,
                     *function_scope,
-                    &active_function_scopes,
+                );
+                if is_symbol_visible(
+                    *decl_line,
+                    *decl_col,
+                    effective_scope,
+                    &active_effective_scopes,
                     line,
                     column,
                     query_inside_function,
@@ -7550,26 +8409,26 @@ where
                 // environment, matching R, and later local defs can overwrite
                 // the aliases again. `attached_packages` for the bare
                 // `data(stem)` form is the set attached at-or-before this
-                // event: packages loaded earlier in this file's timeline
-                // (already in `scope.loaded_packages`) plus inherited ones.
+                // event.
                 if let Some(provider) = data_alias_provider {
+                    let effective_scope = innermost_effective_scope(
+                        &active_conditional_shiny_scopes,
+                        *dl_line,
+                        *dl_col,
+                        *function_scope,
+                    );
                     let passes_position = (*dl_line, *dl_col) <= (line, column);
-                    let should_include = match function_scope {
+                    let should_include = match effective_scope {
                         None => passes_position || query_inside_function,
                         Some(dl_scope) => {
-                            passes_position && active_function_scopes.contains(dl_scope)
+                            passes_position && active_effective_scopes.contains(&dl_scope)
                         }
                     };
                     if should_include {
                         // Only the bare `data(stem)` form consults the attached
                         // set; skip building it for explicit `package =` calls.
                         let attached: HashSet<String> = if package.is_none() {
-                            scope
-                                .loaded_packages
-                                .iter()
-                                .chain(scope.inherited_packages.iter())
-                                .cloned()
-                                .collect()
+                            scope.attached_packages.clone()
                         } else {
                             HashSet::new()
                         };
@@ -7673,6 +8532,55 @@ fn visible_preamble_entries<'a, V>(
         }
         Some(value)
     })
+}
+
+/// Seed only package-attachment facts that exist before the queried file
+/// executes.
+///
+/// Package/test contribution symbols are deliberately appended after timeline
+/// evaluation so locals win. Attachment prerequisites are different: a
+/// `.Rprofile`, test framework, or earlier test preamble has already run when
+/// the file starts, so conditional package-loader events must see those facts
+/// while the timeline is evaluated. The full appenders later add the matching
+/// inherited/loaded package state idempotently.
+fn seed_pre_execution_attached_packages(
+    attached: &mut HashSet<String>,
+    queried_uri: &Url,
+    contrib: &crate::package_state::PackageScopeContribution,
+) {
+    let Ok(path) = queried_uri.to_file_path() else {
+        return;
+    };
+
+    if rprofile_prelude_applies(&path, contrib) {
+        attached.extend(contrib.rprofile_attached_packages.iter().cloned());
+    }
+
+    let Some(root) = contrib.workspace_root.as_ref() else {
+        return;
+    };
+    let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
+        return;
+    };
+    if kind != crate::package_state::RFileKind::Test
+        || !crate::package_state::is_testthat_or_testit_test(&path, root)
+    {
+        return;
+    }
+
+    attached.extend(contrib.test_attached_packages.iter().cloned());
+    let queried_is_preamble = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(crate::package_state::is_test_preamble_filename)
+        .unwrap_or(false);
+    for packages in visible_preamble_entries(
+        &contrib.test_helper_attached_packages,
+        path.as_path(),
+        queried_is_preamble,
+    ) {
+        attached.extend(packages.iter().cloned());
+    }
 }
 
 /// Compute the set of symbol names the package contribution would inject
@@ -8111,6 +9019,7 @@ pub(crate) fn append_package_contribution(
         }
         for pkg in contrib.test_attached_packages.iter() {
             scope.inherited_packages.insert(pkg.clone());
+            scope.attached_packages.insert(pkg.clone());
         }
         // Issue #432: packages attached by testthat preamble files via a
         // top-level `library()`/`require()` propagate to sibling tests, exactly
@@ -8129,6 +9038,7 @@ pub(crate) fn append_package_contribution(
         ) {
             for pkg in pkgs.iter() {
                 scope.inherited_packages.insert(pkg.clone());
+                scope.attached_packages.insert(pkg.clone());
             }
         }
     }
@@ -8200,6 +9110,7 @@ pub(crate) fn append_rprofile_prelude(
     }
     for pkg in contrib.rprofile_attached_packages.iter() {
         scope.inherited_packages.insert(pkg.clone());
+        scope.attached_packages.insert(pkg.clone());
     }
 }
 
@@ -8220,6 +9131,7 @@ pub(crate) fn append_rprofile_prelude(
 struct ScopeFrame {
     symbols: HashMap<Arc<str>, ScopedSymbol>,
     packages: HashSet<String>,
+    attached_packages: HashSet<String>,
     package_origins: HashMap<String, HashSet<Arc<Url>>>,
     /// Names removed by `rm()` / `remove()` calls applicable to this frame.
     /// Applied at `snapshot()` time AFTER all frame symbols have been layered
@@ -8259,6 +9171,7 @@ pub(crate) struct ChildSourceContribution {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
     pub removed_names: HashSet<Arc<str>>,
     pub packages: HashSet<String>,
+    pub attached_packages: HashSet<String>,
     pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
     pub chain: Vec<Url>,
     pub visible_positions: HashMap<Url, (u32, u32)>,
@@ -8277,6 +9190,9 @@ fn merge_tar_batch_into_frame(frame: &mut ScopeFrame, contribution: ChildSourceC
         frame.symbols.insert(name, symbol);
     }
     frame.packages.extend(contribution.packages);
+    frame
+        .attached_packages
+        .extend(contribution.attached_packages);
     for (package, origins) in contribution.package_origins {
         frame
             .package_origins
@@ -8339,6 +9255,10 @@ where
     /// lazily on first need; once built, it is reused for the rest of the
     /// stream's lifetime.
     global_late_frame: Option<ScopeFrame>,
+    /// Attachments established before the queried file executes. Both strict
+    /// and late global frames start with this exact set; rebuilding the late
+    /// frame must not discard `.Rprofile` or test-preamble state.
+    pre_execution_attached_packages: HashSet<String>,
     /// Stack of active function frames, outermost first. Pushed when the
     /// cursor enters a `FunctionScope` interval; popped when it leaves.
     function_stack: Vec<(FunctionScopeInterval, ScopeFrame)>,
@@ -8347,11 +9267,21 @@ where
     timeline_cursor: usize,
     /// Last position the cursor advanced to (`advance_to` is monotonic).
     cursor: (u32, u32),
+    /// Target currently being applied. Kept separate from `cursor` so
+    /// cancellation does not falsely commit a partially advanced position.
+    advance_target: (u32, u32),
+    /// Conditional Shiny deferred-body intervals activated from the package
+    /// environment at each helper call site.
+    active_conditional_shiny_scopes: HashSet<FunctionScopeInterval>,
+    /// Candidates whose call-position attachment environment has already been
+    /// evaluated. Kept separately from the active set because an inactive
+    /// candidate must not be reconsidered after a later attachment.
+    evaluated_conditional_shiny_scopes: HashSet<FunctionScopeInterval>,
 
     /// One-shot child-source resolution cache, keyed by source-call effect
     /// position. The same call site may be applied to both the strict and
     /// late frames; computing once and reusing is the whole point.
-    source_contributions: HashMap<(u32, u32), ChildSourceContribution>,
+    source_contributions: HashMap<(u32, u32, u64), ChildSourceContribution>,
     /// Ordered `targets::tar_source()` batch contributions. Kept separate
     /// from ordinary source contributions because the two event kinds have
     /// different merge semantics.
@@ -8364,6 +9294,13 @@ where
     graph: &'a super::dependency::DependencyGraph,
     workspace_root: Option<&'a Url>,
     max_depth: usize,
+    /// Depth of `queried_uri` in the owning recursive invocation. Ordinary
+    /// diagnostic streams start at zero; attachment projections created while
+    /// resolving a child retain the child's actual depth.
+    resolution_depth: usize,
+    /// Ancestor path inherited by a nested attachment projection. This keeps
+    /// its child source resolution inside the owning invocation's cycle guard.
+    resolution_visited: HashMap<Url, (u32, u32)>,
     base_exports: &'a HashSet<String>,
     hoist_globals: bool,
     backward_dep_mode: super::config::BackwardDependencyMode,
@@ -8664,7 +9601,18 @@ where
         // everywhere otherwise).
         let mut global_strict_frame = ScopeFrame::default();
         seed_base_exports(&mut global_strict_frame, base_exports);
-
+        let mut pre_execution_attached_packages = HashSet::new();
+        if let Some(contrib) = package_contribution {
+            let contribution_uri = package_query_uri.unwrap_or(queried_uri);
+            seed_pre_execution_attached_packages(
+                &mut pre_execution_attached_packages,
+                contribution_uri,
+                contrib,
+            );
+        }
+        global_strict_frame
+            .attached_packages
+            .extend(pre_execution_attached_packages.iter().cloned());
         // Build the queried URI's PathContext once so forward `Source`
         // events can resolve child paths even when the dependency graph
         // edge is absent (e.g. unresolvable path).
@@ -8696,9 +9644,13 @@ where
             prefix_in_function,
             global_strict_frame,
             global_late_frame: None,
+            pre_execution_attached_packages,
             function_stack: Vec::new(),
             timeline_cursor: 0,
             cursor: (0, 0),
+            advance_target: (0, 0),
+            active_conditional_shiny_scopes: HashSet::new(),
+            evaluated_conditional_shiny_scopes: HashSet::new(),
             source_contributions: HashMap::new(),
             tar_batch_contributions: HashMap::new(),
             get_artifacts,
@@ -8706,6 +9658,8 @@ where
             graph,
             workspace_root,
             max_depth,
+            resolution_depth: 0,
+            resolution_visited: HashMap::new(),
             base_exports,
             hoist_globals,
             backward_dep_mode,
@@ -8718,6 +9672,98 @@ where
             data_alias_provider,
             forward_child_memo,
             prefix_forward_child_memo,
+        })
+    }
+
+    /// Construct the ordered attachment projection used by recursive scope
+    /// resolution without running the ordinary stream's eager parent-prefix
+    /// walk. Depth, ancestor visits, and the already-resolved prefix/prelude
+    /// attachment seed are installed before any source event can recurse.
+    #[allow(clippy::too_many_arguments)]
+    fn new_attachment_projection(
+        queried_uri: &'a Url,
+        get_artifacts: &'a F,
+        get_metadata: &'a G,
+        graph: &'a super::dependency::DependencyGraph,
+        workspace_root: Option<&'a Url>,
+        max_depth: usize,
+        base_exports: &'a HashSet<String>,
+        hoist_globals: bool,
+        backward_dep_mode: super::config::BackwardDependencyMode,
+        is_cancelled: &'a dyn Fn() -> bool,
+        prefix_cache: &'a std::cell::RefCell<ParentPrefixCache>,
+        data_alias_provider: Option<&'a DataAliasProvider<'a>>,
+        resolution_depth: usize,
+        visited: &HashMap<Url, (u32, u32)>,
+        attached_packages: &HashSet<String>,
+    ) -> Option<Self> {
+        let artifacts = get_artifacts(queried_uri)?;
+        let mut resolution_visited = visited.clone();
+        resolution_visited.insert(queried_uri.clone(), (u32::MAX, u32::MAX));
+
+        let prefix = Arc::new(ParentPrefix {
+            attached_packages: attached_packages.clone(),
+            ..Default::default()
+        });
+        let mut global_strict_frame = ScopeFrame::default();
+        if resolution_depth == 0 {
+            seed_base_exports(&mut global_strict_frame, base_exports);
+        }
+        global_strict_frame
+            .attached_packages
+            .extend(attached_packages.iter().cloned());
+        let meta = get_metadata(queried_uri);
+        let path_ctx = meta
+            .as_ref()
+            .and_then(|metadata| {
+                super::path_resolve::PathContext::from_metadata(
+                    queried_uri,
+                    metadata,
+                    workspace_root,
+                )
+            })
+            .or_else(|| {
+                super::path_resolve::PathContext::forward_without_metadata(
+                    queried_uri,
+                    workspace_root,
+                )
+            });
+
+        Some(Self {
+            queried_uri,
+            artifacts,
+            prefix_top: prefix.clone(),
+            prefix_in_function: prefix,
+            global_strict_frame,
+            global_late_frame: None,
+            pre_execution_attached_packages: attached_packages.clone(),
+            function_stack: Vec::new(),
+            timeline_cursor: 0,
+            cursor: (0, 0),
+            advance_target: (0, 0),
+            active_conditional_shiny_scopes: HashSet::new(),
+            evaluated_conditional_shiny_scopes: HashSet::new(),
+            source_contributions: HashMap::new(),
+            tar_batch_contributions: HashMap::new(),
+            get_artifacts,
+            get_metadata,
+            graph,
+            workspace_root,
+            max_depth,
+            resolution_depth,
+            resolution_visited,
+            base_exports,
+            hoist_globals,
+            backward_dep_mode,
+            is_cancelled,
+            path_ctx,
+            prefix_cache,
+            package_contribution: None,
+            package_query_uri: None,
+            contribution_symbol_names: HashSet::new(),
+            data_alias_provider,
+            forward_child_memo: std::cell::RefCell::new(ForwardChildMemo::default()),
+            prefix_forward_child_memo: None,
         })
     }
 
@@ -8735,24 +9781,43 @@ where
         if (self.is_cancelled)() {
             return;
         }
-
+        self.advance_target = target;
+        self.ensure_active_conditional_frames_at_target();
         // Process timeline events with effect position <= target. The
-        // timeline is sorted by `event_effect_position` (see scope.rs `compute_artifacts*`).
+        // timeline is sorted by `event_effect_position` (see scope.rs
+        // `compute_artifacts*`). Conditional Shiny candidates are interleaved
+        // at their call positions so a preceding source-produced attachment is
+        // visible, while a later one cannot retroactively activate the body.
         let timeline_len = self.artifacts.timeline.len();
         let mut i = self.timeline_cursor;
-        while i < timeline_len {
+        loop {
             // Cooperative cancellation in hot loops — every 64 events.
             if i & 63 == 0 && (self.is_cancelled)() {
                 self.timeline_cursor = i;
                 return;
             }
-            let event = &self.artifacts.timeline[i];
-            let effect_pos = event_effect_position(event);
-            if effect_pos > target {
+            let next_event = (i < timeline_len)
+                .then(|| event_effect_position(&self.artifacts.timeline[i]))
+                .filter(|position| *position <= target);
+            let next_candidate = self.next_conditional_shiny_candidate(target);
+            match (next_event, next_candidate) {
+                (None, None) => break,
+                (event_position, Some(candidate))
+                    if event_position.is_none_or(|position| {
+                        (candidate.call_position.line, candidate.call_position.column) <= position
+                    }) =>
+                {
+                    self.evaluate_conditional_shiny_candidate(candidate);
+                }
+                (Some(_), _) => {
+                    self.apply_event_to_strict(i);
+                    i += 1;
+                }
+                (None, Some(_)) => unreachable!("candidate arm handles this case"),
+            }
+            if i >= timeline_len && self.next_conditional_shiny_candidate(target).is_none() {
                 break;
             }
-            self.apply_event_to_strict(i);
-            i += 1;
         }
         self.timeline_cursor = i;
 
@@ -8776,6 +9841,103 @@ where
             .retain(|(interval, _)| !target_at_full_eof && interval.contains(target_pos));
 
         self.cursor = target;
+    }
+
+    fn ensure_active_conditional_frames_at_target(&mut self) {
+        let target = Position::new(self.advance_target.0, self.advance_target.1);
+        let missing: Vec<_> = self
+            .active_conditional_shiny_scopes
+            .iter()
+            .filter(|interval| {
+                interval.contains(target)
+                    && !self
+                        .function_stack
+                        .iter()
+                        .any(|(existing, _)| existing == *interval)
+            })
+            .copied()
+            .collect();
+        self.function_stack.extend(
+            missing
+                .into_iter()
+                .map(|interval| (interval, ScopeFrame::default())),
+        );
+    }
+
+    fn next_conditional_shiny_candidate(
+        &self,
+        target: (u32, u32),
+    ) -> Option<ConditionalShinyDeferredScope> {
+        self.artifacts
+            .conditional_shiny_deferred_scopes
+            .iter()
+            .filter(|candidate| {
+                !self
+                    .evaluated_conditional_shiny_scopes
+                    .contains(&candidate.interval)
+                    && (candidate.call_position.line, candidate.call_position.column) <= target
+            })
+            .min_by_key(|candidate| candidate.call_position)
+            .copied()
+    }
+
+    fn candidate_is_inside_ordinary_function(
+        &self,
+        candidate: ConditionalShinyDeferredScope,
+    ) -> bool {
+        self.hoist_globals
+            && !active_function_scopes_at(
+                &self.artifacts.function_scope_tree,
+                candidate.call_position.line,
+                candidate.call_position.column,
+            )
+            .is_empty()
+    }
+
+    /// Evaluate one dormant helper exactly once against the attachment
+    /// environment immediately preceding its call.
+    fn evaluate_conditional_shiny_candidate(&mut self, candidate: ConditionalShinyDeferredScope) {
+        self.evaluated_conditional_shiny_scopes
+            .insert(candidate.interval);
+        let inside_function = self.candidate_is_inside_ordinary_function(candidate);
+        if inside_function {
+            self.ensure_global_late_frame();
+        }
+
+        let mut attached = if inside_function {
+            self.global_late_frame
+                .as_ref()
+                .unwrap_or(&self.global_strict_frame)
+                .attached_packages
+                .clone()
+        } else {
+            self.global_strict_frame.attached_packages.clone()
+        };
+        let prefix = if inside_function {
+            &self.prefix_in_function
+        } else {
+            &self.prefix_top
+        };
+        attached.extend(prefix.attached_packages.iter().cloned());
+        for (interval, frame) in &self.function_stack {
+            if interval.contains(candidate.call_position) {
+                attached.extend(frame.attached_packages.iter().cloned());
+            }
+        }
+        if attached.contains("shiny") {
+            self.active_conditional_shiny_scopes
+                .insert(candidate.interval);
+            let target = Position::new(self.advance_target.0, self.advance_target.1);
+            if candidate.interval.contains(target)
+                && !self
+                    .function_stack
+                    .iter()
+                    .any(|(interval, _)| *interval == candidate.interval)
+            {
+                self.function_stack
+                    .push((candidate.interval, ScopeFrame::default()));
+            }
+        }
     }
 
     /// Apply a single timeline event to the streaming state (strict frame
@@ -8806,24 +9968,34 @@ where
                 self.function_stack.push((interval, frame));
             }
             ScopeEvent::Def {
+                line,
+                column,
                 visible_from_line: _,
                 visible_from_column: _,
                 symbol,
                 function_scope,
                 ..
             } => {
+                let function_scope = self.conditional_event_scope(line, column, function_scope);
+                if !self.conditional_scope_applies(function_scope) {
+                    return;
+                }
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     frame.removed_names.remove(&symbol.name);
                     frame.symbols.insert(symbol.name.clone(), symbol);
                 }
             }
             ScopeEvent::Removal {
-                line: _,
-                column: _,
+                line,
+                column,
                 symbols,
                 function_scope,
                 ..
             } => {
+                let function_scope = self.conditional_event_scope(line, column, function_scope);
+                if !self.conditional_scope_applies(function_scope) {
+                    return;
+                }
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     for sym_name in &symbols {
                         let key: Arc<str> = Arc::from(sym_name.as_str());
@@ -8833,15 +10005,33 @@ where
                 }
             }
             ScopeEvent::PackageLoad {
-                line: _,
-                column: _,
+                line,
+                column,
                 package,
+                attaches,
+                requires_attached,
                 function_scope,
                 ..
             } => {
+                let function_scope = self.conditional_event_scope(line, column, function_scope);
+                if !self.conditional_scope_applies(function_scope) {
+                    return;
+                }
+                if function_scope.is_some() && self.hoist_globals {
+                    self.ensure_global_late_frame();
+                }
+                let enabled = requires_attached
+                    .as_deref()
+                    .is_none_or(|required| self.attached_packages_so_far().contains(required));
+                if !enabled {
+                    return;
+                }
                 let queried_uri = self.queried_uri.clone();
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     frame.packages.insert(package.clone());
+                    if attaches {
+                        frame.attached_packages.insert(package.clone());
+                    }
                     record_package_origin(&mut frame.package_origins, &package, &queried_uri);
                 }
             }
@@ -8852,6 +10042,11 @@ where
                 function_scope,
                 ..
             } => {
+                let function_scope =
+                    self.conditional_event_scope(src_line, src_col, function_scope);
+                if !self.conditional_scope_applies(function_scope) {
+                    return;
+                }
                 // Top-level CurrentFrame sources contribute nothing. An
                 // orderable NonInheriting source still contributes process-wide
                 // package attachments, while `resolve_source_contribution`
@@ -8863,10 +10058,20 @@ where
                     return;
                 }
                 // Resolve once per call site, reuse on every application
-                // (strict-frame application AND late-frame pre-walk).
-                let key = (src_line, src_col);
+                // with the same inherited attachment environment.
+                let attached_for_child = self.attached_packages_so_far();
+                let key = (
+                    src_line,
+                    src_col,
+                    package_set_fingerprint(&attached_for_child),
+                );
                 if !self.source_contributions.contains_key(&key) {
-                    let contrib = self.resolve_source_contribution(src_line, src_col, &source);
+                    let contrib = self.resolve_source_contribution(
+                        src_line,
+                        src_col,
+                        &source,
+                        &attached_for_child,
+                    );
                     self.source_contributions.insert(key, contrib);
                 }
                 // Pull the contribution out behind a clone-of-Arc style
@@ -8891,6 +10096,7 @@ where
                     for pkg in contrib.packages {
                         frame.packages.insert(pkg);
                     }
+                    frame.attached_packages.extend(contrib.attached_packages);
                     for (pkg, origins) in contrib.package_origins {
                         frame
                             .package_origins
@@ -8917,10 +10123,16 @@ where
                 merge_tar_batch_into_frame(&mut self.global_strict_frame, contribution);
             }
             ScopeEvent::Declaration {
+                line,
+                column,
                 symbol,
                 function_scope,
                 ..
             } => {
+                let function_scope = self.conditional_event_scope(line, column, function_scope);
+                if !self.conditional_scope_applies(function_scope) {
+                    return;
+                }
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     // Mirror the recursive resolver's
                     // `entry().and_modify().or_insert_with()` semantics:
@@ -8941,13 +10153,17 @@ where
                 }
             }
             ScopeEvent::DataLoad {
-                line: _,
-                column: _,
+                line,
+                column,
                 stems,
                 package,
                 function_scope,
                 ..
             } => {
+                let function_scope = self.conditional_event_scope(line, column, function_scope);
+                if !self.conditional_scope_applies(function_scope) {
+                    return;
+                }
                 // Expand `data()` file-stem aliases to dataset object names
                 // (issue #429), mirroring the recursive resolver's DataLoad arm.
                 // `advance_to` only reaches this event when its effect position
@@ -8957,7 +10173,7 @@ where
                 // bare `data(stem)` form searches the packages attached
                 // at-or-before this point — every frame's `packages` plus the
                 // prefix's `inherited_packages` — matching the recursive path's
-                // running `scope.loaded_packages ∪ inherited_packages`. Names
+                // running `scope.attached_packages`. Names
                 // are inserted as definitions at this timeline point: they
                 // overwrite earlier bindings in the same frame, and later
                 // timeline events can overwrite them again.
@@ -8985,13 +10201,21 @@ where
     /// `packages` (global + active function frames) plus the prefix's
     /// `inherited_packages`. Used by the `DataLoad` arm to resolve the bare
     /// `data(stem)` form, mirroring the recursive resolver's running
-    /// `scope.loaded_packages ∪ scope.inherited_packages` at the event.
+    /// `scope.attached_packages` at the event.
     fn attached_packages_so_far(&self) -> HashSet<String> {
-        let mut out: HashSet<String> = self.global_strict_frame.packages.iter().cloned().collect();
-        for (_iv, frame) in &self.function_stack {
-            out.extend(frame.packages.iter().cloned());
+        let mut out: HashSet<String> = self
+            .choose_global_frame()
+            .attached_packages
+            .iter()
+            .cloned()
+            .collect();
+        let target = Position::new(self.advance_target.0, self.advance_target.1);
+        for (interval, frame) in &self.function_stack {
+            if interval.contains(target) {
+                out.extend(frame.attached_packages.iter().cloned());
+            }
         }
-        out.extend(self.choose_prefix().inherited_packages.iter().cloned());
+        out.extend(self.choose_prefix().attached_packages.iter().cloned());
         out
     }
 
@@ -9026,6 +10250,11 @@ where
             depth_exceeded: Vec::new(),
             inherited_packages: prefix.inherited_packages.clone(),
             loaded_packages: frame.packages.clone(),
+            attached_packages: prefix
+                .attached_packages
+                .union(&frame.attached_packages)
+                .cloned()
+                .collect(),
             package_origins,
         }
     }
@@ -9037,7 +10266,7 @@ where
         members: &[ForwardSource],
         initial_scope: &ScopeAtPosition,
     ) -> ChildSourceContribution {
-        let mut visited = HashMap::new();
+        let mut visited = self.resolution_visited.clone();
         visited.insert(self.queried_uri.clone(), (u32::MAX, u32::MAX));
         let mut contribution = resolve_tar_batch_contribution(
             self.queried_uri,
@@ -9049,7 +10278,7 @@ where
             self.workspace_root,
             self.path_ctx.as_ref(),
             self.max_depth,
-            0,
+            self.resolution_depth,
             &visited,
             self.base_exports,
             self.hoist_globals,
@@ -9057,12 +10286,48 @@ where
             self.is_cancelled,
             self.data_alias_provider,
         );
-        if self.max_depth <= 1 && contribution.depth_exceeded.is_empty() {
+        if self.resolution_depth + 1 >= self.max_depth && contribution.depth_exceeded.is_empty() {
             contribution
                 .depth_exceeded
                 .push((self.queried_uri.clone(), line, column));
         }
         contribution
+    }
+
+    fn conditional_event_scope(
+        &self,
+        line: u32,
+        column: u32,
+        ordinary_scope: Option<FunctionScopeInterval>,
+    ) -> Option<FunctionScopeInterval> {
+        innermost_effective_scope(
+            &self.active_conditional_shiny_scopes,
+            line,
+            column,
+            ordinary_scope,
+        )
+    }
+
+    /// Ensure an activated conditional interval has a frame when the current
+    /// target lies inside it. Returns `false` when the event belongs to such an
+    /// interval but the target does not, so the caller can skip the event.
+    fn conditional_scope_applies(&mut self, function_scope: Option<FunctionScopeInterval>) -> bool {
+        let Some(candidate) =
+            function_scope.filter(|scope| self.active_conditional_shiny_scopes.contains(scope))
+        else {
+            return true;
+        };
+        if !candidate.contains(Position::new(self.advance_target.0, self.advance_target.1)) {
+            return false;
+        }
+        if !self
+            .function_stack
+            .iter()
+            .any(|(interval, _)| *interval == candidate)
+        {
+            self.function_stack.push((candidate, ScopeFrame::default()));
+        }
+        true
     }
 
     /// Pick the frame to apply an event with the given `function_scope` to.
@@ -9190,6 +10455,7 @@ where
             // global/late frame's `packages` onto `scope.loaded_packages`
             // a few lines below.
             loaded_packages: HashSet::new(),
+            attached_packages: prefix.attached_packages.clone(),
             package_origins: prefix.package_origins.clone(),
         };
 
@@ -9209,6 +10475,9 @@ where
         for pkg in &global.packages {
             scope.loaded_packages.insert(pkg.clone());
         }
+        scope
+            .attached_packages
+            .extend(global.attached_packages.iter().cloned());
         for (pkg, origins) in &global.package_origins {
             scope
                 .package_origins
@@ -9225,6 +10494,9 @@ where
             for pkg in &frame.packages {
                 scope.loaded_packages.insert(pkg.clone());
             }
+            scope
+                .attached_packages
+                .extend(frame.attached_packages.iter().cloned());
             for (pkg, origins) in &frame.package_origins {
                 scope
                     .package_origins
@@ -9285,7 +10557,7 @@ where
         // Dedup note: contributions at different call sites are distinct; there
         // is no double-counting risk from the strict/late frame both hitting the
         // same `source_contributions` entry (both share the cached struct).
-        for (&(src_line, src_col), contrib) in &self.source_contributions {
+        for (&(src_line, src_col, _), contrib) in &self.source_contributions {
             let effect_col = src_col.saturating_add(1);
             if (src_line, effect_col) <= self.cursor {
                 scope.chain.extend(contrib.chain.iter().cloned());
@@ -9420,6 +10692,9 @@ where
         }
         let mut frame = ScopeFrame::default();
         seed_base_exports(&mut frame, self.base_exports);
+        frame
+            .attached_packages
+            .extend(self.pre_execution_attached_packages.iter().cloned());
 
         // Walk the entire timeline. Non-global events (function_scope=Some)
         // are skipped — the late-binding semantics from the recursive
@@ -9433,14 +10708,47 @@ where
         let artifacts = self.artifacts.clone();
         let timeline_len = artifacts.timeline.len();
         let mut idx = 0;
-        while idx < timeline_len {
+        loop {
             if idx & 63 == 0 && (self.is_cancelled)() {
                 // On cancellation, abandon — leave global_late_frame
                 // un-set so the next non-cancelled call rebuilds.
                 return;
             }
-            self.apply_event_to_late(&mut frame, &artifacts.timeline[idx]);
-            idx += 1;
+            let next_event =
+                (idx < timeline_len).then(|| event_effect_position(&artifacts.timeline[idx]));
+            let next_candidate = artifacts
+                .conditional_shiny_deferred_scopes
+                .iter()
+                .filter(|candidate| {
+                    !self
+                        .evaluated_conditional_shiny_scopes
+                        .contains(&candidate.interval)
+                        && !self.candidate_is_inside_ordinary_function(**candidate)
+                })
+                .min_by_key(|candidate| candidate.call_position)
+                .copied();
+            match (next_event, next_candidate) {
+                (None, None) => break,
+                (event_position, Some(candidate))
+                    if event_position.is_none_or(|position| {
+                        (candidate.call_position.line, candidate.call_position.column) <= position
+                    }) =>
+                {
+                    self.evaluated_conditional_shiny_scopes
+                        .insert(candidate.interval);
+                    let mut attached = frame.attached_packages.clone();
+                    attached.extend(self.prefix_top.attached_packages.iter().cloned());
+                    if attached.contains("shiny") {
+                        self.active_conditional_shiny_scopes
+                            .insert(candidate.interval);
+                    }
+                }
+                (Some(_), _) => {
+                    self.apply_event_to_late(&mut frame, &artifacts.timeline[idx]);
+                    idx += 1;
+                }
+                (None, Some(_)) => unreachable!("candidate arm handles this case"),
+            }
         }
         self.global_late_frame = Some(frame);
     }
@@ -9456,22 +10764,32 @@ where
                 // Not a global event — skip.
             }
             ScopeEvent::Def {
+                line,
+                column,
                 symbol,
                 function_scope,
                 ..
             } => {
-                if function_scope.is_some() {
+                if self
+                    .conditional_event_scope(*line, *column, *function_scope)
+                    .is_some()
+                {
                     return;
                 }
                 frame.removed_names.remove(&symbol.name);
                 frame.symbols.insert(symbol.name.clone(), symbol.clone());
             }
             ScopeEvent::Removal {
+                line,
+                column,
                 symbols,
                 function_scope,
                 ..
             } => {
-                if function_scope.is_some() {
+                if self
+                    .conditional_event_scope(*line, *column, *function_scope)
+                    .is_some()
+                {
                     return;
                 }
                 for sym_name in symbols {
@@ -9481,14 +10799,30 @@ where
                 }
             }
             ScopeEvent::PackageLoad {
+                line,
+                column,
                 package,
+                attaches,
+                requires_attached,
                 function_scope,
                 ..
             } => {
-                if function_scope.is_some() {
+                if self
+                    .conditional_event_scope(*line, *column, *function_scope)
+                    .is_some()
+                {
+                    return;
+                }
+                if requires_attached.as_deref().is_some_and(|required| {
+                    !frame.attached_packages.contains(required)
+                        && !self.prefix_in_function.attached_packages.contains(required)
+                }) {
                     return;
                 }
                 frame.packages.insert(package.clone());
+                if *attaches {
+                    frame.attached_packages.insert(package.clone());
+                }
                 record_package_origin(&mut frame.package_origins, package, self.queried_uri);
             }
             ScopeEvent::Source {
@@ -9498,7 +10832,10 @@ where
                 function_scope,
                 ..
             } => {
-                if function_scope.is_some() {
+                if self
+                    .conditional_event_scope(*src_line, *src_col, *function_scope)
+                    .is_some()
+                {
                     return;
                 }
                 if should_apply_local_scoping(source)
@@ -9507,9 +10844,21 @@ where
                     // Top-level CurrentFrame source — skipped globally.
                     return;
                 }
-                let key = (*src_line, *src_col);
+                let mut attached_for_child = frame.attached_packages.clone();
+                attached_for_child
+                    .extend(self.prefix_in_function.attached_packages.iter().cloned());
+                let key = (
+                    *src_line,
+                    *src_col,
+                    package_set_fingerprint(&attached_for_child),
+                );
                 if !self.source_contributions.contains_key(&key) {
-                    let contrib = self.resolve_source_contribution(*src_line, *src_col, source);
+                    let contrib = self.resolve_source_contribution(
+                        *src_line,
+                        *src_col,
+                        source,
+                        &attached_for_child,
+                    );
                     self.source_contributions.insert(key, contrib);
                 }
                 let contrib = self.source_contributions[&key].clone();
@@ -9522,6 +10871,7 @@ where
                 for pkg in contrib.packages {
                     frame.packages.insert(pkg);
                 }
+                frame.attached_packages.extend(contrib.attached_packages);
                 for (pkg, origins) in contrib.package_origins {
                     frame
                         .package_origins
@@ -9547,11 +10897,16 @@ where
                 merge_tar_batch_into_frame(frame, contribution);
             }
             ScopeEvent::Declaration {
+                line,
+                column,
                 symbol,
                 function_scope,
                 ..
             } => {
-                if function_scope.is_some() {
+                if self
+                    .conditional_event_scope(*line, *column, *function_scope)
+                    .is_some()
+                {
                     return;
                 }
                 match frame.symbols.get_mut(&symbol.name) {
@@ -9566,6 +10921,8 @@ where
                 }
             }
             ScopeEvent::DataLoad {
+                line,
+                column,
                 stems,
                 package,
                 function_scope,
@@ -9576,7 +10933,10 @@ where
                 // timeline point, mirroring `apply_event_to_strict`'s DataLoad
                 // arm. Attached packages for the bare form are the late frame's
                 // own global packages plus the prefix's inherited packages.
-                if function_scope.is_some() {
+                if self
+                    .conditional_event_scope(*line, *column, *function_scope)
+                    .is_some()
+                {
                     return;
                 }
                 if let Some(provider) = self.data_alias_provider {
@@ -9584,8 +10944,8 @@ where
                     // set; skip building it for explicit `package =` calls.
                     let mut attached: HashSet<String> = HashSet::new();
                     if package.is_none() {
-                        attached.extend(frame.packages.iter().cloned());
-                        attached.extend(self.choose_prefix().inherited_packages.iter().cloned());
+                        attached.extend(frame.attached_packages.iter().cloned());
+                        attached.extend(self.choose_prefix().attached_packages.iter().cloned());
                     }
                     for (name, symbol) in expand_data_load(stems, package, &attached, provider) {
                         frame.removed_names.remove(&name);
@@ -9612,6 +10972,7 @@ where
         src_line: u32,
         src_col: u32,
         source: &ForwardSource,
+        attached_packages_for_source: &HashSet<String>,
     ) -> ChildSourceContribution {
         let mut contrib = ChildSourceContribution::default();
 
@@ -9644,10 +11005,8 @@ where
             return contrib;
         };
 
-        // Depth check at depth-0 + 1 (cursor's "depth" in the recursive
-        // resolver). Mirrors `current_depth + 1 >= max_depth` where
-        // current_depth=0.
-        if 1 >= self.max_depth {
+        let child_depth = self.resolution_depth + 1;
+        if child_depth >= self.max_depth {
             contrib
                 .depth_exceeded
                 .push((self.queried_uri.clone(), src_line, src_col));
@@ -9687,21 +11046,23 @@ where
         // Look up (or compute) the child's prefix at (uri, false). Child
         // queries always run at (MAX, MAX) which is full-EOF, so the
         // `query_inside_function` bit is always false for child URIs.
-        let child_prefix = compute_or_get_cached_prefix(
-            &child_uri,
-            false,
-            self.get_artifacts,
-            self.get_metadata,
-            self.graph,
-            self.workspace_root,
-            self.max_depth,
-            self.base_exports,
-            self.hoist_globals,
-            self.backward_dep_mode,
-            self.is_cancelled,
-            self.prefix_cache,
-            self.prefix_forward_child_memo.as_ref(),
-        );
+        let child_prefix = (self.resolution_depth == 0).then(|| {
+            compute_or_get_cached_prefix(
+                &child_uri,
+                false,
+                self.get_artifacts,
+                self.get_metadata,
+                self.graph,
+                self.workspace_root,
+                self.max_depth,
+                self.base_exports,
+                self.hoist_globals,
+                self.backward_dep_mode,
+                self.is_cancelled,
+                self.prefix_cache,
+                self.prefix_forward_child_memo.as_ref(),
+            )
+        });
 
         // Run STEP 2 for the child at EOF, supplying the cached prefix.
         // The recursive function's `pre_computed_prefix` parameter skips
@@ -9718,15 +11079,19 @@ where
         // contribution is position-invariant and safe to cache. (Seeding
         // `child_uri` would cause the recursive call to early-return
         // immediately and lose ALL of child's own symbols.)
-        let mut visited = HashMap::new();
+        let mut visited = self.resolution_visited.clone();
         visited.insert(self.queried_uri.clone(), (u32::MAX, u32::MAX));
         let empty_packages = HashSet::new();
+        let package_effects_only = source.locality == super::types::SourceLocality::NonInheriting;
+        let attached_packages_for_child = if child_is_standalone || package_effects_only {
+            HashSet::new()
+        } else {
+            attached_packages_for_source.clone()
+        };
         // Memoize the child's EOF scope (issue #472), skipping cyclic children.
         // `path_fp` is computed before the closure moves `child_ctx`.
         let path_fp = path_context_fingerprint(child_ctx.as_ref());
         let provider_fp = data_alias_provider_fp(child_provider);
-        // The streaming path resolves forward children of the queried URI at
-        // `current_depth = 1` (the queried URI is depth 0).
         let child_scope = resolve_forward_child_memoized(
             &self.forward_child_memo,
             self.graph,
@@ -9734,8 +11099,9 @@ where
             path_fp,
             provider_fp,
             false,
-            1,
+            child_depth,
             &empty_packages,
+            &attached_packages_for_child,
             self.is_cancelled,
             || {
                 scope_at_position_with_graph_recursive(
@@ -9748,15 +11114,17 @@ where
                     self.workspace_root,
                     child_ctx,
                     self.max_depth,
-                    1, // current_depth — child is depth 1 of the queried URI
+                    child_depth,
                     &mut visited,
                     &empty_packages,
+                    &attached_packages_for_child,
+                    true,
                     self.base_exports,
                     self.hoist_globals,
                     self.backward_dep_mode,
                     self.is_cancelled,
                     true,
-                    Some(&child_prefix),
+                    child_prefix.as_ref(),
                     None,
                     None,
                     child_provider,
@@ -9766,7 +11134,6 @@ where
             },
         );
 
-        let package_effects_only = source.locality == super::types::SourceLocality::NonInheriting;
         if !package_effects_only {
             // Forward-source leak rule (same-file + parent-prefix-only) lives in
             // `child_source_symbol_is_leak`.
@@ -9806,6 +11173,13 @@ where
             self.queried_uri,
             &mut contrib.packages,
             &mut contrib.package_origins,
+        );
+        merge_child_source_attachments(
+            &child_scope.attached_packages,
+            package_effects_only.then_some(&child_scope.loaded_packages),
+            &child_scope.package_origins,
+            self.queried_uri,
+            &mut contrib.attached_packages,
         );
 
         contrib
@@ -13062,6 +14436,11 @@ g <- function() {
             sorted(&cached.loaded_packages),
             sorted(&uncached.loaded_packages),
             "loaded_packages must match uncached"
+        );
+        assert_eq!(
+            sorted(&cached.attached_packages),
+            sorted(&uncached.attached_packages),
+            "attached_packages must match uncached"
         );
         assert_eq!(
             origins(&cached.package_origins),
@@ -24424,6 +25803,12 @@ y <- filter(df)"#;
                         "loaded_packages mismatch at ({}, {}) in fixture {}",
                         line, col, fixture_idx
                     );
+                    prop_assert_eq!(
+                        streamed.attached_packages.clone(),
+                        direct.attached_packages.clone(),
+                        "attached_packages mismatch at ({}, {}) in fixture {}",
+                        line, col, fixture_idx
+                    );
 
                     // package_origins comparison: regressions in the
                     // same-file leak filter (which consults the origin
@@ -25669,6 +27054,7 @@ y <- filter(df)"#;
         /// full symbol set, each symbol's provenance tuple
         /// `(source_uri, defined_line, defined_column, kind)`, and the package
         /// surface (`loaded_packages` / `inherited_packages` /
+        /// `attached_packages` /
         /// `package_origins`).
         ///
         /// Concrete expectations at `main.R (2, 0)`:
@@ -25767,6 +27153,11 @@ y <- filter(df)"#;
                  main.R (2, 0)"
             );
             assert_eq!(
+                streamed.attached_packages, cached.attached_packages,
+                "attached_packages must match between streaming and cached at \
+                 main.R (2, 0)"
+            );
+            assert_eq!(
                 streamed.package_origins, cached.package_origins,
                 "package_origins must match between streaming and cached at \
                  main.R (2, 0)"
@@ -25818,7 +27209,8 @@ y <- filter(df)"#;
         /// *completely*. Every observable field matches — symbol name set,
         /// per-symbol provenance tuples `(source_uri, defined_line,
         /// defined_column, kind)`, `loaded_packages`, `inherited_packages`,
-        /// `package_origins`, and `visible_positions`. Both EXCLUDE `late`.
+        /// `attached_packages`, `package_origins`, and `visible_positions`.
+        /// Both EXCLUDE `late`.
         ///
         /// Why they agree despite different seeds: the cached parent-prefix walk
         /// re-enters `main.R` at `(MAX, MAX)` and could therefore *see* `late`,
@@ -28815,6 +30207,10 @@ y <- filter(df)"#;
                 streamed.loaded_packages, direct.loaded_packages,
                 "loaded_packages mismatch at ({line}, {col})"
             );
+            assert_eq!(
+                streamed.attached_packages, direct.attached_packages,
+                "attached_packages mismatch at ({line}, {col})"
+            );
         }
     }
 
@@ -30297,6 +31693,96 @@ mod package_contribution_tests {
         Arc::new(compute_artifacts(uri, &tree, code))
     }
 
+    fn projection_fixture_scopes(
+        fixture: &str,
+        files: &[(&str, &str)],
+        query_file: &str,
+        line: u32,
+        stepped_from: Option<(u32, u32)>,
+    ) -> (ScopeAtPosition, ScopeAtPosition, Option<ScopeAtPosition>) {
+        let root = Url::parse(&format!("file:///projection-{fixture}/")).unwrap();
+        let mut metadata = HashMap::new();
+        let mut artifacts = HashMap::new();
+        for (name, code) in files {
+            let uri = root.join(name).unwrap();
+            let file_metadata = Arc::new(crate::cross_file::extract_metadata(code));
+            let file_artifacts = Arc::new(compute_artifacts_with_metadata(
+                &uri,
+                &parse_r(code),
+                code,
+                Some(&file_metadata),
+            ));
+            metadata.insert(uri.clone(), file_metadata);
+            artifacts.insert(uri, file_artifacts);
+        }
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        for (uri, file_metadata) in &metadata {
+            graph.update_file(uri, file_metadata, Some(&root), |_| None);
+        }
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let query_uri = root.join(query_file).unwrap();
+        let base_exports = HashSet::new();
+        let recursive = scope_at_position_with_graph(
+            &query_uri,
+            line,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        let direct_prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut direct = ScopeStream::new(
+            &query_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &direct_prefix_cache,
+            None,
+            None,
+        )
+        .unwrap();
+        direct.advance_to(line, u32::MAX);
+        let direct = direct.snapshot();
+        let stepped = stepped_from.map(|position| {
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                &query_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                10,
+                &base_exports,
+                true,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &prefix_cache,
+                None,
+                None,
+            )
+            .unwrap();
+            stream.advance_to(position.0, position.1);
+            stream.advance_to(line, u32::MAX);
+            stream.snapshot()
+        });
+        (recursive, direct, stepped)
+    }
+
     // ------------------------------------------------------------------
     // Test 1: package-internal symbol visible in file under R/
     // ------------------------------------------------------------------
@@ -30964,6 +32450,17 @@ mod package_contribution_tests {
         code: &str,
         contrib: &PackageScopeContribution,
     ) -> ScopeAtPosition {
+        resolve_with_contrib_at(uri, code, contrib, u32::MAX, u32::MAX, false)
+    }
+
+    fn resolve_with_contrib_at(
+        uri: &Url,
+        code: &str,
+        contrib: &PackageScopeContribution,
+        line: u32,
+        column: u32,
+        hoist_globals: bool,
+    ) -> ScopeAtPosition {
         let workspace_root = Url::parse("file:///work/pkg").unwrap();
         let arts = artifacts_for(uri, code);
         let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
@@ -30974,20 +32471,69 @@ mod package_contribution_tests {
         let graph = super::super::dependency::DependencyGraph::new();
         scope_at_position_with_graph(
             uri,
-            u32::MAX,
-            u32::MAX,
+            line,
+            column,
             &get_artifacts,
             &get_metadata,
             &graph,
             Some(&workspace_root),
             10,
             &HashSet::new(),
-            false,
+            hoist_globals,
             super::super::config::BackwardDependencyMode::Explicit,
             &|| false,
             Some(contrib),
             None,
         )
+    }
+
+    fn stream_with_contrib(
+        uri: &Url,
+        code: &str,
+        contrib: &PackageScopeContribution,
+    ) -> ScopeAtPosition {
+        stream_with_contrib_at(uri, code, contrib, u32::MAX, u32::MAX, false)
+    }
+
+    fn stream_with_contrib_at(
+        uri: &Url,
+        code: &str,
+        contrib: &PackageScopeContribution,
+        line: u32,
+        column: u32,
+        hoist_globals: bool,
+    ) -> ScopeAtPosition {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let metadata = Arc::new(crate::cross_file::extract_metadata(code));
+        let artifacts = Arc::new(compute_artifacts_with_metadata(
+            uri,
+            &parse_r(code),
+            code,
+            Some(&metadata),
+        ));
+        let get_artifacts = |candidate: &Url| (candidate == uri).then(|| artifacts.clone());
+        let get_metadata = |candidate: &Url| (candidate == uri).then(|| metadata.clone());
+        let graph = super::super::dependency::DependencyGraph::new();
+        let base_exports = HashSet::new();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new(
+            uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &base_exports,
+            hoist_globals,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            &prefix_cache,
+            Some(contrib),
+            None,
+        )
+        .expect("scope stream");
+        stream.advance_to(line, column);
+        stream.snapshot()
     }
 
     /// Issue #432: a package attached by a testthat preamble file is inherited
@@ -31005,6 +32551,33 @@ mod package_contribution_tests {
             "test-a.R must inherit tidyr attached by helper-lib.R; inherited: {:?}",
             scope.inherited_packages,
         );
+    }
+
+    #[test]
+    fn helper_attachment_activates_conditional_loader_before_test_timeline() {
+        let contrib = make_contribution_with_helper_attaches(
+            "/work/pkg",
+            &[("/work/pkg/tests/testthat/helper-pacman.R", &["pacman"])],
+        );
+        let test_uri = Url::parse("file:///work/pkg/tests/testthat/test-loader.R").unwrap();
+        let scope = resolve_with_contrib(&test_uri, "p_load(dplyr)\n", &contrib);
+        let streamed = stream_with_contrib(&test_uri, "p_load(dplyr)\n", &contrib);
+        assert!(scope.attached_packages.contains("pacman"));
+        assert!(
+            scope.loaded_packages.contains("dplyr"),
+            "a helper attachment exists before the test file executes"
+        );
+        assert_eq!(streamed.loaded_packages, scope.loaded_packages);
+        assert_eq!(streamed.attached_packages, scope.attached_packages);
+
+        let function_code = "f <- function() {\n  p_load(tidyr)\n  value\n}\n";
+        let recursive =
+            resolve_with_contrib_at(&test_uri, function_code, &contrib, 2, u32::MAX, true);
+        let streamed =
+            stream_with_contrib_at(&test_uri, function_code, &contrib, 2, u32::MAX, true);
+        assert!(recursive.loaded_packages.contains("tidyr"));
+        assert_eq!(streamed.loaded_packages, recursive.loaded_packages);
+        assert_eq!(streamed.attached_packages, recursive.attached_packages);
     }
 
     /// One-way visibility: a preamble attach must NOT reach `R/` files.
@@ -31732,6 +33305,30 @@ mod package_contribution_tests {
     }
 
     #[test]
+    fn rprofile_attachment_activates_conditional_loader_before_script_timeline() {
+        let root = std::path::Path::new("/work/pkg");
+        let uri = Url::parse("file:///work/pkg/scripts/a.R").unwrap();
+        let mut contrib = prelude_contrib(root, true);
+        contrib.rprofile_attached_packages = Arc::new(["pacman".to_string()].into_iter().collect());
+        let scope = resolve_with_contrib(&uri, "p_load(dplyr)\n", &contrib);
+        let streamed = stream_with_contrib(&uri, "p_load(dplyr)\n", &contrib);
+        assert!(scope.attached_packages.contains("pacman"));
+        assert!(
+            scope.loaded_packages.contains("dplyr"),
+            ".Rprofile attachment exists before the script executes"
+        );
+        assert_eq!(streamed.loaded_packages, scope.loaded_packages);
+        assert_eq!(streamed.attached_packages, scope.attached_packages);
+
+        let function_code = "f <- function() {\n  p_load(tidyr)\n  value\n}\n";
+        let recursive = resolve_with_contrib_at(&uri, function_code, &contrib, 2, u32::MAX, true);
+        let streamed = stream_with_contrib_at(&uri, function_code, &contrib, 2, u32::MAX, true);
+        assert!(recursive.loaded_packages.contains("tidyr"));
+        assert_eq!(streamed.loaded_packages, recursive.loaded_packages);
+        assert_eq!(streamed.attached_packages, recursive.attached_packages);
+    }
+
+    #[test]
     // `R_dir` names the package R/ directory (capital R is R's convention).
     #[allow(non_snake_case)]
     fn rprofile_prelude_withheld_from_package_R_dir() {
@@ -32348,6 +33945,7 @@ mod package_contribution_tests {
         assert_eq!(streamed.symbols, scope.symbols);
         assert_eq!(streamed.loaded_packages, scope.loaded_packages);
         assert_eq!(streamed.inherited_packages, scope.inherited_packages);
+        assert_eq!(streamed.attached_packages, scope.attached_packages);
         assert_eq!(streamed.package_origins, scope.package_origins);
     }
 
@@ -32604,6 +34202,7 @@ mod package_contribution_tests {
         assert_eq!(streamed.symbols, recursive.symbols);
         assert_eq!(streamed.loaded_packages, recursive.loaded_packages);
         assert_eq!(streamed.inherited_packages, recursive.inherited_packages);
+        assert_eq!(streamed.attached_packages, recursive.attached_packages);
         assert_eq!(streamed.package_origins, recursive.package_origins);
         assert_eq!(streamed.chain, recursive.chain);
         assert_eq!(streamed.visible_positions, recursive.visible_positions);
@@ -32818,6 +34417,1700 @@ mod package_contribution_tests {
         assert!(
             !scope.symbols.contains_key("later"),
             "a tar member must not inherit a later sibling"
+        );
+    }
+
+    #[test]
+    fn pacman_p_load_requirement_is_position_aware() {
+        let code = "p_load(before)\nlibrary(pacman)\np_load(after)";
+        let tree = parse_r(code);
+        let uri = Url::parse("file:///pacman-position.R").unwrap();
+        let artifacts = compute_artifacts(&uri, &tree, code);
+
+        let before = scope_at_position(&artifacts, 0, u32::MAX, false);
+        assert!(!before.loaded_packages.contains("before"));
+
+        let after = scope_at_position(&artifacts, 2, u32::MAX, false);
+        assert!(after.loaded_packages.contains("pacman"));
+        assert!(after.loaded_packages.contains("after"));
+        assert!(!after.loaded_packages.contains("before"));
+    }
+
+    #[test]
+    fn load_namespace_does_not_enable_bare_p_load() {
+        let code = "loadNamespace(pacman)\np_load(dplyr)";
+        let uri = Url::parse("file:///pacman-namespace-only.R").unwrap();
+        let artifacts = compute_artifacts(&uri, &parse_r(code), code);
+
+        let scope = scope_at_position(&artifacts, 1, u32::MAX, false);
+        assert!(scope.loaded_packages.contains("pacman"));
+        assert!(!scope.attached_packages.contains("pacman"));
+        assert!(!scope.loaded_packages.contains("dplyr"));
+    }
+
+    #[test]
+    fn qualified_p_load_is_unconditional_but_generic_bare_call_is_not_a_load() {
+        let qualified = "pacman::p_load(dplyr)";
+        let uri = Url::parse("file:///pacman-qualified.R").unwrap();
+        let qualified_artifacts = compute_artifacts(&uri, &parse_r(qualified), qualified);
+        assert!(
+            scope_at_position(&qualified_artifacts, 0, u32::MAX, false)
+                .loaded_packages
+                .contains("dplyr")
+        );
+
+        let generic = "p_load <- function(...) NULL\np_load(dplyr)";
+        let generic_artifacts = compute_artifacts(&uri, &parse_r(generic), generic);
+        assert!(
+            !scope_at_position(&generic_artifacts, 1, u32::MAX, false)
+                .loaded_packages
+                .contains("dplyr")
+        );
+    }
+
+    #[test]
+    fn bare_p_load_uses_pacman_inherited_through_source_graph() {
+        let root = Url::parse("file:///pacman-source/").unwrap();
+        let parent_uri = root.join("parent.R").unwrap();
+        let child_uri = root.join("child.R").unwrap();
+        let parent_code = "library(pacman)\nsource(\"child.R\")";
+        let child_code = "p_load(dplyr)";
+
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let child_meta = crate::cross_file::extract_metadata(child_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_meta.clone())),
+            (child_uri.clone(), Arc::new(child_meta.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_meta),
+                )),
+            ),
+            (
+                child_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &child_uri,
+                    &parse_r(child_code),
+                    child_code,
+                    Some(&child_meta),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+
+        let child_scope = scope_at_position_with_graph(
+            &child_uri,
+            u32::MAX,
+            u32::MAX,
+            &|uri| artifacts.get(uri).cloned(),
+            &|uri| metadata.get(uri).cloned(),
+            &graph,
+            Some(&root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(child_scope.inherited_packages.contains("pacman"));
+        assert!(child_scope.attached_packages.contains("pacman"));
+        assert!(child_scope.loaded_packages.contains("dplyr"));
+
+        let parent_code = "loadNamespace(pacman)\nsource(\"child.R\")";
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_meta.clone())),
+            (child_uri.clone(), Arc::new(child_meta.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_meta),
+                )),
+            ),
+            (
+                child_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &child_uri,
+                    &parse_r(child_code),
+                    child_code,
+                    Some(&child_meta),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+        let child_scope = scope_at_position_with_graph(
+            &child_uri,
+            u32::MAX,
+            u32::MAX,
+            &|uri| artifacts.get(uri).cloned(),
+            &|uri| metadata.get(uri).cloned(),
+            &graph,
+            Some(&root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(child_scope.inherited_packages.contains("pacman"));
+        assert!(!child_scope.attached_packages.contains("pacman"));
+        assert!(!child_scope.loaded_packages.contains("dplyr"));
+    }
+
+    #[test]
+    fn independent_parents_do_not_synthesize_conditional_activation() {
+        let root = Url::parse("file:///pacman-independent-parents/").unwrap();
+        let parent_a = root.join("a.R").unwrap();
+        let parent_b = root.join("b.R").unwrap();
+        let child_uri = root.join("child.R").unwrap();
+        let code_a = "library(pacman)\nsource(\"child.R\")";
+        let code_b = "p_load(dplyr)\nsource(\"child.R\")";
+        let child_code = "value <- 1";
+        let meta_a = crate::cross_file::extract_metadata(code_a);
+        let meta_b = crate::cross_file::extract_metadata(code_b);
+        let child_meta = crate::cross_file::extract_metadata(child_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_a.clone(), Arc::new(meta_a.clone())),
+            (parent_b.clone(), Arc::new(meta_b.clone())),
+            (child_uri.clone(), Arc::new(child_meta.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_a.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_a,
+                    &parse_r(code_a),
+                    code_a,
+                    Some(&meta_a),
+                )),
+            ),
+            (
+                parent_b.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_b,
+                    &parse_r(code_b),
+                    code_b,
+                    Some(&meta_b),
+                )),
+            ),
+            (
+                child_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &child_uri,
+                    &parse_r(child_code),
+                    child_code,
+                    Some(&child_meta),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        for reverse in [false, true] {
+            let mut graph = super::super::dependency::DependencyGraph::new();
+            let order = if reverse {
+                [(&parent_b, &meta_b), (&parent_a, &meta_a)]
+            } else {
+                [(&parent_a, &meta_a), (&parent_b, &meta_b)]
+            };
+            for (parent, parent_metadata) in order {
+                graph.update_file(parent, parent_metadata, Some(&root), |_| None);
+            }
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                u32::MAX,
+                u32::MAX,
+                &|uri| artifacts.get(uri).cloned(),
+                &|uri| metadata.get(uri).cloned(),
+                &graph,
+                Some(&root),
+                10,
+                &HashSet::new(),
+                false,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            );
+            assert!(scope.attached_packages.contains("pacman"));
+            assert!(
+                !scope.inherited_packages.contains("dplyr"),
+                "independent parent facts must not combine (reverse={reverse})"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_source_uses_invocation_owned_attachment_state() {
+        let root = Url::parse("file:///pacman-repeat-source/").unwrap();
+        let parent_uri = root.join("parent.R").unwrap();
+        let child_uri = root.join("child.R").unwrap();
+        let parent_code = concat!(
+            "loadNamespace(pacman)\n",
+            "source(\"child.R\")\n",
+            "library(pacman)\n",
+            "source(\"child.R\")",
+        );
+        let child_code = "p_load(dplyr)";
+
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let child_meta = crate::cross_file::extract_metadata(child_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_meta.clone())),
+            (child_uri.clone(), Arc::new(child_meta.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_meta),
+                )),
+            ),
+            (
+                child_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &child_uri,
+                    &parse_r(child_code),
+                    child_code,
+                    Some(&child_meta),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+
+        let before_attach = scope_at_position_with_graph(
+            &parent_uri,
+            2,
+            0,
+            &|uri| artifacts.get(uri).cloned(),
+            &|uri| metadata.get(uri).cloned(),
+            &graph,
+            Some(&root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(before_attach.loaded_packages.contains("pacman"));
+        assert!(!before_attach.attached_packages.contains("pacman"));
+        assert!(
+            !before_attach.loaded_packages.contains("dplyr"),
+            "the later invocation's attached state must not activate the first child execution"
+        );
+
+        let base_exports = HashSet::new();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let stream_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let stream_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let mut stream = ScopeStream::new(
+            &parent_uri,
+            &stream_artifacts,
+            &stream_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("parent scope stream");
+        stream.advance_to(2, 0);
+        let streamed_before_attach = stream.snapshot();
+        assert!(
+            !streamed_before_attach.loaded_packages.contains("dplyr"),
+            "streaming scope must preserve the first invocation's namespace-only state"
+        );
+
+        let after_second_source = scope_at_position_with_graph(
+            &parent_uri,
+            u32::MAX,
+            u32::MAX,
+            &|uri| artifacts.get(uri).cloned(),
+            &|uri| metadata.get(uri).cloned(),
+            &graph,
+            Some(&root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(after_second_source.loaded_packages.contains("dplyr"));
+        stream.advance_to(u32::MAX, u32::MAX);
+        assert!(stream.snapshot().loaded_packages.contains("dplyr"));
+    }
+
+    #[test]
+    fn preexecution_attachment_survives_forward_source_dispatch() {
+        let root = Url::parse("file:///work/pkg/").unwrap();
+        let parent_uri = root.join("tests/testthat/test-parent.R").unwrap();
+        let child_uri = root.join("tests/testthat/child.R").unwrap();
+        let parent_code = "source(\"child.R\")";
+        let child_code = "p_load(dplyr)";
+        let contribution = make_contribution_with_helper_attaches(
+            "/work/pkg",
+            &[("/work/pkg/tests/testthat/helper-pacman.R", &["pacman"])],
+        );
+
+        let parent_metadata = crate::cross_file::extract_metadata(parent_code);
+        let child_metadata = crate::cross_file::extract_metadata(child_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_metadata.clone())),
+            (child_uri.clone(), Arc::new(child_metadata.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                child_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &child_uri,
+                    &parse_r(child_code),
+                    child_code,
+                    Some(&child_metadata),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root), |_| None);
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let base_exports = HashSet::new();
+
+        let recursive = scope_at_position_with_graph(
+            &parent_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            Some(&contribution),
+            None,
+        );
+        assert!(recursive.attached_packages.contains("pacman"));
+        assert!(
+            recursive.loaded_packages.contains("dplyr"),
+            "a preamble attachment established before the query file executes must reach its source child"
+        );
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new(
+            &parent_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            Some(&contribution),
+            None,
+        )
+        .expect("pre-execution attachment scope stream");
+        stream.advance_to(u32::MAX, u32::MAX);
+        let streamed = stream.snapshot();
+        assert_eq!(streamed.loaded_packages, recursive.loaded_packages);
+        assert_eq!(streamed.attached_packages, recursive.attached_packages);
+    }
+
+    #[test]
+    fn streaming_respects_standalone_and_noninheriting_attachment_barriers() {
+        for (label, parent_code, child_code) in [
+            (
+                "standalone",
+                "library(pacman)\nsource(\"child.R\")",
+                "# raven: standalone\np_load(dplyr)",
+            ),
+            (
+                "noninheriting",
+                "library(pacman)\nsys.source(\"child.R\", envir = new.env())",
+                "p_load(dplyr)",
+            ),
+        ] {
+            let root = Url::parse(&format!("file:///pacman-barrier-{label}/")).unwrap();
+            let parent_uri = root.join("parent.R").unwrap();
+            let child_uri = root.join("child.R").unwrap();
+            let parent_meta = crate::cross_file::extract_metadata(parent_code);
+            let child_meta = crate::cross_file::extract_metadata(child_code);
+            let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+                (parent_uri.clone(), Arc::new(parent_meta.clone())),
+                (child_uri.clone(), Arc::new(child_meta.clone())),
+            ]
+            .into_iter()
+            .collect();
+            let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+                (
+                    parent_uri.clone(),
+                    Arc::new(compute_artifacts_with_metadata(
+                        &parent_uri,
+                        &parse_r(parent_code),
+                        parent_code,
+                        Some(&parent_meta),
+                    )),
+                ),
+                (
+                    child_uri.clone(),
+                    Arc::new(compute_artifacts_with_metadata(
+                        &child_uri,
+                        &parse_r(child_code),
+                        child_code,
+                        Some(&child_meta),
+                    )),
+                ),
+            ]
+            .into_iter()
+            .collect();
+            let mut graph = super::super::dependency::DependencyGraph::new();
+            graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+            let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+            let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+            let base_exports = HashSet::new();
+
+            let recursive = scope_at_position_with_graph(
+                &parent_uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                10,
+                &base_exports,
+                false,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            );
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                &parent_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                10,
+                &base_exports,
+                false,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &prefix_cache,
+                None,
+                None,
+            )
+            .expect("barrier scope stream");
+            stream.advance_to(u32::MAX, u32::MAX);
+            let streamed = stream.snapshot();
+            assert!(
+                !recursive.loaded_packages.contains("dplyr"),
+                "{label}: recursive barrier"
+            );
+            assert_eq!(
+                streamed.loaded_packages, recursive.loaded_packages,
+                "{label}: streaming barrier parity"
+            );
+            assert_eq!(
+                streamed.attached_packages, recursive.attached_packages,
+                "{label}: streaming attachment parity"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_bare_p_load_sees_later_global_pacman_attachment() {
+        let code = "f <- function() {\n  p_load(dplyr)\n  dplyr_symbol\n}\nlibrary(pacman)";
+        let uri = Url::parse("file:///pacman-deferred.R").unwrap();
+        let artifacts = compute_artifacts(&uri, &parse_r(code), code);
+
+        let scope = scope_at_position(&artifacts, 2, u32::MAX, true);
+        assert!(scope.loaded_packages.contains("pacman"));
+        assert!(scope.loaded_packages.contains("dplyr"));
+
+        let namespace_only =
+            "f <- function() {\n  p_load(dplyr)\n  dplyr_symbol\n}\nloadNamespace(pacman)";
+        let artifacts = compute_artifacts(&uri, &parse_r(namespace_only), namespace_only);
+        let scope = scope_at_position(&artifacts, 2, u32::MAX, true);
+        assert!(!scope.loaded_packages.contains("dplyr"));
+    }
+
+    #[test]
+    fn conditional_p_load_shiny_activates_deferred_body_isolation() {
+        let uri = Url::parse("file:///pacman-shiny-deferred.R").unwrap();
+        let active_code = concat!(
+            "f <- function() {\n",
+            "  p_load(shiny)\n",
+            "  reactive({\n",
+            "    leaked <- 1\n",
+            "  })\n",
+            "  leaked\n",
+            "}\n",
+            "library(pacman)",
+        );
+        let metadata = Arc::new(crate::cross_file::extract_metadata(active_code));
+        let artifacts = Arc::new(compute_artifacts_with_metadata(
+            &uri,
+            &parse_r(active_code),
+            active_code,
+            Some(&metadata),
+        ));
+        assert_eq!(artifacts.conditional_shiny_deferred_scopes.len(), 1);
+        let graph = super::super::dependency::DependencyGraph::new();
+        let get_artifacts = |target: &Url| (target == &uri).then(|| artifacts.clone());
+        let get_metadata = |target: &Url| (target == &uri).then(|| metadata.clone());
+        let base_exports = HashSet::new();
+        let recursive = scope_at_position_with_graph(
+            &uri,
+            5,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(recursive.loaded_packages.contains("shiny"));
+        assert!(!recursive.symbols.contains_key("leaked"));
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("conditional Shiny stream");
+        stream.advance_to(5, u32::MAX);
+        let streamed = stream.snapshot();
+        assert!(!streamed.symbols.contains_key("leaked"));
+        assert_eq!(streamed.loaded_packages, recursive.loaded_packages);
+
+        let inactive_code = &active_code[..active_code.rfind('\n').unwrap()];
+        let inactive = compute_artifacts(&uri, &parse_r(inactive_code), inactive_code);
+        assert_eq!(inactive.conditional_shiny_deferred_scopes.len(), 1);
+        assert!(
+            scope_at_position(&inactive, 5, u32::MAX, true)
+                .symbols
+                .contains_key("leaked"),
+            "an inactive conditional loader must not isolate a generic reactive body"
+        );
+
+        let root = Url::parse("file:///pacman-shiny-inherited/").unwrap();
+        let parent_uri = root.join("parent.R").unwrap();
+        let child_uri = root.join("child.R").unwrap();
+        let parent_code = "library(pacman)\nsource(\"child.R\")";
+        let child_code = inactive_code;
+        let parent_metadata = crate::cross_file::extract_metadata(parent_code);
+        let child_metadata = crate::cross_file::extract_metadata(child_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_metadata.clone())),
+            (child_uri.clone(), Arc::new(child_metadata.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                child_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &child_uri,
+                    &parse_r(child_code),
+                    child_code,
+                    Some(&child_metadata),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root), |_| None);
+        let get_artifacts = |target: &Url| artifacts.get(target).cloned();
+        let get_metadata = |target: &Url| metadata.get(target).cloned();
+        let inherited_recursive = scope_at_position_with_graph(
+            &child_uri,
+            5,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(!inherited_recursive.symbols.contains_key("leaked"));
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut inherited_stream = ScopeStream::new(
+            &child_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("inherited conditional Shiny stream");
+        inherited_stream.advance_to(5, u32::MAX);
+        assert!(!inherited_stream.snapshot().symbols.contains_key("leaked"));
+
+        let later_top_level_loader = concat!(
+            "reactive({\n",
+            "  early <- 1\n",
+            "})\n",
+            "library(pacman)\n",
+            "p_load(shiny)\n",
+            "early",
+        );
+        let later_metadata = Arc::new(crate::cross_file::extract_metadata(later_top_level_loader));
+        let later_artifacts = Arc::new(compute_artifacts_with_metadata(
+            &uri,
+            &parse_r(later_top_level_loader),
+            later_top_level_loader,
+            Some(&later_metadata),
+        ));
+        let later_get_artifacts = |target: &Url| (target == &uri).then(|| later_artifacts.clone());
+        let later_get_metadata = |target: &Url| (target == &uri).then(|| later_metadata.clone());
+        let later_recursive = scope_at_position_with_graph(
+            &uri,
+            u32::MAX,
+            u32::MAX,
+            &later_get_artifacts,
+            &later_get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(
+            later_recursive.symbols.contains_key("early"),
+            "a later top-level loader must not retroactively isolate an earlier bare helper"
+        );
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut direct_stream = ScopeStream::new(
+            &uri,
+            &later_get_artifacts,
+            &later_get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("direct conditional stream");
+        direct_stream.advance_to(u32::MAX, u32::MAX);
+        let direct = direct_stream.snapshot();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stepped_stream = ScopeStream::new(
+            &uri,
+            &later_get_artifacts,
+            &later_get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("stepped conditional stream");
+        stepped_stream.advance_to(1, u32::MAX);
+        stepped_stream.advance_to(u32::MAX, u32::MAX);
+        let stepped = stepped_stream.snapshot();
+        assert!(direct.symbols.contains_key("early"));
+        assert_eq!(
+            direct.symbols, stepped.symbols,
+            "conditional activation must not depend on stream query history"
+        );
+
+        let effect_code = concat!(
+            "library(pacman)\n",
+            "p_load(shiny)\n",
+            "kept <- 1\n",
+            "reactive({\n",
+            "  rm(kept)\n",
+            "  library(dplyr)\n",
+            "})\n",
+            "kept",
+        );
+        let effect_artifacts = compute_artifacts(&uri, &parse_r(effect_code), effect_code);
+        let effect_scope = scope_at_position(&effect_artifacts, 7, u32::MAX, true);
+        assert!(
+            effect_scope.symbols.contains_key("kept"),
+            "removals inside an active deferred body must not leak"
+        );
+        assert!(
+            !effect_scope.loaded_packages.contains("dplyr"),
+            "package loads inside an active deferred body must not leak"
+        );
+
+        let nested_code = concat!(
+            "library(pacman)\n",
+            "p_load(shiny)\n",
+            "reactive({\n",
+            "  inner <- function() {\n",
+            "    nested <- 1\n",
+            "  }\n",
+            "  nested\n",
+            "})",
+        );
+        let nested_artifacts = compute_artifacts(&uri, &parse_r(nested_code), nested_code);
+        assert!(
+            !scope_at_position(&nested_artifacts, 6, u32::MAX, true)
+                .symbols
+                .contains_key("nested"),
+            "an ordinary nested function must remain narrower than the deferred sidecar"
+        );
+    }
+
+    #[test]
+    fn inherited_shiny_activates_dormant_child_helpers() {
+        let root = Url::parse("file:///inherited-shiny-helper/").unwrap();
+        let parent_uri = root.join("parent.R").unwrap();
+        let child_uri = root.join("child.R").unwrap();
+        let parent_code = "library(shiny)\nsource(\"child.R\")";
+        let child_code = concat!(
+            "f <- function() {\n",
+            "  reactive({\n",
+            "    child_local <- 1\n",
+            "  })\n",
+            "  child_local\n",
+            "}",
+        );
+        let parent_metadata = crate::cross_file::extract_metadata(parent_code);
+        let child_metadata = crate::cross_file::extract_metadata(child_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_metadata.clone())),
+            (child_uri.clone(), Arc::new(child_metadata.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                child_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &child_uri,
+                    &parse_r(child_code),
+                    child_code,
+                    Some(&child_metadata),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            artifacts[&child_uri]
+                .conditional_shiny_deferred_scopes
+                .len(),
+            1
+        );
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root), |_| None);
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let base_exports = HashSet::new();
+        let recursive = scope_at_position_with_graph(
+            &child_uri,
+            4,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(!recursive.symbols.contains_key("child_local"));
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new(
+            &child_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("inherited Shiny helper stream");
+        stream.advance_to(4, u32::MAX);
+        assert!(!stream.snapshot().symbols.contains_key("child_local"));
+    }
+
+    #[test]
+    fn conditional_shiny_sidecar_participates_in_interface_hash() {
+        let uri = Url::parse("file:///pacman-shiny-hash.R").unwrap();
+        let candidate =
+            "p_load(shiny)\nf <- function() reactive({ body_local <- 1 })\nlibrary(pacman)";
+        let ordinary =
+            "p_load(shiny)\nf <- function() ordinary({ body_local <- 1 })\nlibrary(pacman)";
+        let candidate_artifacts = compute_artifacts(&uri, &parse_r(candidate), candidate);
+        let ordinary_artifacts = compute_artifacts(&uri, &parse_r(ordinary), ordinary);
+        assert_eq!(
+            top_level_interface(&candidate_artifacts),
+            top_level_interface(&ordinary_artifacts),
+            "the sidecar hash regression requires otherwise-identical flat interfaces"
+        );
+        assert_ne!(
+            candidate_artifacts.interface_hash, ordinary_artifacts.interface_hash,
+            "adding/removing a conditional deferred interval must invalidate dependents"
+        );
+    }
+
+    #[test]
+    fn p_load_attachment_requirement_participates_in_interface_hash() {
+        let uri = Url::parse("file:///pacman-hash.R").unwrap();
+        let qualified = "pacman::p_load(dplyr)";
+        let bare = "p_load(dplyr)";
+        let qualified_hash = compute_artifacts(&uri, &parse_r(qualified), qualified).interface_hash;
+        let bare_hash = compute_artifacts(&uri, &parse_r(bare), bare).interface_hash;
+        assert_ne!(qualified_hash, bare_hash);
+
+        let attached = "library(pacman)";
+        let namespace_only = "loadNamespace(pacman)";
+        assert_ne!(
+            compute_artifacts(&uri, &parse_r(attached), attached).interface_hash,
+            compute_artifacts(&uri, &parse_r(namespace_only), namespace_only).interface_hash,
+        );
+    }
+
+    #[test]
+    fn p_load_requirement_matches_between_streaming_and_recursive_scope() {
+        let uri = Url::parse("file:///pacman-stream.R").unwrap();
+        let code = "f <- function() {\n  p_load(dplyr)\n  value\n}\nlibrary(pacman)";
+        let metadata = Arc::new(crate::cross_file::extract_metadata(code));
+        let artifacts = Arc::new(compute_artifacts_with_metadata(
+            &uri,
+            &parse_r(code),
+            code,
+            Some(&metadata),
+        ));
+        let graph = super::super::dependency::DependencyGraph::new();
+        let get_artifacts = |target: &Url| (target == &uri).then(|| artifacts.clone());
+        let get_metadata = |target: &Url| (target == &uri).then(|| metadata.clone());
+        let base_exports = HashSet::new();
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .unwrap();
+        stream.advance_to(2, u32::MAX);
+        let streamed = stream.snapshot();
+        let recursive = scope_at_position_with_graph(
+            &uri,
+            2,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(streamed.loaded_packages.contains("dplyr"));
+        assert_eq!(streamed.loaded_packages, recursive.loaded_packages);
+        assert_eq!(streamed.inherited_packages, recursive.inherited_packages);
+        assert_eq!(streamed.attached_packages, recursive.attached_packages);
+    }
+
+    #[test]
+    fn sibling_function_attachment_does_not_enable_streamed_p_load() {
+        let uri = Url::parse("file:///pacman-sibling-stream.R").unwrap();
+        let code = concat!(
+            "f <- function() {\n",
+            "  library(pacman)\n",
+            "}\n",
+            "g <- function() {\n",
+            "  p_load(dplyr)\n",
+            "  dplyr_symbol\n",
+            "}",
+        );
+        let metadata = Arc::new(crate::cross_file::extract_metadata(code));
+        let artifacts = Arc::new(compute_artifacts_with_metadata(
+            &uri,
+            &parse_r(code),
+            code,
+            Some(&metadata),
+        ));
+        let graph = super::super::dependency::DependencyGraph::new();
+        let get_artifacts = |target: &Url| (target == &uri).then(|| artifacts.clone());
+        let get_metadata = |target: &Url| (target == &uri).then(|| metadata.clone());
+        let base_exports = HashSet::new();
+        let recursive = scope_at_position_with_graph(
+            &uri,
+            5,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(!recursive.loaded_packages.contains("dplyr"));
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut direct = ScopeStream::new(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("direct sibling-function stream");
+        direct.advance_to(5, u32::MAX);
+        let direct_scope = direct.snapshot();
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stepped = ScopeStream::new(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("stepped sibling-function stream");
+        stepped.advance_to(1, u32::MAX);
+        stepped.advance_to(5, u32::MAX);
+        let stepped_scope = stepped.snapshot();
+
+        assert_eq!(direct_scope.loaded_packages, recursive.loaded_packages);
+        assert_eq!(stepped_scope.loaded_packages, recursive.loaded_packages);
+        assert_eq!(direct_scope.attached_packages, recursive.attached_packages);
+        assert_eq!(stepped_scope.attached_packages, recursive.attached_packages);
+    }
+
+    #[test]
+    fn same_function_attachment_order_matches_recursive_and_streaming_scope() {
+        for (name, code, expected_loaded) in [
+            (
+                "preceding",
+                concat!(
+                    "f <- function() {\n",
+                    "  library(pacman)\n",
+                    "  p_load(dplyr)\n",
+                    "  dplyr_symbol\n",
+                    "}\n",
+                    "source(\"irrelevant.R\")",
+                ),
+                true,
+            ),
+            (
+                "later",
+                concat!(
+                    "f <- function() {\n",
+                    "  p_load(dplyr)\n",
+                    "  library(pacman)\n",
+                    "  dplyr_symbol\n",
+                    "}\n",
+                    "source(\"irrelevant.R\")",
+                ),
+                false,
+            ),
+        ] {
+            let root = Url::parse(&format!("file:///pacman-local-order-{name}/")).unwrap();
+            let uri = root.join("main.R").unwrap();
+            let child_uri = root.join("irrelevant.R").unwrap();
+            let metadata = Arc::new(crate::cross_file::extract_metadata(code));
+            let child_metadata = Arc::new(crate::cross_file::extract_metadata("irrelevant <- 1"));
+            let artifacts = Arc::new(compute_artifacts_with_metadata(
+                &uri,
+                &parse_r(code),
+                code,
+                Some(&metadata),
+            ));
+            let child_artifacts = Arc::new(compute_artifacts_with_metadata(
+                &child_uri,
+                &parse_r("irrelevant <- 1"),
+                "irrelevant <- 1",
+                Some(&child_metadata),
+            ));
+            let get_artifacts = |target: &Url| {
+                if target == &uri {
+                    Some(artifacts.clone())
+                } else if target == &child_uri {
+                    Some(child_artifacts.clone())
+                } else {
+                    None
+                }
+            };
+            let get_metadata = |target: &Url| {
+                if target == &uri {
+                    Some(metadata.clone())
+                } else if target == &child_uri {
+                    Some(child_metadata.clone())
+                } else {
+                    None
+                }
+            };
+            let mut graph = super::super::dependency::DependencyGraph::new();
+            graph.update_file(&uri, &metadata, Some(&root), |_| None);
+            let base_exports = HashSet::new();
+            let recursive = scope_at_position_with_graph(
+                &uri,
+                3,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                10,
+                &base_exports,
+                true,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            );
+            assert_eq!(
+                recursive.loaded_packages.contains("dplyr"),
+                expected_loaded,
+                "{name} same-function attachment order"
+            );
+
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                &uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                10,
+                &base_exports,
+                true,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &prefix_cache,
+                None,
+                None,
+            )
+            .unwrap();
+            stream.advance_to(3, u32::MAX);
+            assert_eq!(stream.snapshot().loaded_packages, recursive.loaded_packages);
+        }
+    }
+
+    #[test]
+    fn top_level_source_attachment_activates_only_later_shiny_helpers() {
+        for (name, code, expect_deferred) in [
+            (
+                "preceding",
+                concat!(
+                    "source(\"attach.R\")\n",
+                    "p_load(shiny)\n",
+                    "reactive({\n",
+                    "  deferred_local <- 1\n",
+                    "})\n",
+                    "deferred_local",
+                ),
+                true,
+            ),
+            (
+                "later",
+                concat!(
+                    "p_load(shiny)\n",
+                    "reactive({\n",
+                    "  deferred_local <- 1\n",
+                    "})\n",
+                    "deferred_local\n",
+                    "source(\"attach.R\")",
+                ),
+                false,
+            ),
+        ] {
+            let root = Url::parse(&format!("file:///pacman-top-source-{name}/")).unwrap();
+            let uri = root.join("main.R").unwrap();
+            let attach_uri = root.join("attach.R").unwrap();
+            let metadata = Arc::new(crate::cross_file::extract_metadata(code));
+            let attach_metadata = Arc::new(crate::cross_file::extract_metadata("library(pacman)"));
+            let artifacts = Arc::new(compute_artifacts_with_metadata(
+                &uri,
+                &parse_r(code),
+                code,
+                Some(&metadata),
+            ));
+            let attach_artifacts = Arc::new(compute_artifacts_with_metadata(
+                &attach_uri,
+                &parse_r("library(pacman)"),
+                "library(pacman)",
+                Some(&attach_metadata),
+            ));
+            let get_artifacts = |target: &Url| {
+                if target == &uri {
+                    Some(artifacts.clone())
+                } else if target == &attach_uri {
+                    Some(attach_artifacts.clone())
+                } else {
+                    None
+                }
+            };
+            let get_metadata = |target: &Url| {
+                if target == &uri {
+                    Some(metadata.clone())
+                } else if target == &attach_uri {
+                    Some(attach_metadata.clone())
+                } else {
+                    None
+                }
+            };
+            let mut graph = super::super::dependency::DependencyGraph::new();
+            graph.update_file(&uri, &metadata, Some(&root), |_| None);
+            let base_exports = HashSet::new();
+            let recursive = scope_at_position_with_graph(
+                &uri,
+                5,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                10,
+                &base_exports,
+                true,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            );
+            assert_eq!(
+                !recursive.symbols.contains_key("deferred_local"),
+                expect_deferred,
+                "{name} source ordering must govern helper activation"
+            );
+
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                &uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                10,
+                &base_exports,
+                true,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                &prefix_cache,
+                None,
+                None,
+            )
+            .unwrap();
+            stream.advance_to(5, u32::MAX);
+            assert_eq!(stream.snapshot().symbols, recursive.symbols);
+        }
+    }
+
+    #[test]
+    fn attachment_projection_regressions_match_recursive_and_streaming_scope() {
+        let (recursive, streamed, _) = projection_fixture_scopes(
+            "deferred-body-attachment",
+            &[
+                (
+                    "main.R",
+                    concat!(
+                        "source(\"attach.R\")\n",
+                        "reactive({\n",
+                        "  library(pacman)\n",
+                        "})\n",
+                        "f <- function() {\n",
+                        "  p_load(dplyr)\n",
+                        "  value\n",
+                        "}",
+                    ),
+                ),
+                ("attach.R", "library(shiny)"),
+            ],
+            "main.R",
+            6,
+            None,
+        );
+        assert!(!recursive.loaded_packages.contains("dplyr"));
+        assert_eq!(streamed.loaded_packages, recursive.loaded_packages);
+
+        let (recursive, streamed, _) = projection_fixture_scopes(
+            "nested-child-sidecar",
+            &[
+                ("root.R", "source(\"child.R\")"),
+                (
+                    "child.R",
+                    "source(\"attach.R\")\nreactive({ deferred_only <- 1 })",
+                ),
+                ("attach.R", "library(shiny)"),
+            ],
+            "root.R",
+            u32::MAX,
+            None,
+        );
+        assert!(!recursive.symbols.contains_key("deferred_only"));
+        assert_eq!(streamed.symbols, recursive.symbols);
+
+        let (recursive, streamed, stepped) = projection_fixture_scopes(
+            "effective-function-context",
+            &[
+                (
+                    "main.R",
+                    concat!(
+                        "source(\"attach.R\")\n",
+                        "reactive({\n",
+                        "  later_global\n",
+                        "})\n",
+                        "later_global <- 1",
+                    ),
+                ),
+                ("attach.R", "library(shiny)"),
+            ],
+            "main.R",
+            2,
+            Some((1, 0)),
+        );
+        assert!(recursive.symbols.contains_key("later_global"));
+        assert_eq!(streamed.symbols, recursive.symbols);
+        assert_eq!(stepped.unwrap().symbols, recursive.symbols);
+
+        let (recursive, streamed, _) = projection_fixture_scopes(
+            "late-source-inherited-attachment",
+            &[
+                (
+                    "main.R",
+                    concat!(
+                        "f <- function() {\n",
+                        "  reactive({ deferred_local <- 1 })\n",
+                        "  deferred_local\n",
+                        "}\n",
+                        "library(pacman)\n",
+                        "source(\"child.R\")",
+                    ),
+                ),
+                ("child.R", "p_load(shiny)"),
+            ],
+            "main.R",
+            2,
+            None,
+        );
+        assert!(!recursive.symbols.contains_key("deferred_local"));
+        assert_eq!(streamed.symbols, recursive.symbols);
+
+        let (recursive, streamed, _) = projection_fixture_scopes(
+            "cyclic-sidecars",
+            &[
+                (
+                    "a.R",
+                    "source(\"b.R\")\nreactive({ a_local <- 1 })\na_local",
+                ),
+                (
+                    "b.R",
+                    "source(\"a.R\")\nreactive({ b_local <- 1 })\nb_local",
+                ),
+            ],
+            "a.R",
+            2,
+            None,
+        );
+        assert_eq!(streamed.symbols, recursive.symbols);
+
+        for (fixture, child_code, query_line, expected) in [
+            (
+                "inherited-shiny-formal-shadow",
+                concat!(
+                    "f <- function(reactive) {\n",
+                    "  reactive({ formal_leaked <- 1 })\n",
+                    "  formal_leaked\n",
+                    "}",
+                ),
+                2,
+                "formal_leaked",
+            ),
+            (
+                "inherited-shiny-local-shadow",
+                concat!(
+                    "f <- function() {\n",
+                    "  reactive <- function(x) x\n",
+                    "  reactive({ local_leaked <- 1 })\n",
+                    "  local_leaked\n",
+                    "}",
+                ),
+                3,
+                "local_leaked",
+            ),
+            (
+                "inherited-shiny-dynamic-assign-shadow",
+                concat!(
+                    "f <- function(name) {\n",
+                    "  assign(name, function(x) x)\n",
+                    "  reactive({ dynamic_leaked <- 1 })\n",
+                    "  dynamic_leaked\n",
+                    "}",
+                ),
+                3,
+                "dynamic_leaked",
+            ),
+        ] {
+            let (recursive, streamed, _) = projection_fixture_scopes(
+                fixture,
+                &[
+                    ("parent.R", "library(shiny)\nsource(\"child.R\")"),
+                    ("child.R", child_code),
+                ],
+                "child.R",
+                query_line,
+                None,
+            );
+            assert!(
+                recursive.symbols.contains_key(expected),
+                "{fixture}: a lexically shadowed bare helper must remain an eager generic call"
+            );
+            assert_eq!(streamed.symbols, recursive.symbols);
+        }
+    }
+
+    #[test]
+    fn later_global_source_attachment_enables_deferred_p_load_consistently() {
+        let root = Url::parse("file:///pacman-late-source/").unwrap();
+        let main_uri = root.join("main.R").unwrap();
+        let attach_uri = root.join("attach.R").unwrap();
+        let main_code = concat!(
+            "f <- function() {\n",
+            "  p_load(dplyr)\n",
+            "  dplyr_symbol\n",
+            "}\n",
+            "source(\"attach.R\")",
+        );
+        let attach_code = "library(pacman)";
+        let main_metadata = crate::cross_file::extract_metadata(main_code);
+        let attach_metadata = crate::cross_file::extract_metadata(attach_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (main_uri.clone(), Arc::new(main_metadata.clone())),
+            (attach_uri.clone(), Arc::new(attach_metadata.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                main_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &main_uri,
+                    &parse_r(main_code),
+                    main_code,
+                    Some(&main_metadata),
+                )),
+            ),
+            (
+                attach_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &attach_uri,
+                    &parse_r(attach_code),
+                    attach_code,
+                    Some(&attach_metadata),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&main_uri, &main_metadata, Some(&root), |_| None);
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let base_exports = HashSet::new();
+        let recursive = scope_at_position_with_graph(
+            &main_uri,
+            2,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(recursive.attached_packages.contains("pacman"));
+        assert!(recursive.loaded_packages.contains("dplyr"));
+        let depth_limited = scope_at_position_with_graph(
+            &main_uri,
+            2,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            1,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(
+            !depth_limited.loaded_packages.contains("dplyr"),
+            "the attachment projection must not restart the source depth budget"
+        );
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new(
+            &main_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("late-source p_load stream");
+        stream.advance_to(2, u32::MAX);
+        let streamed = stream.snapshot();
+        assert_eq!(streamed.loaded_packages, recursive.loaded_packages);
+        assert_eq!(streamed.attached_packages, recursive.attached_packages);
+
+        let shiny_code = concat!(
+            "f <- function() {\n",
+            "  p_load(shiny)\n",
+            "  reactive({\n",
+            "    deferred_local <- 1\n",
+            "  })\n",
+            "  deferred_local\n",
+            "}\n",
+            "source(\"attach.R\")",
+        );
+        let shiny_metadata = Arc::new(crate::cross_file::extract_metadata(shiny_code));
+        let shiny_artifacts = Arc::new(compute_artifacts_with_metadata(
+            &main_uri,
+            &parse_r(shiny_code),
+            shiny_code,
+            Some(&shiny_metadata),
+        ));
+        let get_shiny_artifacts = |uri: &Url| {
+            if uri == &main_uri {
+                Some(shiny_artifacts.clone())
+            } else {
+                artifacts.get(uri).cloned()
+            }
+        };
+        let get_shiny_metadata = |uri: &Url| {
+            if uri == &main_uri {
+                Some(shiny_metadata.clone())
+            } else {
+                metadata.get(uri).cloned()
+            }
+        };
+        let mut shiny_graph = super::super::dependency::DependencyGraph::new();
+        shiny_graph.update_file(&main_uri, &shiny_metadata, Some(&root), |_| None);
+        let shiny_recursive = scope_at_position_with_graph(
+            &main_uri,
+            5,
+            u32::MAX,
+            &get_shiny_artifacts,
+            &get_shiny_metadata,
+            &shiny_graph,
+            Some(&root),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(shiny_recursive.loaded_packages.contains("shiny"));
+        assert!(!shiny_recursive.symbols.contains_key("deferred_local"));
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut shiny_stream = ScopeStream::new(
+            &main_uri,
+            &get_shiny_artifacts,
+            &get_shiny_metadata,
+            &shiny_graph,
+            Some(&root),
+            10,
+            &base_exports,
+            true,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("late-source Shiny stream");
+        shiny_stream.advance_to(5, u32::MAX);
+        let shiny_streamed = shiny_stream.snapshot();
+        assert!(!shiny_streamed.symbols.contains_key("deferred_local"));
+        assert_eq!(
+            shiny_streamed.loaded_packages,
+            shiny_recursive.loaded_packages
         );
     }
 }

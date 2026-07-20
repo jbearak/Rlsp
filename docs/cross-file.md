@@ -66,7 +66,21 @@ Inside `.Rmd` / `.Rmarkdown` / `.qmd` documents, only R chunk bodies feed cross-
 
 ## Package Awareness
 
-Raven recognizes `library()`, `require()`, and `loadNamespace()` calls and makes package exports available for completions, hover, and diagnostics.
+Raven recognizes `library()`, `require()`, `loadNamespace()`, and static
+`pacman::p_load()` calls and makes their package exports available for
+completions, hover, and diagnostics. A bare `p_load()` is recognized only when
+`pacman` is already attached to the resolved R search path and no local binding
+shadows `p_load`; this includes `pacman` inherited through an explicit
+`source()` relationship. Merely calling `loadNamespace("pacman")` does not
+enable the bare helper.
+
+For `p_load()`, quoted and unquoted package arguments are supported, along with
+an exact static `char = c("pkg1", "pkg2")` argument (or a same-file,
+assigned-once static character vector). Exact `char` follows pacman's runtime
+semantics and replaces the ordinary `...` arguments. Dynamic, malformed, and
+`character.only = TRUE` forms are left unresolved rather than evaluated.
+Raven does not install or update packages and does not treat `p_load_gh()` as a
+package attachment.
 
 > [!TIP]
 > **Developing an R package?** When Raven detects a `DESCRIPTION` file at the workspace root, it switches to package mode — all `R/*.R` files become mutually visible without `source()` calls, and `@import`/`@importFrom` annotations suppress undefined-variable diagnostics. See [R Package Development](r-package-dev.md).

@@ -24,12 +24,20 @@ pub(crate) const STATIC_SOURCE_MAX_FILES: usize = 1000;
 /// Each instance is built from one parse tree and one shared lazy binding
 /// collection. This keeps definition/removal, package, source, and capture-trust
 /// decisions aligned while avoiding the former parser-per-helper pipeline.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct StaticScriptFacts {
     pub(crate) top_level_defs: std::collections::BTreeSet<String>,
     pub(crate) attached_packages: std::collections::BTreeSet<String>,
+    #[cfg(test)]
     pub(crate) source_targets: Vec<String>,
+    pub(crate) prelude_events: Vec<StaticPreludeEvent>,
     pub(crate) calls_dev_load_all: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum StaticPreludeEvent {
+    Attach(LibraryCall),
+    Source(ForwardSource),
 }
 
 impl StaticScriptFacts {
@@ -40,12 +48,32 @@ impl StaticScriptFacts {
         let mut bindings = super::static_path::LazyStaticBindings::new(tree.root_node(), text);
         let (top_level_defs, calls_dev_load_all) =
             super::scope::static_script_definitions_and_load_all(&tree, text, &mut bindings);
-        let attached_packages = extract_attached_packages_with_bindings(&tree, text, &mut bindings);
-        let source_targets = static_source_targets_with_bindings(&tree, text, &mut bindings);
+        let attaching_calls =
+            top_level_attaching_library_calls_with_bindings(&tree, text, &mut bindings);
+        let source_events = static_source_events_with_bindings(&tree, text, &mut bindings);
+        #[cfg(test)]
+        let source_targets = source_events
+            .iter()
+            .map(|source| source.path.clone())
+            .collect();
+        let mut prelude_events: Vec<StaticPreludeEvent> = attaching_calls
+            .iter()
+            .cloned()
+            .map(StaticPreludeEvent::Attach)
+            .chain(source_events.into_iter().map(StaticPreludeEvent::Source))
+            .collect();
+        prelude_events.sort_by_key(|event| match event {
+            StaticPreludeEvent::Attach(call) => (call.line, call.column),
+            StaticPreludeEvent::Source(source) => (source.line, source.column),
+        });
+        let attached_packages =
+            replay_static_attaching_calls(attaching_calls, &std::collections::BTreeSet::new());
         Self {
             top_level_defs,
             attached_packages,
+            #[cfg(test)]
             source_targets,
+            prelude_events,
             calls_dev_load_all,
         }
     }
@@ -152,6 +180,16 @@ pub struct LibraryCall {
     /// Defaults to `false` for forward compatibility on deserialize.
     #[serde(default)]
     pub attaches: bool,
+    /// Package that must already be attached immediately before this call for
+    /// the load effect to occur.
+    ///
+    /// This is `Some("pacman")` for a bare `p_load(...)` call and `None` for
+    /// direct or namespace-qualified loaders. Keeping the condition on the
+    /// ordinary package-load event lets graph-aware scope resolution honor
+    /// packages inherited through `source()` without making syntax detection
+    /// depend on the workspace graph.
+    #[serde(default)]
+    pub requires_attached: Option<String>,
 }
 
 /// A source range in LSP coordinates: 0-based line, **UTF-16** column.
@@ -296,11 +334,11 @@ pub(crate) fn detect_source_calls_with_bindings_and_frames<'tree, 'text>(
 /// directives, non-inheriting calls, function-scoped calls, and unresolved
 /// paths. Keeping all filters here prevents the two suppressive scans from
 /// drifting as source detection evolves.
-fn static_source_targets_with_bindings<'tree, 'text>(
+fn static_source_events_with_bindings<'tree, 'text>(
     tree: &'tree Tree,
     content: &'text str,
     bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
-) -> Vec<String> {
+) -> Vec<ForwardSource> {
     detect_source_calls_with_bindings_and_frames(tree, content, bindings)
         .into_iter()
         .filter(|detected| {
@@ -310,7 +348,7 @@ fn static_source_targets_with_bindings<'tree, 'text>(
                 && !detected.source.is_function_scoped
                 && !detected.source.path.is_empty()
         })
-        .map(|detected| detected.source.path)
+        .map(|detected| detected.source)
         .collect()
 }
 
@@ -1410,9 +1448,9 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 // ============================================================================
 
 /// Detects package loads in the file: direct `library()`/`require()`/`loadNamespace()`
-/// calls, apply-family calls whose FUN argument is a bare reference to
-/// `library` or `require`, and {targets} `tar_option_set(packages = ...)`
-/// calls (see `try_parse_tar_option_set_call`).
+/// calls, static pacman `p_load()` calls, apply-family calls whose FUN argument
+/// is a bare reference to `library` or `require`, and {targets}
+/// `tar_option_set(packages = ...)` calls (see `try_parse_tar_option_set_call`).
 ///
 /// For direct calls, the package must be a bare identifier (`library(dplyr)`)
 /// or a string literal (`library("dplyr")`); direct calls with
@@ -1438,6 +1476,12 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 /// and related forms) are not detected. Evaluated portions remain visible:
 /// `substitute()` environment arguments, `bquote()` controls and `.()` splices,
 /// and rlang `!!`/`!!!` operands are traversed.
+///
+/// Qualified `pacman::p_load()` calls are unconditional. Bare `p_load()` calls
+/// carry a `requires_attached = Some("pacman")` precondition that graph-aware
+/// scope resolution evaluates at the call; this permits a parent file's
+/// earlier `library(pacman)` to enable a sourced child's bare helper without
+/// making this syntax pass graph-dependent.
 ///
 /// The returned Vec is sorted in document order by `(line, column)`.
 ///
@@ -1498,7 +1542,10 @@ fn detect_library_calls_with_bindings_and_order<'tree, 'text>(
     capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
 ) -> Vec<LibraryWalkCall> {
     log::trace!("Starting tree-sitter parsing for library() call detection");
-    let mut output = LibraryWalkOutput::default();
+    let mut output = LibraryWalkOutput {
+        scan_p_load: content.contains("p_load"),
+        ..Default::default()
+    };
     let root = tree.root_node();
     visit_node_for_library(
         root,
@@ -1588,7 +1635,21 @@ fn extract_attached_packages_with_bindings<'tree, 'text>(
     content: &'text str,
     bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
 ) -> std::collections::BTreeSet<String> {
-    let mut output = LibraryWalkOutput::default();
+    replay_static_attaching_calls(
+        top_level_attaching_library_calls_with_bindings(tree, content, bindings),
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+fn top_level_attaching_library_calls_with_bindings<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<LibraryCall> {
+    let mut output = LibraryWalkOutput {
+        scan_p_load: content.contains("p_load"),
+        ..Default::default()
+    };
     visit_node_for_library(
         tree.root_node(),
         content,
@@ -1601,10 +1662,32 @@ fn extract_attached_packages_with_bindings<'tree, 'text>(
     append_gated_tar_option_set_calls(&mut output);
     output
         .library_calls
+        .sort_by_key(|detected| (detected.call.line, detected.call.column));
+    output
+        .library_calls
         .into_iter()
-        .filter(|detected| detected.call.attaches && !detected.call.package.is_empty())
-        .map(|detected| detected.call.package)
+        .map(|detected| detected.call)
         .collect()
+}
+
+fn replay_static_attaching_calls(
+    calls: impl IntoIterator<Item = LibraryCall>,
+    initial_attached: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let mut attached = initial_attached.clone();
+    for call in calls {
+        if !call.attaches || call.package.is_empty() {
+            continue;
+        }
+        if call
+            .requires_attached
+            .as_ref()
+            .is_none_or(|required| attached.contains(required))
+        {
+            attached.insert(call.package);
+        }
+    }
+    attached
 }
 
 struct LibraryWalkCall {
@@ -1617,6 +1700,7 @@ struct LibraryWalkCall {
 struct LibraryWalkOutput {
     library_calls: Vec<LibraryWalkCall>,
     tar_candidates: Vec<TarOptionSetCandidate>,
+    scan_p_load: bool,
 }
 
 impl LibraryWalkOutput {
@@ -1704,6 +1788,29 @@ fn visit_node_for_library(
             );
             return;
         }
+        // `p_load()` captures its ordinary `...` package arguments rather
+        // than evaluating them. Once the callee is known to be pacman's
+        // helper, do not recurse into those arguments and misclassify nested
+        // call syntax as eagerly evaluated package loads.
+        if output.scan_p_load
+            && let Some(parsed) = try_parse_pacman_p_load_call(node, content, capture_bindings)
+        {
+            if !top_level_only || !runtime_function_scope.is_function_scoped_at(node) {
+                output.extend_calls(parsed.calls, runtime_function_scope, scope_orderable);
+            }
+            if parsed.evaluates_controls {
+                visit_p_load_evaluated_arguments(
+                    node,
+                    content,
+                    capture_bindings,
+                    top_level_only,
+                    runtime_function_scope,
+                    scope_orderable,
+                    output,
+                );
+            }
+            return;
+        }
         if !top_level_only || !runtime_function_scope.is_function_scoped_at(node) {
             if let Some(lib_call) = try_parse_library_call(node, content) {
                 output.push_call(lib_call, runtime_function_scope, scope_orderable);
@@ -1742,6 +1849,44 @@ fn visit_node_for_library(
             scope_orderable,
             output,
         );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_p_load_evaluated_arguments(
+    node: Node,
+    content: &str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings,
+    top_level_only: bool,
+    runtime_function_scope: RuntimeFunctionScope,
+    scope_orderable: bool,
+    output: &mut LibraryWalkOutput,
+) {
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = arguments.walk();
+    for argument in arguments.children(&mut cursor) {
+        let Some(name) = argument.child_by_field_name("name") else {
+            continue;
+        };
+        if !matches!(
+            node_text(name, content),
+            "char" | "character.only" | "install" | "update"
+        ) {
+            continue;
+        }
+        if let Some(value) = argument.child_by_field_name("value") {
+            visit_node_for_library(
+                value,
+                content,
+                capture_bindings,
+                top_level_only,
+                runtime_function_scope,
+                scope_orderable,
+                output,
+            );
+        }
     }
 }
 
@@ -1802,6 +1947,7 @@ fn try_parse_library_call(node: Node, content: &str) -> Option<LibraryCall> {
         // `!= "loadNamespace"` so a future non-attaching loader admitted above
         // is not silently classified as attaching.
         attaches: func_text == "library" || func_text == "require",
+        requires_attached: None,
     })
 }
 
@@ -2179,8 +2325,192 @@ fn try_parse_apply_library_call(
             // `sapply`/`lapply`/etc. (see the `fun_text` guard above), both of
             // which attach.
             attaches: true,
+            requires_attached: None,
         })
         .collect()
+}
+
+// ============================================================================
+// pacman::p_load Package Detection (issue #660)
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PacmanCallee {
+    Qualified,
+    Bare,
+}
+
+/// Classify `pacman::p_load` / `pacman:::p_load` and the bare `p_load`
+/// spelling. Namespace qualification is authoritative; the bare spelling is
+/// returned only when Raven's lexical binding model proves that no local
+/// binding may shadow pacman's exported helper at this use.
+fn pacman_p_load_callee(
+    node: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> Option<PacmanCallee> {
+    let function = node.child_by_field_name("function")?;
+    match function.kind() {
+        "namespace_operator" => {
+            let lhs = function.child_by_field_name("lhs")?;
+            let rhs = function.child_by_field_name("rhs")?;
+            (crate::namespace_completion::unquote_package(node_text(lhs, content)) == "pacman"
+                && crate::namespace_completion::unquote_package(node_text(rhs, content))
+                    == "p_load")
+                .then_some(PacmanCallee::Qualified)
+        }
+        "identifier" if node_text(function, content) == "p_load" => {
+            let deferred = !super::binding::is_known_immediate_context(node);
+            (!bindings
+                .get()
+                .named_local_binding_may_shadow_at("p_load", node, deferred))
+            .then_some(PacmanCallee::Bare)
+        }
+        _ => None,
+    }
+}
+
+/// Parse a statically-known pacman `p_load(...)` invocation.
+///
+/// An empty `calls` set means the callee is pacman's helper but its package
+/// arguments are empty or not fully static. `evaluates_controls` distinguishes
+/// a valid dynamic call (whose exact control values may execute) from malformed
+/// argument matching such as duplicate exact controls, which errors before any
+/// argument is forced.
+struct ParsedPacmanPLoad {
+    calls: Vec<LibraryCall>,
+    evaluates_controls: bool,
+}
+
+fn try_parse_pacman_p_load_call(
+    node: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> Option<ParsedPacmanPLoad> {
+    let callee = pacman_p_load_callee(node, content, bindings)?;
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return Some(ParsedPacmanPLoad {
+            calls: Vec::new(),
+            evaluates_controls: false,
+        });
+    };
+    if arguments.has_error() {
+        return Some(ParsedPacmanPLoad {
+            calls: Vec::new(),
+            evaluates_controls: false,
+        });
+    }
+
+    let mut positional = Vec::new();
+    let mut char_value = None;
+    let mut character_only = None;
+    let mut saw_install = false;
+    let mut saw_update = false;
+    let mut invalid_control = false;
+    let mut unknown_named_dot = false;
+    let mut cursor = arguments.walk();
+    for argument in arguments.children(&mut cursor) {
+        if argument.kind() != "argument" {
+            continue;
+        }
+        let Some(value) = argument.child_by_field_name("value") else {
+            return Some(ParsedPacmanPLoad {
+                calls: Vec::new(),
+                evaluates_controls: false,
+            });
+        };
+        let Some(name) = argument.child_by_field_name("name") else {
+            positional.push(value);
+            continue;
+        };
+        match node_text(name, content) {
+            "char" => invalid_control |= char_value.replace(value).is_some(),
+            "character.only" => {
+                invalid_control |= character_only.replace(value).is_some();
+            }
+            "install" => invalid_control |= std::mem::replace(&mut saw_install, true),
+            "update" => invalid_control |= std::mem::replace(&mut saw_update, true),
+            // Formals after `...` match exactly in R. Partial or unrelated
+            // names belong to dots, but treating their expressions as package
+            // names would be too speculative unless exact `char` overrides
+            // the entire dots list.
+            _ => unknown_named_dot = true,
+        }
+    }
+    if invalid_control {
+        return Some(ParsedPacmanPLoad {
+            calls: Vec::new(),
+            evaluates_controls: false,
+        });
+    }
+    if unknown_named_dot && char_value.is_none() {
+        return Some(ParsedPacmanPLoad {
+            calls: Vec::new(),
+            evaluates_controls: true,
+        });
+    }
+
+    if let Some(value) = character_only
+        && node_text(value, content) != "FALSE"
+    {
+        // With TRUE pacman evaluates the first dots argument rather than using
+        // its NSE spelling. That dynamic mode is outside this bounded detector.
+        // An exact `char` still wins before character.only is consulted.
+        if char_value.is_none() {
+            return Some(ParsedPacmanPLoad {
+                calls: Vec::new(),
+                evaluates_controls: true,
+            });
+        }
+    }
+
+    let packages = if let Some(value) = char_value {
+        // Upstream pacman gives exact `char` precedence over all dots.
+        match value.kind() {
+            "string" => extract_string_literal(value, content).map(|value| vec![value]),
+            "identifier" => super::binding::plain_identifier_name(value, content)
+                .and_then(|name| bindings.resolve_package_vector(name, node)),
+            _ => {
+                let packages = extract_c_strings_strict(value, content);
+                packages.filter(|_| bindings.package_c_is_trusted_at(node))
+            }
+        }
+    } else {
+        positional
+            .into_iter()
+            .map(|value| match value.kind() {
+                "identifier" => {
+                    super::binding::plain_identifier_name(value, content).map(str::to_string)
+                }
+                "string" => extract_string_literal(value, content),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+    };
+    let Some(packages) = packages else {
+        return Some(ParsedPacmanPLoad {
+            calls: Vec::new(),
+            evaluates_controls: true,
+        });
+    };
+
+    let end = node.end_position();
+    let line_text = content.lines().nth(end.row).unwrap_or("");
+    let requires_attached = (callee == PacmanCallee::Bare).then(|| "pacman".to_string());
+    Some(ParsedPacmanPLoad {
+        calls: packages
+            .into_iter()
+            .map(|package| LibraryCall {
+                package,
+                line: end.row as u32,
+                column: byte_offset_to_utf16_column(line_text, end.column),
+                function_scope: None,
+                attaches: true,
+                requires_attached: requires_attached.clone(),
+            })
+            .collect(),
+        evaluates_controls: true,
+    })
 }
 
 // ============================================================================
@@ -2279,10 +2609,21 @@ fn collect_tar_option_set_candidates(
 /// both `detect_library_calls` and `extract_attached_packages` so the two
 /// walkers cannot drift.
 fn append_gated_tar_option_set_calls(output: &mut LibraryWalkOutput) {
-    let targets_attached = output
-        .library_calls
-        .iter()
-        .any(|detected| detected.call.attaches && detected.call.package == "targets");
+    let mut ordered_calls: Vec<_> = output.library_calls.iter().collect();
+    ordered_calls.sort_by_key(|detected| (detected.call.line, detected.call.column));
+    let mut attached = std::collections::BTreeSet::new();
+    for detected in ordered_calls {
+        if detected.call.attaches
+            && detected
+                .call
+                .requires_attached
+                .as_ref()
+                .is_none_or(|required| attached.contains(required.as_str()))
+        {
+            attached.insert(detected.call.package.as_str());
+        }
+    }
+    let targets_attached = attached.contains("targets");
     for candidate in std::mem::take(&mut output.tar_candidates) {
         if !candidate.bare || targets_attached {
             output.push_call(
@@ -2384,6 +2725,7 @@ fn try_parse_tar_option_set_call(
             column: byte_offset_to_utf16_column(line_text, end.column),
             function_scope: None,
             attaches: true,
+            requires_attached: None,
         }
     };
 
@@ -7639,6 +7981,114 @@ mod property_tests {
                 let code = lines.join("\n");
                 (code, specs)
             })
+    }
+
+    #[test]
+    fn pacman_p_load_detects_qualified_and_conditional_bare_calls() {
+        let code = r#"
+pacman::p_load(dplyr, "ggplot2")
+library(pacman)
+p_load(tidyr)
+"#;
+        let calls = detect_library_calls(&parse_r(code), code);
+        let pacman_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| call.package != "pacman")
+            .map(|call| {
+                (
+                    call.package.as_str(),
+                    call.requires_attached.as_deref(),
+                    call.attaches,
+                )
+            })
+            .collect();
+        assert_eq!(
+            pacman_calls,
+            vec![
+                ("dplyr", None, true),
+                ("ggplot2", None, true),
+                ("tidyr", Some("pacman"), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn pacman_p_load_char_overrides_dots_and_resolves_static_vectors() {
+        let code = r#"
+packages <- c("dplyr", "tidyr")
+pacman::p_load(dynamic_call(), ignored = stop("unused"), char = packages, install = FALSE)
+"#;
+        let packages: Vec<_> = detect_library_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|call| call.package)
+            .collect();
+        assert_eq!(packages, vec!["dplyr", "tidyr"]);
+    }
+
+    #[test]
+    fn pacman_p_load_still_visits_evaluated_named_controls() {
+        let code = r#"pacman::p_load(char = { library(controlpkg); dynamic_packages() })"#;
+        let packages: Vec<_> = detect_library_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|call| call.package)
+            .collect();
+        assert_eq!(packages, vec!["controlpkg"]);
+    }
+
+    #[test]
+    fn malformed_p_load_duplicate_controls_do_not_execute_values() {
+        let code = r#"pacman::p_load(char = library(fakepkg), char = "realpkg")"#;
+        assert!(
+            detect_library_calls(&parse_r(code), code).is_empty(),
+            "duplicate exact formals fail argument matching before either value executes"
+        );
+    }
+
+    #[test]
+    fn pacman_p_load_rejects_dynamic_and_shadowed_bare_calls() {
+        for code in [
+            "pacman::p_load(dplyr, package_name())",
+            "pacman::p_load(dplyr, character.only = TRUE)",
+            "p_load <- function(...) NULL\np_load(dplyr)",
+            "f <- function(p_load) p_load(dplyr)",
+        ] {
+            assert!(
+                detect_library_calls(&parse_r(code), code).is_empty(),
+                "unexpected p_load detection for:\n{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn pacman_p_load_preserves_its_unevaluated_dots_boundary() {
+        let code = "pacman::p_load({ library(should_not_run); dplyr })";
+        assert!(
+            detect_library_calls(&parse_r(code), code).is_empty(),
+            "nested library syntax in p_load dots must not be treated as executed"
+        );
+
+        let shadowed = "p_load <- identity\np_load(library(ordinary_argument))";
+        let packages: Vec<_> = detect_library_calls(&parse_r(shadowed), shadowed)
+            .into_iter()
+            .map(|call| call.package)
+            .collect();
+        assert_eq!(packages, vec!["ordinary_argument"]);
+    }
+
+    #[test]
+    fn extract_attached_packages_gates_bare_p_load_in_order() {
+        assert!(
+            extract_attached_packages("p_load(dplyr)").is_empty(),
+            "a generic bare p_load must not attach packages"
+        );
+        let attached = extract_attached_packages("library(pacman)\np_load(dplyr, \"tidyr\")");
+        assert_eq!(
+            attached,
+            ["dplyr", "pacman", "tidyr"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
     }
 
     proptest! {

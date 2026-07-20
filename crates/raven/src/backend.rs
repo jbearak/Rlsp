@@ -139,7 +139,12 @@ impl Drop for DiagnosticsSupersessionGuardForTest {
     }
 }
 
-/// Extract loaded packages from metadata-derived library calls.
+/// Extract a permissive package warm set from metadata-derived library calls.
+///
+/// Conditional calls are intentionally included even when their attachment
+/// prerequisite is not active. This function only prefetches metadata; it
+/// cannot make a package visible in semantic scope, and resolving the full
+/// graph here would make the edit-time warm path disproportionately expensive.
 fn extract_loaded_packages_from_library_calls(
     library_calls: &[crate::cross_file::LibraryCall],
 ) -> Vec<String> {

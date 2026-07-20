@@ -2101,6 +2101,54 @@ pub(crate) fn named_binding_may_shadow_lexically_at<T>(
         })
 }
 
+/// Whether a lexical/local binding may shadow `name`, excluding names that
+/// could arrive only from an attached package.
+///
+/// Bare package helpers use this narrower predicate because their separate
+/// attachment precondition proves the intended provider is present. Treating
+/// that same `library()` effect as an unknown shadow would otherwise reject
+/// every ordinary `library(pkg); helper()` idiom.
+pub(crate) fn named_local_binding_may_shadow_lexically_at<T>(
+    map: &HashMap<String, Binding<T>>,
+    name: &str,
+    use_node: Node,
+    deferred_use: bool,
+) -> bool {
+    [name, UNKNOWN_NAMED_BINDING_KEY].into_iter().any(|key| {
+        map.get(key).is_some_and(|binding| {
+            ordered_shadow_events_may_affect_use(binding, use_node, deferred_use)
+        })
+    }) || map.get(UNKNOWN_HELPER_BINDING_KEY).is_some_and(|binding| {
+        ordered_shadow_events_may_affect_use(binding, use_node, deferred_use)
+            || earliest_shadow_offsets_may_affect_use(
+                &binding.earliest_persistent_shadow_by_scope,
+                use_node,
+                deferred_use,
+            )
+    })
+}
+
+/// Whether a lexical binding of `name` may shadow a helper at this use,
+/// including a mutation that can create an arbitrary exact name.
+///
+/// Shiny's bare deferred helpers use this narrower form after their package
+/// attachment is proven. Unrelated assignment targets such as `output$plot`
+/// must not become unknown-name barriers that disable every helper in the
+/// surrounding server function. Exact formals/local assignments and dynamic
+/// `assign()`-like mutations still suppress the Shiny interpretation.
+pub(crate) fn named_local_binding_may_shadow_without_helper_uncertainty<T>(
+    map: &HashMap<String, Binding<T>>,
+    name: &str,
+    use_node: Node,
+    deferred_use: bool,
+) -> bool {
+    [name, UNKNOWN_NAMED_BINDING_KEY].into_iter().any(|key| {
+        map.get(key).is_some_and(|binding| {
+            ordered_shadow_events_may_affect_use(binding, use_node, deferred_use)
+        })
+    })
+}
+
 /// Whether a named value alias may be shadowed without treating ordered
 /// immediate helper-only uncertainty as a named rebinding. Capture helpers use
 /// [`named_binding_may_shadow_lexically_at`]; source argument aliases retain the
