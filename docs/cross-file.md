@@ -212,6 +212,7 @@ Packages loaded in child files do NOT propagate back to parents (forward-only).
 | `sapply(c("a","b"), library, character.only = TRUE)` | Yes (apply family) |
 | `sapply(libs, library, character.only = TRUE)` where `libs <- c("a","b")` | Yes (same-file variable) |
 | `purrr::map(c("a","b"), library, character.only = TRUE)` | Yes (purrr family) |
+| `for (pkg in libs) library(pkg, character.only = TRUE)` where `libs <- c("a","b")` | Yes (deterministic loader loop) |
 | `sapply(paste0(...), library, character.only = TRUE)` | No (dynamic vector) |
 | `tar_option_set(packages = c("a","b"))` | Yes, when the file also attaches targets (see below) |
 | `targets::tar_option_set(packages = "a")` | Yes (qualified — no `library(targets)` needed) |
@@ -229,7 +230,8 @@ sapply(libs, require, character.only = TRUE)
 
 This works for `sapply`, `lapply`, `vapply`, `mapply`, and the purrr forms
 (`map`, `walk`, `map_chr`, etc., bare or `purrr::`-qualified). The package
-vector must be either an inline non-empty `c("a","b",...)` of string literals,
+vector must be either an inline non-empty `c("a","b",...)` of string literals
+(literal `NULL` entries are allowed and dropped, matching base `c()`),
 or a same-file variable assigned exactly once at the top level to such a vector
 via `<-`/`=` or eligible bare/base-qualified `assign()`. For `assign()`, Raven
 accepts only destinations proven to create the file's top-level binding: the
@@ -246,6 +248,31 @@ not load the strings as packages). Empty vectors (`c()`, `character(0)`),
 dynamic constructions such as `paste0(...)`, `tolower(x)`, or
 `c(libs1, libs2)`, function-parameter origins, and values defined in another
 file are silently ignored.
+
+### Deterministic Package-Loader Loops
+
+Raven recognizes the common explicit-loop equivalent when the package vector
+meets the same static rules:
+
+```r
+packages <- c("dplyr", "ggplot2", NULL)
+for (package in packages) {
+  if (!requireNamespace(package, quietly = TRUE)) install.packages(package)
+  library(package, character.only = TRUE)
+}
+source("analysis.R")
+```
+
+The `library()` or `require()` call must be an unconditional top-level
+statement in the loop body, must load the loop iterator, and must set
+`character.only = TRUE`. Raven records the attachments only after the loop
+finishes, so they propagate into later sourced files without appearing inside
+the loop itself. Dynamic vectors, vectors reassigned before the loop,
+conditional loaders, a different package expression, iterator writes/removals
+before the loader, locally shadowed `library`/`require` helpers, and loops that
+may `break` or `return()` before loading every package are ignored. A named
+vector is resolved only for a loop known to execute eagerly in the file; a
+deferred function-body loop can still use an inline `c("a", "b")` sequence.
 
 ### targets::tar_option_set() Loads
 

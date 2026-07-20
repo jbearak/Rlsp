@@ -758,9 +758,9 @@ fn scan_workspace_referenced_packages(root: &std::path::Path) -> Vec<String> {
 /// - the `namespace_identifier` (LHS) of each `pkg::name` / `pkg:::name`
 ///   (`namespace_operator` node — the package id is `child(0)`, confirmed against
 ///   `find_namespace_context` in `handlers.rs`), and
-/// - the first argument of each `library`/`require`/`loadNamespace`/
-///   `requireNamespace` call (mirrors `state::extract_loaded_packages`, extended
-///   to cover `requireNamespace`).
+/// - statically detected package loaders from the canonical detector, and
+/// - a string literal statically matched to `requireNamespace()`'s `package`
+///   formal.
 fn collect_referenced_packages(
     tree: &tree_sitter::Tree,
     text: &str,
@@ -794,27 +794,12 @@ fn collect_referenced_packages(
             "call" => {
                 if let Some(func) = node.child_by_field_name("function") {
                     let func_text = &text[func.byte_range()];
-                    if matches!(
-                        func_text,
-                        "library" | "require" | "loadNamespace" | "requireNamespace"
-                    ) && let Some(args) = node.child_by_field_name("arguments")
+                    if func_text == "requireNamespace"
+                        && let Some(args) = node.child_by_field_name("arguments")
+                        && let Some(name) = static_require_namespace_package(args, text)
+                        && is_valid_package_name(&name)
                     {
-                        for i in 0..args.child_count() {
-                            let Some(arg) = args.child(i as u32) else {
-                                continue;
-                            };
-                            if arg.kind() != "argument" {
-                                continue;
-                            }
-                            if let Some(value) = arg.child_by_field_name("value") {
-                                let name = text[value.byte_range()]
-                                    .trim_matches(|c| c == '"' || c == '\'');
-                                if is_valid_package_name(name) {
-                                    out.insert(name.to_string());
-                                }
-                                break; // only the first arg names the package
-                            }
-                        }
+                        out.insert(name);
                     }
                 }
             }
@@ -826,6 +811,44 @@ fn collect_referenced_packages(
             }
         }
     }
+}
+
+fn static_require_namespace_package(arguments: tree_sitter::Node, text: &str) -> Option<String> {
+    if arguments.has_error() {
+        return None;
+    }
+    let mut named_package = None;
+    let mut first_positional = None;
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        if argument.kind() != "argument" {
+            continue;
+        }
+        let value = argument.child_by_field_name("value")?;
+        match argument.child_by_field_name("name") {
+            Some(name) => {
+                let name = crate::cross_file::binding::plain_argument_name(name, text)?;
+                if "package".starts_with(name.as_ref())
+                    && (name.is_empty() || named_package.replace(value).is_some())
+                {
+                    return None;
+                }
+            }
+            None => {
+                if first_positional.is_none() {
+                    first_positional = Some(value);
+                }
+            }
+        }
+    }
+    let value = match named_package {
+        Some(value) => value,
+        None => first_positional?,
+    };
+    if value.kind() != "string" {
+        return None;
+    }
+    crate::cross_file::binding::extract_plain_string(value, text)
 }
 
 fn read_description_depends_imports(path: &std::path::Path) -> Vec<String> {
@@ -1816,6 +1839,59 @@ mod tests {
         let mut packages = std::collections::BTreeSet::new();
         super::collect_referenced_packages(&parse(generic), generic, &mut packages);
         assert!(!packages.contains("not_a_package"), "got {packages:?}");
+    }
+
+    #[test]
+    fn collect_referenced_packages_resolves_static_loader_loop_without_iterator() {
+        let source = "packages <- c(\"alpha\", \"beta\", NULL)\n\
+                      for (package in packages) {\n\
+                        requireNamespace(package, quietly = TRUE)\n\
+                        library(package, character.only = TRUE)\n\
+                      }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .expect("load R grammar");
+        let tree = parser.parse(source, None).expect("parse R snippet");
+        let mut packages = std::collections::BTreeSet::new();
+        super::collect_referenced_packages(&tree, source, &mut packages);
+
+        assert_eq!(
+            packages,
+            ["alpha".to_string(), "beta".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert!(!packages.contains("package"));
+    }
+
+    #[test]
+    fn collect_referenced_packages_does_not_promote_other_require_namespace_strings() {
+        let source = "requireNamespace(package_name, lib.loc = \"not_a_package\")\n\
+                      requireNamespace(quietly = TRUE, package = \"namedpkg\")\n\
+                      requireNamespace(\"dot_value\", package = \"named_with_dots\")\n\
+                      requireNamespace(pack = \"partialpkg\")";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .expect("load R grammar");
+        let tree = parser.parse(source, None).expect("parse R snippet");
+        let mut packages = std::collections::BTreeSet::new();
+        super::collect_referenced_packages(&tree, source, &mut packages);
+
+        assert_eq!(
+            packages,
+            [
+                "named_with_dots".to_string(),
+                "namedpkg".to_string(),
+                "partialpkg".to_string(),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(!packages.contains("not_a_package"));
+        assert!(!packages.contains("package_name"));
+        assert!(!packages.contains("dot_value"));
     }
 
     #[test]

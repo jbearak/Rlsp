@@ -1449,7 +1449,8 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 
 /// Detects package loads in the file: direct `library()`/`require()`/`loadNamespace()`
 /// calls, static pacman `p_load()` calls, apply-family calls whose FUN argument
-/// is a bare reference to `library` or `require`, and {targets}
+/// is a bare reference to `library` or `require`, deterministic package-loader
+/// `for` loops, and {targets}
 /// `tar_option_set(packages = ...)` calls (see `try_parse_tar_option_set_call`).
 ///
 /// For direct calls, the package must be a bare identifier (`library(dplyr)`)
@@ -1466,6 +1467,12 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 /// removed bindings cannot supply candidates.
 /// Each apply emits one `LibraryCall` per package, all sharing the apply
 /// call's end position.
+///
+/// A package-loader `for` loop is recognized only when its sequence meets the
+/// same static-vector policy and its body unconditionally calls
+/// `library(iterator, character.only = TRUE)` or `require()` at the body's top
+/// level. The emitted calls share the loop's end position, after every package
+/// has been attached.
 ///
 /// For `tar_option_set(packages = ...)` calls, the bare spelling is honored
 /// only when the same file also attaches targets (`library(targets)` /
@@ -1731,7 +1738,8 @@ impl LibraryWalkOutput {
 
 /// Recursively traverse an AST subtree and collect statically determinable
 /// package loads: direct `library`/`require`/`loadNamespace` calls, apply-family
-/// calls whose FUN is `library`/`require`, and {targets}
+/// calls whose FUN is `library`/`require`, deterministic package-loader `for`
+/// loops, and {targets}
 /// `tar_option_set(packages = ...)` candidates.
 ///
 /// When `top_level_only` is true, calls lexically inside a
@@ -1758,6 +1766,16 @@ fn visit_node_for_library(
     // Identifier nodes have no children and cannot be calls.
     if node.kind() == "identifier" {
         return;
+    }
+
+    if node.kind() == "for_statement"
+        && (!top_level_only || !runtime_function_scope.is_function_scoped_at(node))
+    {
+        output.extend_calls(
+            try_parse_for_library_loop(node, content, capture_bindings),
+            runtime_function_scope,
+            scope_orderable,
+        );
     }
 
     if node.kind() == "call" {
@@ -1850,6 +1868,259 @@ fn visit_node_for_library(
             output,
         );
     }
+}
+
+/// Recognize a deterministic package-loader `for` loop.
+///
+/// The sequence must be a trusted inline `c()` package vector or a resolvable
+/// same-file package-vector binding. The body must contain exactly one
+/// top-level `library(iterator, character.only = TRUE)` or equivalent
+/// `require()` call. A loader nested in control flow is deliberately rejected,
+/// as are loops that can reach `next` before the loader, `break` anywhere in
+/// the body, or `return()` from the enclosing function. Emitted
+/// attachment events are anchored after the complete loop so packages do not
+/// become visible while individual iterations are still running.
+fn try_parse_for_library_loop(
+    node: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> Vec<LibraryCall> {
+    let Some(variable) = node.child_by_field_name("variable") else {
+        return Vec::new();
+    };
+    let Some(iterator) = super::binding::plain_identifier_name(variable, content) else {
+        return Vec::new();
+    };
+    let Some(body) = node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    if contains_loop_break(body) || contains_loop_return(body, content) {
+        return Vec::new();
+    }
+    let statements: Vec<Node> = if body.kind() == "braced_expression" {
+        let mut cursor = body.walk();
+        body.named_children(&mut cursor).collect()
+    } else {
+        vec![body]
+    };
+    let mut loader_index = None;
+    for (index, statement) in statements.iter().copied().enumerate() {
+        if is_iterator_library_call(statement, iterator, content, bindings)
+            && loader_index.replace(index).is_some()
+        {
+            return Vec::new();
+        }
+    }
+    let Some(loader_index) = loader_index else {
+        return Vec::new();
+    };
+    if statements[..loader_index]
+        .iter()
+        .copied()
+        .any(contains_loop_skip)
+        || statements[..loader_index].iter().copied().any(|statement| {
+            super::binding::subtree_may_bind_name(statement, content, iterator)
+                || contains_remove_call(statement, content)
+        })
+    {
+        return Vec::new();
+    }
+
+    let Some(sequence) = node.child_by_field_name("sequence") else {
+        return Vec::new();
+    };
+    let packages = match sequence.kind() {
+        "identifier" => {
+            let Some(name) = super::binding::plain_identifier_name(sequence, content) else {
+                return Vec::new();
+            };
+            let Some(packages) = bindings.resolve_package_vector_before_for(name, node) else {
+                return Vec::new();
+            };
+            packages
+        }
+        _ => {
+            let Some(packages) = extract_c_strings_strict(sequence, content) else {
+                return Vec::new();
+            };
+            if !bindings.package_c_is_trusted_at(node) {
+                return Vec::new();
+            }
+            packages
+        }
+    };
+
+    let end = node.end_position();
+    let line_text = content.lines().nth(end.row).unwrap_or("");
+    let column = byte_offset_to_utf16_column(line_text, end.column);
+    packages
+        .into_iter()
+        .map(|package| LibraryCall {
+            package,
+            line: end.row as u32,
+            column,
+            function_scope: None,
+            attaches: true,
+            requires_attached: None,
+        })
+        .collect()
+}
+
+fn is_iterator_library_call(
+    node: Node,
+    iterator: &str,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> bool {
+    if node.kind() != "call" {
+        return false;
+    }
+    let Some(function) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let loader = node_text(function, content);
+    if !matches!(loader, "library" | "require") {
+        return false;
+    }
+    let deferred = !super::binding::is_known_immediate_context(node);
+    if bindings
+        .get()
+        .named_local_binding_may_shadow_without_helper_uncertainty(loader, node, deferred)
+    {
+        return false;
+    }
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    if arguments.has_error() {
+        return false;
+    }
+
+    let mut package = None;
+    let mut character_only = None;
+    let mut positional = 0usize;
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        if argument.kind() != "argument" {
+            continue;
+        }
+        let Some(value) = argument.child_by_field_name("value") else {
+            return false;
+        };
+        match argument
+            .child_by_field_name("name")
+            .map(|name| node_text(name, content))
+        {
+            Some("package") => {
+                if package.replace(value).is_some() {
+                    return false;
+                }
+            }
+            Some("character.only") => {
+                if character_only
+                    .replace(matches!(node_text(value, content), "TRUE" | "T"))
+                    .is_some()
+                {
+                    return false;
+                }
+            }
+            Some(_) => {}
+            None => {
+                positional += 1;
+                if positional == 1 {
+                    if package.replace(value).is_some() {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    character_only == Some(true)
+        && package.is_some_and(|value| {
+            super::binding::plain_identifier_name(value, content) == Some(iterator)
+        })
+}
+
+fn contains_remove_call(node: Node, content: &str) -> bool {
+    if node.kind() == "call"
+        && node
+            .child_by_field_name("function")
+            .is_some_and(|function| {
+                let leaf = function.child_by_field_name("rhs").unwrap_or(function);
+                matches!(
+                    super::binding::plain_identifier_name(leaf, content),
+                    Some("rm" | "remove")
+                )
+            })
+    {
+        return true;
+    }
+    if node.kind() == "function_definition" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| contains_remove_call(child, content))
+}
+
+fn contains_loop_skip(node: Node) -> bool {
+    if matches!(node.kind(), "next" | "break") {
+        return true;
+    }
+    if node.kind() == "function_definition" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(contains_loop_skip)
+}
+
+fn contains_loop_break(node: Node) -> bool {
+    if node.kind() == "break" {
+        return true;
+    }
+    if node.kind() == "function_definition" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(contains_loop_break)
+}
+
+fn contains_loop_return(node: Node, content: &str) -> bool {
+    if node.kind() == "call"
+        && node
+            .child_by_field_name("function")
+            .is_some_and(|function| is_base_return_function(function, content))
+    {
+        return true;
+    }
+    if node.kind() == "function_definition" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| contains_loop_return(child, content))
+}
+
+fn is_base_return_function(function: Node, content: &str) -> bool {
+    let is_plain_name = |node: Node, expected: &str| {
+        super::binding::plain_identifier_name(node, content) == Some(expected)
+            || super::binding::extract_plain_string(node, content).as_deref() == Some(expected)
+    };
+    if is_plain_name(function, "return") {
+        return true;
+    }
+    if function.kind() != "namespace_operator" {
+        return false;
+    }
+    let Some(lhs) = function.child_by_field_name("lhs") else {
+        return false;
+    };
+    let Some(rhs) = function.child_by_field_name("rhs") else {
+        return false;
+    };
+    is_plain_name(lhs, "base") && is_plain_name(rhs, "return")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2214,7 +2485,7 @@ fn apply_arg_positions(func_node: Node, content: &str) -> Option<(usize, usize)>
 
 /// Return the strings from a strict bare `c()` character vector.
 fn extract_c_strings_strict(node: Node, content: &str) -> Option<Vec<String>> {
-    super::binding::extract_bare_c_plain_strings(node, content)
+    super::binding::extract_bare_c_package_strings(node, content)
         .map(|pairs| pairs.into_iter().map(|(string, _)| string).collect())
 }
 
@@ -5974,6 +6245,155 @@ library(ggplot2)"#;
         assert!(lib_calls[0].function_scope.is_none());
     }
 
+    // ==================== for-loop library detection ====================
+
+    #[test]
+    fn static_for_library_loop_attaches_after_loop() {
+        let code = r#"
+packages <- c("alpha", "beta", NULL)
+for (package in packages) {
+  if (!requireNamespace(package, quietly = TRUE)) {
+    install.packages(package)
+  }
+  library(package, character.only = TRUE)
+}
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.package.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert!(calls.iter().all(|call| call.attaches));
+        assert!(calls.iter().all(|call| call.line == 7));
+    }
+
+    #[test]
+    fn static_inline_for_require_loop_is_detected() {
+        let code =
+            r#"for (package in c("alpha", NULL, "beta")) require(package, character.only = T)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.package.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn loop_checkpoint_does_not_weaken_post_loop_binding_barrier() {
+        let code = r#"
+packages <- c("alpha")
+for (package in packages) library(package, character.only = TRUE)
+sapply(packages, library, character.only = TRUE)
+packages <- c("beta")
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| (call.package.as_str(), call.line))
+                .collect::<Vec<_>>(),
+            [("alpha", 2)]
+        );
+    }
+
+    #[test]
+    fn loop_checkpoint_honors_prior_persistent_unknown_mutation() {
+        let code = r#"
+packages <- c("alpha")
+if (flag) assign(dynamic_name, c("beta"))
+for (package in packages) library(package, character.only = TRUE)
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(
+            calls.iter().all(|call| call.package != "alpha"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn eager_capture_can_checkpoint_named_vector_but_deferred_function_cannot() {
+        let eager = r#"
+packages <- c("alpha")
+bquote(.(for (package in packages) library(package, character.only = TRUE)))
+"#;
+        let eager_calls = detect_library_calls(&parse_r(eager), eager);
+        assert_eq!(
+            eager_calls
+                .iter()
+                .map(|call| call.package.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha"]
+        );
+
+        let deferred = r#"
+packages <- c("alpha")
+f <- function() {
+  for (package in packages) library(package, character.only = TRUE)
+}
+"#;
+        let deferred_calls = detect_library_calls(&parse_r(deferred), deferred);
+        assert!(
+            deferred_calls.iter().all(|call| call.package != "alpha"),
+            "{deferred_calls:?}"
+        );
+    }
+
+    #[test]
+    fn loop_loader_rejects_iterator_writes_and_shadowed_helpers() {
+        for code in [
+            "packages <- c(\"alpha\")\nfor (package in packages) { package <- \"other\"; library(package, character.only = TRUE) }",
+            "packages <- c(\"alpha\")\nfor (package in packages) { assign(\"package\", \"other\"); library(package, character.only = TRUE) }",
+            "packages <- c(\"alpha\")\nfor (package in packages) { rm(package); library(package, character.only = TRUE) }",
+            "packages <- c(\"alpha\")\nlibrary <- function(...) NULL\nfor (package in packages) library(package, character.only = TRUE)",
+            "packages <- c(\"alpha\")\nrequire <- function(...) NULL\nfor (package in packages) require(package, character.only = TRUE)",
+        ] {
+            let calls = detect_library_calls(&parse_r(code), code);
+            assert!(
+                calls.iter().all(|call| call.package != "alpha"),
+                "{code}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_or_nonmandatory_for_loaders_are_skipped() {
+        for code in [
+            "for (package in packages) library(package, character.only = TRUE)",
+            "packages <- c(\"alpha\")\npackages <- get_packages()\nfor (package in packages) library(package, character.only = TRUE)",
+            "packages <- c(\"alpha\")\nassign(target, value)\nfor (package in packages) library(package, character.only = TRUE)",
+            "packages <- c(\"alpha\")\nfor (package in packages) library(other, character.only = TRUE)",
+            "packages <- c(\"alpha\")\nfor (package in packages) library(package)",
+            "packages <- c(\"alpha\")\nfor (package in packages) if (enabled) library(package, character.only = TRUE)",
+            "packages <- c(\"alpha\")\nfor (package in packages) { if (skip) next; library(package, character.only = TRUE) }",
+            "packages <- c(\"alpha\")\nfor (package in packages) { if (stop) break; library(package, character.only = TRUE) }",
+            "packages <- c(\"alpha\", \"beta\")\nfor (package in packages) { library(package, character.only = TRUE); if (stop) break }",
+            "f <- function() for (package in c(\"alpha\", \"beta\")) { library(package, character.only = TRUE); return() }",
+            "f <- function() for (package in c(\"alpha\", \"beta\")) { library(package, character.only = TRUE); `return`() }",
+            "f <- function() for (package in c(\"alpha\", \"beta\")) { library(package, character.only = TRUE); base::return() }",
+            "f <- function() for (package in c(\"alpha\", \"beta\")) { library(package, character.only = TRUE); base:::return() }",
+            "f <- function() for (package in c(\"alpha\", \"beta\")) { library(package, character.only = TRUE); \"return\"() }",
+            "f <- function() for (package in c(\"alpha\", \"beta\")) { library(package, character.only = TRUE); base::\"return\"() }",
+            "f <- function() for (package in c(\"alpha\", \"beta\")) { library(package, character.only = TRUE); \"base\"::return() }",
+        ] {
+            let tree = parse_r(code);
+            let calls = detect_library_calls(&tree, code);
+            assert!(
+                calls.iter().all(|call| call.package != "alpha"),
+                "loop inference unexpectedly attached alpha for {code}: {calls:?}"
+            );
+        }
+    }
+
     // ==================== apply-family library detection (#172) ====================
 
     #[test]
@@ -6085,7 +6505,7 @@ library(ggplot2)"#;
 
     #[test]
     fn package_vector_bindings_are_collected_only_on_demand() {
-        let code = "x <- 1\nlibrary(dplyr)\nrequire(tidyr)";
+        let code = "packages <- c(\"alpha\")\nfor (x in packages) print(x)\nlibrary(dplyr)\nrequire(tidyr)";
         let tree = parse_r(code);
         let root = tree.root_node();
         let mut bindings = super::super::static_path::LazyStaticBindings::new(root, code);

@@ -20623,6 +20623,32 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
     }
 
     #[test]
+    fn static_loader_loop_exports_become_visible_only_after_loop() {
+        let code = concat!(
+            "packages <- c(\"alpha\", \"beta\", NULL)\n",
+            "for (package in packages) {\n",
+            "  library(package, character.only = TRUE)\n",
+            "}\n",
+            "alpha_export()\n",
+            "beta_export()",
+        );
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let get_exports =
+            mock_package_exports(&[("alpha", &["alpha_export"]), ("beta", &["beta_export"])]);
+        let base_exports = empty_base_exports();
+
+        let inside =
+            scope_at_position_with_packages(&artifacts, 2, 0, &get_exports, &base_exports, false);
+        assert!(!inside.symbols.contains_key("alpha_export"));
+        assert!(!inside.symbols.contains_key("beta_export"));
+
+        let after =
+            scope_at_position_with_packages(&artifacts, 5, 0, &get_exports, &base_exports, false);
+        assert!(after.symbols.contains_key("alpha_export"));
+        assert!(after.symbols.contains_key("beta_export"));
+    }
+
+    #[test]
     fn test_scope_with_packages_at_library_call_line() {
         // Requirement 2.2: Package exports available at or after the library() call position
         let code = "library(dplyr)\nx <- mutate";
@@ -35767,6 +35793,38 @@ mod package_contribution_tests {
 
     #[test]
     fn attachment_projection_regressions_match_recursive_and_streaming_scope() {
+        let (recursive, streamed, stepped) = projection_fixture_scopes(
+            "static-loop-source-propagation",
+            &[
+                (
+                    "main.R",
+                    concat!(
+                        "packages <- c(\"alpha\", \"beta\", NULL)\n",
+                        "for (package in packages) {\n",
+                        "  if (!requireNamespace(package, quietly = TRUE)) install.packages(package)\n",
+                        "  library(package, character.only = TRUE)\n",
+                        "}\n",
+                        "source(\"child.R\")",
+                    ),
+                ),
+                ("child.R", "synthetic_export()"),
+            ],
+            "child.R",
+            u32::MAX,
+            Some((0, 0)),
+        );
+        assert_eq!(
+            recursive.attached_packages,
+            ["alpha".to_string(), "beta".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(streamed.attached_packages, recursive.attached_packages);
+        assert_eq!(
+            stepped.unwrap().attached_packages,
+            recursive.attached_packages
+        );
+
         let (recursive, streamed, _) = projection_fixture_scopes(
             "deferred-body-attachment",
             &[

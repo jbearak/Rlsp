@@ -29,6 +29,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use tree_sitter::Node;
 
@@ -52,7 +53,7 @@ pub(crate) fn collection_count_for_current_thread() -> usize {
 #[derive(Debug)]
 struct StaticCandidate<'tree> {
     path_rhs: Option<Node<'tree>>,
-    package_vector: Option<Vec<String>>,
+    package_vector: Option<Arc<[String]>>,
 }
 
 /// Single-assignment facts usable by static path and package-vector consumers,
@@ -66,6 +67,9 @@ struct StaticCandidate<'tree> {
 pub(crate) struct StaticBindings<'tree, 'text> {
     content: &'text str,
     bindings: HashMap<String, super::binding::Binding<StaticCandidate<'tree>>>,
+    /// Package-vector values captured immediately before an eager `for`
+    /// installs its conservative unknown-mutation barrier.
+    package_vectors_before_for: HashMap<usize, Arc<[String]>>,
     /// Memoized intrinsic fold of each candidate's RHS, keyed by name.
     ///
     /// Participating literals are retained with the value so callback-enabled
@@ -89,7 +93,8 @@ impl<'tree, 'text> StaticBindings<'tree, 'text> {
         #[cfg(test)]
         COLLECTION_COUNT.with(|count| count.set(count.get() + 1));
 
-        let bindings = super::binding::collect_bindings(root, content, |site| {
+        let mut package_vectors_before_for = HashMap::new();
+        let mut candidate_for = |site| {
             let (path_rhs, package_rhs) = match site {
                 BindingSite::Binary {
                     target,
@@ -108,16 +113,50 @@ impl<'tree, 'text> StaticBindings<'tree, 'text> {
                 } => (None, value),
                 _ => (None, None),
             };
-            let package_vector =
-                package_rhs.and_then(|value| extract_package_vector(value, content));
+            let package_vector = package_rhs
+                .and_then(|value| extract_package_vector(value, content))
+                .map(Arc::from);
             (path_rhs.is_some() || package_vector.is_some()).then_some(StaticCandidate {
                 path_rhs,
                 package_vector,
             })
-        });
+        };
+        let bindings = super::binding::collect_bindings_with_checkpoints(
+            root,
+            content,
+            &mut candidate_for,
+            &mut |loop_node, bindings, generation| {
+                if super::binding::has_pending_persistent_invalidation(bindings) {
+                    return;
+                }
+                let Some(sequence) = loop_node.child_by_field_name("sequence") else {
+                    return;
+                };
+                let Some(name) = super::binding::plain_identifier_name(sequence, content) else {
+                    return;
+                };
+                let Some((candidate, candidate_offset)) = bindings.get(name).and_then(|binding| {
+                    binding.resolved_at_generation_before(loop_node.start_byte(), generation)
+                }) else {
+                    return;
+                };
+                if super::binding::unknown_loaded_names_may_affect_candidate(
+                    bindings,
+                    candidate_offset,
+                    loop_node,
+                    false,
+                ) {
+                    return;
+                }
+                if let Some(packages) = &candidate.package_vector {
+                    package_vectors_before_for.insert(loop_node.id(), packages.clone());
+                }
+            },
+        );
         Self {
             content,
             bindings,
+            package_vectors_before_for,
             memo: RefCell::new(HashMap::new()),
             visiting: RefCell::new(HashSet::new()),
         }
@@ -274,6 +313,24 @@ impl<'tree, 'text> StaticBindings<'tree, 'text> {
         candidate.package_vector.as_deref()
     }
 
+    /// Resolve the sequence vector captured before this exact eager loop's
+    /// mutation barrier. `name` is rechecked against the loop sequence so a
+    /// caller cannot reuse the checkpoint for a different binding.
+    pub(crate) fn resolve_package_vector_before_for(
+        &self,
+        name: &str,
+        loop_node: Node,
+    ) -> Option<&[String]> {
+        let sequence = loop_node.child_by_field_name("sequence")?;
+        (super::binding::plain_identifier_name(sequence, self.content) == Some(name))
+            .then(|| {
+                self.package_vectors_before_for
+                    .get(&loop_node.id())
+                    .map(AsRef::as_ref)
+            })
+            .flatten()
+    }
+
     /// Whether an inline bare `c()` has provable base semantics at `use_node`.
     pub(crate) fn package_c_is_trusted_at(&self, use_node: Node) -> bool {
         let deferred_use = !super::binding::is_known_immediate_context(use_node);
@@ -355,6 +412,16 @@ impl<'tree, 'text> LazyStaticBindings<'tree, 'text> {
             .map(<[String]>::to_vec)
     }
 
+    pub(crate) fn resolve_package_vector_before_for(
+        &mut self,
+        name: &str,
+        loop_node: Node,
+    ) -> Option<Vec<String>> {
+        self.get()
+            .resolve_package_vector_before_for(name, loop_node)
+            .map(<[String]>::to_vec)
+    }
+
     pub(crate) fn package_c_is_trusted_at(&mut self, use_node: Node) -> bool {
         self.get().package_c_is_trusted_at(use_node)
     }
@@ -376,7 +443,7 @@ impl<'tree, 'text> LazyStaticBindings<'tree, 'text> {
 /// package-vector payload. Helper trust is established by the binding-site
 /// policy before this function is called.
 fn extract_package_vector(node: Node, content: &str) -> Option<Vec<String>> {
-    super::binding::extract_bare_c_plain_strings(node, content)
+    super::binding::extract_bare_c_package_strings(node, content)
         .map(|pairs| pairs.into_iter().map(|(package, _)| package).collect())
 }
 
