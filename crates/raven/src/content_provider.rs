@@ -356,10 +356,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// **Validates: Requirements 14.3**
     fn exists_cached(&self, uri: &Url) -> bool {
-        self.project_open_document(uri, |documents, open_uri| {
-            documents.contains(open_uri).then_some(())
-        })
-        .is_some()
+        self.is_open(uri)
             || self.workspace_index.is_complete(uri)
             || self.file_cache.get(uri).is_some()
     }
@@ -701,23 +698,41 @@ mod tests {
         doc_store
             .open(second_alias.clone(), "second store", 1)
             .await;
-        let content = |doc_store: &TestOpenDocuments| {
-            DefaultContentProvider::with_aliases(
+        let lookup = |doc_store: &TestOpenDocuments| {
+            let provider = DefaultContentProvider::with_aliases(
                 doc_store,
                 &workspace_index,
                 &file_cache,
                 &open_aliases,
+            );
+            (
+                provider.get_content(&canonical_uri),
+                provider.is_open(&canonical_uri),
+                provider.exists_cached(&canonical_uri),
             )
-            .get_content(&canonical_uri)
         };
 
-        assert_eq!(content(&doc_store).as_deref(), Some("exact store"));
+        assert_eq!(
+            lookup(&doc_store),
+            (Some("exact store".to_string()), true, true)
+        );
 
         doc_store.close(&canonical_uri);
-        assert_eq!(content(&doc_store).as_deref(), Some("first store"));
+        assert_eq!(
+            lookup(&doc_store),
+            (Some("first store".to_string()), true, true)
+        );
 
         doc_store.close(&first_alias);
-        assert_eq!(content(&doc_store).as_deref(), Some("second store"));
+        assert_eq!(
+            lookup(&doc_store),
+            (Some("second store".to_string()), true, true)
+        );
+
+        // The alias map is intentionally stale: predicates must still verify
+        // that an aliased document remains open.
+        doc_store.close(&second_alias);
+        assert_eq!(lookup(&doc_store), (None, false, false));
     }
 
     #[tokio::test]
