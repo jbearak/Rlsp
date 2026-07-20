@@ -590,6 +590,16 @@ impl PackageLibrary {
         }
     }
 
+    /// Assert synchronously that an invocation-owned routing transaction
+    /// released every cache-operation lease before returning.
+    #[cfg(test)]
+    pub(crate) fn try_routing_lease_for_test(&self) -> Option<PackageLibraryRoutingLease<'_>> {
+        self.cache_operation_gate
+            .try_write()
+            .ok()
+            .map(|guard| PackageLibraryRoutingLease { _guard: guard })
+    }
+
     pub(crate) fn cache_operation_epoch(&self, _lease: &PackageLibraryRoutingLease<'_>) -> u64 {
         self.cache_operation_epoch.load(Ordering::Acquire)
     }

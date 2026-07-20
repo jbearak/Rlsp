@@ -1044,6 +1044,11 @@ pub struct WorldState {
     /// and the dedicated physical-lifetime tests leave this disabled.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) library_routing_derivation_on_tokio_for_test: bool,
+    /// Instance-owned derivation lane keeps concurrent unit-test backends from
+    /// spending one another's foreground routing deadlines.
+    #[cfg(test)]
+    pub(crate) library_routing_derivation_lane_for_test:
+        Arc<crate::backend::LibraryRoutingDerivationLane>,
     #[cfg(test)]
     pub(crate) library_routing_test_reject_remaining: usize,
     #[cfg(test)]
@@ -1089,6 +1094,13 @@ pub struct WorldState {
     /// degraded/not-ready state without consulting the host R installation.
     #[cfg(test)]
     pub(crate) force_package_library_not_ready_for_test: bool,
+    /// One-shot synthetic package build for tests of package initialization or
+    /// rebuild routing. This replaces only host-dependent R/provider discovery
+    /// at the builder-result seam; production CAS, routing, and handoff still
+    /// run.
+    #[cfg(test)]
+    pub(crate) package_library_build_outcome_for_test:
+        Option<(Arc<crate::package_library::PackageLibrary>, bool)>,
     #[cfg(test)]
     pub(crate) force_package_init_stale_for_test: bool,
 
@@ -3195,9 +3207,28 @@ impl From<&AnalysisRevalidationTicket> for AnalysisRevalidationTicketFingerprint
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WatchedFinalHandoffOutcome {
+    Finalized,
+    RetiredBeforeFinalHandoff,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WatchedFinalHandoffForTest {
+    pub(crate) outcome: WatchedFinalHandoffOutcome,
     pub(crate) reserved: Vec<AnalysisRevalidationTicketFingerprint>,
     pub(crate) transferred: Vec<AnalysisRevalidationTicketFingerprint>,
+}
+
+#[cfg(test)]
+impl Default for WatchedFinalHandoffForTest {
+    fn default() -> Self {
+        Self {
+            outcome: WatchedFinalHandoffOutcome::RetiredBeforeFinalHandoff,
+            reserved: Vec::new(),
+            transferred: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3487,6 +3518,66 @@ impl<T> FinalHandoffCaptureClaim<T> {
         if let Some(root) = self.record(payload) {
             root.finish();
         }
+    }
+
+    /// Record a terminal claim-lineage drop.
+    ///
+    /// Normal last-owner retirement is a completed empty handoff. Unwinding
+    /// drops the root unfinished so the existing abnormal-exit diagnostics
+    /// distinguish a panic from an intentional terminal return.
+    fn record_terminal_drop(&self, payload: T) {
+        if let Some(root) = self.record(payload)
+            && !std::thread::panicking()
+        {
+            root.finish();
+        }
+    }
+}
+
+/// Shared ownership of one claimed final-handoff lineage.
+///
+/// Retry batches and deferred finalizers may clone this wrapper freely, but
+/// they never clone the underlying claim. Normal finalization records through
+/// [`Self::claim`]. If every owner exits before that boundary, the last owner
+/// records a typed terminal payload so tests cannot hang at
+/// `claimed=true, recorded=false`. The payload's type must distinguish that
+/// retirement from a real final handoff.
+#[cfg(test)]
+pub(crate) struct FinalHandoffClaimLineage<T: Default> {
+    inner: Arc<FinalHandoffClaimLineageInner<T>>,
+}
+
+#[cfg(test)]
+impl<T: Default> Clone for FinalHandoffClaimLineage<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T: Default> FinalHandoffClaimLineage<T> {
+    pub(crate) fn new(claim: FinalHandoffCaptureClaim<T>) -> Self {
+        Self {
+            inner: Arc::new(FinalHandoffClaimLineageInner { claim }),
+        }
+    }
+
+    pub(crate) fn claim(&self) -> &FinalHandoffCaptureClaim<T> {
+        &self.inner.claim
+    }
+}
+
+#[cfg(test)]
+struct FinalHandoffClaimLineageInner<T: Default> {
+    claim: FinalHandoffCaptureClaim<T>,
+}
+
+#[cfg(test)]
+impl<T: Default> Drop for FinalHandoffClaimLineageInner<T> {
+    fn drop(&mut self) {
+        self.claim.record_terminal_drop(T::default());
     }
 }
 
@@ -6808,6 +6899,10 @@ impl WorldState {
             #[cfg(any(test, feature = "test-support"))]
             library_routing_derivation_on_tokio_for_test: false,
             #[cfg(test)]
+            library_routing_derivation_lane_for_test: Arc::new(
+                crate::backend::LibraryRoutingDerivationLane::new(),
+            ),
+            #[cfg(test)]
             library_routing_test_reject_remaining: 0,
             #[cfg(test)]
             library_routing_test_commit_attempts: 0,
@@ -6846,6 +6941,8 @@ impl WorldState {
             force_open_install_local_only_for_test: false,
             #[cfg(test)]
             force_package_library_not_ready_for_test: false,
+            #[cfg(test)]
+            package_library_build_outcome_for_test: None,
             #[cfg(test)]
             force_package_init_stale_for_test: false,
 
@@ -12345,6 +12442,76 @@ mod tests {
         .await
         .expect("completion recorded before the waiter must remain observable");
         assert!(handle.status().completed);
+    }
+
+    #[tokio::test]
+    async fn final_handoff_claim_lineage_retires_only_after_last_owner_drops() {
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm_for("lineage");
+        let lineage =
+            FinalHandoffClaimLineage::<WatchedFinalHandoffForTest>::new(capture.claim().unwrap());
+        let successor = lineage.clone();
+
+        drop(lineage);
+        assert!(!handle.status().recorded);
+
+        drop(successor);
+        assert_eq!(
+            handle.wait_payload().await.outcome,
+            WatchedFinalHandoffOutcome::RetiredBeforeFinalHandoff
+        );
+        handle.wait_completed().await;
+        assert!(handle.status().abnormal_exits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_handoff_claim_lineage_normal_record_outranks_terminal_drop() {
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm_for("lineage");
+        let lineage =
+            FinalHandoffClaimLineage::<WatchedFinalHandoffForTest>::new(capture.claim().unwrap());
+        let recorder = lineage.clone();
+        let task = tokio::spawn(async move {
+            recorder
+                .claim()
+                .record_and_pause(WatchedFinalHandoffForTest {
+                    outcome: WatchedFinalHandoffOutcome::Finalized,
+                    reserved: Vec::new(),
+                    transferred: Vec::new(),
+                })
+                .await
+                .unwrap()
+                .finish();
+        });
+
+        assert_eq!(
+            handle.wait_payload().await.outcome,
+            WatchedFinalHandoffOutcome::Finalized
+        );
+        handle.release();
+        task.await.unwrap();
+        drop(lineage);
+        handle.wait_completed().await;
+        assert!(handle.status().abnormal_exits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_handoff_claim_lineage_panic_is_abnormal() {
+        let capture = FinalHandoffCapture::default();
+        let handle = capture.arm_for("lineage");
+        let claim = capture.claim().unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lineage = FinalHandoffClaimLineage::<WatchedFinalHandoffForTest>::new(claim);
+            panic!("test panic");
+        }));
+        assert!(panic.is_err());
+
+        assert_eq!(
+            handle.wait_payload().await.outcome,
+            WatchedFinalHandoffOutcome::RetiredBeforeFinalHandoff
+        );
+        handle.wait_completed().await;
+        assert_eq!(handle.status().abnormal_exits, vec![(1, "root")]);
     }
 
     #[tokio::test]
