@@ -64828,6 +64828,48 @@ my_func <- function(a = default_value) {
         );
     }
 
+    #[test]
+    fn nse_targets_make_suppresses_only_target_name_selectors_end_to_end() {
+        for code in [
+            "targets::tar_make(pipeline_target, shortcut = genuinely_missing)",
+            "targets::tar_make_future(names = pipeline_target, workers = genuinely_missing)",
+            "targets::tar_make_clustermq(pipeline_target, log_worker = genuinely_missing)",
+            "library(targets)\ntar_make(pipeline_target, reporter = genuinely_missing)",
+        ] {
+            let messages = collect_undefined_messages(code);
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| message.contains("pipeline_target")),
+                "captured target selector should be suppressed for {code:?}; got {messages:?}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("genuinely_missing is not defined")),
+                "evaluated control should stay checked for {code:?}; got {messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nse_targets_make_policy_requires_the_targets_function_end_to_end() {
+        for code in [
+            "tar_make <- function(names) names\ntar_make(local_target)",
+            "other::tar_make(foreign_target)",
+        ] {
+            let messages = collect_undefined_messages(code);
+            assert!(
+                messages.iter().any(|message| {
+                    message.contains("local_target is not defined")
+                        || message.contains("foreign_target is not defined")
+                }),
+                "same-named non-targets function must remain standard-eval for {code:?}; \
+                 got {messages:?}"
+            );
+        }
+    }
+
     /// Sweep addition end-to-end (corrected entry): `dplyr::rename_with`'s
     /// trailing dots are EVALUATED (forwarded to `.fn`), so `dots_captured=false`
     /// — only `.cols` is suppressed; an undefined extra argument is still flagged.
