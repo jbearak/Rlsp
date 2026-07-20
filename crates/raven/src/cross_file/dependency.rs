@@ -2216,14 +2216,16 @@ impl DependencyGraph {
         payload
     }
 
-    /// Current global edge revision — a monotonic counter bumped on any
-    /// structural edge change (`update_file` reporting `edges_changed`,
-    /// `remove_file`) or lending-policy transition. Used as the
-    /// membership-pinning component of the cross-snapshot `StandaloneScopeCache`
-    /// key (issue #483): capture it from the *real* `WorldState` graph (a cloned
-    /// per-snapshot graph resets its own counter to 0), so it changes whenever a
-    /// `source()` edge is added, retargeted, moved, or switched between lending
-    /// and non-lending anywhere in the workspace.
+    /// Current global edge revision — a monotonic counter bumped whenever the
+    /// complete edge revision identity changes, including lending-policy
+    /// transitions, and by direct graph mutations such as file removal. Used
+    /// as the membership-pinning component of the cross-snapshot
+    /// `StandaloneScopeCache` key (issue #483): capture it from the *real*
+    /// `WorldState` graph (a cloned per-snapshot graph resets its own counter to
+    /// 0), so it changes whenever a `source()` edge is added, retargeted, moved,
+    /// removed, or switched between lending and non-lending anywhere in the
+    /// workspace. [`UpdateResult::edges_changed`] separately controls
+    /// dependent revalidation.
     pub fn edge_revision(&self) -> u64 {
         self.edge_revision
             .load(std::sync::atomic::Ordering::Acquire)
