@@ -60,6 +60,11 @@ tokio::task_local! {
 }
 
 const DIAGNOSTIC_FANOUT_CONCURRENCY: usize = 8;
+/// Maximum concurrent close-resync bursts per backend service.
+///
+/// Cloned backend handles share this cap, while independent services do not
+/// contend for the same permits.
+const CLOSE_RESYNC_CONCURRENCY: usize = 4;
 
 use crate::r_subprocess::is_valid_package_name;
 
@@ -2409,7 +2414,7 @@ impl Backend {
             request_cancellation,
             traversal_truncation: Arc::new(TraversalTruncationState::default()),
             routing_tasks: RoutingTaskOwner::new(),
-            close_resync_permits: Arc::new(tokio::sync::Semaphore::new(4)),
+            close_resync_permits: Arc::new(tokio::sync::Semaphore::new(CLOSE_RESYNC_CONCURRENCY)),
             open_tar_source_coordinators: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -46810,7 +46815,7 @@ mod project_config_initialize_tests {
         let _all_first_permits = first_backend
             .close_resync_permits
             .clone()
-            .acquire_many_owned(4)
+            .acquire_many_owned(CLOSE_RESYNC_CONCURRENCY as u32)
             .await
             .unwrap();
         let _independent_permit = tokio::time::timeout(
