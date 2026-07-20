@@ -118,6 +118,33 @@ fn genuine_undefined_still_flagged_alongside_computed_helper_source() {
     );
 }
 
+/// Reading a file in a later helper must not retroactively erase the earlier
+/// top-level path binding used to discover the synthetic source closure.
+#[test]
+fn unrelated_function_effect_does_not_drop_computed_source() {
+    let dir = TempDir::new().unwrap();
+    write_repro(dir.path());
+    std::fs::write(
+        dir.path().join("tests/testthat/helper-project.R"),
+        "repo_root <- normalizePath(file.path(\"..\", \"..\"))\n\
+         source(file.path(repo_root, \"scripts/helpers.R\"))\n\
+         inspect_file <- function(path) {\n\
+             lines <- readLines(path, warn = FALSE)\n\
+             length(lines)\n\
+         }\n",
+    )
+    .unwrap();
+    let stdout = run_check(dir.path());
+    assert!(
+        !stdout.contains("my_theme is not defined"),
+        "an unrelated function-local effect must not drop the source edge:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("make_result is not defined"),
+        "all sourced definitions must remain visible:\n{stdout}"
+    );
+}
+
 /// An unfoldable computed path (paste0) must NOT create the edge — the
 /// sourced defs stay flagged, proving folding is strict rather than guessy.
 #[test]

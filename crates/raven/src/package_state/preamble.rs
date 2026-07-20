@@ -575,6 +575,35 @@ mod tests {
     }
 
     #[test]
+    fn later_function_local_effect_preserves_computed_source_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(root.join("scripts/helpers.R"), "sourced_value <- 1\n").unwrap();
+        let helper = root.join("tests/testthat/helper-project.R");
+        std::fs::write(
+            &helper,
+            "repo_root <- normalizePath(file.path(\"..\", \"..\"))\n\
+             source(file.path(repo_root, \"scripts/helpers.R\"))\n\
+             inspect_file <- function(path) {\n\
+                 lines <- readLines(path, warn = FALSE)\n\
+                 length(lines)\n\
+             }\n",
+        )
+        .unwrap();
+
+        let scan = scan_testthat_preambles_with_exclusions(root, &no_exclusions());
+        assert!(
+            scan.symbols
+                .get(&helper)
+                .is_some_and(|symbols| symbols.contains("sourced_value")),
+            "computed source closure was dropped: {:?}",
+            scan.symbols
+        );
+    }
+
+    #[test]
     fn sourced_helper_unified_facts_honor_capture_runtime_effects() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

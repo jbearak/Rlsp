@@ -207,6 +207,15 @@ impl<T> Binding<T> {
 struct BindingCollection<T> {
     map: HashMap<String, Binding<T>>,
     immediate_generation: u32,
+    /// Whether a bare `readLines` call is trusted under the bounded lexical
+    /// helper policy.
+    ///
+    /// This is computed over the whole document before binding collection so a
+    /// recognized shadow declared later or in another lexical scope cannot make
+    /// the classification depend on traversal order. Package attachment,
+    /// sourced definitions, and opaque evaluation are deliberately outside this
+    /// check, as they are for Raven's other bare-helper classifications.
+    bare_read_lines_trusted: bool,
 }
 
 impl<T> Default for BindingCollection<T> {
@@ -214,6 +223,7 @@ impl<T> Default for BindingCollection<T> {
         Self {
             map: HashMap::new(),
             immediate_generation: 0,
+            bare_read_lines_trusted: false,
         }
     }
 }
@@ -233,7 +243,14 @@ pub(crate) fn collect_bindings<'tree, T>(
     content: &str,
     mut candidate_for: impl FnMut(BindingSite<'tree>) -> Option<T>,
 ) -> HashMap<String, Binding<T>> {
-    let mut collection = BindingCollection::default();
+    let mut collection = BindingCollection {
+        // Almost every document has no `readLines` call. Avoid the additional
+        // AST scan entirely in that common case; a textual false positive
+        // (comment/string) costs only the bounded scan and cannot change facts.
+        bare_read_lines_trusted: content.contains("readLines")
+            && !document_may_bind_name(root, content, "readLines"),
+        ..Default::default()
+    };
     let mut visited_effect_nodes = HashSet::new();
     visit_bindings(
         root,
@@ -270,6 +287,133 @@ const UNKNOWN_LOADED_BINDING_KEY: &str = "\0raven-unknown-loaded-binding";
 const ASSIGN_FORMALS: [&str; 6] = ["x", "value", "pos", "envir", "inherits", "immediate"];
 const LOAD_FORMALS: [&str; 3] = ["file", "envir", "verbose"];
 const SYS_LOAD_IMAGE_FORMALS: [&str; 2] = ["name", "quiet"];
+
+/// Whether recognized syntax in the document may create a binding for `name`.
+///
+/// This intentionally checks every lexical scope and ignores execution order.
+/// It is used only to decide whether a bare base helper can receive a narrow
+/// non-mutating-call classification. Unknown assignment names and binding
+/// constructors fail closed. Package attachment, sourced definitions, and
+/// opaque evaluation remain outside this bounded lexical policy.
+fn document_may_bind_name(root: Node, content: &str, name: &str) -> bool {
+    let bare_assign_trusted = name == "assign" || !document_may_bind_name(root, content, "assign");
+
+    fn visit(node: Node, content: &str, name: &str, bare_assign_trusted: bool) -> bool {
+        if node.kind() == "binary_operator"
+            && let Some(operator) = node.child_by_field_name("operator")
+        {
+            let target = match node_text(operator, content) {
+                "<-" | "=" | "<<-" | "%<>%" | ":=" => node.child_by_field_name("lhs"),
+                "->" | "->>" => node.child_by_field_name("rhs"),
+                _ => None,
+            };
+            if target.is_some_and(|target| {
+                !matches!(
+                    binding_target_name(target, content),
+                    Some(BindingTargetName::Known(bound))
+                        if bound != name && bound != ".GlobalEnv"
+                )
+            }) {
+                return true;
+            }
+        }
+
+        if node.kind() == "function_definition"
+            && node
+                .child_by_field_name("parameters")
+                .is_some_and(|parameters| {
+                    let mut cursor = parameters.walk();
+                    parameters.children(&mut cursor).any(|parameter| {
+                        parameter.kind() == "parameter"
+                            && parameter
+                                .child_by_field_name("name")
+                                .is_some_and(|parameter_name| {
+                                    parameter_name.kind() == "identifier"
+                                        && plain_identifier_name(parameter_name, content)
+                                            .is_none_or(|bound| bound == name)
+                                })
+                    })
+                })
+        {
+            return true;
+        }
+
+        if node.kind() == "for_statement"
+            && node
+                .child_by_field_name("variable")
+                .is_some_and(|variable| {
+                    variable.kind() == "identifier"
+                        && plain_identifier_name(variable, content)
+                            .is_none_or(|bound| bound == name)
+                })
+        {
+            return true;
+        }
+
+        if node.kind() == "call"
+            && node
+                .child_by_field_name("function")
+                .is_some_and(|function| {
+                    call_may_bind_name(function, node, content, name, bare_assign_trusted)
+                })
+        {
+            return true;
+        }
+
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .any(|child| visit(child, content, name, bare_assign_trusted))
+    }
+
+    visit(root, content, name, bare_assign_trusted)
+}
+
+fn call_may_bind_name(
+    function: Node,
+    call: Node,
+    content: &str,
+    name: &str,
+    bare_assign_trusted: bool,
+) -> bool {
+    if !matches!(
+        function.kind(),
+        "identifier" | "string" | "raw_string_literal" | "namespace_operator"
+    ) {
+        return true;
+    }
+    if callee_leaf_has_uninterpreted_escape(function, content) {
+        return true;
+    }
+    if callee_leaf_is(function, content, "delayedAssign")
+        || callee_leaf_is(function, content, "makeActiveBinding")
+        || callee_leaf_is(function, content, "load")
+        || callee_leaf_is(function, content, "sys.load.image")
+        || callee_leaf_is(function, content, "list2env")
+        || callee_leaf_is(function, content, "do.call")
+    {
+        return true;
+    }
+    match assign_call_kind(function, content) {
+        Some(AssignCallKind::UnknownNamespace) => return true,
+        Some(AssignCallKind::BareCandidate) if !bare_assign_trusted => return true,
+        Some(AssignCallKind::BareCandidate | AssignCallKind::BaseCandidate) => {}
+        None => return false,
+    };
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return true;
+    };
+    let Some(matched) =
+        match_call_arguments(arguments, content, &ASSIGN_FORMALS, CallMatchMode::Strict)
+    else {
+        return true;
+    };
+    match matched[0] {
+        Some(CallActual::Value(value)) => {
+            extract_plain_string(value, content).is_none_or(|bound| bound == name)
+        }
+        Some(CallActual::Missing) | None => false,
+    }
+}
 
 #[derive(Clone, Copy)]
 struct BindingVisitState {
@@ -1766,6 +1910,44 @@ fn binding_value_is_side_effect_free<T>(
     let Some(function) = value.child_by_field_name("function") else {
         return false;
     };
+    let read_lines_is_trusted = match function.kind() {
+        "identifier" => {
+            node_is_plain_name(function, content, "readLines") && collection.bare_read_lines_trusted
+        }
+        "namespace_operator" => {
+            namespace_is_base(function, content)
+                && function
+                    .child_by_field_name("rhs")
+                    .is_some_and(|rhs| node_is_plain_name(rhs, content, "readLines"))
+        }
+        _ => false,
+    };
+    if read_lines_is_trusted {
+        let Some(arguments) = value.child_by_field_name("arguments") else {
+            return false;
+        };
+        if arguments.has_error() || arguments_have_uninterpreted_names(arguments, content) {
+            return false;
+        }
+        // `readLines` performs I/O but does not create or remove bindings.
+        // Simple identifier actuals are allowed so ordinary function formals
+        // do not turn this narrow classification off. Calls and other dynamic
+        // expressions still use the normal effect classifier, and the binding
+        // walk independently visits nested assignments and mutation calls.
+        let mut cursor = arguments.walk();
+        return arguments.children(&mut cursor).all(|argument| {
+            argument.kind() != "argument"
+                || argument.child_by_field_name("value").is_none_or(|actual| {
+                    actual.kind() == "identifier"
+                        || binding_value_is_side_effect_free(
+                            actual,
+                            content,
+                            collection,
+                            allow_bare_helpers,
+                        )
+                })
+        });
+    }
     let helper = [
         "c",
         "file.path",

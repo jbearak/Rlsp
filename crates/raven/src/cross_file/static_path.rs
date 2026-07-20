@@ -699,6 +699,81 @@ source(path)
     }
 
     #[test]
+    fn pristine_read_lines_does_not_invalidate_unrelated_static_paths() {
+        for helper_body in [
+            "value <- readLines(path)",
+            "value <- base::readLines(path)",
+            "value <- base:::readLines(path, warn = FALSE)",
+        ] {
+            let code = format!(
+                "root <- \"right.R\"\ninspect <- function(path) {helper_body}\nsource(root)\n"
+            );
+            assert_eq!(
+                fold_last_source_arg(&code),
+                Some("right.R".to_string()),
+                "{helper_body}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_read_lines_requires_a_document_wide_unshadowed_name() {
+        for shadow in [
+            "readLines <- identity",
+            "inspect <- function() readLines <- identity",
+            "inspect <- function(readLines) NULL",
+            "for (readLines in list(identity)) NULL",
+            "assign(\"readLines\", identity)",
+            ".GlobalEnv$readLines <- identity",
+            "assign <- function(...) base::assign(\"readLines\", identity, .GlobalEnv); assign(\"other\", 1)",
+            "other::assign(\"other\", identity)",
+            "do.call(\"assign\", list(\"readLines\", identity))",
+            "list2env(list(readLines = identity), .GlobalEnv)",
+            "get(\"assign\", baseenv())(\"readLines\", identity)",
+            "(assign)(\"readLines\", identity)",
+            "baseenv()[[\"assign\"]](\"readLines\", identity)",
+            "baseenv()$assign(\"readLines\", identity)",
+        ] {
+            for code in [
+                format!(
+                    "{shadow}\nroot <- \"right.R\"\nhelper <- function(path) value <- readLines(path)\nsource(root)\n"
+                ),
+                format!(
+                    "root <- \"right.R\"\nhelper <- function(path) value <- readLines(path)\n{shadow}\nsource(root)\n"
+                ),
+            ] {
+                assert_eq!(fold_last_source_arg(&code), None, "{shadow}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_base_read_lines_is_safe_despite_lexical_shadowing() {
+        let code = "root <- \"right.R\"\n\
+                    readLines <- function(...) stop(\"shadowed\")\n\
+                    helper <- function(path) value <- base::readLines(path)\n\
+                    source(root)\n";
+        assert_eq!(fold_last_source_arg(code), Some("right.R".to_string()));
+    }
+
+    #[test]
+    fn read_lines_aliases_and_other_calls_remain_conservative() {
+        for helper_body in [
+            "reader <- readLines; value <- reader(path)",
+            "value <- get(\"readLines\")(path)",
+            "value <- do.call(\"readLines\", list(path))",
+            "value <- scan(path)",
+            "value <- sys.call()",
+            "value <- readLines(assign(\"other\", path))",
+        ] {
+            let code = format!(
+                "root <- \"right.R\"\nhelper <- function(path) {{ {helper_body} }}\nsource(root)\n"
+            );
+            assert_eq!(fold_last_source_arg(&code), None, "{helper_body}");
+        }
+    }
+
+    #[test]
     fn folds_literal_file_path() {
         assert_eq!(
             fold_last_source_arg(r#"source(file.path("a", "b.R"))"#),
