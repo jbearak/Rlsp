@@ -4371,6 +4371,14 @@ impl WorldState {
     }
 
     #[cfg(test)]
+    pub(crate) fn has_active_libpath_watcher_for_test(&self) -> bool {
+        matches!(
+            self.libpath_watcher,
+            LibpathWatcherState::Active { .. } | LibpathWatcherState::ActiveUnapplied { .. }
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn install_libpath_journal_for_test(
         &mut self,
     ) -> Arc<crate::libpath_watcher::LibpathWatchJournal> {

@@ -43167,7 +43167,7 @@ mod project_config_initialize_tests {
             open_in_settled_package_workspace(&tmp, "consumer.R", "r", consumer_text).await;
         let backend = svc.inner();
         seed_package_description_input(backend, tmp.path(), description_text).await;
-        run_system_file_convergence_transfer(&backend.state, None)
+        let setup_transfer = run_system_file_convergence_transfer(&backend.state, None)
             .await
             .expect("the initial package routing must converge");
         let helper_uri = Url::from_file_path(&helper).unwrap();
@@ -43183,6 +43183,14 @@ mod project_config_initialize_tests {
         };
         {
             let state = backend.state.read().await;
+            assert!(
+                !state.has_active_libpath_watcher_for_test(),
+                "the package fixture must not start an unrelated seeded libpath rescan"
+            );
+            assert!(
+                state.analysis_transfer_is_pending_for_test(setup_transfer.handle),
+                "the watched deletion must inherit the manual setup transfer"
+            );
             assert_eq!(
                 state
                     .diagnostics_gate
@@ -48848,6 +48856,11 @@ infixContinuationStyle = "aligned"
     /// Tests asserting a later handler's force-marker or pending-worker state
     /// must use this helper so detached setup diagnostics cannot become an
     /// accidental predecessor of the operation under test.
+    ///
+    /// Library-path watching is deliberately disabled: installing a watcher
+    /// starts a mandatory seeded rescan on a separate routing root, outside the
+    /// `didOpen` receipt. These fixtures exercise workspace-package routing;
+    /// libpath watcher tests own that independent lifecycle.
     async fn open_in_settled_package_workspace(
         tmp: &TempDir,
         rel_path: &str,
@@ -48858,7 +48871,10 @@ infixContinuationStyle = "aligned"
             tmp,
             Some(serde_json::json!({
                 "crossFile": { "indexWorkspace": false },
-                "packages": { "enabled": true }
+                "packages": {
+                    "enabled": true,
+                    "watchLibraryPaths": false
+                }
             })),
         )
         .await;
