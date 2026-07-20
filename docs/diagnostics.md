@@ -242,6 +242,8 @@ Data objects (a package's `lazy_data`, and base-package datasets such as `datase
 
 These dependency-graph diagnostics are **not** suppressible with `# raven: ignore`; turn each off via its severity setting (see [Configuration](configuration.md)). The out-of-scope-symbol diagnostic is the exception — it honors `# raven: ignore` / `# raven: ignore-next` on the offending usage line.
 
+An exact optional source guard — `if (file.exists("path")) source("path")` with the same plain literal path — does not produce `unresolved-source-path` or `source-path-case-mismatch` when the guarded file is absent. The source still enters the dependency graph and lends symbols when it exists. Existing guarded targets outside the workspace remain diagnosable.
+
 #### Source path case mismatch
 
 When a path differs from the real on-disk filename **only by case** — e.g. `source("scripts/templates.r")` when the file is `templates.R` — Raven still resolves the file into the source graph (so the symbols it defines stay visible and you don't get a flood of false `undefined-variable` warnings), and reports the problem **once, at the path's line**, as `source-path-case-mismatch`. This covers both forward references — a `source()` call or forward directive (`# raven: source` / `# raven: run` / `# raven: include`) — **and** backward directives (`# raven: sourced-by` / `# raven: run-by` / `# raven: included-by`). Its severity is host-derived under the default `"auto"` policy:

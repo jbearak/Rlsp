@@ -408,6 +408,14 @@ pub struct ForwardSource {
     /// `Some` also identifies this source as tar-derived. The call identity is
     /// `(line, column)` and the ordinal disambiguates members sharing it.
     pub tar_source_ordinal: Option<u32>,
+    /// Whether this exact source call is the sole consequence of
+    /// `if (file.exists("path"))` for the same literal path.
+    ///
+    /// The source remains an ordinary dependency when the file exists. This
+    /// bit affects only path diagnostics: an absent or case-only-mismatched
+    /// guarded path makes the branch inert rather than causing `source()` to
+    /// fail. Outside-workspace diagnostics remain active for existing files.
+    pub guarded_by_file_exists: bool,
 }
 
 fn default_sys_source_global_env() -> bool {
@@ -448,6 +456,8 @@ struct ForwardSourceWire {
     resolved_uri: Option<tower_lsp::lsp_types::Url>,
     #[serde(default)]
     tar_source_ordinal: Option<u32>,
+    #[serde(default)]
+    guarded_by_file_exists: bool,
 }
 
 impl Serialize for ForwardSource {
@@ -457,7 +467,7 @@ impl Serialize for ForwardSource {
     {
         let local = !self.is_sys_source && self.locality != SourceLocality::Global;
         let sys_source_global_env = !self.is_sys_source || self.locality == SourceLocality::Global;
-        let mut state = serializer.serialize_struct("ForwardSource", 16)?;
+        let mut state = serializer.serialize_struct("ForwardSource", 17)?;
         state.serialize_field("path", &self.path)?;
         state.serialize_field("line", &self.line)?;
         state.serialize_field("column", &self.column)?;
@@ -474,6 +484,7 @@ impl Serialize for ForwardSource {
         state.serialize_field("system_file", &self.system_file)?;
         state.serialize_field("resolved_uri", &self.resolved_uri)?;
         state.serialize_field("tar_source_ordinal", &self.tar_source_ordinal)?;
+        state.serialize_field("guarded_by_file_exists", &self.guarded_by_file_exists)?;
         state.end()
     }
 }
@@ -508,6 +519,7 @@ impl<'de> Deserialize<'de> for ForwardSource {
             system_file: wire.system_file,
             resolved_uri: wire.resolved_uri,
             tar_source_ordinal: wire.tar_source_ordinal,
+            guarded_by_file_exists: wire.guarded_by_file_exists,
         })
     }
 }
@@ -805,6 +817,24 @@ mod tests {
             let round_trip: ForwardSource = serde_json::from_value(value).unwrap();
             assert_eq!(round_trip, source);
         }
+    }
+
+    #[test]
+    fn forward_source_optional_guard_round_trips_and_defaults_false() {
+        let legacy: ForwardSource = serde_json::from_str(r#"{"path":"child.R"}"#).unwrap();
+        assert!(!legacy.guarded_by_file_exists);
+
+        let guarded = ForwardSource {
+            path: "child.R".to_string(),
+            guarded_by_file_exists: true,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&guarded).unwrap();
+        assert_eq!(value["guarded_by_file_exists"], true);
+        assert_eq!(
+            serde_json::from_value::<ForwardSource>(value).unwrap(),
+            guarded
+        );
     }
 
     #[test]
