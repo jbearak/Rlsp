@@ -49,9 +49,90 @@ tokio::task_local! {
     static CURRENT_LSP_REQUEST_ID: JsonRpcId;
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Causal receipt currently owning diagnostic work in this task.
+    ///
+    /// Spawn boundaries explicitly propagate this value. At `schedule()`, it
+    /// is transferred to a superseded predecessor so a cancel-vs-consume
+    /// backstop cannot outlive the originating handler receipt.
+    static DIAGNOSTIC_FINAL_HANDOFF_CONTEXT: crate::state::FinalHandoffCausalContext;
+}
+
 const DIAGNOSTIC_FANOUT_CONCURRENCY: usize = 8;
 
 use crate::r_subprocess::is_valid_package_name;
+
+#[cfg(test)]
+async fn run_in_diagnostic_final_handoff_context<F>(
+    context: Option<crate::state::FinalHandoffCausalContext>,
+    future: F,
+) where
+    F: Future<Output = ()>,
+{
+    if let Some(context) = context {
+        DIAGNOSTIC_FINAL_HANDOFF_CONTEXT
+            .scope(context, future)
+            .await;
+    } else {
+        future.await;
+    }
+}
+
+#[cfg(test)]
+async fn run_with_diagnostic_final_handoff_completion<T, F>(
+    completion: Option<crate::state::FinalHandoffCompletionToken<T>>,
+    future: F,
+) where
+    T: Send + Sync + 'static,
+    F: Future<Output = ()>,
+{
+    if let Some(completion) = completion {
+        let context = completion.causal_context();
+        DIAGNOSTIC_FINAL_HANDOFF_CONTEXT
+            .scope(context, future)
+            .await;
+        completion.finish();
+    } else {
+        future.await;
+    }
+}
+
+#[cfg(test)]
+struct DiagnosticsSupersessionGuardForTest {
+    registry: crate::state::DiagnosticsSupersessionHandoffMapForTest,
+    uri: Url,
+    generation: u64,
+}
+
+#[cfg(test)]
+impl DiagnosticsSupersessionGuardForTest {
+    fn take_handoff(
+        &mut self,
+    ) -> Option<(
+        crate::state::FinalHandoffCausalContext,
+        crate::state::FinalHandoffCausalToken,
+    )> {
+        self.registry
+            .lock()
+            .unwrap()
+            .remove(&(self.uri.clone(), self.generation))
+    }
+}
+
+#[cfg(test)]
+impl Drop for DiagnosticsSupersessionGuardForTest {
+    fn drop(&mut self) {
+        if let Some((_, completion)) = self
+            .registry
+            .lock()
+            .unwrap()
+            .remove(&(self.uri.clone(), self.generation))
+        {
+            completion.finish();
+        }
+    }
+}
 
 /// Extract loaded packages from metadata-derived library calls.
 fn extract_loaded_packages_from_library_calls(
@@ -677,6 +758,8 @@ async fn run_bounded_fanout<T, MakeFuture, FutureOutput>(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(limit.max(1)));
     let make_future = Arc::new(make_future);
     let mut join_set = tokio::task::JoinSet::new();
+    #[cfg(test)]
+    let final_handoff_context = DIAGNOSTIC_FINAL_HANDOFF_CONTEXT.try_with(Clone::clone).ok();
 
     for item in items {
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
@@ -684,10 +767,21 @@ async fn run_bounded_fanout<T, MakeFuture, FutureOutput>(
             Err(_) => return,
         };
         let make_future = Arc::clone(&make_future);
+        #[cfg(not(test))]
         join_set.spawn(async move {
             let _permit = permit;
             make_future(item).await;
         });
+        #[cfg(test)]
+        {
+            let worker = async move {
+                let _permit = permit;
+                make_future(item).await;
+            };
+            let worker =
+                run_in_diagnostic_final_handoff_context(final_handoff_context.clone(), worker);
+            join_set.spawn(worker);
+        }
     }
 
     while let Some(result) = join_set.join_next().await {
@@ -13120,22 +13214,24 @@ async fn run_close_resync(
             let completion = final_handoff_completion
                 .as_ref()
                 .map(|root| root.child("close-resync-reserved-diagnostics"));
-            async move {
-                task.await;
-                if let Some(completion) = completion {
-                    completion.finish();
-                }
-            }
+            run_with_diagnostic_final_handoff_completion(completion, task)
         };
         tokio::spawn(task);
     }
-    Backend::publish_diagnostics_for_uris_bounded(
+    let affected_publish = Backend::publish_diagnostics_for_uris_bounded(
         state_arc,
         client,
         affected,
         Some(traversal_truncation),
-    )
-    .await;
+    );
+    #[cfg(test)]
+    let affected_publish = run_in_diagnostic_final_handoff_context(
+        final_handoff_completion
+            .as_ref()
+            .map(|root| root.causal_context()),
+        affected_publish,
+    );
+    affected_publish.await;
     #[cfg(test)]
     if let Some(completion) = final_handoff_completion {
         completion.finish();
@@ -13404,10 +13500,7 @@ async fn run_watched_deferred_routing_finalization(
         );
         #[cfg(test)]
         let task = async move {
-            task.await;
-            if let Some(completion) = completion {
-                completion.finish();
-            }
+            run_with_diagnostic_final_handoff_completion(completion, task).await;
         };
         if await_reserved_tickets {
             task.await;
@@ -13415,13 +13508,20 @@ async fn run_watched_deferred_routing_finalization(
             tokio::spawn(task);
         }
     }
-    Backend::publish_diagnostics_for_tickets_bounded(
+    let transferred_publish = Backend::publish_diagnostics_for_tickets_bounded(
         state_arc,
         client,
         tickets,
         Some(traversal_truncation),
-    )
-    .await;
+    );
+    #[cfg(test)]
+    let transferred_publish = run_in_diagnostic_final_handoff_context(
+        final_handoff_completion
+            .as_ref()
+            .map(|root| root.causal_context()),
+        transferred_publish,
+    );
+    transferred_publish.await;
     #[cfg(test)]
     if let Some(completion) = final_handoff_completion {
         completion.finish();
@@ -14253,10 +14353,7 @@ async fn run_watched_resync_batch_owned(
         );
         #[cfg(test)]
         let task = async move {
-            task.await;
-            if let Some(completion) = completion {
-                completion.finish();
-            }
+            run_with_diagnostic_final_handoff_completion(completion, task).await;
         };
         if await_reserved_tickets {
             task.await;
@@ -14264,13 +14361,20 @@ async fn run_watched_resync_batch_owned(
             tokio::spawn(task);
         }
     }
-    Backend::publish_diagnostics_for_tickets_bounded(
+    let transferred_publish = Backend::publish_diagnostics_for_tickets_bounded(
         state_arc,
         client,
         transfer_tickets,
         Some(traversal_truncation),
-    )
-    .await;
+    );
+    #[cfg(test)]
+    let transferred_publish = run_in_diagnostic_final_handoff_context(
+        final_handoff_completion
+            .as_ref()
+            .map(|root| root.causal_context()),
+        transferred_publish,
+    );
+    transferred_publish.await;
     #[cfg(test)]
     if let Some(completion) = final_handoff_completion {
         completion.finish();
@@ -14423,6 +14527,30 @@ async fn pause_after_diagnostics_publish_lock_for_test(
 ) {
 }
 
+#[cfg(test)]
+async fn pause_after_diagnostics_consume_for_test(state_arc: &Arc<RwLock<WorldState>>, uri: &Url) {
+    let armed = {
+        let state = state_arc.read().await;
+        state.diagnostics_post_consume_test_pause.take_armed(uri)
+    };
+    if let Some(pause_gate) = armed {
+        pause_gate.pause().await;
+    }
+}
+
+#[cfg(test)]
+async fn pause_backstop_respawn_for_test(state_arc: &Arc<RwLock<WorldState>>, uri: &Url) {
+    let armed = {
+        let state = state_arc.read().await;
+        state
+            .diagnostics_backstop_respawn_test_pause
+            .take_armed(uri)
+    };
+    if let Some(pause_gate) = armed {
+        pause_gate.pause().await;
+    }
+}
+
 /// Run debounced diagnostics for a single URI.
 ///
 /// This is the shared diagnostics pipeline used by both `did_open`/`did_change`
@@ -14451,11 +14579,33 @@ async fn run_debounced_diagnostics(
     // publish (the final commit requires a live epoch), and an all-`None`
     // trigger would otherwise compare equal to a still-absent document and
     // let a retired worker participate in schedule() supersession.
+    #[cfg(test)]
+    let mut supersession_registry = None;
     let scheduled = {
         let state = state_arc.read().await;
         if trigger.epoch.is_none() || trigger.is_stale(&state, &affected_uri) {
             None
         } else {
+            #[cfg(test)]
+            {
+                let registry = Arc::clone(&state.diagnostics_supersession_handoffs_for_test);
+                let mut handoffs = registry.lock().unwrap();
+                if let Ok(context) = DIAGNOSTIC_FINAL_HANDOFF_CONTEXT.try_with(Clone::clone)
+                    && let Some((predecessor_generation, _)) =
+                        state.cross_file_revalidation.latest(&affected_uri)
+                {
+                    let key = (affected_uri.clone(), predecessor_generation);
+                    handoffs.entry(key).or_insert_with(|| {
+                        let completion = context.child("diagnostics-superseded-predecessor");
+                        (context, completion)
+                    });
+                }
+                let scheduled = state.cross_file_revalidation.schedule(affected_uri.clone());
+                drop(handoffs);
+                supersession_registry = Some(registry);
+                Some(scheduled)
+            }
+            #[cfg(not(test))]
             Some(state.cross_file_revalidation.schedule(affected_uri.clone()))
         }
     };
@@ -14465,6 +14615,13 @@ async fn run_debounced_diagnostics(
             affected_uri
         );
         return;
+    };
+    #[cfg(test)]
+    let mut supersession_guard = DiagnosticsSupersessionGuardForTest {
+        registry: supersession_registry
+            .expect("a scheduled test diagnostic owns its supersession registry"),
+        uri: affected_uri.clone(),
+        generation,
     };
 
     // Clone token before select so we can pass it into diagnostic computation
@@ -14634,6 +14791,8 @@ async fn run_debounced_diagnostics(
     };
 
     if can_publish {
+        #[cfg(test)]
+        pause_after_diagnostics_consume_for_test(&state_arc, &affected_uri).await;
         log::trace!(
             "diagnostics lifecycle: publish uri={} count={} path=debounced trigger_version={:?} open={}",
             affected_uri,
@@ -14671,12 +14830,27 @@ async fn run_debounced_diagnostics(
         // at its trigger/eligibility checks.
         if cancel.is_cancelled() {
             state.diagnostics_gate.mark_force_republish(&affected_uri);
-            tokio::spawn(respawn_publish_after_superseded(
+            let respawn = respawn_publish_after_superseded(
                 Arc::clone(&state_arc),
                 client.clone(),
                 affected_uri.clone(),
                 traversal_truncation.clone(),
-            ));
+            );
+            #[cfg(test)]
+            if let Some((context, predecessor_completion)) = supersession_guard.take_handoff() {
+                let backstop_completion = context.child("diagnostics-backstop-respawn");
+                tokio::spawn(async move {
+                    DIAGNOSTIC_FINAL_HANDOFF_CONTEXT
+                        .scope(context, respawn)
+                        .await;
+                    backstop_completion.finish();
+                });
+                predecessor_completion.finish();
+            } else {
+                tokio::spawn(respawn);
+            }
+            #[cfg(not(test))]
+            tokio::spawn(respawn);
         }
     } else if !cancel.is_cancelled() {
         // Gate or eligibility refused the publish and nothing cancelled this
@@ -14703,6 +14877,8 @@ fn respawn_publish_after_superseded(
     traversal_truncation: Option<Arc<TraversalTruncationState>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
+        #[cfg(test)]
+        pause_backstop_respawn_for_test(&state_arc, &uri).await;
         Backend::publish_diagnostics_via_arc(state_arc, client, &uri, traversal_truncation).await;
     })
 }
@@ -15276,12 +15452,7 @@ async fn spawn_open_close_continuation(
                 let completion = final_handoff_completion
                     .as_ref()
                     .map(|root| root.child("did-close-diagnostics"));
-                async move {
-                    task.await;
-                    if let Some(completion) = completion {
-                        completion.finish();
-                    }
-                }
+                run_with_diagnostic_final_handoff_completion(completion, task)
             };
             tokio::spawn(task);
         }
@@ -15320,17 +15491,26 @@ async fn spawn_open_close_continuation(
         // cancel this worker and strand one force marker. Disk convergence
         // follows, so observers see shadow A before fresh disk C and each real
         // transition publishes once.
-        for ticket in effects.revalidations {
-            run_debounced_diagnostics(
-                state.clone(),
-                client.clone(),
-                ticket.uri,
-                ticket.debounce_ms,
-                ticket.trigger,
-                Some(traversal.clone()),
-            )
-            .await;
-        }
+        #[cfg(test)]
+        let continuation_context = continuation_completion
+            .as_ref()
+            .map(|completion| completion.causal_context());
+        let drain = async {
+            for ticket in effects.revalidations {
+                run_debounced_diagnostics(
+                    state.clone(),
+                    client.clone(),
+                    ticket.uri,
+                    ticket.debounce_ms,
+                    ticket.trigger,
+                    Some(traversal.clone()),
+                )
+                .await;
+            }
+        };
+        #[cfg(test)]
+        let drain = run_in_diagnostic_final_handoff_context(continuation_context, drain);
+        drain.await;
         #[cfg(test)]
         if let Some(completion) = continuation_completion {
             completion.finish();
@@ -19526,12 +19706,7 @@ impl Backend {
                 let completion = final_handoff_completion
                     .as_ref()
                     .map(|root| root.child("analysis-revalidation-diagnostics"));
-                async move {
-                    task.await;
-                    if let Some(completion) = completion {
-                        completion.finish();
-                    }
-                }
+                run_with_diagnostic_final_handoff_completion(completion, task)
             };
             tokio::spawn(task);
         }
@@ -25029,7 +25204,7 @@ mod tests {
     }
 
     mod diagnostic_lifecycle {
-        use futures_util::StreamExt;
+        use futures_util::{FutureExt, StreamExt};
         use std::sync::Arc;
         use std::time::Duration;
         use tempfile::TempDir;
@@ -25109,6 +25284,209 @@ mod tests {
                     },
                 })
                 .await;
+        }
+
+        /// A receipt-owned successor may cancel an older diagnostic after the
+        /// older worker consumed the successor's force marker. The older
+        /// worker restores that marker and spawns a normal-pipeline backstop;
+        /// causal completion must include that recursively spawned consumer.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn final_handoff_waits_for_cancel_consume_backstop_respawn() {
+            let tmp = TempDir::new().unwrap();
+            let uri = Url::from_file_path(tmp.path().join("causal-backstop.R")).unwrap();
+            std::fs::write(tmp.path().join("causal-backstop.R"), "x <- (\n").unwrap();
+            let (svc, mut socket) = lifecycle_service(std::slice::from_ref(&uri)).await;
+            let backend = svc.inner();
+            open_lifecycle_doc(backend, &uri, "x <- (\n").await;
+            wait_until_pending(backend, &uri).await;
+            backend
+                .state
+                .read()
+                .await
+                .cross_file_revalidation
+                .cancel(&uri);
+            backend
+                .state
+                .write()
+                .await
+                .cross_file_config
+                .revalidation_debounce_ms = 0;
+
+            let trigger = {
+                let state = backend.state.read().await;
+                crate::state::DiagnosticsTrigger::capture(&state, &uri)
+            };
+            let pre_consume_pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_post_publish_lock_test_pause
+                .arm(uri.clone());
+            let post_consume_pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_post_consume_test_pause
+                .arm(uri.clone());
+            let predecessor = tokio::spawn(super::super::run_debounced_diagnostics(
+                backend.state.clone(),
+                backend.client.clone(),
+                uri.clone(),
+                0,
+                trigger,
+                None,
+            ));
+            tokio::time::timeout(Duration::from_secs(5), pre_consume_pause.wait_arrived())
+                .await
+                .expect("predecessor must acquire the publish lock");
+            backend
+                .state
+                .read()
+                .await
+                .diagnostics_gate
+                .mark_force_republish(&uri);
+            pre_consume_pause.release();
+            tokio::time::timeout(Duration::from_secs(5), post_consume_pause.wait_arrived())
+                .await
+                .expect("predecessor must consume the successor's force marker");
+
+            let capture = crate::state::FinalHandoffCapture::<()>::default();
+            let receipt = capture.arm_for(uri.as_str());
+            let claim = capture
+                .claim()
+                .expect("the target diagnostic transaction must claim its receipt");
+            let root = claim.begin_causal_phase();
+            let record = tokio::spawn(async move {
+                claim.record_and_pause_in_phase(()).await;
+            });
+            tokio::time::timeout(Duration::from_secs(5), receipt.wait_payload())
+                .await
+                .expect("the receipt must expose its typed handoff");
+            receipt.release();
+            record.await.unwrap();
+
+            let backstop_pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_backstop_respawn_test_pause
+                .arm(uri.clone());
+            let successor_completion = root.child("diagnostics-regression-successor");
+            let successor = super::super::run_debounced_diagnostics(
+                backend.state.clone(),
+                backend.client.clone(),
+                uri.clone(),
+                0,
+                trigger,
+                None,
+            );
+            let successor = super::super::run_with_diagnostic_final_handoff_completion(
+                Some(successor_completion),
+                successor,
+            );
+            let successor = tokio::spawn(successor);
+            root.finish();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if receipt
+                        .status()
+                        .outstanding
+                        .iter()
+                        .any(|(_, label)| *label == "diagnostics-superseded-predecessor")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("successor must synchronously own its superseded predecessor");
+            tokio::time::timeout(Duration::from_secs(5), successor)
+                .await
+                .expect(
+                    "successor must gate-refuse while the predecessor still holds \
+                     the consumed publish lock",
+                )
+                .unwrap();
+
+            post_consume_pause.release();
+            tokio::time::timeout(Duration::from_secs(5), backstop_pause.wait_arrived())
+                .await
+                .expect("cancelled predecessor must spawn its convergence backstop");
+            predecessor.await.unwrap();
+            let predecessor_publish = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("predecessor publication must reach the client socket")
+                .expect("client socket must remain open");
+            assert_eq!(
+                predecessor_publish.method(),
+                "textDocument/publishDiagnostics"
+            );
+
+            let paused = receipt.status();
+            assert!(
+                !paused.completed,
+                "the receipt must remain open while its backstop is paused"
+            );
+            assert_eq!(
+                paused
+                    .outstanding
+                    .iter()
+                    .map(|(_, label)| *label)
+                    .collect::<Vec<_>>(),
+                vec!["diagnostics-backstop-respawn"],
+                "the recursively spawned backstop must be the receipt's exact remaining owner"
+            );
+            assert!(
+                paused.abnormal_exits.is_empty(),
+                "expected supersession must finish every causal token normally"
+            );
+
+            backstop_pause.release();
+            let (_, backstop_publish) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(receipt.wait_completed(), socket.next())
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "receipt must complete after the backstop consumes the restored marker: \
+                         status={:?}",
+                    receipt.status()
+                )
+            });
+            assert_eq!(
+                backstop_publish
+                    .expect("client socket must remain open")
+                    .method(),
+                "textDocument/publishDiagnostics"
+            );
+            assert!(
+                socket.next().now_or_never().is_none(),
+                "the restored marker must have exactly one backstop consumer"
+            );
+            let completed = receipt.status();
+            assert!(completed.completed);
+            assert!(completed.outstanding.is_empty());
+            assert!(completed.abnormal_exits.is_empty());
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.diagnostics_gate.force_republish_count_for_test(&uri),
+                0,
+                "backstop must consume the restored marker before causal completion"
+            );
+            assert!(
+                !state.cross_file_revalidation.has_pending_for_test(&uri),
+                "backstop must clear its pending generation before causal completion"
+            );
+            assert!(
+                state
+                    .diagnostics_supersession_handoffs_for_test
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+                "causal completion must leave no supersession handoff registry entry"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -42780,7 +43158,8 @@ mod project_config_initialize_tests {
         fs::write(&description, description_text).unwrap();
         fs::write(&helper, "helper_value <- 1\n").unwrap();
         fs::write(tmp.path().join("consumer.R"), consumer_text).unwrap();
-        let (svc, consumer_uri) = open_in_workspace(&tmp, "consumer.R", "r", consumer_text).await;
+        let (svc, consumer_uri) =
+            open_in_settled_package_workspace(&tmp, "consumer.R", "r", consumer_text).await;
         let backend = svc.inner();
         seed_package_description_input(backend, tmp.path(), description_text).await;
         run_system_file_convergence_transfer(&backend.state, None)
@@ -42797,28 +43176,58 @@ mod project_config_initialize_tests {
             state.system_file_test_reject_remaining = 2;
             state.system_file_test_commit_attempts
         };
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&consumer_uri),
+                0,
+                "settled setup must not lend a force marker to the watched deletion"
+            );
+            assert!(
+                !state
+                    .cross_file_revalidation
+                    .has_pending_for_test(&consumer_uri),
+                "settled setup must not leave a diagnostic worker for the watched deletion to supersede"
+            );
+        }
 
         fs::remove_file(&description).unwrap();
+        let final_handoff = backend
+            .state
+            .read()
+            .await
+            .watched_final_handoff_test_capture
+            .arm_for(consumer_uri.as_str());
         let first_pause = backend
             .state
             .read()
             .await
             .system_file_pre_commit_test_pause
             .arm(Url::parse("raven-test://system-file-pre-commit").unwrap());
-        let deletion = backend.did_change_watched_files(DidChangeWatchedFilesParams {
-            changes: vec![FileEvent {
-                uri: Url::from_file_path(&description).unwrap(),
-                typ: FileChangeType::DELETED,
-            }],
+        let task_backend = backend.clone();
+        let description_uri = Url::from_file_path(&description).unwrap();
+        let deletion = tokio::spawn(async move {
+            task_backend
+                .did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![FileEvent {
+                        uri: description_uri,
+                        typ: FileChangeType::DELETED,
+                    }],
+                })
+                .await;
         });
-        tokio::pin!(deletion);
-        tokio::select! {
-            _ = first_pause.wait_arrived() => {}
-            _ = &mut deletion => panic!("delete-only handler skipped the first routing attempt"),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                panic!("delete-only handler did not reach the first routing attempt")
-            }
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            first_pause.wait_arrived(),
+        )
+        .await
+        .expect("delete-only handler did not reach the first routing attempt");
+        assert!(
+            !deletion.is_finished(),
+            "delete-only handler skipped the first routing attempt"
+        );
         first_pause.release();
 
         let second_pause = backend
@@ -42827,13 +43236,16 @@ mod project_config_initialize_tests {
             .await
             .system_file_pre_commit_test_pause
             .arm(Url::parse("raven-test://system-file-pre-commit").unwrap());
-        tokio::select! {
-            _ = second_pause.wait_arrived() => {}
-            _ = &mut deletion => panic!("delete-only handler skipped the second routing attempt"),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                panic!("delete-only handler did not reach the second routing attempt")
-            }
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            second_pause.wait_arrived(),
+        )
+        .await
+        .expect("delete-only handler did not reach the second routing attempt");
+        assert!(
+            !deletion.is_finished(),
+            "delete-only handler skipped the second routing attempt"
+        );
         second_pause.release();
 
         let deferred_pause = backend
@@ -42842,23 +43254,50 @@ mod project_config_initialize_tests {
             .await
             .system_file_pre_commit_test_pause
             .arm(Url::parse("raven-test://system-file-pre-commit").unwrap());
-        tokio::select! {
-            biased;
-            _ = &mut deletion => {
-                panic!("delete-only handler returned before deferred routing finalization")
-            }
-            _ = deferred_pause.wait_arrived() => {}
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                panic!("deferred routing owner did not reach finalization")
-            }
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            deferred_pause.wait_arrived(),
+        )
+        .await
+        .expect("deferred routing owner did not reach finalization");
+        assert!(
+            !deletion.is_finished(),
+            "delete-only handler returned before deferred routing finalization"
+        );
         assert_eq!(
             backend.state.read().await.system_file_test_commit_attempts,
             attempt_baseline + 2,
             "the retained owner starts only after both immediate attempts are exhausted"
         );
         deferred_pause.release();
-        tokio::time::timeout(std::time::Duration::from_secs(5), &mut deletion)
+        let handoff = wait_final_handoff_payload(
+            backend,
+            &final_handoff,
+            "watched-deferred-delete",
+            &[&consumer_uri],
+        )
+        .await;
+        assert!(
+            handoff.reserved.is_empty(),
+            "deferred package deletion must transfer, not duplicate, its diagnostic ownership"
+        );
+        assert_eq!(
+            handoff
+                .transferred
+                .iter()
+                .map(|ticket| &ticket.uri)
+                .collect::<Vec<_>>(),
+            vec![&consumer_uri],
+            "deferred package deletion must transfer exactly its open consumer"
+        );
+        release_and_wait_final_handoff(
+            backend,
+            &final_handoff,
+            "watched-deferred-delete",
+            &[&consumer_uri],
+        )
+        .await;
+        deletion
             .await
             .expect("delete-only handler must finish after deferred finalization is released");
 
@@ -48396,6 +48835,31 @@ infixContinuationStyle = "aligned"
             })),
         )
         .await
+    }
+
+    /// Package-aware fixture whose `didOpen` diagnostic transaction has
+    /// reached exact causal completion before the caller receives the backend.
+    ///
+    /// Tests asserting a later handler's force-marker or pending-worker state
+    /// must use this helper so detached setup diagnostics cannot become an
+    /// accidental predecessor of the operation under test.
+    async fn open_in_settled_package_workspace(
+        tmp: &TempDir,
+        rel_path: &str,
+        language_id: &str,
+        content: &str,
+    ) -> (tower_lsp::LspService<Backend>, Url) {
+        let svc = service_in_workspace_with_options(
+            tmp,
+            Some(serde_json::json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": true }
+            })),
+        )
+        .await;
+        let uri = Url::from_file_path(tmp.path().join(rel_path)).unwrap();
+        open_doc_with_revalidation_handoff(svc.inner(), &uri, language_id, 1, content).await;
+        (svc, uri)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1403,14 +1403,22 @@ finalization, `didClose` disk resync, and diagnostic workers can continue in
 finite spawned tasks. Tests for those paths must arm the typed
 `FinalHandoffCapture` immediately before the target handler, inspect its typed
 handoff payload, release it, and await its causal completion receipt before
-asserting durable state. The first finalizer to record owns the receipt; every
-finite diagnostic descendant registers a labeled token before spawn, and the
-receipt completes only after the root closes admission and all tokens finish.
+asserting durable state. The first finalizer to record owns the receipt.
+Detached and recursive diagnostic spawn boundaries register a labeled token
+before spawn; bounded-fanout workers instead inherit the causal context and
+remain owned by the aggregate parent that joins them. The receipt completes
+only after the root closes admission and all tokens and joined fanouts finish.
 An abnormal token drop records cancellation/panic instead of silently looking
 successful. A multi-root `didClose` owns one aggregate resync-phase root with
 one pre-registered child per root; its typed payload still describes the first
 final handoff, while completion spans every root. Quiescent didOpen/didChange
 setup uses the same receipt around its exact analysis-revalidation tickets.
+Diagnostic causal context crosses the bounded-fanout spawn boundary. When a
+receipt-owned worker supersedes an older worker, it registers ownership of
+that predecessor before cancellation; if the predecessor loses the
+cancel-vs-gate-consume race, it transfers that ownership to the recursively
+spawned `diagnostics-backstop-respawn` child before spawning. This accounting
+is test-only and does not alter production scheduling or publication.
 
 Do not use `force_republish_count_for_test`, the pending-revalidation map, a
 shared “latest” snapshot, or a sleep as a generic proxy for invocation
@@ -1424,7 +1432,11 @@ Use `open_in_quiescent_workspace` when workspace scanning and package routing
 are outside the test's subject. It disables those two startup authorities while
 preserving on-demand cross-file indexing. Keep separate tests with normal
 initialization for startup/package behavior; quiescent setup is isolation, not
-a replacement for that coverage.
+a replacement for that coverage. Tests that assert a later operation's exact
+force-marker or pending-worker state must also settle `didOpen` through its
+exact analysis-revalidation receipt before arming the target operation. The
+`open_in_settled_package_workspace` helper provides that boundary while
+keeping package routing enabled when package routing is the test subject.
 
 Close-resync concurrency is bounded by an `Arc<Semaphore>` owned by `Backend`.
 Clones of one server share its four permits, while independent `LspService`

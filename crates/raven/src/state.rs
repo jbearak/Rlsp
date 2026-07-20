@@ -973,6 +973,24 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) diagnostics_post_publish_lock_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic barrier after a successful atomic gate consume and before
+    /// client publication, while the diagnostics publish lock remains held.
+    #[cfg(test)]
+    pub(crate) diagnostics_post_consume_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic barrier at entry to the cancel-vs-consume backstop.
+    #[cfg(test)]
+    pub(crate) diagnostics_backstop_respawn_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Test-only causal ownership transferred from a receipt-owned
+    /// diagnostics worker to the worker it supersedes.
+    ///
+    /// The map lives behind its own synchronous lock so scheduling can
+    /// register the predecessor handoff before cancelling that predecessor.
+    /// This closes the test-harness-only cancel/exit race without changing
+    /// production diagnostics scheduling.
+    #[cfg(test)]
+    pub(crate) diagnostics_supersession_handoffs_for_test: DiagnosticsSupersessionHandoffMapForTest,
     /// Deterministic barrier after alias-reconcile derivation and before its
     /// commit-time topology recheck.
     #[cfg(test)]
@@ -3242,6 +3260,14 @@ impl<T> FinalHandoffCaptureGate<T> {
     }
 
     fn register(self: &Arc<Self>, label: &'static str) -> FinalHandoffCompletionToken<T> {
+        let id = self.register_id(label);
+        FinalHandoffCompletionToken {
+            gate: Arc::clone(self),
+            id: Some(id),
+        }
+    }
+
+    fn register_id(&self, label: &'static str) -> u64 {
         let id = self.next_child_id.fetch_add(1, Ordering::Relaxed);
         let mut outstanding = self.outstanding.lock().unwrap();
         assert!(
@@ -3250,11 +3276,97 @@ impl<T> FinalHandoffCaptureGate<T> {
         );
         let previous = outstanding.insert(id, label);
         debug_assert!(previous.is_none());
+        id
+    }
+
+    fn release_id(&self, id: u64, abnormal: bool) {
+        let mut outstanding = self.outstanding.lock().unwrap();
+        let label = outstanding
+            .remove(&id)
+            .expect("causal completion token must own one registered child");
+        if abnormal {
+            self.abnormal_exits.lock().unwrap().push((id, label));
+        }
+        let completed = outstanding.is_empty();
+        if completed {
+            self.completed.store(true, Ordering::Release);
+        }
         drop(outstanding);
-        FinalHandoffCompletionToken {
-            gate: Arc::clone(self),
+        if completed {
+            self.completion.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+trait FinalHandoffCausalGate: Send + Sync {
+    fn register_causal_child(&self, label: &'static str) -> u64;
+    fn release_causal_child(&self, id: u64, abnormal: bool);
+}
+
+#[cfg(test)]
+impl<T: Send + Sync> FinalHandoffCausalGate for FinalHandoffCaptureGate<T> {
+    fn register_causal_child(&self, label: &'static str) -> u64 {
+        self.register_id(label)
+    }
+
+    fn release_causal_child(&self, id: u64, abnormal: bool) {
+        self.release_id(id, abnormal);
+    }
+}
+
+/// Type-erased test-only access to one final-handoff capture's causal gate.
+///
+/// Diagnostic backstops do not know the typed payload captured by the
+/// originating handler. This context lets them register a labeled child
+/// synchronously before spawn while retaining the capture's exact completion
+/// and abnormal-exit semantics.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct FinalHandoffCausalContext {
+    gate: Arc<dyn FinalHandoffCausalGate>,
+}
+
+#[cfg(test)]
+impl FinalHandoffCausalContext {
+    pub(crate) fn child(&self, label: &'static str) -> FinalHandoffCausalToken {
+        let id = self.gate.register_causal_child(label);
+        FinalHandoffCausalToken {
+            context: self.clone(),
             id: Some(id),
         }
+    }
+}
+
+/// Type-erased causal child used by diagnostics work that recursively spawns.
+#[cfg(test)]
+pub(crate) struct FinalHandoffCausalToken {
+    context: FinalHandoffCausalContext,
+    id: Option<u64>,
+}
+
+#[cfg(test)]
+pub(crate) type DiagnosticsSupersessionHandoffMapForTest = Arc<
+    std::sync::Mutex<HashMap<(Url, u64), (FinalHandoffCausalContext, FinalHandoffCausalToken)>>,
+>;
+
+#[cfg(test)]
+impl FinalHandoffCausalToken {
+    pub(crate) fn finish(mut self) {
+        self.release(false);
+    }
+
+    fn release(&mut self, abnormal: bool) {
+        if let Some(id) = self.id.take() {
+            self.context.gate.release_causal_child(id, abnormal);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FinalHandoffCausalToken {
+    fn drop(&mut self) {
+        self.release(true);
     }
 }
 
@@ -3397,6 +3509,15 @@ impl<T> FinalHandoffCompletionToken<T> {
         self.gate.register(label)
     }
 
+    pub(crate) fn causal_context(&self) -> FinalHandoffCausalContext
+    where
+        T: Send + Sync + 'static,
+    {
+        FinalHandoffCausalContext {
+            gate: self.gate.clone(),
+        }
+    }
+
     pub(crate) fn finish(mut self) {
         self.release(false);
     }
@@ -3405,21 +3526,7 @@ impl<T> FinalHandoffCompletionToken<T> {
         let Some(id) = self.id.take() else {
             return;
         };
-        let mut outstanding = self.gate.outstanding.lock().unwrap();
-        let label = outstanding
-            .remove(&id)
-            .expect("causal completion token must own one registered child");
-        if abnormal {
-            self.gate.abnormal_exits.lock().unwrap().push((id, label));
-        }
-        let completed = outstanding.is_empty();
-        if completed {
-            self.gate.completed.store(true, Ordering::Release);
-        }
-        drop(outstanding);
-        if completed {
-            self.gate.completion.notify_waiters();
-        }
+        self.gate.release_id(id, abnormal);
     }
 }
 
@@ -6646,6 +6753,16 @@ impl WorldState {
             #[cfg(test)]
             diagnostics_post_publish_lock_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            diagnostics_post_consume_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            diagnostics_backstop_respawn_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            diagnostics_supersession_handoffs_for_test: Arc::new(std::sync::Mutex::new(
+                HashMap::new(),
+            )),
             #[cfg(test)]
             alias_reconcile_pre_commit_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
