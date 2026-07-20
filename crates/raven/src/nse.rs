@@ -2114,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn targets_read_load_family_capture_target_names() {
+    fn targets_selector_policies_capture_target_names() {
         for name in ["tar_make", "tar_make_future", "tar_make_clustermq"] {
             let p = package_policy("targets", name).unwrap();
             assert_eq!(

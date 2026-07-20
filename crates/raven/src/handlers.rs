@@ -64854,16 +64854,19 @@ my_func <- function(a = default_value) {
 
     #[test]
     fn nse_targets_make_policy_requires_the_targets_function_end_to_end() {
-        for code in [
-            "tar_make <- function(names) names\ntar_make(local_target)",
-            "other::tar_make(foreign_target)",
+        for (code, expected) in [
+            (
+                "tar_make <- function(names) names\ntar_make(local_target)",
+                "local_target",
+            ),
+            ("other::tar_make(foreign_target)", "foreign_target"),
         ] {
             let messages = collect_undefined_messages(code);
+            let expected_message = format!("{expected} is not defined");
             assert!(
-                messages.iter().any(|message| {
-                    message.contains("local_target is not defined")
-                        || message.contains("foreign_target is not defined")
-                }),
+                messages
+                    .iter()
+                    .any(|message| message.contains(&expected_message)),
                 "same-named non-targets function must remain standard-eval for {code:?}; \
                  got {messages:?}"
             );
