@@ -476,12 +476,12 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
         Err(code) => return code,
     };
 
-    // CI default: suppress the missing-package ("not installed") diagnostic,
-    // because CI deliberately omits installation (spec §10.1). The CLI owns
-    // `state` exclusively, so a direct field set here is safe.
-    // `--report-uninstalled` opts back in.
+    // CI default: suppress generic missing-package diagnostics because CI
+    // deliberately omits installation (spec §10.1). Actionable subtypes such
+    // as "available outside this active renv project" remain enabled.
+    // `--report-uninstalled` opts the generic diagnostic back in.
     if !args.report_uninstalled {
-        state.cross_file_config.packages_missing_package_severity = None;
+        state.cross_file_config.packages_report_generic_uninstalled = false;
     }
 
     // Auto-detect R for installed-package / base-symbol awareness. Any failure
@@ -3008,7 +3008,7 @@ infixContinuationStyle = "indented"
         let mut state =
             build_indexed_state(&root, &workspace_url, args.no_config, None, &root).unwrap();
         if !args.report_uninstalled {
-            state.cross_file_config.packages_missing_package_severity = None;
+            state.cross_file_config.packages_report_generic_uninstalled = false;
         }
         maybe_init_r(&mut state, &root).await;
         state.resolve_system_file_in_workspace_cli_compat(None);

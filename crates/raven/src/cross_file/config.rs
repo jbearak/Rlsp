@@ -140,6 +140,12 @@ pub struct CrossFileConfig {
     pub packages_r_path: Option<PathBuf>,
     /// Severity for missing package diagnostics (None = disabled)
     pub packages_missing_package_severity: Option<DiagnosticSeverity>,
+    /// Whether to emit the generic `package-not-installed` diagnostic.
+    ///
+    /// The CLI disables this by default because CI commonly omits all package
+    /// installation, while retaining the actionable renv-specific child
+    /// diagnostic. Editor/LSP operation leaves it enabled.
+    pub(crate) packages_report_generic_uninstalled: bool,
     /// Severity for `namespace-member-not-found` diagnostics (None = disabled).
     /// Fires only when a package's *complete* export set lacks the referenced
     /// `pkg::member`. See `namespace_member_status_sync`.
@@ -260,6 +266,7 @@ impl Default for CrossFileConfig {
             packages_additional_library_paths: Vec::new(),
             packages_r_path: None,
             packages_missing_package_severity: Some(DiagnosticSeverity::WARNING),
+            packages_report_generic_uninstalled: true,
             packages_namespace_member_severity: Some(DiagnosticSeverity::WARNING),
             packages_watch_library_paths: true,
             packages_watch_debounce_ms: 500,

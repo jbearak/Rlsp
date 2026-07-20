@@ -702,6 +702,31 @@ Key ideas:
 - If R is unavailable, fall back to `INDEX` parsing (best-effort)
 - When merging `Depends` with meta-package `attached_packages`, keep a companion `HashSet` for dedupe; repeated `Vec::contains()` checks make recursive export expansion quadratic.
 
+Library-path discovery keeps renv activation and diagnostic provenance in one
+bounded R subprocess. For an explicit workspace containing
+`renv/activate.R`, the probe records `.libPaths()` before and after the existing
+activation, then emits a versioned hex-encoded frame. Rust accepts only the last
+complete valid frame and verifies the activated project reported by renv
+against the canonical workspace root. Source failure, malformed/truncated
+output, missing paths, or a project mismatch fail closed to no renv evidence;
+the ordinary active-path/fallback contract remains unchanged.
+
+The pre-activation paths never enter `PackageLibrary.lib_paths`. They are
+reduced immediately to conservative package-name evidence: a real package
+directory with a readable regular `DESCRIPTION` whose `Package:` field agrees
+with its valid directory name. Names present in the active paths, configured
+additional paths, or the base-priority set are removed. The surviving
+names-only `renv_outside_active_overlay` drives only the
+`package-outside-active-library` diagnostic. It must never feed export lookup,
+completion, `package_exists()`, `system.file()`, watchers, enumeration, or
+freeze/build commands. Library forks retain it, full rebuilds recompute it, and
+`clear_cache` leaves it intact; adding an active library path prunes it
+immediately. Outside-library filesystem changes intentionally require an
+explicit package refresh. Diagnostic collection consults the overlay only when
+the snapshot has exactly one workspace folder; multi-root routing activates the
+first root globally, so attributing that evidence to any document in a
+multi-root session would be ambiguous (especially for nested workspace roots).
+
 `PackageLibrary` owns two in-memory side caches: `packages` for direct per-package metadata and `combined_entries` for aggregate availability/ownership snapshots. Both are atomic read-copy snapshots (`arc_swap::ArcSwap<HashMap<...>>`) with a small writer mutex per map to serialize copy-on-write publication. Synchronous cache readers load an immutable snapshot and do normal `HashMap` lookups, so an in-progress writer publication is never semantic absence and cannot produce transient diagnostics. Writers clone the current map, mutate the clone, and publish a new `Arc<HashMap<...>>`; keep those publication sections small and never hold a writer mutex across `.await`, R subprocess calls, disk/provider reads, or recursive package expansion. Multi-map operations such as invalidation publish the two maps sequentially rather than nesting writer gates. Completion readers should clone only the relevant `Arc<PackageInfo>` / `Arc<CombinedEntry>` handles from snapshots before doing string iteration/dedupe.
 
 Logical cache operations also hold one shared library-operation lease from their

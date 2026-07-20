@@ -95,9 +95,19 @@ Before reporting, `raven check` warms the export cache for the packages each rep
 
 `raven check` resolves package **export names** through an ordered three-tier fallback — installed packages, then a committed `.raven/packages.json`, then Raven's broad CRAN/Bioconductor metadata when available — so symbols from attached packages can resolve even when no R is installed. That metadata is downloaded with `raven packages update` — it isn't bundled with the binary — so a CI image that installs Raven needs that step for broad CRAN/Bioconductor coverage; embedded base R-platform coverage is in the binary regardless. This stops the undefined-variable storm that otherwise makes Raven unusable in CI. See [Package database](package-database.md).
 
-Knowing a package's exports is **separate** from knowing whether it is installed. The **missing-package** diagnostic answers a different question — *"will `library(X)` succeed at runtime?"*, i.e. is `X` installed? — so it is driven solely by what is present in the local library paths, never by the package symbol database. Because CI deliberately omits package installation, `raven check` **suppresses missing-package warnings by default**.
+Knowing a package's exports is **separate** from knowing whether it is installed. The **missing-package** diagnostic answers a different question — *"will `library(X)` succeed at runtime?"*, i.e. is `X` installed? — so it is driven solely by what is present in the local library paths, never by the package symbol database. Because CI deliberately omits package installation, `raven check` **suppresses generic missing-package warnings by default**.
 
-`--report-uninstalled` re-enables them. Reach for it whenever a `library(X)` call must really succeed at runtime: a pipeline that *does* install packages (e.g. `renv::restore()`) and wants to fail if any didn't, **or** any CI that **actually runs your R scripts** after `raven check` (e.g. R-package CI), where an uninstalled package is a genuine failure rather than CI noise. Gate-only CI that never executes the scripts wants the default (suppressed). It reports `library()` calls **not present in the local library paths** — **not** relative to the package symbol databases (`.raven/packages.json` or the `names.db` database). One consequence: with the default off, a genuine typo such as `library(dpylr)` is silent (no database knows it, but `raven check` isn't checking install status); it is reported only with `--report-uninstalled`. The language server is unchanged — it still fires missing-package whenever install state is known. See [Diagnostics](diagnostics.md#package-names-vs-install-status) for the full model.
+`--report-uninstalled` re-enables them. Reach for it whenever a `library(X)` call must really succeed at runtime: a pipeline that *does* install packages (e.g. `renv::restore()`) and wants to fail if any didn't, **or** any CI that **actually runs your R scripts** after `raven check` (e.g. R-package CI), where an uninstalled package is a genuine failure rather than CI noise. Gate-only CI that never executes the scripts wants the default (suppressed). It reports `library()` calls **not present in the local library paths** — **not** relative to the package symbol databases (`.raven/packages.json` or the `names.db` database). One consequence: with the default off, a genuine typo such as `library(dpylr)` is silent (no database knows it, but `raven check` isn't checking install status); it is reported only with `--report-uninstalled`. The language server is unchanged — it still fires missing-package whenever install state is known.
+
+One actionable subtype remains enabled even without the flag:
+`package-outside-active-library` means Raven successfully activated the
+workspace's renv project, the referenced package is unavailable in its active
+library, and a validated package with that name exists in a vanilla system/user
+library removed by activation. That is evidence of a project setup problem, not
+the ordinary "CI did not install dependencies" case; run `renv::restore()` or
+install the package into the project library. See
+[Diagnostics](diagnostics.md#package-names-vs-install-status) for the full
+model.
 
 ### File encoding
 

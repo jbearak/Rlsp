@@ -50,6 +50,9 @@ pub const SOURCE_PATH_CASE_MISMATCH: &str = "source-path-case-mismatch";
 pub const ASSIGN_TO_STRING_LITERAL: &str = "assign-to-string-literal";
 /// A `library()`/`require()` of a package that is not installed / not found.
 pub const PACKAGE_NOT_INSTALLED: &str = "package-not-installed";
+/// A missing package that is installed in a vanilla R library removed from
+/// `.libPaths()` by the workspace's active renv project.
+pub const PACKAGE_OUTSIDE_ACTIVE_LIBRARY: &str = "package-outside-active-library";
 /// A `pkg::member` reference where a *complete* package export set has no such
 /// exported member or data object. Never emitted for `pkg:::member` (internal
 /// access) or from partial/unknown metadata. See `namespace_member_status_sync`.
@@ -87,18 +90,20 @@ pub const ANALYZER_CODES: &[&str] = &[
     UNUSED_SUPPRESSION,
 ];
 
-/// Analyzer codes that ignore directives may suppress. This is the subset of
-/// [`ANALYZER_CODES`] that the suppression machinery actually honors:
-/// `undefined-variable`, `assign-to-string-literal`, and `package-not-installed`.
-/// Deliberately excludes `syntax-error` (parse errors are not suppressible),
-/// `unresolved-source-path` and the other dependency-graph diagnostics (governed
-/// only by their severity settings), and `unused-suppression` itself. Used by
-/// the range/file/chunk post-filter so block- and chunk-level suppression covers
-/// these codes the same way the inline per-line checks do. See `docs/linting.md`.
+/// Analyzer codes that ignore directives may suppress.
+///
+/// This includes suppressible canonical analyzer codes from [`ANALYZER_CODES`]
+/// and independently suppressible child codes. Deliberately excludes
+/// `syntax-error` (parse errors are not suppressible), `unresolved-source-path`
+/// and the other dependency-graph diagnostics (governed only by their severity
+/// settings), and `unused-suppression` itself. Used by the range/file/chunk
+/// post-filter so block- and chunk-level suppression covers these codes the same
+/// way the inline per-line checks do. See `docs/linting.md`.
 pub const SUPPRESSIBLE_ANALYZER_CODES: &[&str] = &[
     UNDEFINED_VARIABLE,
     ASSIGN_TO_STRING_LITERAL,
     PACKAGE_NOT_INSTALLED,
+    PACKAGE_OUTSIDE_ACTIVE_LIBRARY,
     NAMESPACE_MEMBER_NOT_FOUND,
 ];
 
@@ -146,6 +151,9 @@ pub fn parent(code: &str) -> Option<&'static str> {
     let norm = normalize(code);
     if SYNTAX_ERROR_CHILDREN.contains(&norm.as_str()) {
         return Some(SYNTAX_ERROR);
+    }
+    if norm == PACKAGE_OUTSIDE_ACTIVE_LIBRARY {
+        return Some(PACKAGE_NOT_INSTALLED);
     }
     None
 }
@@ -625,6 +633,14 @@ mod tests {
         }
         assert!(suppresses("unclosed-paren", "unclosed-paren"));
         assert!(!suppresses("unclosed-paren", "unclosed-brace"));
+        assert!(suppresses(
+            PACKAGE_NOT_INSTALLED,
+            PACKAGE_OUTSIDE_ACTIVE_LIBRARY
+        ));
+        assert!(!suppresses(
+            PACKAGE_OUTSIDE_ACTIVE_LIBRARY,
+            PACKAGE_NOT_INSTALLED
+        ));
     }
 
     #[test]
@@ -636,6 +652,7 @@ mod tests {
         assert!(is_suppressible("undefined-variable"));
         assert!(is_suppressible("assign-to-string-literal"));
         assert!(is_suppressible("package-not-installed"));
+        assert!(is_suppressible("package-outside-active-library"));
         // Non-suppressible codes.
         assert!(!is_suppressible("syntax-error"));
         assert!(!is_suppressible("unclosed-paren"));

@@ -124,6 +124,25 @@ pub struct RSubprocess {
     working_dir: Option<PathBuf>,
 }
 
+/// Library-path discovery from one R invocation.
+///
+/// `active` is the only path list package resolution may consume.
+/// `renv_transition` is diagnostic-only evidence that a successfully activated
+/// renv project removed paths from the vanilla R search path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LibraryPathDiscovery {
+    pub(crate) active: Vec<PathBuf>,
+    pub(crate) renv_transition: Option<RenvLibraryPathTransition>,
+}
+
+/// Diagnostic-only renv transition. Callers must reduce `outside_paths` to
+/// validated package names and must never add these paths to package routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenvLibraryPathTransition {
+    pub(crate) project_root: PathBuf,
+    pub(crate) outside_paths: Vec<PathBuf>,
+}
+
 /// Stable identity of the executable backing one configured R runtime.
 ///
 /// The requested path alone is insufficient: an installer can replace the
@@ -722,19 +741,72 @@ impl RSubprocess {
     /// # }
     /// ```
     pub async fn get_lib_paths(&self) -> Result<Vec<PathBuf>> {
-        // Use cat() with sep="\n" to output each path on its own line without R's vector formatting
-        // Check for renv/activate.R and source it if it exists (handles renv projects)
-        // Security: Validate that renv/activate.R is in the working directory to prevent path traversal
-        let r_code = r#"renv_path <- normalizePath("renv/activate.R", mustWork=FALSE); if (file.exists(renv_path) && dirname(renv_path) == file.path(getwd(), "renv")) try(source(renv_path), silent=TRUE); cat(.libPaths(), sep="\n")"#;
+        Ok(self.discover_lib_paths().await?.active)
+    }
+
+    /// Discover active R library paths and a diagnostic-only renv transition.
+    ///
+    /// Raven already sources `<working-dir>/renv/activate.R` during package
+    /// discovery. This extends that same bounded subprocess: when an explicit
+    /// working directory contains that file, it records `.libPaths()` before
+    /// and after activation and emits a versioned, hex-encoded frame. Arbitrary
+    /// activation output is ignored; only the last complete valid frame is
+    /// accepted. Missing/malformed frames, activation errors, and project-root
+    /// mismatches fail closed to no transition.
+    pub(crate) async fn discover_lib_paths(&self) -> Result<LibraryPathDiscovery> {
+        let renv_candidate = self
+            .working_dir
+            .as_ref()
+            .is_some_and(|root| root.join("renv").join("activate.R").is_file());
+        let r_code = if renv_candidate {
+            // Hex encoding makes the line protocol unambiguous for paths that
+            // contain tabs, newlines, or marker-looking text.
+            r#"base::local({
+  raven_hex <- function(xs) base::vapply(base::enc2utf8(xs), function(x) base::paste(base::sprintf("%02x", base::as.integer(base::charToRaw(x))), collapse=""), base::character(1), USE.NAMES=FALSE)
+  raven_before <- base::.libPaths()
+  raven_root <- base::normalizePath(base::getwd(), winslash="/", mustWork=TRUE)
+  raven_renv_dir <- base::normalizePath(base::file.path(raven_root, "renv"), winslash="/", mustWork=TRUE)
+  raven_activate <- base::normalizePath(base::file.path(raven_renv_dir, "activate.R"), winslash="/", mustWork=TRUE)
+  raven_ok <- FALSE
+  if (base::dirname(raven_activate) == raven_renv_dir) {
+    raven_ok <- base::isTRUE(base::tryCatch({ base::source(raven_activate, local=base::globalenv()); TRUE }, error=function(e) FALSE))
+  }
+  raven_after <- base::.libPaths()
+  raven_project <- ""
+  if (raven_ok && "renv" %in% base::loadedNamespaces()) {
+    raven_project <- base::tryCatch(base::getExportedValue("renv", "project")(default=""), error=function(e) "")
+  }
+  if (base::nzchar(raven_project)) raven_project <- base::normalizePath(raven_project, winslash="/", mustWork=FALSE)
+  base::cat("__RAVEN_LIB_PATHS_V1_BEGIN__\n")
+  base::cat("S\t", if (raven_ok) "1" else "0", "\n", sep="")
+  base::cat("P\t", raven_hex(raven_project), "\n", sep="")
+  for (x in raven_before) base::cat("B\t", raven_hex(x), "\n", sep="")
+  for (x in raven_after) base::cat("A\t", raven_hex(x), "\n", sep="")
+  base::cat("__RAVEN_LIB_PATHS_V1_END__\n")
+})"#
+        } else {
+            r#"cat(.libPaths(), sep="\n")"#
+        };
 
         match self.execute_r_code(r_code).await {
             Ok(output) => {
-                let paths = parse_lib_paths_output(&output);
-                if paths.is_empty() {
-                    log::trace!("R returned empty .libPaths(), using fallback paths");
-                    Ok(get_fallback_lib_paths())
+                let discovery = if renv_candidate {
+                    parse_renv_lib_paths_output(&output, self.working_dir.as_deref())
                 } else {
-                    Ok(paths)
+                    let active = parse_lib_paths_output(&output);
+                    (!active.is_empty()).then_some(LibraryPathDiscovery {
+                        active,
+                        renv_transition: None,
+                    })
+                };
+                if let Some(discovery) = discovery {
+                    Ok(discovery)
+                } else {
+                    log::trace!("R returned empty .libPaths(), using fallback paths");
+                    Ok(LibraryPathDiscovery {
+                        active: get_fallback_lib_paths(),
+                        renv_transition: None,
+                    })
                 }
             }
             Err(error) if error.downcast_ref::<OuterDeadlineExpired>().is_some() => Err(error),
@@ -743,7 +815,10 @@ impl RSubprocess {
                     "Failed to get .libPaths() from R: {}, using fallback paths",
                     e
                 );
-                Ok(get_fallback_lib_paths())
+                Ok(LibraryPathDiscovery {
+                    active: get_fallback_lib_paths(),
+                    renv_transition: None,
+                })
             }
         }
     }
@@ -1187,6 +1262,140 @@ fn parse_lib_paths_output(output: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+#[derive(Default)]
+struct RenvLibPathsFrame {
+    source_succeeded: Option<bool>,
+    project_seen: bool,
+    project_root: Option<PathBuf>,
+    before: Vec<PathBuf>,
+    active: Vec<PathBuf>,
+    malformed: bool,
+}
+
+fn decode_hex_path(encoded: &str) -> Option<PathBuf> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(text, 16).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let path = String::from_utf8(bytes).ok().map(PathBuf::from)?;
+    (!path.as_os_str().is_empty() && path.is_absolute()).then_some(path)
+}
+
+/// Parse the last complete valid Raven frame from an activation probe.
+///
+/// Paths must exist. The transition is retained only when activation succeeded
+/// and renv reports a project root matching the explicit working directory.
+fn parse_renv_lib_paths_output(
+    output: &str,
+    expected_project_root: Option<&std::path::Path>,
+) -> Option<LibraryPathDiscovery> {
+    const BEGIN: &str = "__RAVEN_LIB_PATHS_V1_BEGIN__";
+    const END: &str = "__RAVEN_LIB_PATHS_V1_END__";
+
+    let mut current: Option<RenvLibPathsFrame> = None;
+    let mut last_complete: Option<RenvLibPathsFrame> = None;
+    for line in output.lines() {
+        if line == BEGIN {
+            current = Some(RenvLibPathsFrame::default());
+            continue;
+        }
+        if line == END {
+            if let Some(frame) = current.take() {
+                last_complete = Some(frame);
+            }
+            continue;
+        }
+        let Some(frame) = current.as_mut() else {
+            continue;
+        };
+        let Some((tag, encoded)) = line.split_once('\t') else {
+            frame.malformed = true;
+            continue;
+        };
+        match tag {
+            "S" if frame.source_succeeded.is_none() => {
+                frame.source_succeeded = match encoded {
+                    "0" => Some(false),
+                    "1" => Some(true),
+                    _ => {
+                        frame.malformed = true;
+                        None
+                    }
+                };
+            }
+            "P" if !frame.project_seen => {
+                frame.project_seen = true;
+                if !encoded.is_empty() {
+                    frame.project_root = decode_hex_path(encoded);
+                    frame.malformed |= frame.project_root.is_none();
+                }
+            }
+            "B" => match decode_hex_path(encoded) {
+                Some(path) if path.exists() => frame.before.push(path),
+                _ => frame.malformed = true,
+            },
+            "A" => match decode_hex_path(encoded) {
+                Some(path) if path.exists() => frame.active.push(path),
+                _ => frame.malformed = true,
+            },
+            _ => frame.malformed = true,
+        }
+    }
+
+    if current.is_some() {
+        return None;
+    }
+    let frame = last_complete?;
+    if frame.malformed
+        || frame.source_succeeded.is_none()
+        || !frame.project_seen
+        || frame.active.is_empty()
+    {
+        return None;
+    }
+
+    let renv_transition = (|| {
+        if frame.source_succeeded != Some(true) {
+            return None;
+        }
+        let expected = std::fs::canonicalize(expected_project_root?).ok()?;
+        let reported = std::fs::canonicalize(frame.project_root.as_ref()?).ok()?;
+        if expected != reported {
+            return None;
+        }
+        let active: std::collections::HashSet<_> = frame
+            .active
+            .iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .collect();
+        let mut outside_paths = Vec::new();
+        for path in &frame.before {
+            let Ok(canonical) = std::fs::canonicalize(path) else {
+                continue;
+            };
+            if !active.contains(&canonical) && !outside_paths.contains(&canonical) {
+                outside_paths.push(canonical);
+            }
+        }
+        Some(RenvLibraryPathTransition {
+            project_root: expected,
+            outside_paths,
+        })
+    })();
+
+    Some(LibraryPathDiscovery {
+        active: frame.active,
+        renv_transition,
+    })
+}
+
 /// Parse the output of R's `.packages()` (one package name per line) into a list of package names.
 ///
 fn parse_packages_output(output: &str) -> Vec<String> {
@@ -1600,6 +1809,112 @@ mod tests {
         let output = "   \n   \n";
         let paths = parse_lib_paths_output(output);
         assert!(paths.is_empty());
+    }
+
+    fn hex_path(path: &std::path::Path) -> String {
+        path.to_string_lossy()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn renv_frame(
+        succeeded: bool,
+        project: &std::path::Path,
+        before: &[&std::path::Path],
+        active: &[&std::path::Path],
+    ) -> String {
+        let mut output = String::from("activation noise\n__RAVEN_LIB_PATHS_V1_BEGIN__\n");
+        output.push_str(if succeeded { "S\t1\n" } else { "S\t0\n" });
+        output.push_str(&format!("P\t{}\n", hex_path(project)));
+        for path in before {
+            output.push_str(&format!("B\t{}\n", hex_path(path)));
+        }
+        for path in active {
+            output.push_str(&format!("A\t{}\n", hex_path(path)));
+        }
+        output.push_str("__RAVEN_LIB_PATHS_V1_END__\n");
+        output
+    }
+
+    #[test]
+    fn renv_lib_paths_frame_retains_only_removed_vanilla_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let shared = temp.path().join("shared");
+        let outside = temp.path().join("outside");
+        let added = temp.path().join("project-library");
+        for path in [&project, &shared, &outside, &added] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let output = renv_frame(
+            true,
+            &project,
+            &[shared.as_path(), outside.as_path()],
+            &[shared.as_path(), added.as_path()],
+        );
+
+        let discovery = parse_renv_lib_paths_output(&output, Some(&project)).unwrap();
+        assert_eq!(discovery.active, vec![shared.clone(), added]);
+        let transition = discovery.renv_transition.unwrap();
+        assert_eq!(
+            transition.project_root,
+            std::fs::canonicalize(project).unwrap()
+        );
+        assert_eq!(
+            transition.outside_paths,
+            vec![std::fs::canonicalize(outside).unwrap()]
+        );
+    }
+
+    #[test]
+    fn renv_lib_paths_frame_fails_closed_for_source_or_project_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let other = temp.path().join("other");
+        let active = temp.path().join("active");
+        let outside = temp.path().join("outside");
+        for path in [&project, &other, &active, &outside] {
+            std::fs::create_dir(path).unwrap();
+        }
+
+        let source_failed = renv_frame(false, &project, &[outside.as_path()], &[active.as_path()])
+            .replace(&format!("P\t{}\n", hex_path(&project)), "P\t\n");
+        let discovery = parse_renv_lib_paths_output(&source_failed, Some(&project)).unwrap();
+        assert_eq!(discovery.active, vec![active.clone()]);
+        assert!(discovery.renv_transition.is_none());
+
+        let mismatch = renv_frame(true, &other, &[outside.as_path()], &[active.as_path()]);
+        let discovery = parse_renv_lib_paths_output(&mismatch, Some(&project)).unwrap();
+        assert_eq!(discovery.active, vec![active.clone()]);
+        assert!(discovery.renv_transition.is_none());
+
+        let missing_project = renv_frame(true, &project, &[outside.as_path()], &[active.as_path()])
+            .replace(&format!("P\t{}\n", hex_path(&project)), "P\t\n");
+        let discovery = parse_renv_lib_paths_output(&missing_project, Some(&project)).unwrap();
+        assert!(discovery.renv_transition.is_none());
+    }
+
+    #[test]
+    fn renv_lib_paths_frame_rejects_relative_and_truncated_final_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let active = temp.path().join("active");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&active).unwrap();
+
+        let relative = format!(
+            "__RAVEN_LIB_PATHS_V1_BEGIN__\nS\t1\nP\t{}\nA\t{}\n\
+             __RAVEN_LIB_PATHS_V1_END__\n",
+            hex_path(std::path::Path::new("relative-project")),
+            hex_path(&active)
+        );
+        assert!(parse_renv_lib_paths_output(&relative, Some(&project)).is_none());
+
+        let mut truncated = renv_frame(true, &project, &[], &[active.as_path()]);
+        truncated.push_str("__RAVEN_LIB_PATHS_V1_BEGIN__\nS\t1\n");
+        assert!(parse_renv_lib_paths_output(&truncated, Some(&project)).is_none());
     }
 
     #[tokio::test]
