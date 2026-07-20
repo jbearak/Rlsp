@@ -3143,11 +3143,17 @@ fn is_package_relevant_open_uri(uri: &Url, root: &std::path::Path) -> bool {
 /// `.Rprofile` or preamble scan. Routing canonicalization tolerates a missing
 /// target by canonicalizing its parent, so delete/create events under symlinked
 /// roots keep matching the same set entry. Used for helpers outside the tracked
-/// package R directories as well as ordinary existing targets.
+/// package R directories as well as ordinary existing targets. Empty sets
+/// return before filesystem-backed routing canonicalization because live
+/// routing snapshots may hold the state read guard.
 fn path_in_rprofile_sourced_set(
     p: &std::path::Path,
     sourced: &std::collections::BTreeSet<std::path::PathBuf>,
 ) -> bool {
+    if sourced.is_empty() {
+        return false;
+    }
+
     sourced.contains(p)
         || sourced.contains(&crate::package_state::preamble::canonicalize_for_routing(p))
 }
@@ -28416,6 +28422,7 @@ mod tests {
             let canonical = helper.canonicalize().unwrap();
 
             let mut sourced: BTreeSet<PathBuf> = BTreeSet::new();
+            assert!(!path_in_rprofile_sourced_set(&canonical, &sourced));
             sourced.insert(canonical.clone());
 
             // Canonical path is a member.
