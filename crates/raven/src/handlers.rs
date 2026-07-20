@@ -5062,10 +5062,20 @@ async fn collect_missing_file_diagnostics_standalone(
     // Backward directives IGNORE `# raven: cd` - always resolve relative to file's directory
     let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_folders);
 
-    // Collect all paths to check: (path, path_str, line, col, is_backward, is_directive)
-    // is_directive is true for `# raven: source` directives, false for source() calls
+    struct PathToCheck {
+        path: std::path::PathBuf,
+        path_str: String,
+        line: u32,
+        col: u32,
+        is_backward: bool,
+        is_directive: bool,
+        guarded_by_file_exists: bool,
+        outside_workspace: bool,
+    }
+
+    // is_directive is true for `# raven: source` directives, false for source() calls.
     // _Requirements: 6.1, 6.3_ (for `# raven: source` directive missing file diagnostics)
-    let mut paths_to_check: Vec<(std::path::PathBuf, String, u32, u32, bool, bool)> = Vec::new();
+    let mut paths_to_check = Vec::new();
 
     for source in &meta.sources {
         // Resolved or inert-unresolved system.file() sources carry no literal
@@ -5073,13 +5083,25 @@ async fn collect_missing_file_diagnostics_standalone(
         if source.exempt_from_missing_file_diagnostics() {
             continue;
         }
-        let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
+        let outcome = forward_ctx.as_ref().map(|ctx| {
+            crate::cross_file::path_resolve::resolve_source_path_rich(&source.path, ctx)
         });
+        if source.guarded_by_file_exists
+            && outcome.as_ref().and_then(|outcome| outcome.case_mismatch)
+                == Some(crate::cross_file::path_resolve::CaseMismatchRegime::CaseSensitiveFs)
+        {
+            // On a case-sensitive host the typed path does not exist, so
+            // file.exists() makes the guarded branch inert. The resolver's
+            // single-case-insensitive-match leniency must not turn that into
+            // an outside-workspace diagnostic.
+            continue;
+        }
+        let resolved = outcome.and_then(|outcome| outcome.path);
         if let Some(path) = resolved {
-            if let Some(root) = &workspace_root
-                && !path.starts_with(root)
-            {
+            let outside_workspace = workspace_root
+                .as_ref()
+                .is_some_and(|root| !path.starts_with(root));
+            if outside_workspace && !source.guarded_by_file_exists {
                 let message = if source.is_directive {
                     format!(
                         "File '{}' referenced by source directive is outside workspace",
@@ -5105,15 +5127,17 @@ async fn collect_missing_file_diagnostics_standalone(
                 });
                 continue;
             }
-            paths_to_check.push((
+            paths_to_check.push(PathToCheck {
                 path,
-                source.path.clone(),
-                source.line,
-                source.column,
-                false,
-                source.is_directive,
-            ));
-        } else {
+                path_str: source.path.clone(),
+                line: source.line,
+                col: source.column,
+                is_backward: false,
+                is_directive: source.is_directive,
+                guarded_by_file_exists: source.guarded_by_file_exists,
+                outside_workspace,
+            });
+        } else if !source.guarded_by_file_exists {
             let message = if source.is_directive {
                 format!("Cannot resolve path '{}' in source directive", source.path)
             } else {
@@ -5160,14 +5184,17 @@ async fn collect_missing_file_diagnostics_standalone(
                 continue;
             }
             // Backward directives are always directives (is_directive=true for backward)
-            paths_to_check.push((
+            paths_to_check.push(PathToCheck {
                 path,
-                directive.path.clone(),
-                directive.directive_line,
-                0,
-                true,
-                false, // is_directive is false here because we use is_backward to distinguish
-            ));
+                path_str: directive.path.clone(),
+                line: directive.directive_line,
+                col: 0,
+                is_backward: true,
+                // false because is_backward distinguishes this path.
+                is_directive: false,
+                guarded_by_file_exists: false,
+                outside_workspace: false,
+            });
         } else {
             diagnostics.push(Diagnostic {
                 range: Range {
@@ -5191,7 +5218,7 @@ async fn collect_missing_file_diagnostics_standalone(
     // Batch check existence on blocking thread
     let paths: Vec<std::path::PathBuf> = paths_to_check
         .iter()
-        .map(|(p, _, _, _, _, _)| p.clone())
+        .map(|candidate| candidate.path.clone())
         .collect();
     let existence = match tokio::task::spawn_blocking(move || {
         paths.iter().map(|p| p.exists()).collect::<Vec<_>>()
@@ -5207,18 +5234,38 @@ async fn collect_missing_file_diagnostics_standalone(
 
     // Generate diagnostics for missing files
     // _Requirements: 6.1_ (for `# raven: source` directive missing file diagnostics)
-    for (i, (_, path_str, line, col, is_backward, is_directive)) in
-        paths_to_check.into_iter().enumerate()
-    {
-        if !existence.get(i).copied().unwrap_or(false) {
-            if is_backward {
+    for (i, candidate) in paths_to_check.into_iter().enumerate() {
+        let exists = existence.get(i).copied().unwrap_or(false);
+        if candidate.outside_workspace && exists {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(candidate.line, candidate.col),
+                    end: Position::new(
+                        candidate.line,
+                        candidate
+                            .col
+                            .saturating_add(candidate.path_str.len() as u32)
+                            .saturating_add(10),
+                    ),
+                },
+                severity: Some(missing_file_severity),
+                message: format!("Path is outside workspace: '{}'", candidate.path_str),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                )),
+                ..Default::default()
+            });
+            continue;
+        }
+        if !exists && !candidate.guarded_by_file_exists {
+            if candidate.is_backward {
                 diagnostics.push(Diagnostic {
                     range: Range {
-                        start: Position::new(line, 0),
-                        end: Position::new(line, LSP_EOL_CHARACTER),
+                        start: Position::new(candidate.line, 0),
+                        end: Position::new(candidate.line, LSP_EOL_CHARACTER),
                     },
                     severity: Some(missing_file_severity),
-                    message: format!("Parent file not found: '{}'", path_str),
+                    message: format!("Parent file not found: '{}'", candidate.path_str),
                     code: Some(NumberOrString::String(
                         crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
                     )),
@@ -5226,20 +5273,23 @@ async fn collect_missing_file_diagnostics_standalone(
                 });
             } else {
                 // Use specific message for `# raven: source` directives (Requirement 6.1)
-                let message = if is_directive {
+                let message = if candidate.is_directive {
                     format!(
                         "File '{}' referenced by source directive not found",
-                        path_str
+                        candidate.path_str
                     )
                 } else {
-                    format!("File not found: '{}'", path_str)
+                    format!("File not found: '{}'", candidate.path_str)
                 };
                 diagnostics.push(Diagnostic {
                     range: Range {
-                        start: Position::new(line, col),
+                        start: Position::new(candidate.line, candidate.col),
                         end: Position::new(
-                            line,
-                            col.saturating_add(path_str.len() as u32).saturating_add(10),
+                            candidate.line,
+                            candidate
+                                .col
+                                .saturating_add(candidate.path_str.len() as u32)
+                                .saturating_add(10),
                         ),
                     },
                     severity: Some(missing_file_severity),
@@ -5321,7 +5371,10 @@ fn collect_case_mismatch_diagnostics_standalone(
     for source in &meta.sources {
         // `system.file()` sources are out of scope (non-goal). Skip them all —
         // including branch-1 self-package entries, which are not exempt.
-        if source.system_file.is_some() || source.exempt_from_missing_file_diagnostics() {
+        if source.guarded_by_file_exists
+            || source.system_file.is_some()
+            || source.exempt_from_missing_file_diagnostics()
+        {
             continue;
         }
         let outcome = crate::cross_file::path_resolve::resolve_source_path_rich(&source.path, &ctx);
@@ -5472,6 +5525,143 @@ pub async fn collect_missing_file_diagnostics_standalone_for_test(
 ) -> Vec<Diagnostic> {
     collect_missing_file_diagnostics_standalone(uri, meta, workspace_folders, missing_file_severity)
         .await
+}
+
+#[cfg(test)]
+mod optional_guarded_source_tests {
+    use super::*;
+    use crate::cross_file::CaseMismatchSeverity;
+
+    fn run_standalone(
+        main: &std::path::Path,
+        workspace: &std::path::Path,
+        code: &str,
+    ) -> Vec<Diagnostic> {
+        let meta = crate::cross_file::extract_metadata(code);
+        let uri = Url::from_file_path(main).unwrap();
+        let workspace = Url::from_file_path(workspace).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(diagnostics_async_standalone(
+                &uri,
+                Vec::new(),
+                &meta,
+                Some(&workspace),
+                Some(DiagnosticSeverity::WARNING),
+                CaseMismatchSeverity::Fixed(DiagnosticSeverity::WARNING),
+            ))
+    }
+
+    #[test]
+    fn absent_matching_guard_suppresses_only_the_missing_path_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.R");
+        let code = r#"if (file.exists("scripts/config.R")) source("scripts/config.R")"#;
+        std::fs::write(&main, code).unwrap();
+
+        let diagnostics = run_standalone(&main, dir.path(), code);
+        assert!(
+            diagnostics.is_empty(),
+            "an absent exact guard makes the source branch inert: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn matching_guard_suppresses_case_mismatch_but_preserves_existing_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts").join("Config.R"), "helper <- 1\n").unwrap();
+        let main = dir.path().join("main.R");
+        let code = r#"if (file.exists("scripts/config.R")) source("scripts/config.R")"#;
+        std::fs::write(&main, code).unwrap();
+
+        let meta = crate::cross_file::extract_metadata(code);
+        assert_eq!(meta.sources.len(), 1);
+        assert!(meta.sources[0].guarded_by_file_exists);
+        assert_eq!(meta.sources[0].path, "scripts/config.R");
+
+        let diagnostics = run_standalone(&main, dir.path(), code);
+        assert!(
+            diagnostics.is_empty(),
+            "a case-sensitive host skips the branch and a case-insensitive host executes it: \
+             {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn existing_guarded_source_outside_workspace_remains_diagnosable() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(dir.path().join("outside.R"), "helper <- 1\n").unwrap();
+        let main = workspace.join("main.R");
+        let code = r#"if (file.exists("../outside.R")) source("../outside.R")"#;
+        std::fs::write(&main, code).unwrap();
+
+        let diagnostics = run_standalone(&main, &workspace, code);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("outside workspace"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn absent_guarded_source_outside_workspace_is_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let main = workspace.join("main.R");
+        let code = r#"if (file.exists("../absent.R")) source("../absent.R")"#;
+        std::fs::write(&main, code).unwrap();
+
+        let diagnostics = run_standalone(&main, &workspace, code);
+        assert!(
+            diagnostics.is_empty(),
+            "an absent guard is inert even when its lexical path leaves the workspace: \
+             {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_case_guarded_source_outside_workspace_follows_runtime_existence() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(dir.path().join("Outside.R"), "helper <- 1\n").unwrap();
+        let typed_path = dir.path().join("outside.R");
+        let main = workspace.join("main.R");
+        let code = r#"if (file.exists("../outside.R")) source("../outside.R")"#;
+        std::fs::write(&main, code).unwrap();
+
+        let diagnostics = run_standalone(&main, &workspace, code);
+        assert_eq!(
+            diagnostics.len(),
+            usize::from(typed_path.exists()),
+            "the guarded branch executes only when the typed path exists on this host: \
+             {diagnostics:?}"
+        );
+        if typed_path.exists() {
+            assert!(diagnostics[0].message.contains("outside workspace"));
+        }
+    }
+
+    #[test]
+    fn mismatched_guard_does_not_suppress_missing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.R");
+        let code = r#"if (file.exists("other.R")) source("missing.R")"#;
+        std::fs::write(&main, code).unwrap();
+
+        let diagnostics = run_standalone(&main, dir.path(), code);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(crate::diagnostic_code::diagnostic_has_code(
+            &diagnostics[0].code,
+            crate::diagnostic_code::UNRESOLVED_SOURCE_PATH
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -5929,7 +6119,7 @@ fn collect_missing_file_diagnostics_from_snapshot(
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
             crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
         });
-        if resolved.is_none() {
+        if resolved.is_none() && !source.guarded_by_file_exists {
             let message = if source.is_directive {
                 format!("Cannot resolve path '{}' in source directive", source.path)
             } else {

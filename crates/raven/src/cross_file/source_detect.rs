@@ -362,13 +362,20 @@ fn visit_node<'tree, 'text>(
     sources: &mut Vec<FramedSource>,
 ) {
     if node.kind() == "call" {
-        if let Some(source) = try_parse_source_call(
+        if let Some(mut source) = try_parse_source_call(
             node,
             content,
             capture_bindings,
             evaluation_frame,
             runtime_function_scope,
         ) {
+            source.guarded_by_file_exists = source_is_guarded_by_matching_file_exists(
+                node,
+                &source.path,
+                content,
+                capture_bindings,
+                runtime_function_scope,
+            );
             sources.push(FramedSource {
                 source,
                 runtime_function_scope,
@@ -663,7 +670,108 @@ fn try_parse_source_call<'tree, 'text>(
         system_file,
         resolved_uri: None,
         tar_source_ordinal: None,
+        guarded_by_file_exists: false,
     })
+}
+
+/// Recognize the narrow optional-source idiom
+/// `if (file.exists("path")) source("path")`.
+///
+/// This is deliberately a diagnostic-only proof. The source call remains in
+/// metadata and the dependency graph when the target exists. We accept only a
+/// direct or singleton-braced consequence, one positional plain string passed
+/// to `file.exists`, and exact decoded path equality. An `else` branch is
+/// irrelevant to dominance of the consequence and may be present. Broader
+/// conditions would require control-flow analysis and therefore fail closed.
+fn source_is_guarded_by_matching_file_exists<'tree, 'text>(
+    source_call: Node<'tree>,
+    source_path: &str,
+    content: &'text str,
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+    runtime_function_scope: RuntimeFunctionScope,
+) -> bool {
+    let Some(parent) = source_call.parent() else {
+        return false;
+    };
+    let if_node = if parent.kind() == "if_statement"
+        && parent
+            .child_by_field_name("consequence")
+            .is_some_and(|consequence| consequence.id() == source_call.id())
+    {
+        parent
+    } else if parent.kind() == "braced_expression"
+        && singleton_braced_expression(parent, source_call)
+        && parent.parent().is_some_and(|candidate| {
+            candidate.kind() == "if_statement"
+                && candidate
+                    .child_by_field_name("consequence")
+                    .is_some_and(|consequence| consequence.id() == parent.id())
+        })
+    {
+        parent.parent().expect("parent checked above")
+    } else {
+        return false;
+    };
+
+    if if_node.has_error() {
+        return false;
+    }
+    let Some(condition) = if_node.child_by_field_name("condition") else {
+        return false;
+    };
+    let deferred_use = runtime_function_scope.is_function_scoped_at(condition)
+        || !super::binding::is_known_immediate_context(if_node);
+    matching_file_exists_path(condition, content, bindings, deferred_use)
+        .is_some_and(|guarded_path| guarded_path == source_path)
+}
+
+fn singleton_braced_expression(braced: Node<'_>, expected: Node<'_>) -> bool {
+    let mut cursor = braced.walk();
+    let mut expressions = braced
+        .children_by_field_name("body", &mut cursor)
+        .filter(|child| child.is_named());
+    expressions
+        .next()
+        .is_some_and(|expression| expression.id() == expected.id())
+        && expressions.next().is_none()
+}
+
+fn matching_file_exists_path<'tree, 'text>(
+    condition: Node<'tree>,
+    content: &'text str,
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+    deferred_use: bool,
+) -> Option<String> {
+    if condition.kind() != "call" || condition.has_error() {
+        return None;
+    }
+    let function = condition.child_by_field_name("function")?;
+    match node_text(function, content).trim() {
+        "base::file.exists" | "base:::file.exists" => {}
+        "file.exists" => {
+            if bindings
+                .get()
+                .named_alias_may_shadow_at("file.exists", condition, deferred_use)
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+
+    let arguments = condition.child_by_field_name("arguments")?;
+    let mut argument = None;
+    let mut cursor = arguments.walk();
+    for child in arguments.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        if argument.is_some() || child.child_by_field_name("name").is_some() {
+            return None;
+        }
+        argument = Some(child.child_by_field_name("value")?);
+    }
+    super::binding::extract_plain_string(argument?, content)
 }
 
 /// Parse a `system.file(part1, part2, ..., package = "P")` call node.
@@ -3313,6 +3421,60 @@ mod tests {
 
     fn tar_requests(code: &str) -> Vec<TarSourceRequest> {
         detect_tar_source_requests(&parse_r(code), code)
+    }
+
+    #[test]
+    fn matching_file_exists_guard_marks_only_the_source_diagnostic() {
+        for code in [
+            r#"if (file.exists("scripts/config.R")) source("scripts/config.R")"#,
+            r#"if (base::file.exists("scripts/config.R")) { source("scripts/config.R") }"#,
+            r#"if (base:::file.exists("scripts/config.R")) {
+                # A comment does not make this a multi-expression consequence.
+                source("scripts/config.R")
+            }"#,
+            r#"if (file.exists("scripts/config.R")) {
+                source("scripts/config.R")
+            } else {
+                message("Using built-in defaults")
+            }"#,
+            r#"source(dynamic_path)
+               if (file.exists("scripts/config.R")) source("scripts/config.R")"#,
+            r#"if (file.exists("scripts/config.R")) source("scripts/config.R")
+               file.exists <- function(...) TRUE"#,
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert!(sources[0].guarded_by_file_exists, "{code}: {sources:?}");
+            assert_eq!(sources[0].path, "scripts/config.R");
+        }
+    }
+
+    #[test]
+    fn file_exists_guard_fails_closed_for_broader_control_flow() {
+        for code in [
+            r#"if (file.exists("other.R")) source("config.R")"#,
+            r#"if (!file.exists("config.R")) source("config.R")"#,
+            r#"if (file.exists(path)) source("config.R")"#,
+            r#"if (file.exists("config.R", "other.R")) source("config.R")"#,
+            r#"if (file.exists(file = "config.R")) source("config.R")"#,
+            r#"if (file.exists("config.R")) { x <- 1; source("config.R") }"#,
+            r#"if (file.exists("config.R")) NULL else source("config.R")"#,
+            r#"file.exists <- function(...) TRUE
+               if (file.exists("config.R")) source("config.R")"#,
+            r#"name <- "file.exists"
+               assign(name, function(...) TRUE)
+               if (file.exists("config.R")) source("config.R")"#,
+            r#"defer <- function(x) function() x
+               g <- defer(if (file.exists("config.R")) source("config.R"))
+               file.exists <- function(...) TRUE
+               g()"#,
+            r#"if (file.exists("config.R")) print("not a source")
+               source("config.R")"#,
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert!(!sources[0].guarded_by_file_exists, "{code}: {sources:?}");
+        }
     }
 
     #[test]
