@@ -753,7 +753,8 @@ fn scan_workspace_referenced_packages(root: &std::path::Path) -> Vec<String> {
 /// - the `namespace_identifier` (LHS) of each `pkg::name` / `pkg:::name`
 ///   (`namespace_operator` node — the package id is `child(0)`, confirmed against
 ///   `find_namespace_context` in `handlers.rs`), and
-/// - statically detected package loaders from the canonical detector, and
+/// - statically detected lexical package loaders and targets pipeline packages,
+///   and
 /// - a string literal statically matched to `requireNamespace()`'s `package`
 ///   formal.
 fn collect_referenced_packages(
@@ -772,6 +773,13 @@ fn collect_referenced_packages(
         }
         if is_valid_package_name(&call.package) {
             out.insert(call.package);
+        }
+    }
+    for declaration in
+        crate::cross_file::source_detect::detect_targets_pipeline_packages(tree, text)
+    {
+        if is_valid_package_name(&declaration.package) {
+            out.insert(declaration.package);
         }
     }
 
@@ -1790,6 +1798,7 @@ mod tests {
                    require(tibble)\n\
                    loadNamespace(\"jsonlite\")\n\
                    requireNamespace(\"rlang\")\n\
+                   targets::tar_option_set(packages = \"tidyr\")\n\
                    bare_var\n";
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -1800,7 +1809,9 @@ mod tests {
         let mut out = std::collections::BTreeSet::new();
         super::collect_referenced_packages(&tree, src, &mut out);
 
-        for expected in ["dplyr", "utils", "ggplot2", "tibble", "jsonlite", "rlang"] {
+        for expected in [
+            "dplyr", "utils", "ggplot2", "tibble", "jsonlite", "rlang", "tidyr",
+        ] {
             assert!(out.contains(expected), "expected {expected}, got {out:?}");
         }
         assert!(

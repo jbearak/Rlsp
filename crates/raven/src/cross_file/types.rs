@@ -181,6 +181,23 @@ impl SuppressionDirective {
     }
 }
 
+/// One statically recognized package from a top-level {targets}
+/// `tar_option_set(packages = ...)` declaration.
+///
+/// This is intentionally separate from [`LibraryCall`]: targets worker
+/// packages are a file/pipeline-level contribution, not a lexical package-load
+/// event. The source anchor is retained for missing-package diagnostics and
+/// line-scoped suppressions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetsPackageDeclaration {
+    /// Statically resolved package name.
+    pub package: String,
+    /// 0-based line of the package literal or call-end fallback.
+    pub line: u32,
+    /// 0-based UTF-16 column of the package literal or call-end fallback.
+    pub column: u32,
+}
+
 /// Complete cross-file metadata for a document
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrossFileMetadata {
@@ -234,6 +251,10 @@ pub struct CrossFileMetadata {
     pub suppression_directives: Vec<SuppressionDirective>,
     /// Detected package-load calls, including static pacman `p_load()` forms.
     pub library_calls: Vec<LibraryCall>,
+    /// File/pipeline-level worker packages declared by statically recognized
+    /// top-level `tar_option_set(packages = ...)` calls.
+    #[serde(default)]
+    pub targets_pipeline_packages: Vec<TargetsPackageDeclaration>,
     /// Variables declared via `# raven: var` directives
     #[serde(default)]
     pub declared_variables: Vec<DeclaredSymbol>,
@@ -268,6 +289,25 @@ pub struct CrossFileMetadata {
     /// Detected `pkg::member` namespace references (issue #503).
     #[serde(default)]
     pub namespace_references: Vec<NamespaceReference>,
+}
+
+impl CrossFileMetadata {
+    /// Package names referenced by lexical package loaders or the targets
+    /// pipeline worker-package declaration.
+    ///
+    /// This is a warming/inventory view only. Semantic scope keeps the two
+    /// channels separate because ordinary loaders are position-sensitive while
+    /// targets packages are pipeline-level.
+    pub fn referenced_packages(&self) -> impl Iterator<Item = &str> {
+        self.library_calls
+            .iter()
+            .map(|call| call.package.as_str())
+            .chain(
+                self.targets_pipeline_packages
+                    .iter()
+                    .map(|declaration| declaration.package.as_str()),
+            )
+    }
 }
 
 /// One statically recognized top-level `{targets}` `tar_source()` call.

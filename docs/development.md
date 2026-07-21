@@ -541,6 +541,25 @@ Scope resolution has two distinct graph traversals:
 
 Ordered source batches share the detached expansion, watch-root ownership, generation fencing, graph identity, and left-to-right scope resolver originally built for `{targets}` `tar_source()`. `SourceBatchKind` separates tar's contextual working-directory semantics from ordinary bounded `list.files()` source loops. The serialized `tar_source_ordinal` and `tar_source_expansion_watch_paths` names remain for metadata compatibility, but their runtime contract is batch-generic: kind plus call site plus ordinal identify a member, and expansions replace all derived members atomically. Detection never touches the filesystem; expansion runs only after working-directory enrichment and outside state locks. Request-bearing `didChange` operations enumerate inside the existing detached OpenEdit derivation and await its atomic document/metadata/graph commit. If any source-file event in one normalized watcher notification belongs to an open source-batch parent, every normalized source-file event in that notification runs as one invocation-owned watched transaction (including any package projection). Config-layer mutations are applied first, but their diagnostic publication joins the same completion boundary. This prevents the parent from publishing after its batch member lands but before an ordinary dependency event from the same notification commits. The owned transaction drains its diagnostic reservations before completing the receipt-backed parent refresh; if package convergence crosses the existing coalesced retry boundary, the parent-refresh obligation moves with that owner and the original handler awaits the shared terminal receipt. A cancelled parent refresh cancels the outer receipt and withholds sysdata admission. Sysdata continuation otherwise keeps the ordinary watcher contract: admission is ordered after the owned transaction, but convergence remains lifecycle-owned. Workspace-replay refreshes use the same generation-owned parent receipts. Workspace graph derivations reuse the expansion already owned by the scan candidate, keeping the complete-graph pin pass and final graph pass on one filesystem observation. Unsafe enumeration and member-cap overflow fail closed without publishing a partial batch; traversal-budget overflow uses the deterministic ordered fallback described below.
 
+`tar_option_set(packages = ...)` uses a distinct durable metadata channel,
+`CrossFileMetadata::targets_pipeline_packages`, rather than synthetic
+line-zero `PackageLoad` events. Detection and static-vector resolution happen
+once during metadata extraction; query-time scope resolution never reparses the
+declaring file. Recursive and streaming resolution project the package-name set
+onto the declaring pipeline only after its ordinary timeline, making the set
+order-independent without feeding it into ordinary `Source` events. A private
+TarSource initial scope is seeded with the same set before ordinal zero executes;
+ListFiles batches are not seeded. Targets-only loaded/attached provenance markers
+survive parent-prefix and ordered-batch merging so TarSource edges can lend the
+contribution while ordinary Source/ListFiles edges filter it. A real lexical
+package load clears the corresponding marker, preserving normal propagation
+when both channels name the same package. Conditional helper classification
+(such as Shiny deferred scopes) reads the stored targets set directly without
+installing it in the running frames, maintaining the same propagation barrier.
+The interface hash includes the sorted, deduplicated package-name set: package
+order and source anchors are hash-neutral, while a semantic set change
+revalidates dependents.
+
 The cached/streaming parent prefix is seeded with the queried URI at `(u32::MAX, u32::MAX)` so a single cache slot covers all positions in that file within a snapshot, whereas the uncached point resolver (`scope_at_position_with_graph`) seeds the visited map at the real `(line, column)`. For acyclic graphs the two seeds are identical. In a cyclic graph the cached prefix is a deliberate over-approximation: a back-edge can re-enter the queried file at `(MAX, MAX)` and so could "see" symbols defined later in that file, but the same-file leak filter (a symbol whose `source_uri` equals the queried URI is dropped from a parent prefix) plus `entry().or_insert()` merging keep the result sound at the symbol level, so those later symbols never surface. Tightening this would require position-dependent cache keys, which would defeat the cache; it is therefore pinned as intentional — `test_cyclic_cached_overapproximates_vs_uncached_point_query` observes the cached and uncached resolvers agreeing on every field at the boundary query (issue #374).
 
 ### Interface hash + selective invalidation
@@ -555,6 +574,9 @@ The hash is deterministic and includes:
   helper call. Scope results retain a separate attached-package fact because
   `loadNamespace()` remains available for namespace-aware analysis but must not
   enable attachment-sensitive helpers.
+- The semantic package-name set from `tar_option_set(packages = ...)`, sorted
+  and deduplicated so declaration position and order do not cause needless
+  dependent revalidation.
 - Declared symbols (from `# raven: var` / `# raven: func` directives)
 - Source-edge inputs, including precise `SourceLocality`, call site, path, `chdir`, function scope, and resolved URI. `CurrentFrame` and `NonInheriting` remain distinct runtime/hash values even though old serialized readers see the same lossy `local = true` compatibility projection for regular `source()` calls.
 

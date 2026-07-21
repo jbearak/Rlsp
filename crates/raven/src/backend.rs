@@ -139,21 +139,21 @@ impl Drop for DiagnosticsSupersessionGuardForTest {
     }
 }
 
-/// Extract a permissive package warm set from metadata-derived library calls.
+/// Extract a permissive package warm set from durable metadata.
 ///
-/// Conditional calls are intentionally included even when their attachment
-/// prerequisite is not active. This function only prefetches metadata; it
-/// cannot make a package visible in semantic scope, and resolving the full
-/// graph here would make the edit-time warm path disproportionately expensive.
-fn extract_loaded_packages_from_library_calls(
-    library_calls: &[crate::cross_file::LibraryCall],
+/// Conditional lexical calls and targets pipeline packages are intentionally
+/// included. Warming cannot make a package semantically visible, and resolving
+/// the full graph here would make the edit-time path disproportionately
+/// expensive.
+fn extract_loaded_packages_from_metadata(
+    metadata: &crate::cross_file::CrossFileMetadata,
 ) -> Vec<String> {
     let mut packages = Vec::new();
-    for lib_call in library_calls {
-        if is_valid_package_name(&lib_call.package) {
-            packages.push(lib_call.package.clone());
+    for package in metadata.referenced_packages() {
+        if is_valid_package_name(package) {
+            packages.push(package.to_string());
         } else {
-            log::warn!("Skipping suspicious package name: {}", lib_call.package);
+            log::warn!("Skipping suspicious package name: {package}");
         }
     }
     packages
@@ -168,10 +168,10 @@ fn extract_loaded_packages_from_library_calls(
 /// the `is_valid_package_name` filter the caller applies to the merged
 /// prefetch set (mirroring the did_open path). Extracted for unit testing.
 fn edited_document_warm_packages(
-    library_calls: &[crate::cross_file::LibraryCall],
+    metadata: &crate::cross_file::CrossFileMetadata,
     doc: &crate::state::Document,
 ) -> Vec<String> {
-    let mut packages = extract_loaded_packages_from_library_calls(library_calls);
+    let mut packages = extract_loaded_packages_from_metadata(metadata);
     packages.extend(doc.data_packages.iter().cloned());
     packages
 }
@@ -10127,8 +10127,7 @@ fn derive_open_edit_fallback(
         .collect();
     let mut plan = captured.plan;
     if captured.packages_enabled {
-        plan.packages_to_prefetch =
-            extract_loaded_packages_from_library_calls(&local_metadata.library_calls);
+        plan.packages_to_prefetch = extract_loaded_packages_from_metadata(&local_metadata);
         plan.packages_to_prefetch
             .extend(namespace_warm_packages(&local_metadata));
         plan.packages_to_prefetch.extend(
@@ -10172,8 +10171,7 @@ fn capture_live_package_open_edit_with_metadata(
     let subject_excluded = state.is_project_excluded_uri(uri);
     let workspace_root = state.workspace_folders.first().cloned();
     let packages_to_prefetch = if state.cross_file_config.packages_enabled {
-        let mut packages =
-            edited_document_warm_packages(&metadata.library_calls, prepared.document());
+        let mut packages = edited_document_warm_packages(&metadata, prepared.document());
         packages.extend(namespace_warm_packages(&metadata));
         packages
     } else {
@@ -11291,9 +11289,7 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
                     entry: crate::workspace_index::IndexEntry {
                         contents: ropey::Rope::from_str(&content),
                         tree: tree.clone(),
-                        loaded_packages: extract_loaded_packages_from_library_calls(
-                            &semantic.library_calls,
-                        ),
+                        loaded_packages: extract_loaded_packages_from_metadata(&semantic),
                         data_packages: crate::state::extract_data_packages(&tree, &analysis),
                         snapshot: snapshot.clone(),
                         metadata: Arc::new(semantic.clone()),
@@ -11886,7 +11882,7 @@ fn derive_open_install_analysis(
     });
     let mut packages_to_prefetch = Vec::new();
     if captured.packages_enabled {
-        packages_to_prefetch = extract_loaded_packages_from_library_calls(&metadata.library_calls);
+        packages_to_prefetch = extract_loaded_packages_from_metadata(&metadata);
         packages_to_prefetch.extend(namespace_warm_packages(&metadata));
         packages_to_prefetch.extend(
             captured
@@ -13367,8 +13363,7 @@ async fn resync_file_from_disk(
         None => crate::cross_file::scope::ScopeArtifacts::default(),
     });
     let new_interface_hash = artifacts.interface_hash;
-    let loaded_packages =
-        extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
+    let loaded_packages = extract_loaded_packages_from_metadata(&cross_file_meta);
     let data_packages = crate::state::extract_data_packages(&tree, &analysis);
 
     let fresh_entry = crate::workspace_index::IndexEntry {
@@ -18244,8 +18239,7 @@ impl LanguageServer for Backend {
                         Vec::new()
                     };
                     let packages_to_prefetch = if packages_enabled {
-                        let mut packages =
-                            extract_loaded_packages_from_library_calls(&meta.library_calls);
+                        let mut packages = extract_loaded_packages_from_metadata(&meta);
                         packages.extend(namespace_warm_packages(&meta));
                         packages
                     } else {
@@ -18368,8 +18362,7 @@ impl LanguageServer for Backend {
                     extract_enriched_live_metadata_with_contexts(&state, &uri, &text);
                 let workspace_root = state.workspace_folders.first().cloned();
                 let packages_to_prefetch: Vec<String> = if packages_enabled {
-                    let mut packages =
-                        edited_document_warm_packages(&meta.library_calls, prepared.document());
+                    let mut packages = edited_document_warm_packages(&meta, prepared.document());
                     packages.extend(namespace_warm_packages(&meta));
                     packages
                 } else {
@@ -21486,8 +21479,7 @@ impl Backend {
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
 
-        let loaded_packages =
-            extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
+        let loaded_packages = extract_loaded_packages_from_metadata(&cross_file_meta);
         let data_packages = crate::state::extract_data_packages(&tree, analysis_text);
         let packages_to_prefetch = if packages_enabled {
             loaded_packages.clone()
@@ -21990,8 +21982,7 @@ impl Backend {
             None => crate::cross_file::scope::ScopeArtifacts::default(),
         });
 
-        let loaded_packages =
-            extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
+        let loaded_packages = extract_loaded_packages_from_metadata(&cross_file_meta);
         let data_packages = crate::state::extract_data_packages(&tree, analysis_text);
         let packages_to_prefetch = if packages_enabled {
             loaded_packages.clone()
@@ -31992,12 +31983,35 @@ mod refresh_packages_tests {
         use crate::state::Document;
 
         let doc = Document::new("data(api, package = \"survey\")\n", Some(1));
-        let pkgs = edited_document_warm_packages(&[], &doc);
+        let metadata = crate::cross_file::CrossFileMetadata::default();
+        let pkgs = edited_document_warm_packages(&metadata, &doc);
 
         assert!(
             pkgs.contains(&"survey".to_string()),
             "did_change warm set must include data(package=) packages (issue #429); got {:?}",
             pkgs
+        );
+    }
+
+    #[test]
+    fn targets_pipeline_packages_remain_in_metadata_warm_set() {
+        let mut metadata = crate::cross_file::CrossFileMetadata::default();
+        metadata.targets_pipeline_packages = vec![
+            crate::cross_file::TargetsPackageDeclaration {
+                package: "dplyr".to_string(),
+                line: 1,
+                column: 34,
+            },
+            crate::cross_file::TargetsPackageDeclaration {
+                package: "not a package".to_string(),
+                line: 2,
+                column: 34,
+            },
+        ];
+
+        assert_eq!(
+            extract_loaded_packages_from_metadata(&metadata),
+            vec!["dplyr".to_string()]
         );
     }
 

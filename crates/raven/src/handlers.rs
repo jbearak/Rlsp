@@ -6250,6 +6250,51 @@ fn collect_missing_package_diagnostics_from_snapshot_for_uri(
         });
     }
 
+    for declaration in &snapshot.directive_meta.targets_pipeline_packages {
+        if snapshot
+            .package_library
+            .package_exists(&declaration.package)
+        {
+            continue;
+        }
+        let outside_active = package_available_outside_active_renv(snapshot, &declaration.package);
+        if !outside_active
+            && !snapshot
+                .cross_file_config
+                .packages_report_generic_uninstalled
+        {
+            continue;
+        }
+        let code = if outside_active {
+            crate::diagnostic_code::PACKAGE_OUTSIDE_ACTIVE_LIBRARY
+        } else {
+            crate::diagnostic_code::PACKAGE_NOT_INSTALLED
+        };
+        if crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            declaration.line,
+            Some(code),
+        ) {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((declaration.line, code.to_string()));
+            }
+            continue;
+        }
+        if outside_active && !reported_outside_active.insert(declaration.package.as_str()) {
+            continue;
+        }
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(declaration.line, 0),
+                end: Position::new(declaration.line, declaration.column),
+            },
+            severity: Some(severity),
+            message: missing_package_message(&declaration.package, outside_active),
+            code: Some(NumberOrString::String(code.to_string())),
+            ..Default::default()
+        });
+    }
+
     for ns_ref in &snapshot.directive_meta.namespace_references {
         // Both `::` and `:::` qualify for the missing-package diagnostic.
         if snapshot.package_library.package_exists(&ns_ref.package) {
@@ -7037,10 +7082,18 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 
 /// File/workspace-level set of packages detectably in play for NSE callee
 /// classification (issue #398): `library()` / `require()` calls, DESCRIPTION
-/// `Imports` (`full_imports`), `importFrom` packages, and test-attached
-/// packages. Deliberately file-level rather than position-aware — the
-/// conservative "unresolved callee suppresses its arguments" fallback keeps the
-/// approximation safe.
+/// `Imports` (`full_imports`), `importFrom` packages, test-attached packages,
+/// and targets worker packages for the declaring pipeline or a direct
+/// `tar_source()` member. Deliberately file-level rather than position-aware —
+/// the conservative "unresolved callee suppresses its arguments" fallback keeps
+/// the approximation safe.
+///
+/// Targets declarations deliberately bypass the broad ancestor/descendant
+/// library walk below. They are a pipeline contribution, not an ordinary
+/// lexical attach: the declaring file always receives its own set, and only a
+/// direct incoming `TarSource` edge lends its parent's set to a batch member.
+/// This prevents leakage through ordinary `source()` edges, `ListFiles` batches,
+/// and unrelated graph branches.
 fn collect_in_play_packages(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
@@ -7074,6 +7127,37 @@ fn collect_in_play_packages(
         }
         packages.insert(package);
     }
+
+    // A targets worker package is attached throughout its declaring pipeline,
+    // independent of declaration position.
+    for declaration in &snapshot.directive_meta.targets_pipeline_packages {
+        if declaration.package.is_empty() {
+            continue;
+        }
+        packages.insert(declaration.package.clone());
+        attached_packages_for_meta.insert(declaration.package.clone());
+    }
+
+    // Direct `tar_source()` members execute in the pipeline's worker package
+    // environment. Inspect only incoming TarSource edges: using the generic
+    // ancestor walk would incorrectly lend the declaration through ordinary
+    // source chains and across unrelated branches.
+    for edge in snapshot.cross_file_graph.get_dependents(uri) {
+        if edge.source_batch_kind != Some(crate::cross_file::types::SourceBatchKind::TarSource) {
+            continue;
+        }
+        let Some(parent_meta) = snapshot.metadata_map.get(&edge.from) else {
+            continue;
+        };
+        for declaration in &parent_meta.targets_pipeline_packages {
+            if declaration.package.is_empty() {
+                continue;
+            }
+            packages.insert(declaration.package.clone());
+            attached_packages_for_meta.insert(declaration.package.clone());
+        }
+    }
+
     // Include packages loaded by ancestor files in the cross-file source chain.
     // Without this, a child file inheriting `dplyr` from a parent would not get
     // NSE suppression for verbs like `filter` that shadow base/stats exports.
