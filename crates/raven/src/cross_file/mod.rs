@@ -39,13 +39,13 @@ pub use source_detect::*;
 pub use tar_source::*;
 pub use types::*;
 
-/// Extract cross-file metadata from R source by combining directive parsing with AST-detected `source()` and library-related calls.
+/// Extract cross-file metadata from R source by combining directive parsing with AST-detected sources and package facts.
 ///
-/// Directive-derived `source` entries take precedence over AST-detected `source()` calls when they occur on the same line. When a thread-local parser is available the function also detects `library()`, `require()`, and `loadNamespace()` calls and records them in `library_calls`; if parsing fails those AST-derived detections are skipped.
+/// Directive-derived `source` entries take precedence over AST-detected `source()` calls when they occur on the same line. When a thread-local parser is available the function also detects lexical package loads (`library()`, `require()`, and `loadNamespace()`) and file-level targets worker-package declarations; if parsing fails those AST-derived detections are skipped.
 ///
 /// # Returns
 ///
-/// A `CrossFileMetadata` containing collected `sources`, `sourced_by` entries, and `library_calls`. `sources` and `library_calls` are sorted by document order (line, column).
+/// A `CrossFileMetadata` containing collected sources, backward declarations, lexical package loads, and targets pipeline packages. Positional collections are sorted by document order (line, column).
 ///
 /// # Examples
 ///
@@ -196,13 +196,18 @@ pub fn extract_metadata_with_tree(
         // Sort by line number for consistent ordering
         meta.sources.sort_by_key(|s| (s.line, s.column));
 
-        // Detect library(), require(), loadNamespace(), and static
-        // targets::tar_source() calls with one shared lazy binding table.
-        let (mut library_calls, tar_source_requests, list_files_source_requests) =
-            source_detect::detect_library_and_tar_source_requests(tree, content);
+        // Detect lexical package loads, targets worker-package declarations,
+        // and static source-batch requests with one shared lazy binding table.
+        let (
+            mut library_calls,
+            targets_pipeline_packages,
+            tar_source_requests,
+            list_files_source_requests,
+        ) = source_detect::detect_library_and_tar_source_requests(tree, content);
         // Sort by line/column for document order (Requirement 1.8)
         library_calls.sort_by_key(|lc| (lc.line, lc.column));
         meta.library_calls = library_calls;
+        meta.targets_pipeline_packages = targets_pipeline_packages;
         meta.tar_source_requests = tar_source_requests;
         meta.list_files_source_requests = list_files_source_requests;
         meta.namespace_references = source_detect::detect_namespace_references(tree, content);
@@ -211,12 +216,13 @@ pub fn extract_metadata_with_tree(
     }
 
     log::trace!(
-        "Metadata extraction complete: {} total sources ({} from directives, {} from AST), {} backward directives, {} library calls",
+        "Metadata extraction complete: {} total sources ({} from directives, {} from AST), {} backward directives, {} library calls, {} targets pipeline packages",
         meta.sources.len(),
         meta.sources.iter().filter(|s| s.is_directive).count(),
         meta.sources.iter().filter(|s| !s.is_directive).count(),
         meta.sourced_by.len(),
-        meta.library_calls.len()
+        meta.library_calls.len(),
+        meta.targets_pipeline_packages.len()
     );
 
     meta

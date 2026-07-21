@@ -276,29 +276,38 @@ may `break` or `return()` before loading every package are ignored. A named
 vector is resolved only for a loop known to execute eagerly in the file; a
 deferred function-body loop can still use an inline `c("a", "b")` sequence.
 
-### targets::tar_option_set() Loads
+### targets::tar_option_set() Worker Packages
 
-Raven treats a [{targets}](https://docs.ropensci.org/targets/)
-`tar_option_set(packages = ...)` call as a package attachment — targets
-attaches the listed packages before running each target, so scripts sourced by
-`_targets.R` use their exports as bare names:
+Raven models a [{targets}](https://docs.ropensci.org/targets/)
+`tar_option_set(packages = ...)` declaration as a file/pipeline-level worker
+package contribution, not as a source-positioned `library()` call. The package
+set is therefore available throughout the declaring targets pipeline and to
+every member of each `tar_source()` batch, regardless of whether the declaration
+appears before or after the batch:
 
 ```r
 # _targets.R
 library(targets)
+tar_source("R")
 tar_option_set(packages = c("dplyr", "tidyr"))
-source("R/functions.R")  # dplyr and tidyr verbs resolve in functions.R
+
+# dplyr and tidyr resolve throughout _targets.R and in every tar_source() member.
 ```
+
+This special propagation is limited to targets execution. It does not flow into
+an ordinary `source()` child or a `source(list.files(...))` batch. Actual
+`library()`, `require()`, and `loadNamespace()` calls remain position-sensitive
+and retain their normal cross-file propagation behavior.
 
 Details:
 
 - **Bare vs. qualified callee.** The qualified spellings
   `targets::tar_option_set(...)` / `targets:::tar_option_set(...)` are
-  recognized unconditionally. The bare spelling `tar_option_set(...)` is
-  recognized only when the same file also attaches targets via
-  `library(targets)` / `require(targets)` — anywhere in the file, before or
-  after the call — so an unrelated user function named `tar_option_set`
-  doesn't silently attach packages.
+  recognized directly. The bare spelling `tar_option_set(...)` is recognized
+  only when the same file also attaches targets via `library(targets)` /
+  `require(targets)` — anywhere in the file, before or after the call — and the
+  bare name is not locally shadowed. A qualified call remains recognized when a
+  local binding named `tar_option_set` exists.
 - **Named `packages =` only.** `tar_option_set`'s first formal is
   `tidy_eval`, not `packages`, so positional forms like
   `tar_option_set(TRUE, c("dplyr"))` are deliberately not matched.
@@ -308,14 +317,14 @@ Details:
   such a vector (including eligible bare/base-qualified `assign()` with the
   same global-destination rules as apply-family loads). Nested, conditional,
   dynamic, non-global, reassigned, or removed bindings, `character(0)`, and
-  empty `c()` are ignored.
+  empty `c()` are ignored. Raven never evaluates R to resolve a dynamic value.
 - **Per-literal anchoring.** `tar_option_set()` calls routinely span many
   lines, so each package's missing-package diagnostic is anchored at that
   package's own string literal — a `# nolint` on the literal's line suppresses
   it. The variable-resolved shape anchors at the call's end instead.
 - **Union across calls.** Multiple `tar_option_set()` calls in one file union
   their `packages =` vectors. targets' real runtime semantics are
-  last-call-wins, but raven deliberately favors false negatives here.
+  last-call-wins, but Raven deliberately favors false negatives here.
 
 ### targets::tar_source() Scripts
 
@@ -337,8 +346,9 @@ from before the call plus the definitions, removals, and package attachments
 produced by earlier members. A later member replaces an earlier binding of the
 same name. A member never sees a later sibling. `change_directory = TRUE` is
 honored, including for ordinary `source()` calls nested inside a member.
-Packages from `tar_option_set(packages = ...)` and packages attached by earlier
-members flow through the same ordered environment.
+The file-level `tar_option_set(packages = ...)` set seeds every member, including
+ordinal zero, while actual package loads from members continue to flow through
+the ordered environment.
 
 In the language server, workspace watcher events keep membership live:
 creating, deleting, or renaming a script under a finalized request refreshes

@@ -672,8 +672,8 @@ pub(crate) fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<St
         return Vec::new();
     };
 
-    // Use the canonical detector for direct, apply-family, loop, targets, and
-    // pacman package loads. `Document.loaded_packages`
+    // Use the canonical detectors for lexical package loads and targets
+    // pipeline worker-package declarations. `Document.loaded_packages`
     // also feeds CLI reporting, so conditional bare `p_load()` targets must
     // stay out until a graph-aware scope query proves their prerequisite.
     // Backend edit-time prefetching deliberately keeps its separate permissive
@@ -684,6 +684,11 @@ pub(crate) fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<St
             .filter(|call| call.requires_attached.is_none())
             .map(|call| call.package)
             .collect();
+    packages.extend(
+        crate::cross_file::source_detect::detect_targets_pipeline_packages(tree, text)
+            .into_iter()
+            .map(|declaration| declaration.package),
+    );
     packages.sort();
     packages.dedup();
     packages
@@ -14475,6 +14480,15 @@ mod tests {
 
         let qualified = Document::new("pacman::p_load(ggplot2)", None);
         assert_eq!(qualified.loaded_packages, vec!["ggplot2"]);
+    }
+
+    #[test]
+    fn document_loaded_packages_includes_targets_pipeline_packages() {
+        let document = Document::new(
+            "targets::tar_option_set(packages = c(\"dplyr\", \"tidyr\"))",
+            None,
+        );
+        assert_eq!(document.loaded_packages, ["dplyr", "tidyr"]);
     }
 
     #[test]
