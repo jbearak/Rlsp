@@ -325,10 +325,62 @@ fn contextual_source_uri(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListFilesSourceFailure {
+    MemberCapExceeded {
+        directory: PathBuf,
+        limit: usize,
+    },
+    UnreadableDirectory {
+        directory: PathBuf,
+        error_kind: std::io::ErrorKind,
+    },
+    UnreadableEntry {
+        path: Option<PathBuf>,
+        operation: &'static str,
+        error_kind: std::io::ErrorKind,
+    },
+    MatchingDirectory {
+        path: PathBuf,
+    },
+}
+
+impl std::fmt::Display for ListFilesSourceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MemberCapExceeded { directory, limit } => {
+                write!(
+                    formatter,
+                    "member cap exceeded for {directory:?} (limit {limit})"
+                )
+            }
+            Self::UnreadableDirectory {
+                directory,
+                error_kind,
+            } => write!(
+                formatter,
+                "could not read directory {directory:?} ({error_kind:?})"
+            ),
+            Self::UnreadableEntry {
+                path,
+                operation,
+                error_kind,
+            } => write!(
+                formatter,
+                "could not {operation} at {path:?} ({error_kind:?})"
+            ),
+            Self::MatchingDirectory { path } => {
+                write!(formatter, "matching .R entry is a directory: {path:?}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct RequestExpansion {
     files: Vec<PathBuf>,
     watch_paths: Vec<PathBuf>,
+    list_files_failure: Option<ListFilesSourceFailure>,
 }
 
 /// Expand every static `tar_source()` request without mutating metadata.
@@ -406,6 +458,14 @@ pub fn expand_tar_source_requests_with_exclusions(
     }
     for request in &metadata.list_files_source_requests {
         let expansion = expand_list_files_request(request, &context, workspace_root);
+        if let Some(failure) = &expansion.list_files_failure {
+            log::debug!(
+                "bounded list.files() source batch failed closed for {uri} at {}:{} (directory {:?}): {failure}",
+                request.line + 1,
+                request.column + 1,
+                request.directory,
+            );
+        }
         result.watch_paths.extend(expansion.watch_paths);
         for (ordinal, path) in expansion
             .files
@@ -790,7 +850,7 @@ fn expand_list_files_request(
     workspace_root: Option<&Url>,
 ) -> RequestExpansion {
     expand_list_files_request_with_probe(request, context, workspace_root, |path| {
-        std::fs::File::open(path).is_ok()
+        std::fs::File::open(path).map(drop)
     })
 }
 
@@ -798,7 +858,7 @@ fn expand_list_files_request_with_probe(
     request: &ListFilesSourceRequest,
     context: &PathContext,
     workspace_root: Option<&Url>,
-    can_open: impl Fn(&Path) -> bool,
+    can_open: impl Fn(&Path) -> std::io::Result<()>,
 ) -> RequestExpansion {
     let mut expansion = RequestExpansion::default();
     let candidates = candidate_watch_paths(&request.directory, context);
@@ -823,13 +883,26 @@ fn expand_list_files_request_with_probe(
     record_symlink_watch_paths(&directory, &mut expansion.watch_paths);
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
-        Err(_) => return expansion,
+        Err(error) => {
+            expansion.list_files_failure = Some(ListFilesSourceFailure::UnreadableDirectory {
+                directory,
+                error_kind: error.kind(),
+            });
+            return expansion;
+        }
     };
     let mut files = Vec::new();
     for entry in entries {
-        let Ok(entry) = entry else {
-            expansion.files.clear();
-            return expansion;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                expansion.list_files_failure = Some(ListFilesSourceFailure::UnreadableEntry {
+                    path: None,
+                    operation: "read directory entry",
+                    error_kind: error.kind(),
+                });
+                return expansion;
+            }
         };
         let name = entry.file_name();
         if name.to_string_lossy().starts_with('.')
@@ -841,27 +914,52 @@ fn expand_list_files_request_with_probe(
             continue;
         }
         let path = entry.path();
-        let Ok(symlink_metadata) = std::fs::symlink_metadata(&path) else {
-            expansion.files.clear();
-            return expansion;
+        let symlink_metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                expansion.list_files_failure = Some(ListFilesSourceFailure::UnreadableEntry {
+                    path: Some(path),
+                    operation: "read symlink metadata",
+                    error_kind: error.kind(),
+                });
+                return expansion;
+            }
         };
         if symlink_metadata.file_type().is_symlink() {
             record_symlink_watch_paths(&path, &mut expansion.watch_paths);
         }
-        let Ok(metadata) = std::fs::metadata(&path) else {
-            expansion.files.clear();
-            return expansion;
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                expansion.list_files_failure = Some(ListFilesSourceFailure::UnreadableEntry {
+                    path: Some(path),
+                    operation: "read metadata",
+                    error_kind: error.kind(),
+                });
+                return expansion;
+            }
         };
-        if !metadata.is_file()
-            || !path_is_within_workspace(&path, workspace_root)
-            || !can_open(&path)
-        {
-            expansion.files.clear();
+        if metadata.is_dir() {
+            expansion.list_files_failure = Some(ListFilesSourceFailure::MatchingDirectory { path });
+            return expansion;
+        }
+        if !metadata.is_file() || !path_is_within_workspace(&path, workspace_root) {
+            return expansion;
+        }
+        if let Err(error) = can_open(&path) {
+            expansion.list_files_failure = Some(ListFilesSourceFailure::UnreadableEntry {
+                path: Some(path),
+                operation: "open matching entry",
+                error_kind: error.kind(),
+            });
             return expansion;
         }
         files.push(path);
         if files.len() > MAX_LIST_FILES_SOURCE_MEMBERS {
-            expansion.files.clear();
+            expansion.list_files_failure = Some(ListFilesSourceFailure::MemberCapExceeded {
+                directory,
+                limit: MAX_LIST_FILES_SOURCE_MEMBERS,
+            });
             return expansion;
         }
     }
@@ -1134,11 +1232,27 @@ mod tests {
                     for (file in files) source(file)\n";
         touch(&parent, code);
 
-        let metadata = finalize(root, &parent, code);
+        let workspace_root = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(&parent).unwrap();
+        let metadata = crate::cross_file::extract_metadata(code);
+        let context =
+            PathContext::from_metadata(&parent_uri, &metadata, Some(&workspace_root)).unwrap();
+        let expansion = expand_list_files_request(
+            &metadata.list_files_source_requests[0],
+            &context,
+            Some(&workspace_root),
+        );
+
         assert!(
-            metadata.sources.is_empty(),
+            expansion.files.is_empty(),
             "a partial prefix would model the wrong execution: {:?}",
-            metadata.sources
+            expansion.files
+        );
+        assert_eq!(
+            expansion.list_files_failure,
+            Some(ListFilesSourceFailure::MatchingDirectory {
+                path: root.join("functions/not-a-file.R"),
+            })
         );
     }
 
@@ -1162,13 +1276,27 @@ mod tests {
             &metadata.list_files_source_requests[0],
             &context,
             Some(&workspace_root),
-            |path| path.file_name().and_then(|name| name.to_str()) != Some("unopenable.R"),
+            |path| {
+                if path.file_name().and_then(|name| name.to_str()) == Some("unopenable.R") {
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(())
+                }
+            },
         );
 
         assert!(
             expansion.files.is_empty(),
             "an unreadable member must reject the entire batch: {:?}",
             expansion.files
+        );
+        assert_eq!(
+            expansion.list_files_failure,
+            Some(ListFilesSourceFailure::UnreadableEntry {
+                path: Some(root.join("functions/unopenable.R")),
+                operation: "open matching entry",
+                error_kind: std::io::ErrorKind::PermissionDenied,
+            })
         );
     }
 
@@ -1206,8 +1334,25 @@ mod tests {
                     for (file in files) source(file)\n";
         touch(&parent, code);
 
-        let metadata = finalize(root, &parent, code);
-        assert!(metadata.sources.is_empty());
+        let workspace_root = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(&parent).unwrap();
+        let metadata = crate::cross_file::extract_metadata(code);
+        let context =
+            PathContext::from_metadata(&parent_uri, &metadata, Some(&workspace_root)).unwrap();
+        let expansion = expand_list_files_request(
+            &metadata.list_files_source_requests[0],
+            &context,
+            Some(&workspace_root),
+        );
+
+        assert!(expansion.files.is_empty());
+        assert_eq!(
+            expansion.list_files_failure,
+            Some(ListFilesSourceFailure::MemberCapExceeded {
+                directory: root.join("functions"),
+                limit: MAX_LIST_FILES_SOURCE_MEMBERS,
+            })
+        );
     }
 
     #[test]
