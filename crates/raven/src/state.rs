@@ -1451,6 +1451,12 @@ impl DiagnosticsCoherenceGate {
             .suppressed_generation_through
             .is_some_and(|through| generation <= through)
     }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_test(&self) -> (u64, u32, usize) {
+        let state = self.state.lock();
+        (state.generation, state.active, state.deferred.len())
+    }
 }
 
 /// RAII ownership for one counted diagnostics-coherence reservation.
@@ -6400,6 +6406,24 @@ impl WorldState {
         self.refresh_tar_source_watch_registry(TarSourceWatchRegistryRefresh::Parents(
             parents.into_iter().collect(),
         ));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_batch_watch_snapshot_for_test(
+        &self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> (u64, Vec<Option<u64>>, usize, usize, usize) {
+        let generations = paths
+            .into_iter()
+            .map(|path| self.tar_source_watch_path_generations.get(&path).copied())
+            .collect();
+        (
+            self.tar_source_event_generation,
+            generations,
+            self.tar_source_watch_path_generations.len(),
+            self.tar_source_watch_paths_by_parent.len(),
+            self.tar_source_parents_by_watch_path.len(),
+        )
     }
 
     /// Current operational generation of raw package inputs.

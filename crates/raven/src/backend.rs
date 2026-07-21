@@ -50891,6 +50891,346 @@ infixContinuationStyle = "aligned"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_source_batch_churn_soak_converges_and_releases_all_owners() {
+        use crate::cross_file::types::SourceBatchKind;
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        const ROUNDS: usize = 32;
+
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().canonicalize().unwrap();
+        let r_root = workspace.join("R");
+        let list_root = workspace.join("functions");
+        fs::create_dir_all(&r_root).unwrap();
+        fs::create_dir_all(&list_root).unwrap();
+
+        let tar_text = "targets::tar_source(\"R\")\ntar_churn_fn()\n";
+        let shiny_text = "shiny_churn_fn()\n";
+        let list_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+                         for (file in files) source(file)\n\
+                         list_churn_fn()\n";
+        fs::write(workspace.join("_targets.R"), tar_text).unwrap();
+        fs::write(workspace.join("app.R"), shiny_text).unwrap();
+        fs::write(workspace.join("main.R"), list_text).unwrap();
+
+        let svc = service_in_workspace_with_options_at(
+            &workspace,
+            Some(serde_json::json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+        )
+        .await;
+        let backend = svc.inner();
+        let tar_uri = Url::from_file_path(workspace.join("_targets.R")).unwrap();
+        let shiny_uri = Url::from_file_path(workspace.join("app.R")).unwrap();
+        let list_uri = Url::from_file_path(workspace.join("main.R")).unwrap();
+        open_doc_with_revalidation_handoff(backend, &tar_uri, "r", 1, tar_text).await;
+        open_doc_with_revalidation_handoff(backend, &shiny_uri, "r", 1, shiny_text).await;
+        open_doc_with_revalidation_handoff(backend, &list_uri, "r", 1, list_text).await;
+        // This package-disabled fixture deliberately skips the background scan.
+        // Mark its empty initial scan complete so undefined-symbol diagnostics
+        // participate in the coherence assertions below.
+        backend.state.write().await.workspace_scan_complete = true;
+        let r_member_path = r_root.join("churn.R");
+        let list_member_path = list_root.join("churn.R");
+        let r_member_uri = Url::from_file_path(&r_member_path).unwrap();
+        let list_member_uri = Url::from_file_path(&list_member_path).unwrap();
+
+        let (
+            mut event_generation,
+            mut root_generations,
+            mut generation_map_size,
+            parent_map_size,
+            root_map_size,
+            base_artifact_count,
+        ) = {
+            let state = backend.state.read().await;
+            let (event, roots, generation_size, parent_size, root_size) =
+                state.source_batch_watch_snapshot_for_test([r_root.clone(), list_root.clone()]);
+            assert!(roots.iter().all(Option::is_some));
+            (
+                event,
+                roots,
+                generation_size,
+                parent_size,
+                root_size,
+                state.workspace_index.artifact_uris().len(),
+            )
+        };
+        {
+            let state = backend.state.read().await;
+            for (parent, symbol) in [
+                (&tar_uri, "tar_churn_fn"),
+                (&shiny_uri, "shiny_churn_fn"),
+                (&list_uri, "list_churn_fn"),
+            ] {
+                assert!(
+                    snapshot_diagnostics(&state, parent)
+                        .iter()
+                        .any(|diagnostic| diagnostic
+                            .message
+                            .contains(&format!("{symbol} is not defined"))),
+                    "the soak requires an initially undefined source-batch symbol for {parent}"
+                );
+            }
+        }
+        let mut derivations = [0u64; 3];
+        let mut coherence_generation = backend
+            .state
+            .read()
+            .await
+            .diagnostics_coherence
+            .generation();
+
+        for round in 0..ROUNDS {
+            let (change_type, members_exist, bindings_exist) = match round % 4 {
+                0 => {
+                    fs::write(
+                        &r_member_path,
+                        "tar_churn_fn <- function() 1\nshiny_churn_fn <- function() 1\n",
+                    )
+                    .unwrap();
+                    fs::write(&list_member_path, "list_churn_fn <- function() 1\n").unwrap();
+                    (FileChangeType::CREATED, true, true)
+                }
+                1 => {
+                    fs::write(&r_member_path, "other_r_fn <- function() 1\n").unwrap();
+                    fs::write(&list_member_path, "other_list_fn <- function() 1\n").unwrap();
+                    (FileChangeType::CHANGED, true, false)
+                }
+                2 => {
+                    fs::write(
+                        &r_member_path,
+                        "tar_churn_fn <- function() 2\nshiny_churn_fn <- function() 2\n",
+                    )
+                    .unwrap();
+                    fs::write(&list_member_path, "list_churn_fn <- function() 2\n").unwrap();
+                    (FileChangeType::CHANGED, true, true)
+                }
+                _ => {
+                    fs::remove_file(&r_member_path).unwrap();
+                    fs::remove_file(&list_member_path).unwrap();
+                    (FileChangeType::DELETED, false, false)
+                }
+            };
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                backend.did_change_watched_files(DidChangeWatchedFilesParams {
+                    changes: vec![
+                        FileEvent {
+                            uri: r_member_uri.clone(),
+                            typ: change_type,
+                        },
+                        FileEvent {
+                            uri: list_member_uri.clone(),
+                            typ: change_type,
+                        },
+                    ],
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("source-batch churn round {round} did not converge"));
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let coordinators_clear = {
+                    let coordinators = backend.open_tar_source_coordinators.lock().unwrap();
+                    [&tar_uri, &shiny_uri, &list_uri]
+                        .iter()
+                        .all(|uri| !coordinators.contains_key(*uri))
+                };
+                let completions_clear = {
+                    let waiters = backend
+                        .open_tar_source_refresh_completions
+                        .waiters
+                        .lock()
+                        .unwrap();
+                    [&tar_uri, &shiny_uri, &list_uri]
+                        .iter()
+                        .all(|uri| !waiters.contains_key(*uri))
+                };
+                if coordinators_clear && completions_clear {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "source-batch churn round {round} leaked a coordinator or completion receipt"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            let state = backend.state.read().await;
+            for (parent, kind, member) in [
+                (&tar_uri, SourceBatchKind::TarSource, &r_member_uri),
+                (&shiny_uri, SourceBatchKind::Shiny, &r_member_uri),
+                (&list_uri, SourceBatchKind::ListFiles, &list_member_uri),
+            ] {
+                let record = state.documents.get_record(parent).unwrap();
+                let matching_sources: Vec<_> = record
+                    .metadata()
+                    .sources
+                    .iter()
+                    .filter(|source| source.source_batch_kind == Some(kind))
+                    .collect();
+                assert_eq!(
+                    matching_sources.len(),
+                    usize::from(members_exist),
+                    "round {round} left incoherent {kind:?} metadata"
+                );
+                if members_exist {
+                    assert_eq!(matching_sources[0].resolved_uri.as_ref(), Some(member));
+                    assert_eq!(matching_sources[0].tar_source_ordinal, Some(0));
+                }
+                let dependencies = state.cross_file_graph.get_dependencies(parent);
+                let matching_edges: Vec<_> = dependencies
+                    .iter()
+                    .filter(|edge| edge.source_batch_kind == Some(kind))
+                    .collect();
+                assert_eq!(
+                    matching_edges.len(),
+                    usize::from(members_exist),
+                    "round {round} left incoherent {kind:?} graph edges"
+                );
+                if members_exist {
+                    assert_eq!(&matching_edges[0].to, member);
+                    assert_eq!(matching_edges[0].tar_source_ordinal, Some(0));
+                }
+                assert!(
+                    !state.open_tar_source_refreshes.has_pending_for_test(parent),
+                    "round {round} left a source-parent refresh owner for {parent}"
+                );
+                assert!(
+                    !state.cross_file_revalidation.has_pending_for_test(parent),
+                    "round {round} left a diagnostic revalidation owner for {parent}"
+                );
+                assert_eq!(
+                    state
+                        .diagnostics_gate
+                        .force_republish_count_for_test(parent),
+                    0,
+                    "round {round} left a force-republish marker for {parent}"
+                );
+            }
+
+            assert_eq!(
+                state.workspace_index.get_artifacts(&r_member_uri).is_some(),
+                members_exist
+            );
+            assert_eq!(
+                state
+                    .workspace_index
+                    .get_artifacts(&list_member_uri)
+                    .is_some(),
+                members_exist
+            );
+            assert_eq!(
+                state.workspace_index.artifact_uris().len(),
+                base_artifact_count + usize::from(members_exist) * 2,
+                "round {round} leaked closed-file artifacts"
+            );
+            if members_exist {
+                let r_artifacts = state.workspace_index.get_artifacts(&r_member_uri).unwrap();
+                let list_artifacts = state
+                    .workspace_index
+                    .get_artifacts(&list_member_uri)
+                    .unwrap();
+                assert_eq!(
+                    r_artifacts.exported_interface.contains_key("tar_churn_fn"),
+                    bindings_exist,
+                    "round {round} retained stale tar/Shiny member artifacts"
+                );
+                assert_eq!(
+                    list_artifacts
+                        .exported_interface
+                        .contains_key("list_churn_fn"),
+                    bindings_exist,
+                    "round {round} retained stale list-files member artifacts"
+                );
+            }
+            assert_eq!(
+                state.watched_file_resync_generations.len(),
+                usize::from(members_exist) * 2,
+                "round {round} left unbounded watched-file resync ownership"
+            );
+            assert!(!state.watched_package_retry.has_pending());
+
+            for (parent, symbol) in [
+                (&tar_uri, "tar_churn_fn"),
+                (&shiny_uri, "shiny_churn_fn"),
+                (&list_uri, "list_churn_fn"),
+            ] {
+                let is_undefined = snapshot_diagnostics(&state, parent)
+                    .iter()
+                    .any(|diagnostic| {
+                        diagnostic
+                            .message
+                            .contains(&format!("{symbol} is not defined"))
+                    });
+                assert_eq!(
+                    is_undefined, !bindings_exist,
+                    "round {round} published diagnostics from an incoherent source-batch state for {parent}"
+                );
+            }
+
+            let (next_event, next_roots, next_generation_size, next_parent_size, next_root_size) =
+                state.source_batch_watch_snapshot_for_test([r_root.clone(), list_root.clone()]);
+            assert_eq!(next_event, event_generation + 1);
+            if round == 0 {
+                // The first indexed Shiny helper may discover transient watch
+                // roots of its own. Removed roots remain deliberate generation
+                // tombstones, but later churn must not add one per notification.
+                assert!(next_generation_size <= generation_map_size + 2);
+                generation_map_size = next_generation_size;
+            } else {
+                assert_eq!(next_generation_size, generation_map_size);
+            }
+            assert_eq!(
+                next_parent_size,
+                parent_map_size + usize::from(members_exist),
+                "round {round} leaked source-batch parent ownership"
+            );
+            assert_eq!(
+                next_root_size,
+                root_map_size + usize::from(members_exist),
+                "round {round} leaked source-batch watch-root ownership"
+            );
+            for (next, previous) in next_roots.iter().zip(&root_generations) {
+                assert!(
+                    next.zip(*previous)
+                        .is_some_and(|(next, previous)| next > previous),
+                    "round {round} did not advance an overlapping watch-root generation"
+                );
+            }
+            event_generation = next_event;
+            root_generations = next_roots;
+
+            let (next_coherence, active_coherence, deferred_diagnostics) =
+                state.diagnostics_coherence.snapshot_for_test();
+            assert!(next_coherence > coherence_generation);
+            assert_eq!(active_coherence, 0);
+            assert_eq!(deferred_diagnostics, 0);
+            coherence_generation = next_coherence;
+            drop(state);
+
+            let counts = backend.open_tar_source_derivations_for_test.lock().unwrap();
+            for (index, parent) in [&tar_uri, &shiny_uri, &list_uri].iter().enumerate() {
+                let next = counts.get(*parent).copied().unwrap_or_default();
+                assert!(
+                    next > derivations[index],
+                    "round {round} did not recompute source-batch parent {parent}"
+                );
+                derivations[index] = next;
+            }
+            assert!(
+                counts.len() <= 3,
+                "source-batch derivation keys grew across churn"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watched_list_files_package_retry_carries_parent_refresh_obligation() {
         use tower_lsp::lsp_types::FileChangeType;
 
