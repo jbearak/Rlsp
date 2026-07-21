@@ -103,7 +103,7 @@ To run Raven's native lints *alongside* REditorSupport's `lintr` on purpose, set
 
 ## Settings reference by rule
 
-Each rule lists the Raven settings that control it and the `lintr` linter it mirrors. Severities accept `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`. See [Diagnostics § Style Lints](diagnostics.md#style-lints) to see these rules in context with Raven's other diagnostic categories.
+Each rule lists the Raven settings that control it and the `lintr` linter it mirrors. Severities accept `"error"`, `"warning"`, `"information"` (or its `"info"` alias), `"hint"`, or `"off"`. See [Diagnostics § Style Lints](diagnostics.md#style-lints) to see these rules in context with Raven's other diagnostic categories.
 
 ### Line length
 

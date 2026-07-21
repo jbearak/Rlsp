@@ -2,7 +2,7 @@
  * Severity level for diagnostic messages.
  * Maps to LSP DiagnosticSeverity values.
  */
-export type SeverityLevel = "error" | "warning" | "information" | "hint" | "off";
+export type SeverityLevel = "error" | "warning" | "information" | "info" | "hint" | "off";
 
 /**
  * Naming scheme for the object-name lint. `any` disables the check for the

@@ -89,12 +89,12 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.maxRevalidationsPerTrigger', jsonPath: ['crossFile', 'maxRevalidationsPerTrigger'], type: 'number' },
     { vsCodeKey: 'crossFile.revalidationDebounceMs', jsonPath: ['crossFile', 'revalidationDebounceMs'], type: 'number' },
     // Cross-file severity settings
-    { vsCodeKey: 'crossFile.missingFileSeverity', jsonPath: ['crossFile', 'missingFileSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'crossFile.caseMismatchSeverity', jsonPath: ['crossFile', 'caseMismatchSeverity'], type: 'enum', enumValues: ['auto', 'error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'crossFile.circularDependencySeverity', jsonPath: ['crossFile', 'circularDependencySeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'crossFile.outOfScopeSeverity', jsonPath: ['crossFile', 'outOfScopeSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'crossFile.maxChainDepthSeverity', jsonPath: ['crossFile', 'maxChainDepthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'crossFile.redundantDirectiveSeverity', jsonPath: ['crossFile', 'redundantDirectiveSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.missingFileSeverity', jsonPath: ['crossFile', 'missingFileSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.caseMismatchSeverity', jsonPath: ['crossFile', 'caseMismatchSeverity'], type: 'enum', enumValues: ['auto', 'error', 'warning', 'information', 'info', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.circularDependencySeverity', jsonPath: ['crossFile', 'circularDependencySeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.outOfScopeSeverity', jsonPath: ['crossFile', 'outOfScopeSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.maxChainDepthSeverity', jsonPath: ['crossFile', 'maxChainDepthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
+    { vsCodeKey: 'crossFile.redundantDirectiveSeverity', jsonPath: ['crossFile', 'redundantDirectiveSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
     // On-demand indexing settings
     { vsCodeKey: 'crossFile.onDemandIndexing.enabled', jsonPath: ['crossFile', 'onDemandIndexing', 'enabled'], type: 'boolean' },
     // Cache settings
@@ -104,15 +104,15 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.cache.workspaceIndexMaxEntries', jsonPath: ['crossFile', 'cache', 'workspaceIndexMaxEntries'], type: 'number' },
     // Diagnostics settings
     { vsCodeKey: 'diagnostics.enabled', jsonPath: ['diagnostics', 'enabled'], type: 'boolean', defaultWhenUnconfigured: true },
-    { vsCodeKey: 'diagnostics.undefinedVariableSeverity', jsonPath: ['diagnostics', 'undefinedVariableSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'diagnostics.undefinedVariableSeverity', jsonPath: ['diagnostics', 'undefinedVariableSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
     { vsCodeKey: 'diagnostics.undefinedVariableInCallArguments', jsonPath: ['diagnostics', 'undefinedVariableInCallArguments'], type: 'boolean' },
     { vsCodeKey: 'diagnostics.undefinedVariableInBracketIndices', jsonPath: ['diagnostics', 'undefinedVariableInBracketIndices'], type: 'boolean' },
     // Package settings
     { vsCodeKey: 'packages.enabled', jsonPath: ['packages', 'enabled'], type: 'boolean' },
     { vsCodeKey: 'packages.additionalLibraryPaths', jsonPath: ['packages', 'additionalLibraryPaths'], type: 'array' },
     { vsCodeKey: 'packages.rPath', jsonPath: ['packages', 'rPath'], type: 'string' },
-    { vsCodeKey: 'packages.missingPackageSeverity', jsonPath: ['packages', 'missingPackageSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'packages.namespaceMemberSeverity', jsonPath: ['packages', 'namespaceMemberSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'packages.missingPackageSeverity', jsonPath: ['packages', 'missingPackageSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
+    { vsCodeKey: 'packages.namespaceMemberSeverity', jsonPath: ['packages', 'namespaceMemberSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
     { vsCodeKey: 'packages.watchLibraryPaths', jsonPath: ['packages', 'watchLibraryPaths'], type: 'boolean' },
     { vsCodeKey: 'packages.watchDebounceMs', jsonPath: ['packages', 'watchDebounceMs'], type: 'number' },
     { vsCodeKey: 'packages.packageMode', jsonPath: ['packages', 'packageMode'], type: 'enum', enumValues: ['auto', 'enabled', 'disabled'] as const },
@@ -137,33 +137,33 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.infixContinuationStyle', jsonPath: ['linting', 'infixContinuationStyle'], type: 'enum', enumValues: ['indented', 'aligned', 'either'] as const, defaultWhenUnconfigured: 'either' },
     { vsCodeKey: 'linting.assignmentOperator', jsonPath: ['linting', 'assignmentOperator'], type: 'enum', enumValues: ['<-', '='] as const, defaultWhenUnconfigured: '<-' },
     { vsCodeKey: 'linting.stringDelimiter', jsonPath: ['linting', 'stringDelimiter'], type: 'enum', enumValues: ['"', "'"] as const, defaultWhenUnconfigured: '"' },
-    { vsCodeKey: 'linting.lineLengthSeverity', jsonPath: ['linting', 'lineLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.trailingWhitespaceSeverity', jsonPath: ['linting', 'trailingWhitespaceSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.noTabSeverity', jsonPath: ['linting', 'noTabSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.trailingBlankLinesSeverity', jsonPath: ['linting', 'trailingBlankLinesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.assignmentOperatorSeverity', jsonPath: ['linting', 'assignmentOperatorSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.lineLengthSeverity', jsonPath: ['linting', 'lineLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.trailingWhitespaceSeverity', jsonPath: ['linting', 'trailingWhitespaceSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.noTabSeverity', jsonPath: ['linting', 'noTabSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.trailingBlankLinesSeverity', jsonPath: ['linting', 'trailingBlankLinesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.assignmentOperatorSeverity', jsonPath: ['linting', 'assignmentOperatorSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
     { vsCodeKey: 'linting.objectNameStyleFunction', jsonPath: ['linting', 'objectNameStyleFunction'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'symbols', 'any'] as const, defaultWhenUnconfigured: ['snake_case', 'symbols'] },
     { vsCodeKey: 'linting.objectNameStyleVariable', jsonPath: ['linting', 'objectNameStyleVariable'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'symbols', 'any'] as const, defaultWhenUnconfigured: ['snake_case', 'symbols'] },
     { vsCodeKey: 'linting.objectNameStyleArgument', jsonPath: ['linting', 'objectNameStyleArgument'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'symbols', 'any'] as const, defaultWhenUnconfigured: ['snake_case', 'symbols'] },
     { vsCodeKey: 'linting.objectNameRegexesFunction', jsonPath: ['linting', 'objectNameRegexesFunction'], type: 'array', defaultWhenUnconfigured: [] },
     { vsCodeKey: 'linting.objectNameRegexesVariable', jsonPath: ['linting', 'objectNameRegexesVariable'], type: 'array', defaultWhenUnconfigured: [] },
     { vsCodeKey: 'linting.objectNameRegexesArgument', jsonPath: ['linting', 'objectNameRegexesArgument'], type: 'array', defaultWhenUnconfigured: [] },
-    { vsCodeKey: 'linting.objectNameSeverity', jsonPath: ['linting', 'objectNameSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.infixSpacesSeverity', jsonPath: ['linting', 'infixSpacesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.commentedCodeSeverity', jsonPath: ['linting', 'commentedCodeSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.quotesSeverity', jsonPath: ['linting', 'quotesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.commasSeverity', jsonPath: ['linting', 'commasSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.tAndFSymbolSeverity', jsonPath: ['linting', 'tAndFSymbolSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.semicolonSeverity', jsonPath: ['linting', 'semicolonSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.equalsNaSeverity', jsonPath: ['linting', 'equalsNaSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.objectLengthSeverity', jsonPath: ['linting', 'objectLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.vectorLogicSeverity', jsonPath: ['linting', 'vectorLogicSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'diagnostics.mixedLogicalSeverity', jsonPath: ['diagnostics', 'mixedLogicalSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
-    { vsCodeKey: 'diagnostics.conditionAssignmentSeverity', jsonPath: ['diagnostics', 'conditionAssignmentSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const },
+    { vsCodeKey: 'linting.objectNameSeverity', jsonPath: ['linting', 'objectNameSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.infixSpacesSeverity', jsonPath: ['linting', 'infixSpacesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.commentedCodeSeverity', jsonPath: ['linting', 'commentedCodeSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.quotesSeverity', jsonPath: ['linting', 'quotesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.commasSeverity', jsonPath: ['linting', 'commasSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.tAndFSymbolSeverity', jsonPath: ['linting', 'tAndFSymbolSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.semicolonSeverity', jsonPath: ['linting', 'semicolonSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.equalsNaSeverity', jsonPath: ['linting', 'equalsNaSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.objectLengthSeverity', jsonPath: ['linting', 'objectLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.vectorLogicSeverity', jsonPath: ['linting', 'vectorLogicSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'diagnostics.mixedLogicalSeverity', jsonPath: ['diagnostics', 'mixedLogicalSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
+    { vsCodeKey: 'diagnostics.conditionAssignmentSeverity', jsonPath: ['diagnostics', 'conditionAssignmentSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
     { vsCodeKey: 'diagnostics.reportUnusedSuppressions', jsonPath: ['diagnostics', 'reportUnusedSuppressions'], type: 'boolean' },
-    { vsCodeKey: 'linting.functionLeftParenthesesSeverity', jsonPath: ['linting', 'functionLeftParenthesesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.spacesInsideSeverity', jsonPath: ['linting', 'spacesInsideSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.indentationSeverity', jsonPath: ['linting', 'indentationSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.functionLeftParenthesesSeverity', jsonPath: ['linting', 'functionLeftParenthesesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.spacesInsideSeverity', jsonPath: ['linting', 'spacesInsideSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
+    { vsCodeKey: 'linting.indentationSeverity', jsonPath: ['linting', 'indentationSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
     // Help viewer settings
     { vsCodeKey: 'help.viewerColumn', jsonPath: ['helpViewer', 'viewColumn'], type: 'enum', enumValues: ['active', 'beside'] as const },
 ];
@@ -510,7 +510,7 @@ suite('Settings Transmission Unit Tests', () => {
      * Unit test: Verify severity settings transmission.
      */
     test('severity settings transmit correctly', () => {
-        const severities: SeverityLevel[] = ['error', 'warning', 'information', 'hint', 'off'];
+        const severities: SeverityLevel[] = ['error', 'warning', 'information', 'info', 'hint', 'off'];
 
         for (const severity of severities) {
             const configuredSettings = new Map<string, unknown>([
@@ -537,7 +537,7 @@ suite('Settings Transmission Unit Tests', () => {
      * the host-derived `auto` sentinel (issue #530).
      */
     test('caseMismatchSeverity transmits including the auto sentinel', () => {
-        const values = ['auto', 'error', 'warning', 'information', 'hint', 'off'] as const;
+        const values = ['auto', 'error', 'warning', 'information', 'info', 'hint', 'off'] as const;
         for (const value of values) {
             const mockConfig = createMockConfig(
                 new Map<string, unknown>([['crossFile.caseMismatchSeverity', value]]),

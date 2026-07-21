@@ -117,7 +117,8 @@ LRU-evicted; raise these if you have a very large workspace and see repeated re-
 
 ## Diagnostic Severity Settings
 
-Each accepts: `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`.
+Each accepts: `"error"`, `"warning"`, `"information"` (or its `"info"`
+alias), `"hint"`, or `"off"`.
 
 | Setting | Default | Description |
 |---|---|---|
