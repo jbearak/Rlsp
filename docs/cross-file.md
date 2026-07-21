@@ -62,6 +62,59 @@ Raven also provides **file path intellisense** inside `source()` strings and pat
 
 For dynamic or conditional paths that Raven can't detect, use [directives](directives.md) to declare relationships explicitly.
 
+### Shiny application loading
+
+Raven recognizes Shiny's implicit application layouts without running R. Entry
+filenames are matched case-insensitively. A matching `server.R` selects the
+legacy layout, even when `app.R` also exists; `app.R` selects the single-file
+layout only when no `server.R` exists. The two layouts are never combined.
+Explicit `shinyAppFile()` calls naming arbitrary files are not inferred.
+
+In a **single-file application**, Raven models Shiny's shared support
+environment: immediate `R/*.[Rr]` files load in C-locale filename order, then
+`app.R` loads in a child environment. Earlier helpers are visible to later
+helpers immediately, while functions defined by an earlier helper late-bind
+names from the completed support environment. An adjacent `global.R` is not
+implicitly loaded.
+
+In a **legacy application**, `global.R` loads in the global environment, the
+immediate `R/*.[Rr]` helpers load into one shared child support environment, and
+`ui.R` and `server.R` load into separate sibling entry environments. Both
+entries see global and support bindings, with helper bindings shadowing globals;
+entries do not see one another's entry-local definitions. `global.R` cannot see
+bindings created later by helpers, and Raven does not invent an execution order
+between `ui.R` and `server.R`.
+
+Only direct children of the exact `R/` directory participate. Hidden files and
+nested files are skipped, and more than 256 matching helpers fails closed rather
+than modeling a partial batch. A direct `R/_disable_autoload.R` marker,
+case-insensitively matched, disables the helper batch. It does not disable
+legacy `global.R`, and it never causes `global.R` to load in single-file mode.
+Raven deliberately does not execute R or guess historical process-global
+`options(shiny.autoload.r = ...)` state. Project exclusions are applied before
+layout selection: an excluded `server.R` cannot select legacy mode, and excluded
+entries, globals, helpers, or disable markers do not participate in implicit
+loading. Negated exclusion rules can re-include individual helpers.
+
+Convention-loaded global, helper, and entry files execute with the application
+directory as their working directory. Relative `source()` calls therefore
+resolve from the application root unless an explicit [`# raven: cd`](directives.md)
+override applies; `source(..., chdir = TRUE)` still switches a sourced child's
+base to that child's directory. Backward directives remain file-relative and
+ignore runtime working-directory mechanisms.
+
+Application entry files, the exact `R/` directory, helpers, `global.R`, and the
+disable marker are watched as one filesystem-derived topology. Creating,
+deleting, renaming, or changing the case of these paths refreshes the selected
+mode and scope for open and closed files. Lexical and canonical watch roots are
+both retained, so applications opened through a symlink still react to events on
+the real path without creating a second application scope. Opening only a
+helper or legacy `global.R` also materializes the selected `app.R` or `server.R`
+host on demand before initial diagnostics. The same model feeds diagnostics,
+completion, hover, navigation, references, and `raven check`; unresolved names
+inside an active application are not allowed to fall through into sibling entry
+environments or unrelated applications.
+
 ### R Markdown / Quarto chunks
 
 Inside `.Rmd` / `.Rmarkdown` / `.qmd` documents, only R chunk bodies feed cross-file analysis — prose and YAML front matter are masked out before detection. A `source()` or `library()` call written in a chunk participates exactly as it would in a `.R` file; the same text in prose is ignored. Within a single document, bindings from earlier chunks are visible in later chunks (ordered-concatenation semantics) — define `x` in chunk 1 and it resolves in chunk 3. A `.R` file may also declare `# raven: sourced-by report.Rmd`, in which case Raven reads the report's chunks to supply that file's inherited scope. `.Rmd` / `.Rmarkdown` / `.qmd` files are not added to the proactive workspace scan, so the editor sees these relationships when the Rmd is open or when a `.R` file points at it via a backward directive. See [R Code Chunks](./chunks.md#cross-file-resolution-from-chunks).

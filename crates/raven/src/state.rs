@@ -11891,10 +11891,11 @@ pub(crate) fn derive_workspace_dependency_graph(
             )
         });
         if !reused {
-            crate::cross_file::tar_source::finalize_tar_source_requests(
+            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 metadata,
                 uri,
                 workspace_root,
+                &context.exclusions,
             );
         }
         let analysis = entry.contents.to_string();
@@ -11920,10 +11921,11 @@ pub(crate) fn derive_workspace_dependency_graph(
                 )
             });
         if !reused {
-            crate::cross_file::tar_source::finalize_tar_source_requests(
+            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 metadata,
                 uri,
                 workspace_root,
+                &context.exclusions,
             );
         }
     }
@@ -12487,10 +12489,11 @@ pub fn scan_workspace_with_exclusions(
     }
 
     for (uri, entry) in &mut entries {
-        crate::cross_file::tar_source::finalize_tar_source_requests(
+        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
             Arc::make_mut(&mut entry.metadata),
             uri,
             workspace_root.as_ref(),
+            exclusions,
         );
         let analysis = entry.contents.to_string();
         entry.artifacts = Arc::new(match entry.tree.as_ref() {
@@ -16792,7 +16795,7 @@ mod tests {
         }));
         assert!(entry.artifacts.timeline.iter().any(|event| matches!(
             event,
-            crate::cross_file::scope::ScopeEvent::TarBatch { members, .. }
+            crate::cross_file::scope::ScopeEvent::SourceBatch { members, .. }
                 if members.len() == 1
         )));
 

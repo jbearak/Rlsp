@@ -6344,7 +6344,7 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
         if state.is_project_excluded_uri(&uri) {
             let workspace_root = state.workspace_folders.first().cloned();
             let meta = extract_enriched_live_metadata(state, &uri, &analysis_text);
-            if !meta.tar_source_requests.is_empty() || !meta.list_files_source_requests.is_empty() {
+            if meta.has_source_batch_topology() {
                 source_batch_parents.push(uri.clone());
             }
             state
@@ -6358,7 +6358,7 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
         }
 
         let meta = extract_enriched_live_metadata(state, &uri, &analysis_text);
-        if !meta.tar_source_requests.is_empty() || !meta.list_files_source_requests.is_empty() {
+        if meta.has_source_batch_topology() {
             source_batch_parents.push(uri.clone());
         }
         let workspace_root = state.workspace_folders.first().cloned();
@@ -10089,10 +10089,11 @@ fn derive_open_edit_fallback(
             &captured.library_paths,
         );
         if let Some(primary_uri) = captured.graph_roots.first() {
-            crate::cross_file::tar_source::finalize_tar_source_requests(
+            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 &mut metadata,
                 primary_uri,
                 captured.workspace_root.as_ref(),
+                &captured.exclusions,
             );
         }
         metadata
@@ -10487,7 +10488,7 @@ async fn commit_detached_live_package_open_edit(
         if shutdown.is_cancelled() {
             return None;
         }
-        let (mut metadata, attempted_contexts, workspace_root) = {
+        let (mut metadata, attempted_contexts, workspace_root, exclusions) = {
             let state = state_arc.read().await;
             prepared = state.rebase_open_edit_if_subject_current(prepared)?;
             let text = prepared.document().analysis_text();
@@ -10497,14 +10498,16 @@ async fn commit_detached_live_package_open_edit(
                 metadata,
                 attempted_contexts,
                 state.workspace_folders.first().cloned(),
+                state.workspace_exclusions.clone(),
             )
         };
         let expansion_uri = uri.clone();
         metadata = tokio::task::spawn_blocking(move || {
-            crate::cross_file::tar_source::finalize_tar_source_requests(
+            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 &mut metadata,
                 &expansion_uri,
                 workspace_root.as_ref(),
+                &exclusions,
             );
             metadata
         })
@@ -11238,10 +11241,11 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
                     captured.max_chain_depth,
                 );
             }
-            crate::cross_file::tar_source::finalize_tar_source_requests(
+            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 &mut semantic,
                 &root.uri,
                 captured.workspace_root.as_ref(),
+                &captured.exclusions,
             );
             let disk_artifacts = disk_material.get(&root.uri).map(|(_, analysis, tree, _)| {
                 Arc::new(match tree.as_ref() {
@@ -11695,6 +11699,7 @@ fn capture_open_install_analysis(
 #[derive(Default)]
 struct OpenInstallPrerequisites {
     direct_sources: Vec<(Url, Option<std::path::PathBuf>)>,
+    source_batch_hosts: Vec<Url>,
     backward_parents: Vec<Url>,
     workspace_root: Option<Url>,
     max_forward_depth: usize,
@@ -11703,7 +11708,9 @@ struct OpenInstallPrerequisites {
 
 impl OpenInstallPrerequisites {
     fn is_empty(&self) -> bool {
-        self.direct_sources.is_empty() && self.backward_parents.is_empty()
+        self.direct_sources.is_empty()
+            && self.source_batch_hosts.is_empty()
+            && self.backward_parents.is_empty()
     }
 }
 
@@ -11744,11 +11751,13 @@ fn derive_open_install_analysis(
             &captured.library_paths,
         );
     }
-    crate::cross_file::tar_source::finalize_tar_source_requests(
-        &mut metadata,
-        &captured.uri,
-        captured.workspace_root.as_ref(),
-    );
+    let selected_shiny_entry =
+        crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+            &mut metadata,
+            &captured.uri,
+            captured.workspace_root.as_ref(),
+            &captured.exclusions,
+        );
 
     let mut prerequisites = OpenInstallPrerequisites {
         workspace_root: captured.workspace_root.clone(),
@@ -11757,6 +11766,26 @@ fn derive_open_install_analysis(
         ..OpenInstallPrerequisites::default()
     };
     if captured.on_demand_enabled && !local_only {
+        let opened_support_file = metadata
+            .shiny_application
+            .as_ref()
+            .is_some_and(|application| {
+                matches!(
+                    application.role,
+                    crate::cross_file::types::ShinyFileRole::Helper { .. }
+                        | crate::cross_file::types::ShinyFileRole::LegacyGlobal
+                )
+            });
+        if opened_support_file
+            && let Some(host_path) = selected_shiny_entry
+            && let Ok(host_uri) = Url::from_file_path(host_path)
+            && !captured.graph_roots.contains(&host_uri)
+            && !captured.exclusions.is_excluded_uri(&host_uri)
+            && !captured.metadata_map.contains_key(&host_uri)
+        {
+            prerequisites.source_batch_hosts.push(host_uri);
+        }
+
         if let Some(forward_ctx) = crate::cross_file::path_resolve::PathContext::from_metadata(
             &captured.uri,
             &metadata,
@@ -12154,10 +12183,11 @@ fn derive_open_metadata_reenrichment(
         captured.package_workspace_root.as_deref(),
         &captured.library_paths,
     );
-    crate::cross_file::tar_source::finalize_tar_source_requests(
+    let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
         &mut metadata,
         &captured.uri,
         captured.workspace_root.as_ref(),
+        &captured.exclusions,
     );
 
     let input_root = captured.graph_roots.first().unwrap_or(&captured.uri);
@@ -12176,10 +12206,11 @@ fn derive_open_metadata_reenrichment(
                         captured.max_chain_depth,
                     );
                 }
-                crate::cross_file::tar_source::finalize_tar_source_requests(
+                let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                     &mut root_metadata,
                     graph_uri,
                     captured.workspace_root.as_ref(),
+                    &captured.exclusions,
                 );
                 root_metadata
             };
@@ -13203,7 +13234,7 @@ async fn resync_file_from_disk(
     // source-batch enumeration. The directory walk below is detached from
     // `WorldState`; the captured basis makes any intervening state change veto
     // the eventual commit.
-    let (analysis_basis, workspace_root, mut consumed_context_uris) = {
+    let (analysis_basis, workspace_root, exclusions, mut consumed_context_uris) = {
         let state = state_arc.read().await;
         if state.is_document_open_or_alias(uri) {
             log::trace!("Disk resync preparation vetoed by reopen: {}", uri);
@@ -13240,13 +13271,19 @@ async fn resync_file_from_disk(
             state.cross_file_config.max_chain_depth,
         );
         let basis = state.capture_closed_removal_analysis_basis(uri);
-        (basis, workspace_root, consumed_context_uris.into_inner())
+        (
+            basis,
+            workspace_root,
+            state.workspace_exclusions.clone(),
+            consumed_context_uris.into_inner(),
+        )
     };
 
-    crate::cross_file::tar_source::finalize_tar_source_requests(
+    let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
         &mut cross_file_meta,
         uri,
         workspace_root.as_ref(),
+        &exclusions,
     );
 
     // Snapshot the remaining graph inputs after the walk without weakening the
@@ -18086,12 +18123,10 @@ impl LanguageServer for Backend {
             let source_batch_affected = prepared.as_ref().is_some_and(|prepared| {
                 let metadata =
                     crate::cross_file::extract_metadata(&prepared.document().analysis_text());
-                !metadata.tar_source_requests.is_empty()
-                    || !metadata.list_files_source_requests.is_empty()
-                    || state.get_enriched_metadata(&uri).is_some_and(|previous| {
-                        !previous.tar_source_requests.is_empty()
-                            || !previous.list_files_source_requests.is_empty()
-                    })
+                metadata.has_source_batch_topology()
+                    || state
+                        .get_enriched_metadata(&uri)
+                        .is_some_and(|previous| previous.has_source_batch_topology())
             });
             let excluded = state.is_project_excluded_uri(&uri);
             let detached = (source_batch_affected
@@ -21242,6 +21277,20 @@ impl Backend {
         prerequisites: OpenInstallPrerequisites,
     ) -> Vec<Url> {
         let mut effects = Vec::new();
+        for host_uri in prerequisites.source_batch_hosts {
+            let _ = self
+                .index_file_on_demand_with_effect_sink(&host_uri, Some(&mut effects))
+                .await;
+            if prerequisites.max_forward_depth > 0 {
+                self.index_forward_chain_with_effect_sink(
+                    &host_uri,
+                    prerequisites.max_forward_depth,
+                    prerequisites.workspace_root.as_ref(),
+                    Some(&mut effects),
+                )
+                .await;
+            }
+        }
         for (source_uri, inherited_wd) in prerequisites.direct_sources {
             match inherited_wd {
                 Some(inherited_wd) => {
@@ -21392,6 +21441,7 @@ impl Backend {
             sys_file_ws_name,
             sys_file_ws_root,
             sys_file_lib_paths,
+            exclusions,
             analysis_basis,
         ) = {
             let state = self.state.read().await;
@@ -21449,6 +21499,7 @@ impl Backend {
                 ws_name,
                 ws_root,
                 lib_paths,
+                state.workspace_exclusions.clone(),
                 analysis_basis,
             )
         };
@@ -21461,10 +21512,11 @@ impl Backend {
             sys_file_ws_root.as_deref(),
             &sys_file_lib_paths,
         );
-        crate::cross_file::tar_source::finalize_tar_source_requests(
+        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
             &mut cross_file_meta,
             file_uri,
             workspace_root.as_ref(),
+            &exclusions,
         );
         let artifacts = std::sync::Arc::new(match tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
@@ -21902,6 +21954,7 @@ impl Backend {
             sys_file_ws_name,
             sys_file_ws_root,
             sys_file_lib_paths,
+            exclusions,
             analysis_basis,
         ) = {
             let state = self.state.read().await;
@@ -21955,6 +22008,7 @@ impl Backend {
                 ws_name,
                 ws_root,
                 lib_paths,
+                state.workspace_exclusions.clone(),
                 analysis_basis,
             )
         };
@@ -21967,10 +22021,11 @@ impl Backend {
             sys_file_ws_root.as_deref(),
             &sys_file_lib_paths,
         );
-        crate::cross_file::tar_source::finalize_tar_source_requests(
+        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
             &mut cross_file_meta,
             file_uri,
             workspace_root.as_ref(),
+            &exclusions,
         );
         let artifacts = std::sync::Arc::new(match tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
@@ -32781,7 +32836,7 @@ mod refresh_packages_tests {
                     .expect("parent artifacts");
                 assert!(artifacts.timeline.iter().any(|event| matches!(
                     event,
-                    crate::cross_file::scope::ScopeEvent::TarBatch { members, .. }
+                    crate::cross_file::scope::ScopeEvent::SourceBatch { members, .. }
                         if members.len() == 1
                             && members[0].resolved_uri.as_ref() == Some(&child_uri)
                 )));
@@ -50339,6 +50394,91 @@ infixContinuationStyle = "aligned"
         (svc, uri)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_shiny_helper_open_materializes_selected_host_and_batch() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("R")).unwrap();
+        std::fs::write(tmp.path().join("app.R"), "entry_value <- earlier + later\n").unwrap();
+        std::fs::write(tmp.path().join("R/01-earlier.R"), "earlier <- 1\n").unwrap();
+        let helper_text = "later <- 2\nf <- function() earlier\n";
+        std::fs::write(tmp.path().join("R/02-later.R"), helper_text).unwrap();
+
+        let (svc, helper_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "R/02-later.R", "r", helper_text).await;
+        let host_uri =
+            Url::from_file_path(tmp.path().join("app.R").canonicalize().unwrap()).unwrap();
+        let earlier_uri =
+            Url::from_file_path(tmp.path().join("R/01-earlier.R").canonicalize().unwrap()).unwrap();
+        let later_uri =
+            Url::from_file_path(tmp.path().join("R/02-later.R").canonicalize().unwrap()).unwrap();
+
+        let state = svc.inner().state.read().await;
+        let host = state
+            .workspace_index
+            .get_metadata(&host_uri)
+            .expect("selected app.R host must be indexed before diagnostics");
+        assert_eq!(
+            host.sources
+                .iter()
+                .filter(|source| {
+                    source.source_batch_kind
+                        == Some(crate::cross_file::types::SourceBatchKind::Shiny)
+                })
+                .filter_map(|source| source.resolved_uri.clone())
+                .collect::<Vec<_>>(),
+            [earlier_uri.clone(), later_uri.clone()]
+        );
+        let dependencies = state.cross_file_graph.get_dependencies(&host_uri);
+        assert!(dependencies.iter().any(|edge| edge.to == earlier_uri));
+        assert!(dependencies.iter().any(|edge| edge.to == later_uri));
+        assert!(state.workspace_index.get_metadata(&earlier_uri).is_some());
+        assert!(matches!(
+            state
+                .get_enriched_metadata(&helper_uri)
+                .and_then(|metadata| metadata.shiny_application.clone())
+                .map(|application| application.role),
+            Some(crate::cross_file::types::ShinyFileRole::Helper { ordinal: 1 })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_legacy_global_open_materializes_server_host() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("R")).unwrap();
+        std::fs::write(
+            tmp.path().join("server.R"),
+            "server_value <- global_value\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("R/helper.R"), "helper_value <- 1\n").unwrap();
+        let global_text = "global_value <- 1\n";
+        std::fs::write(tmp.path().join("global.R"), global_text).unwrap();
+
+        let (svc, global_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "global.R", "r", global_text).await;
+        let host_uri =
+            Url::from_file_path(tmp.path().join("server.R").canonicalize().unwrap()).unwrap();
+        let canonical_global =
+            Url::from_file_path(tmp.path().join("global.R").canonicalize().unwrap()).unwrap();
+
+        let state = svc.inner().state.read().await;
+        let host = state
+            .workspace_index
+            .get_metadata(&host_uri)
+            .expect("selected server.R host must be indexed before diagnostics");
+        assert!(host.sources.iter().any(|source| {
+            source.source_batch_kind == Some(crate::cross_file::types::SourceBatchKind::ShinyGlobal)
+                && source.resolved_uri.as_ref() == Some(&canonical_global)
+        }));
+        assert!(matches!(
+            state
+                .get_enriched_metadata(&global_uri)
+                .and_then(|metadata| metadata.shiny_application.clone())
+                .map(|application| application.role),
+            Some(crate::cross_file::types::ShinyFileRole::LegacyGlobal)
+        ));
+    }
+
     /// Open with package mode enabled and an explicitly installed synthetic
     /// ready library. This preserves package-input/routing behavior without
     /// consulting host R, provider databases, or filesystem watchers.
@@ -50439,7 +50579,7 @@ infixContinuationStyle = "aligned"
         }));
         assert!(record.artifacts().timeline.iter().any(|event| matches!(
             event,
-            crate::cross_file::scope::ScopeEvent::TarBatch { members, .. }
+            crate::cross_file::scope::ScopeEvent::SourceBatch { members, .. }
                 if members.len() == 2
                     && members[0].resolved_uri.as_ref() == Some(&new_uri)
                     && members[1].resolved_uri.as_ref() == Some(&old_uri)
@@ -50544,7 +50684,7 @@ infixContinuationStyle = "aligned"
         );
         assert!(record.artifacts().timeline.iter().any(|event| matches!(
             event,
-            crate::cross_file::scope::ScopeEvent::TarBatch { members, .. }
+            crate::cross_file::scope::ScopeEvent::SourceBatch { members, .. }
                 if members.len() == 2
                     && members[0].resolved_uri.as_ref() == Some(&new_uri)
                     && members[1].resolved_uri.as_ref() == Some(&old_uri)
@@ -50637,7 +50777,7 @@ infixContinuationStyle = "aligned"
         assert!(
             record.artifacts().timeline.iter().all(|event| !matches!(
                 event,
-                crate::cross_file::scope::ScopeEvent::TarBatch { members, .. }
+                crate::cross_file::scope::ScopeEvent::SourceBatch { members, .. }
                     if members
                         .iter()
                         .any(|member| member.resolved_uri.as_ref() == Some(&old_uri))
@@ -52263,7 +52403,7 @@ infixContinuationStyle = "aligned"
                             artifacts.timeline.iter().any(|event| {
                                 matches!(
                                     event,
-                                    crate::cross_file::scope::ScopeEvent::TarBatch { members, .. }
+                                    crate::cross_file::scope::ScopeEvent::SourceBatch { members, .. }
                                         if members.len() == 2
                                 )
                             })

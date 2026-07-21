@@ -14,6 +14,7 @@ pub mod parent_resolve;
 pub mod path_resolve;
 pub mod revalidation;
 pub mod scope;
+pub(crate) mod shiny;
 pub mod source_detect;
 pub mod standalone_cache;
 pub(crate) mod static_path;

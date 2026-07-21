@@ -40,6 +40,8 @@ pub struct PathContext {
     pub file_path: PathBuf,
     /// Explicit working directory from directive
     pub working_directory: Option<PathBuf>,
+    /// Shiny application directory used as a runtime working directory.
+    pub application_working_directory: Option<PathBuf>,
     /// Working directory inherited from parent
     pub inherited_working_directory: Option<PathBuf>,
     /// Workspace root
@@ -83,6 +85,7 @@ impl PathContext {
         Some(Self {
             file_path,
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root,
             implicit_test_working_directory: None,
@@ -116,7 +119,9 @@ impl PathContext {
     /// **DO NOT USE FOR:** Backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`).
     /// Use `PathContext::new()` instead, which ignores `# raven: cd`.
     ///
-    /// Priority for path resolution: explicit working_directory > inherited > file's directory
+    /// Priority for path resolution: explicit Raven working directory > Shiny
+    /// application directory > inherited working directory > implicit test
+    /// directory > file directory.
     pub fn from_metadata(
         file_uri: &Url,
         metadata: &CrossFileMetadata,
@@ -129,10 +134,20 @@ impl PathContext {
             ctx.working_directory = resolve_working_directory(wd_path, &ctx);
         }
 
-        // Apply inherited working directory if no explicit one.
+        // Shiny evaluates convention-loaded files with the application directory
+        // as the process working directory. This hard convention is weaker than an
+        // explicit Raven override but stronger than unrelated inherited metadata.
+        if ctx.working_directory.is_none()
+            && let Some(application) = metadata.application_working_directory.as_ref()
+        {
+            ctx.application_working_directory = Some(PathBuf::from(application));
+        }
+
+        // Apply inherited working directory if neither explicit nor Shiny context applies.
         // Inherited working directories are stored as absolute paths, so use directly
         // when absolute. Only resolve if relative (legacy/edge case).
         if ctx.working_directory.is_none()
+            && ctx.application_working_directory.is_none()
             && let Some(ref inherited_wd) = metadata.inherited_working_directory
         {
             let inherited_path = PathBuf::from(inherited_wd);
@@ -151,7 +166,10 @@ impl PathContext {
 
         // Implicit testthat/testit working directory (issue #638): only when
         // neither an explicit nor an inherited `# raven: cd` applies.
-        if ctx.working_directory.is_none() && ctx.inherited_working_directory.is_none() {
+        if ctx.working_directory.is_none()
+            && ctx.application_working_directory.is_none()
+            && ctx.inherited_working_directory.is_none()
+        {
             ctx.implicit_test_working_directory =
                 implicit_test_working_directory(&ctx.file_path, ctx.workspace_root.as_deref());
         }
@@ -161,10 +179,11 @@ impl PathContext {
 
     /// Get the effective working directory for path resolution
     pub fn effective_working_directory(&self) -> PathBuf {
-        // Priority: explicit > inherited > implicit testthat/testit (issue
-        // #638) > file's directory
+        // Priority: explicit Raven override > Shiny application > inherited >
+        // implicit testthat/testit (issue #638) > file directory.
         self.working_directory
             .clone()
+            .or_else(|| self.application_working_directory.clone())
             .or_else(|| self.inherited_working_directory.clone())
             .or_else(|| self.implicit_test_working_directory.clone())
             .unwrap_or_else(|| {
@@ -235,7 +254,10 @@ impl PathContext {
     fn implicit_wd_file_dir_fallback(&self) -> Option<PathBuf> {
         // Explicit/inherited cd wins outright; from_metadata never sets the
         // implicit field alongside them, but guard anyway.
-        if self.working_directory.is_some() || self.inherited_working_directory.is_some() {
+        if self.working_directory.is_some()
+            || self.application_working_directory.is_some()
+            || self.inherited_working_directory.is_some()
+        {
             return None;
         }
         let anchor = self.implicit_test_working_directory.as_ref()?;
@@ -252,6 +274,7 @@ impl PathContext {
         Self {
             file_path: child_path.to_path_buf(),
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some(child_dir),
             workspace_root: self.workspace_root.clone(),
             implicit_test_working_directory: None,
@@ -263,6 +286,7 @@ impl PathContext {
         Self {
             file_path: child_path.to_path_buf(),
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some(self.effective_working_directory()),
             workspace_root: self.workspace_root.clone(),
             implicit_test_working_directory: None,
@@ -296,7 +320,9 @@ impl PathContext {
     /// paths but must neither suppress the workspace-root fallback nor
     /// propagate into forward-sourced children.
     pub fn cd_in_effect(&self) -> bool {
-        self.working_directory.is_some() || self.inherited_working_directory.is_some()
+        self.working_directory.is_some()
+            || self.application_working_directory.is_some()
+            || self.inherited_working_directory.is_some()
     }
 
     /// Working directory that may propagate through `sourced-by` metadata.
@@ -385,7 +411,10 @@ where
             None => PathContext::forward_without_metadata(child_uri, workspace_root)?,
         };
         let inherited = parent_ctx.forward_child_inherited_wd(&child_ctx.file_path, chdir);
-        if child_ctx.working_directory.is_none() && inherited.is_some() {
+        if child_ctx.working_directory.is_none()
+            && child_ctx.application_working_directory.is_none()
+            && inherited.is_some()
+        {
             child_ctx.inherited_working_directory = inherited;
         }
         Some(child_ctx)
@@ -1575,6 +1604,7 @@ mod tests {
         PathContext {
             file_path: PathBuf::from(file),
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root: workspace.map(PathBuf::from),
             implicit_test_working_directory: None,
@@ -1619,6 +1649,64 @@ mod tests {
                 &lib,
             ),
             Some(PathBuf::from("/ws/inst/extdata/x.R"))
+        );
+    }
+
+    #[test]
+    fn shiny_application_wd_anchors_forward_paths_and_explicit_cd_wins() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        std::fs::create_dir(root.join("override")).unwrap();
+        std::fs::write(root.join("from-app.R"), "").unwrap();
+        std::fs::write(root.join("override/from-override.R"), "").unwrap();
+        let helper_uri = Url::from_file_path(root.join("R/helper.R")).unwrap();
+        let workspace = Url::from_directory_path(root).unwrap();
+
+        let mut metadata = CrossFileMetadata {
+            application_working_directory: Some(root.to_string_lossy().into_owned()),
+            ..CrossFileMetadata::default()
+        };
+        let app_context =
+            PathContext::from_metadata(&helper_uri, &metadata, Some(&workspace)).unwrap();
+        assert!(app_context.cd_in_effect());
+        assert_eq!(
+            resolve_path_with_workspace_fallback("from-app.R", &app_context),
+            Some(root.join("from-app.R"))
+        );
+        assert_eq!(
+            app_context.forward_completion_base_directories(),
+            [root.to_path_buf()]
+        );
+
+        metadata.working_directory = Some("/override".to_string());
+        let explicit =
+            PathContext::from_metadata(&helper_uri, &metadata, Some(&workspace)).unwrap();
+        assert_eq!(explicit.application_working_directory, None);
+        assert_eq!(
+            resolve_path_with_workspace_fallback("from-override.R", &explicit),
+            Some(root.join("override/from-override.R"))
+        );
+
+        let backward = PathContext::new(&helper_uri, Some(&workspace)).unwrap();
+        assert_eq!(backward.application_working_directory, None);
+        assert_eq!(backward.effective_working_directory(), root.join("R"));
+    }
+
+    #[test]
+    fn shiny_application_wd_propagates_until_source_chdir_true() {
+        let parent = make_context("/app/R/helper.R", Some("/app"));
+        let parent = PathContext {
+            application_working_directory: Some(PathBuf::from("/app")),
+            ..parent
+        };
+        assert_eq!(
+            parent.forward_child_inherited_wd(Path::new("/app/nested/child.R"), false),
+            Some(PathBuf::from("/app"))
+        );
+        assert_eq!(
+            parent.forward_child_inherited_wd(Path::new("/app/nested/child.R"), true),
+            Some(PathBuf::from("/app/nested"))
         );
     }
 
@@ -2002,6 +2090,7 @@ mod tests {
 
         let meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some("/project/data".to_string()),
             ..Default::default()
         };
@@ -2032,6 +2121,7 @@ mod tests {
 
         let meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some("../data".to_string()),
             ..Default::default()
         };
@@ -2092,6 +2182,7 @@ mod tests {
 
         let meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -2119,6 +2210,7 @@ mod tests {
 
         let meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some("/absolute/path".to_string()),
             ..Default::default()
         };

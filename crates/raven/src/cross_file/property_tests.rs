@@ -246,6 +246,7 @@ proptest! {
         let ctx = PathContext {
             file_path,
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(workspace_root.clone()),
             implicit_test_working_directory: None,
@@ -270,6 +271,7 @@ proptest! {
         let ctx = PathContext {
             file_path: PathBuf::from("/some/file.R"),
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root: None,
             implicit_test_working_directory: None,
@@ -299,6 +301,7 @@ proptest! {
         let ctx = PathContext {
             file_path,
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(PathBuf::from("/project")),
             implicit_test_working_directory: None,
@@ -324,6 +327,7 @@ proptest! {
         let ctx = PathContext {
             file_path,
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(PathBuf::from("/project")),
             implicit_test_working_directory: None,
@@ -765,6 +769,7 @@ proptest! {
         let ctx = PathContext {
             file_path,
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(workspace_root),
             implicit_test_working_directory: None,
@@ -795,6 +800,7 @@ proptest! {
         let ctx = PathContext {
             file_path,
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(workspace_root),
             implicit_test_working_directory: None,
@@ -837,6 +843,7 @@ proptest! {
         let ctx_a = PathContext {
             file_path: PathBuf::from(format!("/{}/src/a.R", workspace)),
             working_directory: Some(working_dir.clone()),
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(workspace_root.clone()),
             implicit_test_working_directory: None,
@@ -869,6 +876,7 @@ proptest! {
         let ctx_parent = PathContext {
             file_path: PathBuf::from(format!("/{}/src/parent.R", workspace)),
             working_directory: Some(working_dir.clone()),
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(workspace_root.clone()),
             implicit_test_working_directory: None,
@@ -904,6 +912,7 @@ proptest! {
         let ctx = PathContext {
             file_path,
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(PathBuf::from(format!("/{}", dir_a))),
             implicit_test_working_directory: None,
@@ -926,6 +935,7 @@ proptest! {
         let ctx = PathContext {
             file_path,
             working_directory: Some(explicit_working_dir.clone()),
+            application_working_directory: None,
             inherited_working_directory: Some(PathBuf::from(format!("/{}/inherited", dir_a))),
             workspace_root: Some(PathBuf::from(format!("/{}", dir_a))),
             implicit_test_working_directory: None,
@@ -948,6 +958,7 @@ proptest! {
         let ctx = PathContext {
             file_path,
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some(inherited_working_dir.clone()),
             workspace_root: Some(PathBuf::from(format!("/{}", dir_a))),
             implicit_test_working_directory: None,
@@ -11108,6 +11119,7 @@ proptest! {
         let inherited_wd_path = format!("../{}", relative_wd);
         let meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some(inherited_wd_path.clone()),
             ..Default::default()
         };
@@ -11147,6 +11159,7 @@ proptest! {
         // Create metadata with NO inherited_working_directory
         let meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -11245,6 +11258,7 @@ proptest! {
         // Create metadata with inherited_working_directory
         let meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some(inherited_wd_path.clone()),
             ..Default::default()
         };
@@ -11703,6 +11717,7 @@ proptest! {
                 directive_line: 0,
             }],
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -11835,6 +11850,7 @@ proptest! {
         let child_meta = CrossFileMetadata {
             sourced_by: vec![], // No backward directives
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -11905,6 +11921,7 @@ proptest! {
                 directive_line: 0,
             }],
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -11991,6 +12008,7 @@ proptest! {
                 directive_line: 0,
             }],
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -12066,6 +12084,7 @@ proptest! {
                 directive_line: 0,
             }],
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -12286,12 +12305,14 @@ proptest! {
         // Both parents have NO explicit @lsp-cd (implicit WD = their directory)
         let parent1_meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
 
         let parent2_meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -12313,6 +12334,7 @@ proptest! {
                 },
             ],
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -12410,6 +12432,7 @@ proptest! {
         // Parent1 has NO explicit @lsp-cd (implicit WD = its directory)
         let parent1_meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -12439,6 +12462,7 @@ proptest! {
                 },
             ],
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -12591,6 +12615,7 @@ proptest! {
                 },
             ],
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -12787,6 +12812,7 @@ proptest! {
         // So we store the parent's effective WD (already resolved to absolute).
         let child_meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some(parent_effective_wd.to_string_lossy().to_string()),
             ..Default::default()
         };
@@ -12863,6 +12889,7 @@ proptest! {
         // So we store the parent's effective WD (already resolved to absolute).
         let child_meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some(parent_effective_wd.to_string_lossy().to_string()),
             ..Default::default()
         };
@@ -12920,6 +12947,7 @@ proptest! {
         // Parent has NO explicit @lsp-cd (uses its own directory)
         let parent_meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -12942,6 +12970,7 @@ proptest! {
         // So we store the parent's effective WD (already resolved to absolute).
         let child_meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some(parent_effective_wd.to_string_lossy().to_string()),
             ..Default::default()
         };
@@ -13002,6 +13031,7 @@ proptest! {
         // Child has NO inherited working directory
         let child_meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             ..Default::default()
         };
@@ -13088,6 +13118,7 @@ proptest! {
         let inherited_wd_absolute = format!("/{}/{}", workspace, inherited_wd);
         let meta_with_inherited_wd = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some(inherited_wd_absolute.clone()),
             ..Default::default()
         };
@@ -13399,6 +13430,7 @@ proptest! {
         let inherited_wd_absolute = format!("/{}/{}", workspace, inherited_wd_subdir);
         let meta_with_inherited_wd = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: Some(inherited_wd_absolute.clone()),
             ..Default::default()
         };
@@ -13514,6 +13546,7 @@ proptest! {
         // B's inherited_working_directory will be computed from A
         let meta_b_initial = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -13526,6 +13559,7 @@ proptest! {
         // File C: has backward directive to B, no explicit @lsp-cd
         let meta_c = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -13562,6 +13596,7 @@ proptest! {
         // Create B's metadata with the computed inherited WD
         let meta_b_with_inherited = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: b_inherited_wd.clone(),
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -13652,6 +13687,7 @@ proptest! {
         // File B: backward directive to A
         let meta_b_initial = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -13664,6 +13700,7 @@ proptest! {
         // File C: backward directive to B
         let meta_c = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -13697,6 +13734,7 @@ proptest! {
         // Create B's metadata with inherited WD
         let meta_b_with_inherited = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: b_inherited_wd.clone(),
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -13782,6 +13820,7 @@ proptest! {
         // File B: backward directive to A
         let meta_b_initial = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -13802,6 +13841,7 @@ proptest! {
 
         let meta_b = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: b_inherited_wd.clone(),
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -13814,6 +13854,7 @@ proptest! {
         // File C: backward directive to B
         let meta_c_initial = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -13840,6 +13881,7 @@ proptest! {
 
         let meta_c = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: c_inherited_wd.clone(),
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -13852,6 +13894,7 @@ proptest! {
         // File D: backward directive to C
         let meta_d = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/c.R", dir_c),
@@ -13938,6 +13981,7 @@ proptest! {
         // File C: backward directive to B
         let meta_c = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -14008,6 +14052,7 @@ proptest! {
         // File A: NO explicit @lsp-cd (uses its directory as effective WD)
         let meta_a = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![],
             ..Default::default()
@@ -14016,6 +14061,7 @@ proptest! {
         // File B: backward directive to A
         let meta_b_initial = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -14050,6 +14096,7 @@ proptest! {
         // Create B's metadata with inherited WD
         let meta_b = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: b_inherited_wd.clone(),
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -14062,6 +14109,7 @@ proptest! {
         // File C: backward directive to B
         let meta_c = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -14144,6 +14192,7 @@ proptest! {
         // Child has backward directive to parent
         let child_meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/parent.R", dir_parent),
@@ -14408,6 +14457,7 @@ proptest! {
         // Child has backward directive to parent
         let child_meta = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/parent.R", dir_parent),
@@ -14596,6 +14646,7 @@ proptest! {
         // File B: has backward directive to A (creates cycle A → B → A)
         let meta_b = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -14655,6 +14706,7 @@ proptest! {
         // File A: has backward directive pointing to itself (self-reference)
         let meta_a = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: "a.R".to_string(), // Points to itself
@@ -14721,6 +14773,7 @@ proptest! {
         // File A: backward directive to C (completing the cycle)
         let meta_a = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/c.R", dir_c),
@@ -14733,6 +14786,7 @@ proptest! {
         // File B: backward directive to A
         let meta_b = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -14745,6 +14799,7 @@ proptest! {
         // File C: backward directive to B
         let meta_c = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -14818,6 +14873,7 @@ proptest! {
         // File A: backward directive to B (no explicit WD)
         let meta_a = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -14896,6 +14952,7 @@ proptest! {
         // File A: backward directive to B
         let meta_a = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -14908,6 +14965,7 @@ proptest! {
         // File B: backward directive to A (creates cycle)
         let meta_b = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -14999,6 +15057,7 @@ proptest! {
         // File B: backward directive to A (part of potential cycle)
         let meta_b_initial = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -15020,6 +15079,7 @@ proptest! {
         // Create B's metadata with inherited WD
         let meta_b = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: b_inherited_wd.clone(),
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
@@ -15032,6 +15092,7 @@ proptest! {
         // File C: backward directive to B
         let meta_c_initial = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -15059,6 +15120,7 @@ proptest! {
         // Create C's metadata with inherited WD
         let meta_c = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: c_inherited_wd.clone(),
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -15071,6 +15133,7 @@ proptest! {
         // File D: backward directive to C
         let meta_d = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/c.R", dir_c),
@@ -15135,6 +15198,7 @@ proptest! {
         // File A: backward directive to B, no explicit WD
         let meta_a = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/b.R", dir_b),
@@ -15147,6 +15211,7 @@ proptest! {
         // File B: backward directive to A, no explicit WD (creates cycle)
         let meta_b = CrossFileMetadata {
             working_directory: None,
+            application_working_directory: None,
             inherited_working_directory: None,
             sourced_by: vec![BackwardDirective {
                 path: format!("../{}/a.R", dir_a),
