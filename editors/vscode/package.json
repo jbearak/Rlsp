@@ -1157,6 +1157,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1164,6 +1165,7 @@
             "Report missing sourced files as errors",
             "Report missing sourced files as warnings",
             "Report missing sourced files as information",
+            "Alias for information severity",
             "Report missing sourced files as hints",
             "Disable missing sourced file diagnostics"
           ],
@@ -1177,6 +1179,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1185,6 +1188,7 @@
             "Report case-only path mismatches as errors",
             "Report case-only path mismatches as warnings",
             "Report case-only path mismatches as information",
+            "Alias for information severity",
             "Report case-only path mismatches as hints",
             "Disable case-only path mismatch diagnostics"
           ],
@@ -1197,6 +1201,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1204,6 +1209,7 @@
             "Report circular dependencies as errors",
             "Report circular dependencies as warnings",
             "Report circular dependencies as information",
+            "Alias for information severity",
             "Report circular dependencies as hints",
             "Disable circular dependency diagnostics"
           ],
@@ -1216,6 +1222,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1223,6 +1230,7 @@
             "Report out-of-scope symbol usage as errors",
             "Report out-of-scope symbol usage as warnings",
             "Report out-of-scope symbol usage as information",
+            "Alias for information severity",
             "Report out-of-scope symbol usage as hints",
             "Disable out-of-scope symbol diagnostics"
           ],
@@ -1235,6 +1243,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1242,6 +1251,7 @@
             "Report max chain depth exceeded as errors",
             "Report max chain depth exceeded as warnings",
             "Report max chain depth exceeded as information",
+            "Alias for information severity",
             "Report max chain depth exceeded as hints",
             "Disable max chain depth diagnostics"
           ],
@@ -1254,6 +1264,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1261,6 +1272,7 @@
             "Report redundant directives as errors",
             "Report redundant directives as warnings",
             "Report redundant directives as information",
+            "Alias for information severity",
             "Report redundant directives as hints",
             "Disable redundant directive diagnostics"
           ],
@@ -1307,6 +1319,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1314,6 +1327,7 @@
             "Report undefined variables as errors",
             "Report undefined variables as warnings",
             "Report undefined variables as information",
+            "Alias for information severity",
             "Report undefined variables as hints",
             "Disable undefined variable diagnostics"
           ],
@@ -1336,6 +1350,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1343,6 +1358,7 @@
             "Report mixed `&`/`|` without parentheses as errors",
             "Report mixed `&`/`|` without parentheses as warnings",
             "Report mixed `&`/`|` without parentheses as information",
+            "Alias for information severity",
             "Report mixed `&`/`|` without parentheses as hints",
             "Disable the mixed-logical diagnostic"
           ],
@@ -1355,6 +1371,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1362,6 +1379,7 @@
             "Report `=` in conditions as errors",
             "Report `=` in conditions as warnings",
             "Report `=` in conditions as information",
+            "Alias for information severity",
             "Report `=` in conditions as hints",
             "Disable the condition-assignment diagnostic"
           ],
@@ -1399,6 +1417,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1406,6 +1425,7 @@
             "Report missing packages as errors",
             "Report missing packages as warnings",
             "Report missing packages as information",
+            "Alias for information severity",
             "Report missing packages as hints",
             "Disable missing package diagnostics"
           ],
@@ -1418,6 +1438,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1425,6 +1446,7 @@
             "Report unknown namespace members as errors",
             "Report unknown namespace members as warnings",
             "Report unknown namespace members as information",
+            "Alias for information severity",
             "Report unknown namespace members as hints",
             "Disable namespace member diagnostics"
           ],
@@ -1764,6 +1786,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1771,6 +1794,7 @@
             "Report long lines as errors",
             "Report long lines as warnings",
             "Report long lines as information",
+            "Alias for information severity",
             "Report long lines as hints",
             "Disable the line-length lint"
           ],
@@ -1783,6 +1807,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1790,6 +1815,7 @@
             "Report trailing whitespace as errors",
             "Report trailing whitespace as warnings",
             "Report trailing whitespace as information",
+            "Alias for information severity",
             "Report trailing whitespace as hints",
             "Disable the trailing-whitespace lint"
           ],
@@ -1802,6 +1828,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1809,6 +1836,7 @@
             "Report tab characters as errors",
             "Report tab characters as warnings",
             "Report tab characters as information",
+            "Alias for information severity",
             "Report tab characters as hints",
             "Disable the no-tab lint"
           ],
@@ -1821,6 +1849,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1828,6 +1857,7 @@
             "Report trailing blank lines as errors",
             "Report trailing blank lines as warnings",
             "Report trailing blank lines as information",
+            "Alias for information severity",
             "Report trailing blank lines as hints",
             "Disable the trailing-blank-lines lint"
           ],
@@ -1840,6 +1870,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -1847,6 +1878,7 @@
             "Report mismatched assignment operator as errors",
             "Report mismatched assignment operator as warnings",
             "Report mismatched assignment operator as information",
+            "Alias for information severity",
             "Report mismatched assignment operator as hints",
             "Disable the assignment-operator lint"
           ],
@@ -2052,6 +2084,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2059,6 +2092,7 @@
             "Report object-name violations as errors",
             "Report object-name violations as warnings",
             "Report object-name violations as information",
+            "Alias for information severity",
             "Report object-name violations as hints",
             "Disable the object-name lint entirely"
           ],
@@ -2071,6 +2105,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2078,6 +2113,7 @@
             "Report infix-spacing violations as errors",
             "Report infix-spacing violations as warnings",
             "Report infix-spacing violations as information",
+            "Alias for information severity",
             "Report infix-spacing violations as hints",
             "Disable the infix-spaces lint"
           ],
@@ -2090,6 +2126,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2097,6 +2134,7 @@
             "Report commented-out code as errors",
             "Report commented-out code as warnings",
             "Report commented-out code as information",
+            "Alias for information severity",
             "Report commented-out code as hints",
             "Disable the commented-code lint"
           ],
@@ -2122,6 +2160,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2129,6 +2168,7 @@
             "Report quote-style violations as errors",
             "Report quote-style violations as warnings",
             "Report quote-style violations as information",
+            "Alias for information severity",
             "Report quote-style violations as hints",
             "Disable the quotes lint"
           ],
@@ -2141,6 +2181,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2148,6 +2189,7 @@
             "Report comma-spacing violations as errors",
             "Report comma-spacing violations as warnings",
             "Report comma-spacing violations as information",
+            "Alias for information severity",
             "Report comma-spacing violations as hints",
             "Disable the commas lint"
           ],
@@ -2160,6 +2202,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2167,6 +2210,7 @@
             "Report `T`/`F` usage as errors",
             "Report `T`/`F` usage as warnings",
             "Report `T`/`F` usage as information",
+            "Alias for information severity",
             "Report `T`/`F` usage as hints",
             "Disable the T/F symbol lint"
           ],
@@ -2179,6 +2223,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2186,6 +2231,7 @@
             "Report `;` separators as errors",
             "Report `;` separators as warnings",
             "Report `;` separators as information",
+            "Alias for information severity",
             "Report `;` separators as hints",
             "Disable the semicolon lint"
           ],
@@ -2198,6 +2244,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2205,6 +2252,7 @@
             "Report `== NA` / `!= NA` as errors",
             "Report `== NA` / `!= NA` as warnings",
             "Report `== NA` / `!= NA` as information",
+            "Alias for information severity",
             "Report `== NA` / `!= NA` as hints",
             "Disable the equals-NA lint"
           ],
@@ -2224,6 +2272,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2231,6 +2280,7 @@
             "Report overlong identifiers as errors",
             "Report overlong identifiers as warnings",
             "Report overlong identifiers as information",
+            "Alias for information severity",
             "Report overlong identifiers as hints",
             "Disable the object-length lint"
           ],
@@ -2243,6 +2293,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2250,6 +2301,7 @@
             "Report `&`/`|` in `if`/`while` conditions as errors",
             "Report `&`/`|` in `if`/`while` conditions as warnings",
             "Report `&`/`|` in `if`/`while` conditions as information",
+            "Alias for information severity",
             "Report `&`/`|` in `if`/`while` conditions as hints",
             "Disable the vector-logic lint"
           ],
@@ -2262,6 +2314,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2269,6 +2322,7 @@
             "Report space between `function` and `(` as errors",
             "Report space between `function` and `(` as warnings",
             "Report space between `function` and `(` as information",
+            "Alias for information severity",
             "Report space between `function` and `(` as hints",
             "Disable the function-left-parens lint"
           ],
@@ -2281,6 +2335,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2288,6 +2343,7 @@
             "Report whitespace inside brackets as errors",
             "Report whitespace inside brackets as warnings",
             "Report whitespace inside brackets as information",
+            "Alias for information severity",
             "Report whitespace inside brackets as hints",
             "Disable the spaces-inside lint"
           ],
@@ -2330,6 +2386,7 @@
             "error",
             "warning",
             "information",
+            "info",
             "hint",
             "off"
           ],
@@ -2337,6 +2394,7 @@
             "Report mis-indented lines as errors",
             "Report mis-indented lines as warnings",
             "Report mis-indented lines as information",
+            "Alias for information severity",
             "Report mis-indented lines as hints",
             "Disable the indentation lint"
           ],

@@ -79,7 +79,7 @@ on existing code.
 | Setting | Values | Default | Effect |
 |---|---|---|---|
 | `raven.linting.enabled` | `"auto"`, `"on"`, `"off"`, `true`, `false` | `"auto"` | Master switch for Raven's style lints; `"auto"` is normally off until project configuration opts in |
-| `raven.linting.indentationSeverity` | `error`, `warning`, `information`, `hint`, `off` | `information` | Severity for indentation diagnostics; `off` disables this rule |
+| `raven.linting.indentationSeverity` | `error`, `warning`, `information` (`info`), `hint`, `off` | `information` | Severity for indentation diagnostics; `info` aliases `information`, and `off` disables this rule |
 | `raven.linting.indentationUnit` | `"auto"`, integer `1` through `8` | `"auto"` | Expected spaces per level; in VS Code, `"auto"` follows the file's `editor.tabSize` |
 | `raven.linting.infixContinuationStyle` | `aligned`, `indented`, `either` | `either` | Whether infix continuations must use one strict style or may use either |
 

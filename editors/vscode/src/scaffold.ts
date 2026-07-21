@@ -203,8 +203,8 @@ const ARRAY_LINTING_SETTINGS = new Set(
 
 const LINTING_BLOCK_HEADER =
     'Raven native style/lint diagnostics. Severities accept: "error",\n' +
-    '"warning", "information", "hint", or "off". Each group below names\n' +
-    'the lintr linter it mirrors (or is marked Raven-only). See\n' +
+    '"warning", "information" (or "info"), "hint", or "off". Each group\n' +
+    'below names the lintr linter it mirrors (or is marked Raven-only). See\n' +
     'docs/linting.md for details.';
 
 /**
@@ -704,7 +704,7 @@ export function renderRavenToml(linting: Record<string, unknown> | undefined): s
         ...severities.map<[string, unknown, string]>(([k, d]) => [
             k,
             d,
-            'error | warning | information | hint | off',
+            'error | warning | information | info | hint | off',
         ]),
     ];
     const ravenDefaultEnabled = false; // mirror VS Code package.json default

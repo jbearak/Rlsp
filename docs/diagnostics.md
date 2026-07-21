@@ -359,7 +359,7 @@ See [Directives](directives.md#declaration-directives) for full syntax.
 
 ### Per-Category: Configuration
 
-Each diagnostic category has a severity setting that accepts `"error"`, `"warning"`, `"information"`, `"hint"`, or `"off"`:
+Each diagnostic category has a severity setting that accepts `"error"`, `"warning"`, `"information"` (or its `"info"` alias), `"hint"`, or `"off"`:
 
 ```json
 "raven.crossFile.missingFileSeverity": "off",

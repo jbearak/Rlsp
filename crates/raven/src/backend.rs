@@ -853,7 +853,7 @@ pub async fn run_bounded_fanout_for_test<T, MakeFuture, FutureOutput>(
 ///   `objectNameRegexesArgument` (array of strings) — partial-match regexes
 ///   accepted for each symbol kind.
 /// * Per-rule severities (string, `"error" | "warning" | "information" |
-///   "hint" | "off"`):
+///   "info" | "hint" | "off"`; `"info"` aliases `"information"`):
 ///   - `lineLengthSeverity`
 ///   - `trailingWhitespaceSeverity`
 ///   - `noTabSeverity`
@@ -30354,6 +30354,7 @@ mod tests {
                 ("error", Some(DiagnosticSeverity::ERROR)),
                 ("warning", Some(DiagnosticSeverity::WARNING)),
                 ("information", Some(DiagnosticSeverity::INFORMATION)),
+                ("info", Some(DiagnosticSeverity::INFORMATION)),
                 ("hint", Some(DiagnosticSeverity::HINT)),
             ] {
                 let settings = json!({
