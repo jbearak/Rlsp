@@ -253,10 +253,11 @@ fn run_with_cwd_and_options(
 
     // Parse the base lint config from the (project-only) settings, since the
     // CLI has no LSP client. Merge with an empty client layer for correctness.
-    let merged = crate::config_file::merge_settings(
+    let mut merged = crate::config_file::merge_settings(
         &serde_json::Value::Object(Default::default()),
         project_settings.as_ref(),
     );
+    force_cli_linting_enabled(&mut merged);
     let lint_config =
         crate::backend::parse_lint_config(&merged, lintr_discovered).unwrap_or_default();
     let base_section = merged.get("linting").cloned().unwrap_or(json!({}));
@@ -297,6 +298,27 @@ fn run_with_cwd_and_options(
     } else {
         EXIT_OK
     }
+}
+
+/// Make the explicit `raven lint` command opt into the native linter.
+///
+/// This changes only the base `[linting].enabled` value. In particular, it
+/// leaves per-file override switches and rule severities untouched so an
+/// exclusion can still disable a matching file and an individual rule can
+/// still be set to `off`. The normalization happens on the merged JSON before
+/// both the typed base config and the override base section are derived;
+/// otherwise a matching override would reparse the original disabled value.
+fn force_cli_linting_enabled(settings: &mut serde_json::Value) {
+    let Some(root) = settings.as_object_mut() else {
+        *settings = json!({ "linting": { "enabled": true } });
+        return;
+    };
+    let linting = root.entry("linting").or_insert_with(|| json!({}));
+    let Some(linting) = linting.as_object_mut() else {
+        *linting = json!({ "enabled": true });
+        return;
+    };
+    linting.insert("enabled".to_string(), json!(true));
 }
 
 fn walk(
@@ -855,6 +877,143 @@ mod tests {
         // suite that runs the binary.
         let code = run(args);
         assert_eq!(code, EXIT_LINT_FAILED); // warning > info default
+    }
+
+    fn end_to_end_args(path: &Path) -> LintArgs {
+        LintArgs {
+            paths: vec![path.to_path_buf()],
+            config_path: None,
+            no_config: false,
+            format: OutputFormat::Json,
+            max_severity: SeverityLevel::Off,
+            quiet: true,
+            color: ColorChoice::Never,
+        }
+    }
+
+    #[test]
+    fn end_to_end_lint_enables_defaults_without_config() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("assignment.R");
+        fs::write(&file, "x = 1\n").unwrap();
+
+        let args = end_to_end_args(&file);
+        assert_eq!(
+            run_with_cwd(args.clone(), tmp.path()),
+            EXIT_LINT_FAILED,
+            "an explicit lint command must run the built-in rules without a config"
+        );
+
+        let mut no_config = args;
+        no_config.no_config = true;
+        assert_eq!(
+            run_with_cwd(no_config, tmp.path()),
+            EXIT_LINT_FAILED,
+            "--no-config must still run the built-in rules"
+        );
+    }
+
+    #[test]
+    fn end_to_end_lint_ignores_base_off_but_keeps_custom_rule_values() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("raven.toml");
+        let file = tmp.path().join("over.R");
+        fs::write(
+            &config,
+            "[linting]\nenabled = false\nlineLength = 20\nlineLengthSeverity = \"warning\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &file,
+            "x <- \"this line is intentionally way more than twenty characters wide\"\n",
+        )
+        .unwrap();
+
+        let mut args = end_to_end_args(&file);
+        args.config_path = Some(config);
+        args.max_severity = SeverityLevel::Info;
+        assert_eq!(run_with_cwd(args, tmp.path()), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn end_to_end_matching_override_inherits_forced_enabled_base() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let tests = tmp.path().join("tests");
+        fs::create_dir(&tests).unwrap();
+        let config = tmp.path().join("raven.toml");
+        let file = tests.join("over.R");
+        fs::write(
+            &config,
+            "[linting]\nenabled = false\nlineLength = 1000\nlineLengthSeverity = \"warning\"\n\n[[linting.overrides]]\nfiles = [\"tests/*.R\"]\nlineLength = 20\n",
+        )
+        .unwrap();
+        fs::write(
+            &file,
+            "x <- \"this line is intentionally way more than twenty characters wide\"\n",
+        )
+        .unwrap();
+
+        let mut args = end_to_end_args(&file);
+        args.config_path = Some(config);
+        args.max_severity = SeverityLevel::Info;
+        assert_eq!(run_with_cwd(args, tmp.path()), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn end_to_end_override_off_still_skips_only_matching_files() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("raven.toml");
+        let skipped = tmp.path().join("skip.R");
+        let linted = tmp.path().join("keep.R");
+        fs::write(
+            &config,
+            "[linting]\nenabled = false\nassignmentOperatorSeverity = \"warning\"\n\n[[linting.overrides]]\nfiles = [\"skip.R\"]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::write(&skipped, "x = 1\n").unwrap();
+        fs::write(&linted, "x = 1\n").unwrap();
+
+        let mut skipped_args = end_to_end_args(&skipped);
+        skipped_args.config_path = Some(config.clone());
+        skipped_args.max_severity = SeverityLevel::Info;
+        assert_eq!(run_with_cwd(skipped_args, tmp.path()), EXIT_OK);
+
+        let mut linted_args = end_to_end_args(&linted);
+        linted_args.config_path = Some(config);
+        linted_args.max_severity = SeverityLevel::Info;
+        assert_eq!(run_with_cwd(linted_args, tmp.path()), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn end_to_end_rule_severity_off_remains_silent() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("raven.toml");
+        let file = tmp.path().join("assignment.R");
+        fs::write(
+            &config,
+            "[linting]\nenabled = false\nassignmentOperatorSeverity = \"off\"\n",
+        )
+        .unwrap();
+        fs::write(&file, "x = 1\n").unwrap();
+
+        let mut args = end_to_end_args(&file);
+        args.config_path = Some(config);
+        assert_eq!(run_with_cwd(args, tmp.path()), EXIT_OK);
     }
 
     #[test]
