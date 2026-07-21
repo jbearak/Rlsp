@@ -204,11 +204,14 @@ exists only in a path removed by activation, Raven reports
 `package-outside-active-library` and suggests restoring or installing it into
 the project library. Raven reports this project-level setup problem at most once
 per package per document, even when that document contains many qualified
-references. This names-only evidence never makes the package available for
-exports, completion, `system.file()`, or package loading. Packages installed
-after startup are recognized when the library is rebuilt (for example with
-`raven.refreshPackages`); changes made only in an outside vanilla library are
-picked up by the next refresh rather than watched continuously. Suppressing
+references. Raven may use explicitly declared exports from that outside
+installation only to suppress undefined-variable cascades after a true
+`library()` / `require()` attachment. This diagnostic-only evidence never makes
+the package available for completion, `system.file()`, or package loading.
+Packages installed after startup are recognized when the library is rebuilt
+(for example with `raven.refreshPackages`); changes made only in an outside
+vanilla library are picked up by the next refresh rather than watched
+continuously. Suppressing
 `package-not-installed` also suppresses this child code. Multi-root editor
 sessions fail closed to no subtype because package routing has no unambiguous
 single-project renv identity there.

@@ -78,6 +78,40 @@ pub fn parse_namespace_explicit_exports(namespace_path: &Path) -> (Vec<String>, 
     }
 }
 
+/// Extract explicit names that a successful package attachment places on the
+/// search path.
+///
+/// Unlike [`parse_namespace_explicit_exports`], this diagnostic-only view does
+/// not include `S3method(...)` registrations: registering a method does not by
+/// itself export or attach the method binding. Pattern exports are also omitted
+/// because this static parser cannot expand them. Missing or unreadable files
+/// therefore fail closed to no positive evidence.
+pub(crate) fn parse_namespace_attachment_visible_explicit_exports(
+    namespace_path: &Path,
+) -> Vec<String> {
+    let Ok(content) = fs::read_to_string(namespace_path) else {
+        return Vec::new();
+    };
+    let normalized = normalize_multiline_directives(&content);
+    let mut exports = Vec::new();
+
+    for line in normalized.lines().map(str::trim) {
+        let args = extract_directive_args(line, "export")
+            .or_else(|| extract_directive_args(line, "exportClasses"))
+            .or_else(|| extract_directive_args(line, "exportMethods"));
+        let Some(args) = args else {
+            continue;
+        };
+        exports.extend(
+            parse_comma_separated_args(&args)
+                .into_iter()
+                .filter(|name| !name.is_empty()),
+        );
+    }
+
+    exports
+}
+
 /// Parse NAMESPACE file content to extract exported symbols and pattern markers.
 ///
 /// This function scans normalized NAMESPACE directives and collects:
