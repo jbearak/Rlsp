@@ -26,7 +26,6 @@ pub mod runiverse;
 #[cfg(test)]
 use std::cell::RefCell;
 use std::fs::File;
-use std::fs::Metadata;
 use std::io;
 use std::path::PathBuf;
 
@@ -81,24 +80,27 @@ struct ThinFileIdentity {
     #[cfg(unix)]
     change_nanoseconds: i64,
     #[cfg(windows)]
-    volume_serial_number: Option<u32>,
+    volume_serial_number: u64,
     #[cfg(windows)]
-    file_index: Option<u64>,
+    file_index: u64,
     #[cfg(windows)]
-    file_attributes: u32,
+    file_attributes: u64,
     #[cfg(windows)]
-    creation_time: u64,
+    creation_time: Option<u64>,
     #[cfg(windows)]
-    last_write_time: u64,
+    last_write_time: Option<u64>,
 }
 
-fn thin_file_identity(metadata: &Metadata) -> ThinFileIdentity {
+/// Capture identity from an open file so Windows can use stable by-handle APIs
+/// for the volume serial number and file index.
+fn thin_file_identity(file: &File) -> io::Result<ThinFileIdentity> {
+    let metadata = file.metadata()?;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     #[cfg(windows)]
-    use std::os::windows::fs::MetadataExt;
+    let windows_identity = winapi_util::file::information(file)?;
 
-    ThinFileIdentity {
+    Ok(ThinFileIdentity {
         len: metadata.len(),
         modified: metadata.modified().ok(),
         created: metadata.created().ok(),
@@ -114,16 +116,16 @@ fn thin_file_identity(metadata: &Metadata) -> ThinFileIdentity {
         #[cfg(unix)]
         change_nanoseconds: metadata.ctime_nsec(),
         #[cfg(windows)]
-        volume_serial_number: metadata.volume_serial_number(),
+        volume_serial_number: windows_identity.volume_serial_number(),
         #[cfg(windows)]
-        file_index: metadata.file_index(),
+        file_index: windows_identity.file_index(),
         #[cfg(windows)]
-        file_attributes: metadata.file_attributes(),
+        file_attributes: windows_identity.file_attributes(),
         #[cfg(windows)]
-        creation_time: metadata.creation_time(),
+        creation_time: windows_identity.creation_time(),
         #[cfg(windows)]
-        last_write_time: metadata.last_write_time(),
-    }
+        last_write_time: windows_identity.last_write_time(),
+    })
 }
 
 /// Load a thin provider file from one opened handle and verify that the path
@@ -150,15 +152,10 @@ pub(crate) fn load_thin_file_with_retry<T, E>(
             }
             Err(error) => return Err(ThinFileLoadError::Io(error)),
         };
-        let before = file
-            .metadata()
-            .map(|metadata| thin_file_identity(&metadata))
-            .map_err(ThinFileLoadError::Io)?;
+        let before = thin_file_identity(&file).map_err(ThinFileLoadError::Io)?;
         let loaded = load(&file);
-        let handle_after = file
-            .metadata()
-            .map(|metadata| thin_file_identity(&metadata));
-        let path_after = std::fs::metadata(path).map(|metadata| thin_file_identity(&metadata));
+        let handle_after = thin_file_identity(&file);
+        let path_after = File::open(path).and_then(|file| thin_file_identity(&file));
         let unchanged = matches!(
             (&handle_after, &path_after),
             (Ok(handle), Ok(current)) if handle == &before && current == &before
