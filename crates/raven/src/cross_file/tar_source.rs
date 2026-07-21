@@ -15,14 +15,16 @@ use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::Url;
 
+use crate::config_file::exclusions::CompiledWorkspaceExclusions;
+
 use super::path_resolve::{
     CaseMismatchRegime, PathContext, forward_child_path_context, forward_path_candidate_tiers,
     normalize_path_public, path_to_uri, resolve_path_with_workspace_fallback,
     resolve_source_path_rich,
 };
 use super::types::{
-    CrossFileMetadata, ForwardSource, ListFilesSourceRequest, SourceBatchKind, SourceLocality,
-    TarSourceRequest,
+    CrossFileMetadata, ForwardSource, ListFilesSourceRequest, ShinyApplicationMetadata,
+    SourceBatchKind, SourceLocality, TarSourceRequest,
 };
 
 const MAX_LIST_FILES_SOURCE_MEMBERS: usize = 256;
@@ -30,10 +32,18 @@ const MAX_LIST_FILES_SOURCE_MEMBERS: usize = 256;
 /// Detached result of expanding all requests in one metadata record.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TarSourceExpansion {
-    /// Ordered tar-derived forward sources.
+    /// Ordered filesystem-derived forward sources.
     pub sources: Vec<ForwardSource>,
     /// Existing and potential membership roots, including symlink targets.
     pub watch_paths: Vec<PathBuf>,
+    /// Project exclusion patterns applied while selecting members.
+    pub exclusion_patterns: Vec<String>,
+    /// Filesystem-derived Shiny context for the enriched file.
+    pub shiny_application: Option<ShinyApplicationMetadata>,
+    /// Lexical Shiny application directory used for runtime path resolution.
+    pub application_working_directory: Option<PathBuf>,
+    /// Exact selected Shiny entry used to bootstrap direct support-file opens.
+    pub selected_shiny_entry: Option<PathBuf>,
 }
 
 /// Context-sensitive provider files needed in addition to a URI-global graph
@@ -332,14 +342,48 @@ pub fn expand_tar_source_requests(
     uri: &Url,
     workspace_root: Option<&Url>,
 ) -> TarSourceExpansion {
-    let Some(context) = PathContext::from_metadata(uri, metadata, workspace_root) else {
+    expand_tar_source_requests_with_exclusions(
+        metadata,
+        uri,
+        workspace_root,
+        &CompiledWorkspaceExclusions::default(),
+    )
+}
+
+/// Expand every static source-batch request while honoring project exclusions.
+pub fn expand_tar_source_requests_with_exclusions(
+    metadata: &CrossFileMetadata,
+    uri: &Url,
+    workspace_root: Option<&Url>,
+    exclusions: &CompiledWorkspaceExclusions,
+) -> TarSourceExpansion {
+    let shiny = super::shiny::discover_shiny_application(uri, exclusions);
+    let mut effective_metadata = metadata.clone();
+    effective_metadata.application_working_directory = shiny
+        .application_working_directory
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    effective_metadata.shiny_application = shiny.metadata.clone();
+    let Some(context) = PathContext::from_metadata(uri, &effective_metadata, workspace_root) else {
         return TarSourceExpansion::default();
     };
-    let mut result = TarSourceExpansion::default();
+    let mut result = TarSourceExpansion {
+        watch_paths: shiny.watch_paths,
+        exclusion_patterns: exclusions.patterns().to_vec(),
+        shiny_application: shiny.metadata,
+        application_working_directory: shiny.application_working_directory,
+        selected_shiny_entry: shiny.selected_entry,
+        ..TarSourceExpansion::default()
+    };
     for request in &metadata.tar_source_requests {
         let expansion = expand_request(request, &context);
         result.watch_paths.extend(expansion.watch_paths);
-        for (ordinal, path) in expansion.files.into_iter().enumerate() {
+        for (ordinal, path) in expansion
+            .files
+            .into_iter()
+            .filter(|path| !exclusions.is_excluded_path(path))
+            .enumerate()
+        {
             let Some(resolved_uri) = path_to_uri(&path) else {
                 continue;
             };
@@ -363,7 +407,12 @@ pub fn expand_tar_source_requests(
     for request in &metadata.list_files_source_requests {
         let expansion = expand_list_files_request(request, &context, workspace_root);
         result.watch_paths.extend(expansion.watch_paths);
-        for (ordinal, path) in expansion.files.into_iter().enumerate() {
+        for (ordinal, path) in expansion
+            .files
+            .into_iter()
+            .filter(|path| !exclusions.is_excluded_path(path))
+            .enumerate()
+        {
             let Some(resolved_uri) = path_to_uri(&path) else {
                 continue;
             };
@@ -375,6 +424,30 @@ pub fn expand_tar_source_requests(
                 resolved_uri: Some(resolved_uri),
                 tar_source_ordinal: Some(ordinal as u32),
                 source_batch_kind: Some(SourceBatchKind::ListFiles),
+                ..Default::default()
+            });
+        }
+    }
+    if let Some(path) = shiny.global
+        && let Some(resolved_uri) = path_to_uri(&path)
+    {
+        result.sources.push(ForwardSource {
+            path: path.to_string_lossy().into_owned(),
+            locality: SourceLocality::Global,
+            resolved_uri: Some(resolved_uri),
+            tar_source_ordinal: Some(0),
+            source_batch_kind: Some(SourceBatchKind::ShinyGlobal),
+            ..Default::default()
+        });
+    }
+    for (ordinal, path) in shiny.helpers.into_iter().enumerate() {
+        if let Some(resolved_uri) = path_to_uri(&path) {
+            result.sources.push(ForwardSource {
+                path: path.to_string_lossy().into_owned(),
+                locality: SourceLocality::Global,
+                resolved_uri: Some(resolved_uri),
+                tar_source_ordinal: Some(ordinal as u32),
+                source_batch_kind: Some(SourceBatchKind::Shiny),
                 ..Default::default()
             });
         }
@@ -401,6 +474,11 @@ pub fn apply_tar_source_expansion(metadata: &mut CrossFileMetadata, expansion: T
         .retain(|source| !source.is_source_batch_member());
     metadata.sources.extend(expansion.sources);
     metadata.tar_source_expansion_watch_paths = expansion.watch_paths;
+    metadata.source_batch_exclusion_patterns = expansion.exclusion_patterns;
+    metadata.application_working_directory = expansion
+        .application_working_directory
+        .map(|path| path.to_string_lossy().into_owned());
+    metadata.shiny_application = expansion.shiny_application;
     metadata.sources.sort_by_key(|source| {
         (
             source.line,
@@ -421,8 +499,26 @@ pub fn finalize_tar_source_requests(
     apply_tar_source_expansion(metadata, expansion);
 }
 
-/// Reuse a prior record's derived expansion when its syntax and effective path
-/// context are identical.
+/// Expand and install source batches while honoring project exclusions.
+///
+/// Returns the exact selected Shiny host when the file belongs to an active
+/// application, allowing open-install prerequisite convergence to materialize
+/// the host before diagnostics.
+pub fn finalize_tar_source_requests_with_exclusions(
+    metadata: &mut CrossFileMetadata,
+    uri: &Url,
+    workspace_root: Option<&Url>,
+    exclusions: &CompiledWorkspaceExclusions,
+) -> Option<PathBuf> {
+    let expansion =
+        expand_tar_source_requests_with_exclusions(metadata, uri, workspace_root, exclusions);
+    let selected_shiny_entry = expansion.selected_shiny_entry.clone();
+    apply_tar_source_expansion(metadata, expansion);
+    selected_shiny_entry
+}
+
+/// Reuse a prior record's derived expansion when its syntax, effective path
+/// context, and project exclusions are identical.
 ///
 /// This is the only cache-like seam in the module: ownership and freshness stay
 /// with the caller's authoritative record. Returns `true` when reuse occurred.
@@ -431,17 +527,22 @@ pub fn reuse_tar_source_expansion(
     previous: &CrossFileMetadata,
     uri: &Url,
     workspace_root: Option<&Url>,
+    exclusions: &CompiledWorkspaceExclusions,
 ) -> bool {
+    if previous.source_batch_exclusion_patterns.as_slice() != exclusions.patterns() {
+        return false;
+    }
     if metadata.tar_source_requests != previous.tar_source_requests
         || metadata.list_files_source_requests != previous.list_files_source_requests
     {
         return false;
     }
-    if (!previous.tar_source_requests.is_empty() || !previous.list_files_source_requests.is_empty())
-        && previous.tar_source_expansion_watch_paths.is_empty()
+    if previous.has_source_batch_topology() && previous.tar_source_expansion_watch_paths.is_empty()
     {
         return false;
     }
+    metadata.shiny_application = previous.shiny_application.clone();
+    metadata.application_working_directory = previous.application_working_directory.clone();
     let current_context = PathContext::from_metadata(uri, metadata, workspace_root);
     let previous_context = PathContext::from_metadata(uri, previous, workspace_root);
     if current_context != previous_context {
@@ -455,6 +556,13 @@ pub fn reuse_tar_source_expansion(
             .cloned()
             .collect(),
         watch_paths: previous.tar_source_expansion_watch_paths.clone(),
+        exclusion_patterns: previous.source_batch_exclusion_patterns.clone(),
+        shiny_application: previous.shiny_application.clone(),
+        application_working_directory: previous
+            .application_working_directory
+            .as_ref()
+            .map(PathBuf::from),
+        selected_shiny_entry: None,
     };
     apply_tar_source_expansion(metadata, expansion);
     true
@@ -481,9 +589,54 @@ fn path_starts_with_ascii_case(path: &Path, base: &Path) -> bool {
     let mut path_components = path.components();
     base.components().all(|base_component| {
         path_components.next().is_some_and(|path_component| {
-            os_str_eq_ignore_ascii_case(path_component.as_os_str(), base_component.as_os_str())
+            path_components_eq_ignore_ascii_case(path_component, base_component)
         })
     })
+}
+
+/// Compare path components with the same ASCII case leniency as watch overlap.
+///
+/// Windows canonicalization commonly changes `C:` into the extended-length
+/// `\\?\C:` prefix (and likewise for UNC paths). Those prefix forms identify the
+/// same filesystem root and must compare equal so canonical Shiny watch roots
+/// can match ordinary file-URI event paths.
+pub(crate) fn path_components_eq_ignore_ascii_case(
+    left: std::path::Component<'_>,
+    right: std::path::Component<'_>,
+) -> bool {
+    #[cfg(windows)]
+    if let (std::path::Component::Prefix(left), std::path::Component::Prefix(right)) = (left, right)
+    {
+        use std::path::Prefix;
+
+        return match (left.kind(), right.kind()) {
+            (Prefix::Disk(left), Prefix::VerbatimDisk(right))
+            | (Prefix::VerbatimDisk(left), Prefix::Disk(right))
+            | (Prefix::Disk(left), Prefix::Disk(right))
+            | (Prefix::VerbatimDisk(left), Prefix::VerbatimDisk(right)) => {
+                left.eq_ignore_ascii_case(&right)
+            }
+            (
+                Prefix::UNC(left_server, left_share),
+                Prefix::VerbatimUNC(right_server, right_share),
+            )
+            | (
+                Prefix::VerbatimUNC(left_server, left_share),
+                Prefix::UNC(right_server, right_share),
+            )
+            | (Prefix::UNC(left_server, left_share), Prefix::UNC(right_server, right_share))
+            | (
+                Prefix::VerbatimUNC(left_server, left_share),
+                Prefix::VerbatimUNC(right_server, right_share),
+            ) => {
+                os_str_eq_ignore_ascii_case(left_server, right_server)
+                    && os_str_eq_ignore_ascii_case(left_share, right_share)
+            }
+            _ => os_str_eq_ignore_ascii_case(left.as_os_str(), right.as_os_str()),
+        };
+    }
+
+    os_str_eq_ignore_ascii_case(left.as_os_str(), right.as_os_str())
 }
 
 #[cfg(unix)]
@@ -1228,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn reuse_requires_identical_requests_and_path_context() {
+    fn reuse_requires_identical_requests_path_context_and_exclusions() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         touch(&root.join("R/a.R"), "");
@@ -1237,13 +1390,15 @@ mod tests {
         let root_uri = Url::from_directory_path(root).unwrap();
         let parent_uri = Url::from_file_path(&parent).unwrap();
         let previous = finalize(root, &parent, "targets::tar_source(\"R\")");
+        let no_exclusions = CompiledWorkspaceExclusions::default();
 
         let mut same = crate::cross_file::extract_metadata("targets::tar_source(\"R\")");
         assert!(reuse_tar_source_expansion(
             &mut same,
             &previous,
             &parent_uri,
-            Some(&root_uri)
+            Some(&root_uri),
+            &no_exclusions,
         ));
         assert_eq!(relative_sources(root, &same), ["R/a.R"]);
 
@@ -1254,8 +1409,55 @@ mod tests {
             &mut changed,
             &previous,
             &parent_uri,
-            Some(&root_uri)
+            Some(&root_uri),
+            &no_exclusions,
         ));
+
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["R/**"] } }),
+            vec![root.to_path_buf()],
+        );
+        let mut newly_excluded = crate::cross_file::extract_metadata("targets::tar_source(\"R\")");
+        assert!(!reuse_tar_source_expansion(
+            &mut newly_excluded,
+            &previous,
+            &parent_uri,
+            Some(&root_uri),
+            &exclusions,
+        ));
+    }
+
+    #[test]
+    fn direct_shiny_helper_expansion_retains_selected_host_without_emitting_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        touch(&root.join("app.R"), "entry_value <- helper_value\n");
+        touch(&root.join("R/a.R"), "helper_value <- 1\n");
+        touch(&root.join("R/b.R"), "later_value <- 2\n");
+        let helper_uri = Url::from_file_path(root.join("R/b.R")).unwrap();
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let metadata = crate::cross_file::extract_metadata("later_value <- 2\n");
+
+        let expansion = expand_tar_source_requests_with_exclusions(
+            &metadata,
+            &helper_uri,
+            Some(&root_uri),
+            &CompiledWorkspaceExclusions::default(),
+        );
+
+        assert_eq!(
+            expansion.selected_shiny_entry,
+            Some(root.join("app.R").canonicalize().unwrap())
+        );
+        assert!(expansion.sources.is_empty());
+        assert_eq!(
+            expansion.shiny_application.unwrap().role,
+            super::super::types::ShinyFileRole::Helper { ordinal: 1 }
+        );
+        assert_eq!(
+            expansion.application_working_directory,
+            Some(root.to_path_buf())
+        );
     }
 
     #[test]
@@ -1271,6 +1473,19 @@ mod tests {
         assert!(!paths_overlap(
             Path::new("/workspace/R"),
             Path::new("/workspace/other")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overlap_equates_normal_and_verbatim_windows_roots() {
+        assert!(paths_overlap(
+            Path::new(r"C:\real-app\R\helper.R"),
+            Path::new(r"\\?\c:\REAL-APP")
+        ));
+        assert!(paths_overlap(
+            Path::new(r"\\server\share\real-app\app.R"),
+            Path::new(r"\\?\UNC\SERVER\SHARE\real-app")
         ));
     }
 

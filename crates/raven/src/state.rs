@@ -6205,13 +6205,59 @@ impl WorldState {
         for event_path in &event_paths {
             for (watch_path, owners) in &self.tar_source_parents_by_watch_path {
                 if crate::cross_file::tar_source::paths_overlap(event_path, watch_path) {
-                    parents.extend(owners.iter().cloned());
+                    parents.extend(
+                        owners
+                            .iter()
+                            .filter(|parent| {
+                                self.source_batch_filesystem_event_affects_parent(
+                                    parent, event_path,
+                                )
+                            })
+                            .cloned(),
+                    );
                 }
             }
         }
         let mut parents: Vec<_> = parents.into_iter().collect();
         parents.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
         parents
+    }
+
+    /// Refine generic recursive watch-root overlap for implicit Shiny layouts.
+    ///
+    /// Explicit `tar_source()` and `list.files()` batches retain their existing
+    /// recursive matching. A Shiny-only owner instead follows the convention's
+    /// direct-child topology so unrelated application-root descendants do not
+    /// force an open-parent refresh.
+    fn source_batch_filesystem_event_affects_parent(
+        &self,
+        parent: &Url,
+        event_path: &Path,
+    ) -> bool {
+        let metadata = if let Some(record) = self.documents.get_record(parent) {
+            Some(Arc::clone(record.metadata()))
+        } else if self.is_document_open_or_alias(parent) {
+            None
+        } else {
+            self.workspace_index.get_metadata(parent)
+        };
+        let Some(metadata) = metadata else {
+            return true;
+        };
+        if !metadata.tar_source_requests.is_empty()
+            || !metadata.list_files_source_requests.is_empty()
+        {
+            return true;
+        }
+        metadata
+            .shiny_application
+            .as_ref()
+            .is_none_or(|application| {
+                crate::cross_file::shiny::filesystem_event_affects_application(
+                    application,
+                    event_path,
+                )
+            })
     }
 
     fn bump_tar_source_watch_path_generation(&mut self, path: &Path) {
@@ -11888,13 +11934,15 @@ pub(crate) fn derive_workspace_dependency_graph(
                 previous,
                 uri,
                 workspace_root,
+                &context.exclusions,
             )
         });
         if !reused {
-            crate::cross_file::tar_source::finalize_tar_source_requests(
+            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 metadata,
                 uri,
                 workspace_root,
+                &context.exclusions,
             );
         }
         let analysis = entry.contents.to_string();
@@ -11917,13 +11965,15 @@ pub(crate) fn derive_workspace_dependency_graph(
                     previous,
                     uri,
                     workspace_root,
+                    &context.exclusions,
                 )
             });
         if !reused {
-            crate::cross_file::tar_source::finalize_tar_source_requests(
+            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 metadata,
                 uri,
                 workspace_root,
+                &context.exclusions,
             );
         }
     }
@@ -12487,10 +12537,11 @@ pub fn scan_workspace_with_exclusions(
     }
 
     for (uri, entry) in &mut entries {
-        crate::cross_file::tar_source::finalize_tar_source_requests(
+        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
             Arc::make_mut(&mut entry.metadata),
             uri,
             workspace_root.as_ref(),
+            exclusions,
         );
         let analysis = entry.contents.to_string();
         entry.artifacts = Arc::new(match entry.tree.as_ref() {
@@ -14323,6 +14374,112 @@ mod tests {
                 .iter()
                 .any(|path| path.ends_with("generated/ignored.R")),
             "excluded generated directory must be skipped; got {indexed_paths:?}"
+        );
+    }
+
+    #[test]
+    fn changed_exclusions_refinalize_open_shiny_and_closed_tar_source_batches() {
+        use serde_json::json;
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shiny_root = tmp.path().join("shiny");
+        let pipeline_root = tmp.path().join("pipeline");
+        fs::create_dir_all(shiny_root.join("R")).unwrap();
+        fs::create_dir_all(pipeline_root.join("R")).unwrap();
+        fs::write(shiny_root.join("app.R"), "shiny_helper\n").unwrap();
+        fs::write(shiny_root.join("R/helper.R"), "shiny_helper <- 1\n").unwrap();
+        fs::write(
+            pipeline_root.join("_targets.R"),
+            "targets::tar_source(\"R\")\ntar_helper\n",
+        )
+        .unwrap();
+        fs::write(pipeline_root.join("R/helper.R"), "tar_helper <- 1\n").unwrap();
+
+        let root_uri = Url::from_directory_path(tmp.path()).unwrap();
+        let app_uri = Url::from_file_path(shiny_root.join("app.R")).unwrap();
+        let targets_uri = Url::from_file_path(pipeline_root.join("_targets.R")).unwrap();
+        let mut entries = scan_workspace(std::slice::from_ref(&root_uri), 20);
+
+        let app_entry = entries.get(&app_uri).unwrap();
+        let shiny_helper_uri = app_entry
+            .metadata
+            .sources
+            .iter()
+            .find_map(|source| {
+                source
+                    .is_source_batch_member()
+                    .then_some(source.resolved_uri.clone())
+            })
+            .flatten()
+            .expect("initial Shiny expansion must contain its helper");
+        let tar_helper_uri = entries[&targets_uri]
+            .metadata
+            .sources
+            .iter()
+            .find_map(|source| {
+                source
+                    .is_source_batch_member()
+                    .then_some(source.resolved_uri.clone())
+            })
+            .flatten()
+            .expect("initial tar_source expansion must contain its helper");
+        let open_overlay = WorkspaceGraphOverlay {
+            uri: app_uri.clone(),
+            content: app_entry.contents.clone(),
+            chunk_kind: ChunkKind::R,
+            metadata: Some(app_entry.metadata.clone()),
+            graph_roots: vec![app_uri.clone()],
+            excluded: false,
+        };
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &json!({
+                "workspace": {
+                    "exclude": ["shiny/R/**", "pipeline/R/**"]
+                }
+            }),
+            vec![tmp.path().to_path_buf()],
+        );
+        let context = WorkspaceGraphDerivationContext {
+            workspace_root: Some(root_uri),
+            max_depth: 20,
+            exclusions,
+            system_file_workspace_name: None,
+            system_file_workspace_root: None,
+            system_file_library_paths: Vec::new(),
+        };
+
+        let (graph, open_metadata) =
+            derive_workspace_dependency_graph(&mut entries, None, &[open_overlay], &context, false);
+
+        assert!(
+            open_metadata[&app_uri]
+                .sources
+                .iter()
+                .all(|source| source.resolved_uri.as_ref() != Some(&shiny_helper_uri)),
+            "changed exclusions must invalidate the open Shiny expansion"
+        );
+        assert!(
+            entries[&targets_uri]
+                .metadata
+                .sources
+                .iter()
+                .all(|source| source.resolved_uri.as_ref() != Some(&tar_helper_uri)),
+            "changed exclusions must invalidate the closed tar_source expansion"
+        );
+        assert!(
+            graph
+                .get_dependencies(&app_uri)
+                .iter()
+                .all(|edge| edge.to != shiny_helper_uri),
+            "excluded Shiny helpers must leave the dependency graph"
+        );
+        assert!(
+            graph
+                .get_dependencies(&targets_uri)
+                .iter()
+                .all(|edge| edge.to != tar_helper_uri),
+            "excluded tar_source members must leave the dependency graph"
         );
     }
 
@@ -16792,7 +16949,7 @@ mod tests {
         }));
         assert!(entry.artifacts.timeline.iter().any(|event| matches!(
             event,
-            crate::cross_file::scope::ScopeEvent::TarBatch { members, .. }
+            crate::cross_file::scope::ScopeEvent::SourceBatch { members, .. }
                 if members.len() == 1
         )));
 

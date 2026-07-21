@@ -221,8 +221,23 @@ pub struct CrossFileMetadata {
     /// The historical field name is retained for metadata compatibility.
     #[serde(default)]
     pub tar_source_expansion_watch_paths: Vec<std::path::PathBuf>,
+    /// Project exclusion patterns used by the last filesystem expansion.
+    ///
+    /// Reuse is valid only when these match the current compiled exclusions;
+    /// otherwise entries, helpers, or disable markers may remain stale.
+    #[serde(default)]
+    pub source_batch_exclusion_patterns: Vec<String>,
+    /// Implicit Shiny application context derived during filesystem enrichment.
+    ///
+    /// This is retained even for candidate files in an incomplete layout so the
+    /// application directory remains watched for entry-file mode transitions.
+    #[serde(default)]
+    pub shiny_application: Option<ShinyApplicationMetadata>,
     /// Working directory override (explicit `# raven: cd`)
     pub working_directory: Option<String>,
+    /// Shiny application directory used while convention-loaded files execute.
+    #[serde(default)]
+    pub application_working_directory: Option<String>,
     /// Working directory inherited from parent via backward directive.
     /// This is populated when a file has a backward directive (`# raven: sourced-by`, etc.)
     /// pointing to a parent file, and the parent has an effective working directory.
@@ -354,6 +369,144 @@ pub struct ListFilesSourceRequest {
 pub enum SourceBatchKind {
     TarSource,
     ListFiles,
+    /// Legacy `global.R`, evaluated in the global environment before support.
+    ShinyGlobal,
+    /// Top-level `R/*.[Rr]` helpers evaluated in one shared support environment.
+    Shiny,
+}
+
+impl SourceBatchKind {
+    /// Whether this batch executes before any source position in its parent.
+    pub(crate) fn is_pre_entry(self) -> bool {
+        matches!(self, Self::ShinyGlobal | Self::Shiny)
+    }
+}
+
+/// Selected implicit Shiny application mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ShinyApplicationMode {
+    Legacy,
+    SingleFile,
+}
+
+/// One file's role in an implicit Shiny application topology.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ShinyFileRole {
+    /// A conventional candidate that is not active in the selected layout.
+    Candidate,
+    LegacyGlobal,
+    Helper {
+        ordinal: u32,
+    },
+    AppEntry,
+    UiEntry,
+    ServerEntry,
+}
+
+impl ShinyFileRole {
+    pub(crate) fn is_entry(&self) -> bool {
+        matches!(self, Self::AppEntry | Self::UiEntry | Self::ServerEntry)
+    }
+
+    pub(crate) fn helper_ordinal(&self) -> Option<u32> {
+        match self {
+            Self::Helper { ordinal } => Some(*ordinal),
+            _ => None,
+        }
+    }
+}
+
+/// Visibility of one Shiny participant's foreign declarations from another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShinyDeclarationVisibility {
+    Never,
+    /// Visible only while analyzing a function body, after the shared support
+    /// environment has been completely populated.
+    DeferredOnly,
+    Always,
+}
+
+/// Filesystem-derived implicit Shiny application context for one file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ShinyApplicationMetadata {
+    /// Lexical application directory used as the runtime working directory.
+    pub application_root: String,
+    /// Canonical physical application identity used across URI aliases.
+    ///
+    /// Older serialized metadata falls back to `application_root`.
+    #[serde(default)]
+    pub application_identity: Option<String>,
+    /// `None` for an incomplete candidate layout without `server.R` or `app.R`.
+    pub mode: Option<ShinyApplicationMode>,
+    pub role: ShinyFileRole,
+}
+
+impl ShinyApplicationMetadata {
+    fn identity(&self) -> &str {
+        self.application_identity
+            .as_deref()
+            .unwrap_or(&self.application_root)
+    }
+
+    /// Whether this file participates in the selected implicit runtime layout.
+    ///
+    /// Candidate metadata is retained to watch incomplete and mode-incompatible
+    /// conventional paths, but candidates must keep ordinary file semantics.
+    pub(crate) fn is_active_participant(&self) -> bool {
+        self.mode.is_some() && !matches!(self.role, ShinyFileRole::Candidate)
+    }
+
+    pub(crate) fn is_same_active_application(&self, other: &Self) -> bool {
+        self.is_active_participant()
+            && other.is_active_participant()
+            && self.mode == other.mode
+            && self.identity() == other.identity()
+    }
+
+    /// Classify declaration visibility from `declaration` into `self`.
+    ///
+    /// Returns `None` when the files do not belong to the same active implicit
+    /// application; callers then retain ordinary source-graph propagation.
+    /// Within one application, legacy global declarations flow forward into
+    /// support and entries, helper declarations flow eagerly only to later
+    /// helpers but late-bind throughout completed support function bodies, and
+    /// entry-local declarations never flow to support or sibling entries.
+    pub(crate) fn declaration_visibility_from(
+        &self,
+        declaration: &Self,
+    ) -> Option<ShinyDeclarationVisibility> {
+        if !self.is_same_active_application(declaration) {
+            return None;
+        }
+
+        use ShinyDeclarationVisibility::{Always, DeferredOnly, Never};
+        let visibility = match (&self.role, &declaration.role) {
+            // Entry-local and inactive-candidate declarations never lend to
+            // another participant in the implicit application.
+            (_, ShinyFileRole::Candidate)
+            | (_, ShinyFileRole::AppEntry)
+            | (_, ShinyFileRole::UiEntry)
+            | (_, ShinyFileRole::ServerEntry) => Never,
+
+            // Legacy global executes before support and entries, but does not
+            // see declarations made by those later environments.
+            (ShinyFileRole::Helper { .. }, ShinyFileRole::LegacyGlobal) => Always,
+            (role, ShinyFileRole::LegacyGlobal) if role.is_entry() => Always,
+            (_, ShinyFileRole::LegacyGlobal) => Never,
+
+            // Entries are created after the support batch is complete.
+            (role, ShinyFileRole::Helper { .. }) if role.is_entry() => Always,
+
+            // Eager helper code sees only the ordered prefix. Function bodies
+            // close over the completed shared support environment.
+            (query, declaration) => match (query.helper_ordinal(), declaration.helper_ordinal()) {
+                (Some(query), Some(declaration)) if declaration < query => Always,
+                (Some(query), Some(declaration)) if declaration != query => DeferredOnly,
+                _ => Never,
+            },
+        };
+        Some(visibility)
+    }
 }
 
 impl CrossFileMetadata {
@@ -371,6 +524,13 @@ impl CrossFileMetadata {
     /// `any_nse_or_func_directives` signal that drives the skip.
     pub fn has_nse_or_func_directives(&self) -> bool {
         !self.nse_declarations.is_empty() || !self.declared_functions.is_empty()
+    }
+
+    /// Whether this file owns filesystem-derived ordered source topology.
+    pub fn has_source_batch_topology(&self) -> bool {
+        !self.tar_source_requests.is_empty()
+            || !self.list_files_source_requests.is_empty()
+            || self.shiny_application.is_some()
     }
 }
 
@@ -691,6 +851,66 @@ pub fn enrich_metadata_with_inherited_wd<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shiny(role: ShinyFileRole, mode: ShinyApplicationMode) -> ShinyApplicationMetadata {
+        ShinyApplicationMetadata {
+            application_root: "/workspace/app".to_string(),
+            application_identity: None,
+            mode: Some(mode),
+            role,
+        }
+    }
+
+    #[test]
+    fn shiny_declaration_visibility_matches_environment_phases() {
+        use ShinyDeclarationVisibility::{Always, DeferredOnly, Never};
+        use ShinyFileRole::{AppEntry, Candidate, Helper, LegacyGlobal, ServerEntry, UiEntry};
+
+        let global = shiny(LegacyGlobal, ShinyApplicationMode::Legacy);
+        let first = shiny(Helper { ordinal: 0 }, ShinyApplicationMode::Legacy);
+        let second = shiny(Helper { ordinal: 1 }, ShinyApplicationMode::Legacy);
+        let ui = shiny(UiEntry, ShinyApplicationMode::Legacy);
+        let server = shiny(ServerEntry, ShinyApplicationMode::Legacy);
+
+        assert_eq!(first.declaration_visibility_from(&global), Some(Always));
+        assert_eq!(global.declaration_visibility_from(&first), Some(Never));
+        assert_eq!(second.declaration_visibility_from(&first), Some(Always));
+        assert_eq!(
+            first.declaration_visibility_from(&second),
+            Some(DeferredOnly)
+        );
+        assert_eq!(ui.declaration_visibility_from(&second), Some(Always));
+        assert_eq!(server.declaration_visibility_from(&ui), Some(Never));
+
+        let app = shiny(AppEntry, ShinyApplicationMode::SingleFile);
+        let single_helper = shiny(Helper { ordinal: 0 }, ShinyApplicationMode::SingleFile);
+        assert_eq!(
+            app.declaration_visibility_from(&single_helper),
+            Some(Always)
+        );
+        assert_eq!(single_helper.declaration_visibility_from(&app), Some(Never));
+
+        let candidate = shiny(Candidate, ShinyApplicationMode::Legacy);
+        assert!(!candidate.is_active_participant());
+        assert!(!candidate.is_same_active_application(&server));
+        assert!(!server.is_same_active_application(&candidate));
+        assert_eq!(candidate.declaration_visibility_from(&server), None);
+        assert_eq!(server.declaration_visibility_from(&candidate), None);
+
+        let mut other = second.clone();
+        other.application_root = "/workspace/other".to_string();
+        assert_eq!(first.declaration_visibility_from(&other), None);
+
+        let mut alias = first.clone();
+        alias.application_root = "/workspace/alias".to_string();
+        alias.application_identity = Some("/workspace/real".to_string());
+        let mut canonical = second.clone();
+        canonical.application_identity = Some("/workspace/real".to_string());
+        assert_eq!(
+            alias.declaration_visibility_from(&canonical),
+            Some(DeferredOnly)
+        );
+    }
 
     /// Four-state matrix for the missing-file-diagnostics exemption: only a
     /// branch-2 resolved entry (resolved_uri set) or an inert unresolved

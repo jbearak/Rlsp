@@ -7315,15 +7315,15 @@ fn collect_in_play_packages(
 /// Foreign `# raven: nse` / `# raven: func` declarations propagated to `uri` from
 /// the files connected to it through the source graph (issue #460).
 struct CrossFileNse {
-    /// Foreign NSE declarations, collapsed to at most one per `(name, package)`.
+    /// Foreign declarations visible to eager top-level code in the query file.
     nse: Vec<crate::cross_file::types::NseDeclaration>,
-    /// Every formals-bearing foreign `# raven: func` declaration (package
-    /// qualifier retained). Conflict resolution is deferred to
-    /// [`unanimous_declared_formals`], which matches by name+package and accepts
-    /// an order only when all matching declarations agree — so distinct qualified
-    /// functions sharing a bare name keep their own orders and `line` is never
-    /// compared across files.
+    /// Formals declarations visible to eager top-level code.
     funcs: Vec<crate::cross_file::types::DeclaredSymbol>,
+    /// Foreign declarations visible from function bodies. This differs only for
+    /// a Shiny helper, whose functions close over completed support.
+    deferred_nse: Vec<crate::cross_file::types::NseDeclaration>,
+    /// Formals declarations visible from function bodies.
+    deferred_funcs: Vec<crate::cross_file::types::DeclaredSymbol>,
 }
 
 /// Collect the foreign NSE/func declarations that govern `uri` (issue #460).
@@ -7368,7 +7368,7 @@ struct CrossFileNse {
 /// latest-wins rule, since a foreign file has no call site). This yields at most
 /// one foreign declaration per `(name, package)` (NSE) / bare `name` (func).
 fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFileNse {
-    use std::collections::BTreeMap;
+    use crate::cross_file::types::ShinyDeclarationVisibility;
 
     // A bounded neighborhood can contain a declaration whose edit-time inverse
     // walk omits this query under the same visited/depth budget. Propagating that
@@ -7379,6 +7379,8 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
         return CrossFileNse {
             nse: Vec::new(),
             funcs: Vec::new(),
+            deferred_nse: Vec::new(),
+            deferred_funcs: Vec::new(),
         };
     }
 
@@ -7387,14 +7389,12 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
     let max_visited = snapshot.cross_file_config.max_transitive_dependents_visited;
 
     // The revalidation-consistent set `S(uri) = ancestors ∪ descendants(ancestors
-    // ∪ {uri})`, shared with
-    // `compute_affected_dependents_after_edit` via
-    // `DependencyGraph::revalidation_consistent_set` so collection and
-    // revalidation use the identical traversal shape (full directed-inverse
-    // equivalence also requires matching budgets + the safe trimmed-vs-full graph
-    // asymmetry — see the helper's doc). The helper does not exclude `uri` or
-    // dedup across its two halves; we apply the collection-side post-processing
-    // (drop self, sort, dedup) here.
+    // ∪ {uri})`, shared with `compute_affected_dependents_after_edit`. Shiny adds
+    // a post-traversal visibility filter without changing the traversal: entry
+    // declarations do not lend backward, and a later helper lends only to
+    // function bodies in earlier helpers. Revalidation intentionally retains the
+    // unfiltered superset, so every declaration this collector accepts still has
+    // a guaranteed inverse republish path.
     let mut members: Vec<Url> = graph
         .revalidation_consistent_set(uri, max_depth, max_visited)
         .filter(|u| u != uri)
@@ -7402,83 +7402,114 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
     members.sort();
     members.dedup();
 
-    // Per `(name, package)`: within a file the highest-line declaration wins
-    // (file-level intent); across files the smallest-URI declaration wins —
-    // EXCEPT that a narrower per-formal scope always beats a broader whole-call,
-    // even from a larger-URI file. NSE scope (unlike a `# raven: func` formal
-    // order) has a well-defined "less suppressive" choice, so on a cross-file
-    // whole-call-vs-per-formal conflict we keep the per-formal rather than risk a
-    // broad propagated whole-call masking an argument a connected file's narrower
-    // directive would keep checked. (Two differing per-formal scopes still resolve
-    // by smallest URI — both are explicit user captures.)
+    let query_shiny = snapshot
+        .metadata_map
+        .get(uri)
+        .and_then(|meta| meta.shiny_application.as_ref());
+    let mut eager_members = Vec::with_capacity(members.len());
+    let mut deferred_members = Vec::with_capacity(members.len());
+    for member in members {
+        let visibility = query_shiny
+            .zip(
+                snapshot
+                    .metadata_map
+                    .get(&member)
+                    .and_then(|meta| meta.shiny_application.as_ref()),
+            )
+            .and_then(|(query, declaration)| query.declaration_visibility_from(declaration));
+        match visibility.unwrap_or(ShinyDeclarationVisibility::Always) {
+            ShinyDeclarationVisibility::Never => {}
+            ShinyDeclarationVisibility::DeferredOnly => deferred_members.push(member),
+            ShinyDeclarationVisibility::Always => {
+                eager_members.push(member.clone());
+                deferred_members.push(member);
+            }
+        }
+    }
+
+    let (nse, funcs) = collapse_cross_file_nse(snapshot, &eager_members);
+    let (deferred_nse, deferred_funcs) = if eager_members == deferred_members {
+        (nse.clone(), funcs.clone())
+    } else {
+        collapse_cross_file_nse(snapshot, &deferred_members)
+    };
+    CrossFileNse {
+        nse,
+        funcs,
+        deferred_nse,
+        deferred_funcs,
+    }
+}
+
+/// Deterministically collapse declarations from an already visibility-filtered
+/// member set. The same reducer is used for eager and deferred Shiny phases.
+fn collapse_cross_file_nse(
+    snapshot: &DiagnosticsSnapshot,
+    members: &[Url],
+) -> (
+    Vec<crate::cross_file::types::NseDeclaration>,
+    Vec<crate::cross_file::types::DeclaredSymbol>,
+) {
     use crate::cross_file::types::NseScope;
+    use std::collections::BTreeMap;
+
+    // Per `(name, package)`: latest wins within one file; across files the
+    // smallest URI wins except that a narrower per-formal declaration beats a
+    // whole-call declaration to avoid hiding additional diagnostics.
     let mut nse_chosen: BTreeMap<
         (String, Option<String>),
         (Url, crate::cross_file::types::NseDeclaration),
     > = BTreeMap::new();
-    // All formals-bearing foreign `# raven: func` declarations, kept verbatim
-    // (package qualifier and all). Conflict resolution is deferred to
-    // `unanimous_declared_formals`, which matches by name+package via
-    // `declared_name_matches` and accepts an order only when every matching
-    // declaration agrees — so distinct qualified functions sharing a bare name
-    // (`pkgA::f` vs `pkgB::f`) keep their own orders (issue #460 review: a
-    // bare-name collapse here wrongly conflated them), genuinely-conflicting
-    // same-name+package orders fall back to safe named-only matching, and `line`
-    // is never compared across files.
     let mut funcs: Vec<crate::cross_file::types::DeclaredSymbol> = Vec::new();
-    for m in &members {
-        let Some(meta) = snapshot.metadata_map.get(m) else {
+    for member in members {
+        let Some(meta) = snapshot.metadata_map.get(member) else {
             continue;
         };
-        for d in &meta.nse_declarations {
-            let key = (d.name.clone(), d.package.clone());
+        for declaration in &meta.nse_declarations {
+            let key = (declaration.name.clone(), declaration.package.clone());
             match nse_chosen.get(&key) {
                 None => {
-                    nse_chosen.insert(key, (m.clone(), d.clone()));
+                    nse_chosen.insert(key, (member.clone(), declaration.clone()));
                 }
-                // Same file: latest line wins (file-level latest-wins).
-                Some((u, existing)) if u == m => {
-                    if d.line > existing.line {
-                        nse_chosen.insert(key, (m.clone(), d.clone()));
+                Some((uri, existing)) if uri == member => {
+                    if declaration.line > existing.line {
+                        nse_chosen.insert(key, (member.clone(), declaration.clone()));
                     }
                 }
-                // Earlier (smaller-URI) file already chose: switch only if the new
-                // declaration is strictly LESS suppressive (per-formal beats the
-                // existing whole-call), so a broad propagated whole-call cannot
-                // mask args a narrower directive keeps checked.
                 Some((_, existing)) => {
                     if matches!(existing.scope, NseScope::WholeCall)
-                        && matches!(d.scope, NseScope::Formals(_))
+                        && matches!(declaration.scope, NseScope::Formals(_))
                     {
-                        nse_chosen.insert(key, (m.clone(), d.clone()));
+                        nse_chosen.insert(key, (member.clone(), declaration.clone()));
                     }
                 }
             }
         }
-        // Within a file, keep only the LATEST (highest-line) formals-bearing
-        // declaration per full callee name (`pkg::name` is distinct from bare
-        // `name`), mirroring the own-file latest-wins rule — so an obsolete
-        // earlier `# raven: func` line does not make `unanimous_declared_formals`
-        // see a same-file old/new pair as a cross-file conflict. Cross-file
-        // conflicts between the per-file winners are still resolved there.
+
+        // Keep the latest formals-bearing declaration for each full callee name
+        // within a file. Cross-file agreement is resolved later.
         let mut latest: BTreeMap<&str, &crate::cross_file::types::DeclaredSymbol> = BTreeMap::new();
-        for d in &meta.declared_functions {
-            if d.formals.is_none() {
+        for declaration in &meta.declared_functions {
+            if declaration.formals.is_none() {
                 continue;
             }
-            match latest.get(d.name.as_str()) {
-                Some(prev) if prev.line >= d.line => {}
+            match latest.get(declaration.name.as_str()) {
+                Some(previous) if previous.line >= declaration.line => {}
                 _ => {
-                    latest.insert(d.name.as_str(), d);
+                    latest.insert(declaration.name.as_str(), declaration);
                 }
             }
         }
         funcs.extend(latest.into_values().cloned());
     }
-    CrossFileNse {
-        nse: nse_chosen.into_values().map(|(_, d)| d).collect(),
+
+    (
+        nse_chosen
+            .into_values()
+            .map(|(_, declaration)| declaration)
+            .collect(),
         funcs,
-    }
+    )
 }
 
 /// The formal order a set of `# raven: func` declarations supplies for a
@@ -7593,6 +7624,8 @@ fn collect_undefined_variables_from_snapshot(
         CrossFileNse {
             nse: Vec::new(),
             funcs: Vec::new(),
+            deferred_nse: Vec::new(),
+            deferred_funcs: Vec::new(),
         }
     };
     let nse_analysis = NseAnalysis::build(
@@ -7612,6 +7645,8 @@ fn collect_undefined_variables_from_snapshot(
         &snapshot.directive_meta.declared_functions,
         &cross_file_nse.nse,
         &cross_file_nse.funcs,
+        &cross_file_nse.deferred_nse,
+        &cross_file_nse.deferred_funcs,
     );
     let mut used: Vec<(String, Node)> = Vec::new();
     collect_usages_with_analysis(
@@ -15113,6 +15148,10 @@ pub(crate) struct NseAnalysis<'a> {
     /// narrower than Raven's own inference can re-surface diagnostics the verb
     /// tables would otherwise have suppressed. The user owns the accuracy.
     directive_nse: HashMap<String, Vec<DirectiveNsePolicy>>,
+    /// Shiny-helper variant used while walking function bodies, where later
+    /// helpers are visible through the completed support environment. Equal to
+    /// `directive_nse` for every other topology.
+    deferred_directive_nse: HashMap<String, Vec<DirectiveNsePolicy>>,
 }
 
 impl<'a> NseAnalysis<'a> {
@@ -15140,6 +15179,8 @@ impl<'a> NseAnalysis<'a> {
         declared_functions: &[crate::cross_file::types::DeclaredSymbol],
         foreign_nse_declarations: &[crate::cross_file::types::NseDeclaration],
         foreign_funcs: &[crate::cross_file::types::DeclaredSymbol],
+        deferred_foreign_nse_declarations: &[crate::cross_file::types::NseDeclaration],
+        deferred_foreign_funcs: &[crate::cross_file::types::DeclaredSymbol],
     ) -> Self {
         let mut local_function_defs: HashMap<String, Node> = HashMap::new();
         let mut local_callee_shadows = HashSet::new();
@@ -15226,6 +15267,7 @@ impl<'a> NseAnalysis<'a> {
             package_library,
             base_exports,
             directive_nse: HashMap::new(),
+            deferred_directive_nse: HashMap::new(),
         };
         // Issue #433, second (context-aware) inference pass: a local function
         // that forwards its `...` directly into a covered verb's data-mask
@@ -15316,130 +15358,115 @@ impl<'a> NseAnalysis<'a> {
         // the call-args-enabled path: when call arguments are blanket-suppressed
         // the policies are never consulted, so the work is skipped via the
         // `!call_args_enabled` early return above.
-        let mut directive_nse: HashMap<String, Vec<DirectiveNsePolicy>> = HashMap::new();
-        // Translate one declaration into an `ArgPolicy`. Formal order (for
-        // positional per-formal matching) resolves OWN-first — own `# raven: func`,
-        // then a visible local `name <- function(...)` (bare names only,
-        // non-ambiguous), then a FOREIGN `# raven: func` propagated from a
-        // connected file (issue #460) — and finally named-only. Foreign order is
-        // consulted last via `unanimous_declared_formals`, which resolves by
-        // name+package agreement (not `max_by_key(line)`, since cross-file lines
-        // are not comparable) — so distinct qualified functions sharing a bare
-        // name keep their own orders. Shared by the own- and foreign-declaration
-        // loops below so both honor identical shaping (the `...`-boundary handling
-        // for captured-but-unordered names).
-        let to_policy = |decl: &crate::cross_file::types::NseDeclaration| -> crate::nse::ArgPolicy {
-            use crate::cross_file::types::NseScope;
-            match &decl.scope {
-                NseScope::WholeCall => crate::nse::ArgPolicy::WholeCall,
-                NseScope::Formals(listed) => {
-                    let captured_dots = listed.iter().any(|c| c == "...");
-                    let captured: Vec<String> = listed
-                        .iter()
-                        .filter(|c| c.as_str() != "...")
-                        .cloned()
-                        .collect();
-                    let order = declared_function_formals(
-                        declared_functions,
-                        &decl.name,
-                        decl.package.as_deref(),
-                    )
-                    .or_else(|| {
-                        // Only a *bare* `# raven: nse name` may borrow a
-                        // visible local `name <- function(...)` signature.
-                        // A qualified `pkg::name` must not (local defs are
-                        // keyed by bare name). A name redefined under
-                        // conflicting orders is ambiguous → fall through.
-                        if decl.package.is_some() {
-                            return None;
-                        }
-                        if formal_order.is_ambiguous(&decl.name) {
-                            return None;
-                        }
-                        local_function_defs
-                            .get(&decl.name)
-                            .map(|def| function_formal_names(*def, text))
-                            .filter(|f| !f.is_empty())
-                    })
-                    // Issue #460: a foreign `# raven: func` from a connected
-                    // file supplies order when no own context does, resolved by
-                    // unanimity (no cross-file line comparison).
-                    .or_else(|| {
-                        unanimous_declared_formals(
-                            foreign_funcs,
-                            &decl.name,
-                            decl.package.as_deref(),
-                        )
-                    });
-                    match order {
-                        Some(mut formals) => {
-                            // Captured names absent from the resolved order may be
-                            // matched by NAME but must never bind a positional slot;
-                            // place them after a `...` boundary so the positional
-                            // pass stops before them.
-                            let missing: Vec<String> = captured
-                                .iter()
-                                .filter(|c| !formals.contains(*c))
-                                .cloned()
-                                .collect();
-                            if !missing.is_empty() {
-                                if !formals.iter().any(|f| f == "...") {
-                                    formals.push("...".to_string());
+        let build_directive_nse =
+            |phase_foreign_nse: &[crate::cross_file::types::NseDeclaration],
+             phase_foreign_funcs: &[crate::cross_file::types::DeclaredSymbol]| {
+                let mut directive_nse: HashMap<String, Vec<DirectiveNsePolicy>> = HashMap::new();
+                // Translate one declaration into an `ArgPolicy`. Formal order resolves
+                // own `# raven: func`, then a visible local definition, then the
+                // foreign formals visible in this eager/deferred phase.
+                let to_policy =
+                    |decl: &crate::cross_file::types::NseDeclaration| -> crate::nse::ArgPolicy {
+                        use crate::cross_file::types::NseScope;
+                        match &decl.scope {
+                            NseScope::WholeCall => crate::nse::ArgPolicy::WholeCall,
+                            NseScope::Formals(listed) => {
+                                let captured_dots = listed.iter().any(|c| c == "...");
+                                let captured: Vec<String> = listed
+                                    .iter()
+                                    .filter(|c| c.as_str() != "...")
+                                    .cloned()
+                                    .collect();
+                                let order = declared_function_formals(
+                                    declared_functions,
+                                    &decl.name,
+                                    decl.package.as_deref(),
+                                )
+                                .or_else(|| {
+                                    if decl.package.is_some()
+                                        || formal_order.is_ambiguous(&decl.name)
+                                    {
+                                        return None;
+                                    }
+                                    local_function_defs
+                                        .get(&decl.name)
+                                        .map(|def| function_formal_names(*def, text))
+                                        .filter(|formals| !formals.is_empty())
+                                })
+                                .or_else(|| {
+                                    unanimous_declared_formals(
+                                        phase_foreign_funcs,
+                                        &decl.name,
+                                        decl.package.as_deref(),
+                                    )
+                                });
+                                match order {
+                                    Some(mut formals) => {
+                                        let missing: Vec<String> = captured
+                                            .iter()
+                                            .filter(|capture| !formals.contains(*capture))
+                                            .cloned()
+                                            .collect();
+                                        if !missing.is_empty() {
+                                            if !formals.iter().any(|formal| formal == "...") {
+                                                formals.push("...".to_string());
+                                            }
+                                            formals.extend(missing);
+                                        }
+                                        crate::nse::ArgPolicy::PerFormal {
+                                            formals,
+                                            captured,
+                                            captured_dots,
+                                        }
+                                    }
+                                    None => {
+                                        let mut formals = vec!["...".to_string()];
+                                        formals.extend(captured.iter().cloned());
+                                        crate::nse::ArgPolicy::PerFormal {
+                                            formals,
+                                            captured,
+                                            captured_dots,
+                                        }
+                                    }
                                 }
-                                formals.extend(missing);
-                            }
-                            crate::nse::ArgPolicy::PerFormal {
-                                formals,
-                                captured,
-                                captured_dots,
                             }
                         }
-                        None => {
-                            let mut formals = vec!["...".to_string()];
-                            formals.extend(captured.iter().cloned());
-                            crate::nse::ArgPolicy::PerFormal {
-                                formals,
-                                captured,
-                                captured_dots,
-                            }
-                        }
-                    }
+                    };
+
+                // Own declarations remain position-gated in both phase maps. Building
+                // them twice is necessary because a per-formal declaration can borrow
+                // a later helper's `# raven: func` order only from a function body.
+                for declaration in nse_declarations {
+                    directive_nse
+                        .entry(declaration.name.clone())
+                        .or_default()
+                        .push(DirectiveNsePolicy {
+                            line: declaration.line,
+                            package: declaration.package.clone(),
+                            policy: to_policy(declaration),
+                            file_level: false,
+                        });
                 }
-            }
-        };
-        // Own (current-file) declarations: position-gated, latest-wins.
-        for decl in nse_declarations {
-            directive_nse
-                .entry(decl.name.clone())
-                .or_default()
-                .push(DirectiveNsePolicy {
-                    line: decl.line,
-                    package: decl.package.clone(),
-                    policy: to_policy(decl),
-                    file_level: false,
-                });
-        }
-        // Foreign declarations propagated from connected files (issue #460):
-        // file-level (no line gate), one per (name, package) after the collector's
-        // collapse. `line` is set to 0 (unused for file-level entries).
-        for decl in foreign_nse_declarations {
-            directive_nse
-                .entry(decl.name.clone())
-                .or_default()
-                .push(DirectiveNsePolicy {
-                    line: 0,
-                    package: decl.package.clone(),
-                    policy: to_policy(decl),
-                    file_level: true,
-                });
-        }
-        // Sort own entries by line (latest-wins via reverse scan); file-level
-        // foreign entries sort after own ones so the own-first lookup tier finds
-        // a position-applicable own directive before any foreign fallback.
-        for entries in directive_nse.values_mut() {
-            entries.sort_by_key(|e| (e.file_level, e.line));
-        }
-        analysis.directive_nse = directive_nse;
+                for declaration in phase_foreign_nse {
+                    directive_nse
+                        .entry(declaration.name.clone())
+                        .or_default()
+                        .push(DirectiveNsePolicy {
+                            line: 0,
+                            package: declaration.package.clone(),
+                            policy: to_policy(declaration),
+                            file_level: true,
+                        });
+                }
+                for entries in directive_nse.values_mut() {
+                    entries.sort_by_key(|entry| (entry.file_level, entry.line));
+                }
+                directive_nse
+            };
+
+        analysis.directive_nse = build_directive_nse(foreign_nse_declarations, foreign_funcs);
+        analysis.deferred_directive_nse =
+            build_directive_nse(deferred_foreign_nse_declarations, deferred_foreign_funcs);
 
         analysis
     }
@@ -15472,8 +15499,14 @@ impl<'a> NseAnalysis<'a> {
         name: &str,
         qualifier: CallQualifier,
         call_line: u32,
+        deferred: bool,
     ) -> Option<crate::nse::ArgPolicy> {
-        let entries = self.directive_nse.get(name)?;
+        let policies = if deferred {
+            &self.deferred_directive_nse
+        } else {
+            &self.directive_nse
+        };
+        let entries = policies.get(name)?;
         entries
             .iter()
             .rev()
@@ -15491,8 +15524,14 @@ impl<'a> NseAnalysis<'a> {
         &self,
         name: &str,
         qualifier: CallQualifier,
+        deferred: bool,
     ) -> Option<crate::nse::ArgPolicy> {
-        let entries = self.directive_nse.get(name)?;
+        let policies = if deferred {
+            &self.deferred_directive_nse
+        } else {
+            &self.directive_nse
+        };
+        let entries = policies.get(name)?;
         entries
             .iter()
             .find(|e| e.file_level && self.qualifier_matches(e, &qualifier))
@@ -16963,6 +17002,10 @@ fn resolve_call_arg_policy(
     let Some(func) = call_node.child_by_field_name("function") else {
         return ArgPolicy::WholeCall;
     };
+    // Shiny helper functions close over the completed shared support
+    // environment. The collector supplies a distinct foreign-directive set for
+    // this phase; ordinary files receive identical eager/deferred maps.
+    let deferred = containing_function_definition(call_node).is_some();
 
     // Namespace-qualified `pkg::name` resolves purely from syntax.
     if func.kind() == "namespace_operator" {
@@ -16970,9 +17013,12 @@ fn resolve_call_arg_policy(
         if let Some((pkg, n)) = namespace_parts(func, text) {
             let n = crate::r_names::canonical_use_name(n);
             // Own qualified directive is the authoritative override.
-            if let Some(p) =
-                analysis.own_directive_nse_policy(n, CallQualifier::Qualified(pkg), call_line)
-            {
+            if let Some(p) = analysis.own_directive_nse_policy(
+                n,
+                CallQualifier::Qualified(pkg),
+                call_line,
+                deferred,
+            ) {
                 return p;
             }
             // Precise built-in policy table next.
@@ -16981,7 +17027,8 @@ fn resolve_call_arg_policy(
             }
             // Issue #460: a foreign qualified directive (file-level) is consulted
             // below the table so it cannot clobber a precise built-in policy.
-            if let Some(p) = analysis.foreign_directive_nse_policy(n, CallQualifier::Qualified(pkg))
+            if let Some(p) =
+                analysis.foreign_directive_nse_policy(n, CallQualifier::Qualified(pkg), deferred)
             {
                 return p;
             }
@@ -17011,7 +17058,7 @@ fn resolve_call_arg_policy(
     //    Position-gated to calls after the directive line.
     let call_line = call_node.start_position().row as u32;
     if let Some(policy) =
-        analysis.own_directive_nse_policy(name, CallQualifier::BareExact, call_line)
+        analysis.own_directive_nse_policy(name, CallQualifier::BareExact, call_line, deferred)
     {
         return policy;
     }
@@ -17051,9 +17098,12 @@ fn resolve_call_arg_policy(
     //     only now that no local binding shadowed it above — R invokes the
     //     local value, not `pkg::name`, when one exists. It still overrides the
     //     built-in policy tables below, so it is consulted before them.
-    if let Some(policy) =
-        analysis.own_directive_nse_policy(name, CallQualifier::BareInPlayQualified, call_line)
-    {
+    if let Some(policy) = analysis.own_directive_nse_policy(
+        name,
+        CallQualifier::BareInPlayQualified,
+        call_line,
+        deferred,
+    ) {
         return policy;
     }
     // 2–3.5. Built-in policy tables (in-play packages, self-package, base,
@@ -17066,11 +17116,13 @@ fn resolve_call_arg_policy(
     // definitions/aliases, and the precise built-in tables, but ABOVE the step-4
     // resolvable-standard-eval classification so a user can suppress a
     // loaded-package export (e.g. `lmer`) they declared NSE in another file.
-    if let Some(policy) = analysis.foreign_directive_nse_policy(name, CallQualifier::BareExact) {
+    if let Some(policy) =
+        analysis.foreign_directive_nse_policy(name, CallQualifier::BareExact, deferred)
+    {
         return policy;
     }
     if let Some(policy) =
-        analysis.foreign_directive_nse_policy(name, CallQualifier::BareInPlayQualified)
+        analysis.foreign_directive_nse_policy(name, CallQualifier::BareInPlayQualified, deferred)
     {
         return policy;
     }
@@ -17782,6 +17834,8 @@ fn collect_usages_with_context<'a>(
         None,
         None,
         None,
+        &[],
+        &[],
         &[],
         &[],
         &[],
@@ -22153,6 +22207,22 @@ fn build_load_all_signature(
 // Goto Definition
 // ============================================================================
 
+/// Return the active filesystem-derived Shiny application context for `uri`.
+///
+/// Candidate metadata with no selected mode is deliberately excluded: an
+/// incomplete layout has no implicit runtime environments yet, so ordinary
+/// workspace fallback behavior remains available until `server.R` or `app.R`
+/// activates the application.
+fn active_shiny_application(
+    state: &WorldState,
+    uri: &Url,
+) -> Option<crate::cross_file::types::ShinyApplicationMetadata> {
+    state
+        .get_enriched_metadata(uri)
+        .and_then(|metadata| metadata.shiny_application.clone())
+        .filter(|application| application.is_active_participant())
+}
+
 /// Locate the definition location for the identifier at the given position by searching
 /// the current document, cross-file symbols, open documents, and the workspace index.
 ///
@@ -22537,6 +22607,15 @@ pub fn goto_definition_with_cancel(
         }
     }
 
+    // An active implicit Shiny application has an explicit environment graph.
+    // If position-aware scope did not resolve the name, the broad workspace
+    // fallback below is not semantically valid: it could jump from one legacy
+    // entry environment into its sibling, or into a nested/sibling application.
+    // Explicitly sourced files are already covered by `get_cross_file_scope`.
+    if active_shiny_application(state, uri).is_some() {
+        return None;
+    }
+
     // Search all open documents using ContentProvider
     for file_uri in state.documents.uris() {
         if cancel.is_cancelled() {
@@ -22712,6 +22791,129 @@ fn resolve_package_internal_goto(
 // References
 // ============================================================================
 
+fn artifact_definition_at(
+    artifacts: &scope::ScopeArtifacts,
+    uri: &Url,
+    name: &str,
+    scope_key: &str,
+    position: Position,
+) -> Option<ScopedSymbol> {
+    artifacts.timeline.iter().find_map(|event| {
+        let scope::ScopeEvent::Def { symbol, .. } = event else {
+            return None;
+        };
+        (symbol.source_uri == *uri
+            && (symbol.name.as_ref() == name || symbol.name.as_ref() == scope_key)
+            && symbol.defined_line == position.line
+            && position.character >= symbol.defined_column
+            && position.character <= symbol.defined_end_column)
+            .then(|| symbol.clone())
+    })
+}
+
+/// Resolve the definition identity named by a find-references query in an
+/// active implicit Shiny application.
+///
+/// Assignment targets are matched against their own artifact location before
+/// consulting position-aware scope, because scope at the left-hand side can
+/// still contain a shadowed earlier binding. Structural labels such as `$`
+/// members and named arguments retain the existing name-based references
+/// behavior; they are not implicit-environment bindings.
+fn shiny_reference_target(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    node: Node,
+    name: &str,
+    content_provider: &impl ContentProvider,
+) -> Option<ScopedSymbol> {
+    let scope_key = unquote_backtick_name(name).unwrap_or(name);
+
+    if is_assignment_target(node)
+        && let Some(artifacts) = content_provider.get_artifacts(uri)
+        && let Some(symbol) = artifact_definition_at(&artifacts, uri, name, scope_key, position)
+    {
+        return Some(symbol);
+    }
+
+    if is_structural_label(node) {
+        return None;
+    }
+
+    let resolved = get_cross_file_scope(
+        state,
+        uri,
+        position.line,
+        position.character,
+        &DiagCancelToken::never(),
+        Some(state.package_state.scope_contribution()),
+    );
+    resolved
+        .symbols
+        .get(name)
+        .or_else(|| resolved.symbols.get(scope_key))
+        .cloned()
+}
+
+fn same_symbol_definition(left: &ScopedSymbol, right: &ScopedSymbol) -> bool {
+    left.source_uri == right.source_uri
+        && left.defined_line == right.defined_line
+        && left.defined_column == right.defined_column
+        && left.defined_end_column == right.defined_end_column
+        && left.is_declared == right.is_declared
+}
+
+/// Whether one textual occurrence resolves to the selected Shiny binding.
+///
+/// This turns the otherwise workspace-wide textual reference scan into a
+/// scope-aware filter only for active implicit Shiny applications. It prevents
+/// sibling entry environments and unrelated applications from lending same-name
+/// occurrences while still admitting explicit source-graph children whose own
+/// metadata is not a conventional Shiny role.
+fn shiny_reference_matches_target(
+    state: &WorldState,
+    location: &Location,
+    name: &str,
+    target: &ScopedSymbol,
+    content_provider: &impl ContentProvider,
+) -> bool {
+    let scope_key = unquote_backtick_name(name).unwrap_or(name);
+
+    if location.uri == target.source_uri && location.range == scoped_symbol_range(target) {
+        return true;
+    }
+
+    // A same-name definition is a binding site, not a reference to an earlier
+    // binding. This also prevents a sibling entry's local definition from being
+    // retained merely because its pre-assignment scope sees another symbol.
+    if let Some(artifacts) = content_provider.get_artifacts(&location.uri)
+        && let Some(symbol) = artifact_definition_at(
+            &artifacts,
+            &location.uri,
+            name,
+            scope_key,
+            location.range.start,
+        )
+        && location.range == scoped_symbol_range(&symbol)
+    {
+        return same_symbol_definition(&symbol, target);
+    }
+
+    let resolved = get_cross_file_scope(
+        state,
+        &location.uri,
+        location.range.start.line,
+        location.range.start.character,
+        &DiagCancelToken::never(),
+        Some(state.package_state.scope_contribution()),
+    );
+    resolved
+        .symbols
+        .get(name)
+        .or_else(|| resolved.symbols.get(scope_key))
+        .is_some_and(|symbol| same_symbol_definition(symbol, target))
+}
+
 pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<Vec<Location>> {
     // Use ContentProvider for unified access
     let content_provider = state.content_provider();
@@ -22846,6 +23048,14 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     } else {
         return None;
     };
+    let shiny_application = active_shiny_application(state, uri);
+    let shiny_name_based_search = node.kind() != "identifier" || is_structural_label(node);
+    let shiny_target = shiny_application.as_ref().and_then(|_| {
+        if node.kind() != "identifier" {
+            return None;
+        }
+        shiny_reference_target(state, uri, position, node, name, &content_provider)
+    });
     let mut locations = Vec::new();
 
     // Search current document
@@ -22892,6 +23102,27 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
                 &file_uri,
                 &mut locations,
             );
+        }
+    }
+
+    if let Some(application) = shiny_application {
+        if let Some(target) = shiny_target {
+            locations.retain(|location| {
+                shiny_reference_matches_target(state, location, name, &target, &content_provider)
+            });
+        } else if shiny_name_based_search {
+            // Structural/member searches have no lexical binding identity. Keep
+            // their historical name-based behavior, but confine it to the same
+            // selected implicit application so sibling/nested apps cannot leak.
+            locations.retain(|location| {
+                active_shiny_application(state, &location.uri)
+                    .is_some_and(|candidate| candidate.is_same_active_application(&application))
+            });
+        } else {
+            // An unresolved lexical identifier has no definition identity to
+            // compare. Do not turn that uncertainty back into a workspace-wide
+            // or sibling-entry textual search.
+            locations.retain(|location| location.uri == *uri);
         }
     }
 
@@ -24440,6 +24671,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
         );
         collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
     }
@@ -24461,6 +24694,8 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            &[],
             &[],
             &[],
             &[],
@@ -24643,6 +24878,8 @@ mod tests {
             &meta.declared_functions,
             &[],
             &[],
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -24685,6 +24922,8 @@ mod tests {
             None,
             &meta.nse_declarations,
             &meta.declared_functions,
+            &[],
+            &[],
             &[],
             &[],
         );
@@ -24907,6 +25146,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
         );
         let mut used = Vec::new();
         collect_usages_with_analysis(
@@ -24959,6 +25200,8 @@ mod tests {
             None,
             Some(&lib),
             None,
+            &[],
+            &[],
             &[],
             &[],
             &[],
@@ -25290,6 +25533,8 @@ mod tests {
             None,
             None,
             Some(&base_exports),
+            &[],
+            &[],
             &[],
             &[],
             &[],
@@ -63999,6 +64244,8 @@ my_func <- function(a = default_value) {
             own_funcs,
             foreign_nse,
             foreign_funcs,
+            foreign_nse,
+            foreign_funcs,
         );
         let mut used = Vec::new();
         super::collect_usages_with_analysis(
@@ -64037,6 +64284,48 @@ my_func <- function(a = default_value) {
                 .any(|n| n == "undefined_var"),
             "a foreign whole-call NSE directive must suppress the arg"
         );
+    }
+
+    #[test]
+    fn shiny_later_helper_directive_applies_only_in_function_body() {
+        use crate::cross_file::types::{NseDeclaration, NseScope};
+
+        let code = "nrow(eager_missing)\nf <- function() nrow(deferred_missing)\n";
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let deferred = vec![NseDeclaration {
+            name: "nrow".into(),
+            package: None,
+            scope: NseScope::WholeCall,
+            line: 0,
+        }];
+        let analysis = super::NseAnalysis::build(
+            root,
+            code,
+            true,
+            true,
+            vec![],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &deferred,
+            &[],
+        );
+        let mut used = Vec::new();
+        super::collect_usages_with_analysis(
+            root,
+            code,
+            &analysis,
+            &super::UsageContext::default(),
+            &mut used,
+        );
+        let used: Vec<String> = used.into_iter().map(|(name, _)| name).collect();
+        assert!(used.iter().any(|name| name == "eager_missing"));
+        assert!(!used.iter().any(|name| name == "deferred_missing"));
     }
 
     // Issue #460: a local standard-eval definition (step 1) shadows the foreign
@@ -64170,6 +64459,8 @@ my_func <- function(a = default_value) {
             &[],
             &foreign,
             &[],
+            &foreign,
+            &[],
         );
         // Locate the `undefined_b` identifier node.
         fn find_ident<'t>(
@@ -64237,6 +64528,8 @@ my_func <- function(a = default_value) {
             &[],
             &[],
             &[],
+            &[],
+            &[],
         );
         let usage = find_ident(root, code, "undefined_other").expect("usage node");
         assert!(
@@ -64280,6 +64573,8 @@ my_func <- function(a = default_value) {
             None,
             None,
             None,
+            &[],
+            &[],
             &[],
             &[],
             &[],
@@ -64350,6 +64645,77 @@ my_func <- function(a = default_value) {
                 .update_file(&uri, &meta, Some(&ws), |_| None);
         }
         (state, ws)
+    }
+
+    #[test]
+    fn shiny_helper_nse_collection_separates_eager_and_deferred_phases() {
+        use crate::cross_file::types::{
+            ShinyApplicationMetadata, ShinyApplicationMode, ShinyFileRole,
+        };
+
+        let ws = Url::parse("file:///w/").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders.push(ws.clone());
+        state.workspace_scan_complete = true;
+        let files = [
+            (
+                "app.R",
+                "source(\"R/first.R\")\nsource(\"R/second.R\")\n",
+                ShinyFileRole::AppEntry,
+            ),
+            (
+                "R/first.R",
+                "nrow(eager_missing)\nf <- function() nrow(deferred_missing)\n",
+                ShinyFileRole::Helper { ordinal: 0 },
+            ),
+            (
+                "R/second.R",
+                "# raven: nse: nrow\n",
+                ShinyFileRole::Helper { ordinal: 1 },
+            ),
+        ];
+        for (name, code, role) in files {
+            let uri = ws.join(name).unwrap();
+            let mut metadata = crate::cross_file::extract_metadata(code);
+            metadata.shiny_application = Some(ShinyApplicationMetadata {
+                application_root: "/w".to_string(),
+                application_identity: None,
+                mode: Some(ShinyApplicationMode::SingleFile),
+                role,
+            });
+            state.open_document_with_language_id_and_metadata(
+                uri.clone(),
+                code,
+                None,
+                Some("r"),
+                std::sync::Arc::new(metadata.clone()),
+                None,
+            );
+            state
+                .cross_file_graph
+                .update_file(&uri, &metadata, Some(&ws), |_| None);
+        }
+
+        let query = ws.join("R/first.R").unwrap();
+        let snapshot = DiagnosticsSnapshot::build(&state, &query).expect("snapshot built");
+        let collected = super::collect_cross_file_nse(&snapshot, &query);
+        assert!(collected.nse.is_empty());
+        assert_eq!(collected.deferred_nse.len(), 1);
+
+        let messages: Vec<String> = super::diagnostics(&state, &query, &DiagCancelToken::never())
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("eager_missing"))
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("deferred_missing"))
+        );
     }
 
     // The short-circuit signal is OFF when no file in the (neighborhood) metadata
@@ -69222,6 +69588,154 @@ mod computed_source_path_navigation_tests {
                 "nonfoldable expression navigated from {literal}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod shiny_navigation_isolation_tests {
+    use super::{active_shiny_application, goto_definition, references};
+    use crate::cross_file::types::{ShinyApplicationMetadata, ShinyApplicationMode, ShinyFileRole};
+    use crate::state::WorldState;
+    use std::sync::Arc;
+    use tower_lsp::lsp_types::{Position, Url};
+
+    fn add_shiny_document(
+        state: &mut WorldState,
+        uri: Url,
+        code: &str,
+        application_root: &str,
+        role: ShinyFileRole,
+    ) {
+        let mut metadata = crate::cross_file::extract_metadata(code);
+        metadata.shiny_application = Some(ShinyApplicationMetadata {
+            application_root: application_root.to_string(),
+            application_identity: None,
+            mode: Some(ShinyApplicationMode::Legacy),
+            role,
+        });
+        state.open_document_with_language_id_and_metadata(
+            uri,
+            code,
+            None,
+            Some("r"),
+            Arc::new(metadata),
+            None,
+        );
+    }
+
+    #[test]
+    fn shiny_candidate_keeps_ordinary_navigation_semantics() {
+        let mut state = WorldState::new();
+        let candidate_uri = Url::parse("file:///app/global.R").unwrap();
+        add_shiny_document(
+            &mut state,
+            candidate_uri.clone(),
+            "ordinary_name\n",
+            "/app",
+            ShinyFileRole::Candidate,
+        );
+
+        assert!(active_shiny_application(&state, &candidate_uri).is_none());
+    }
+
+    #[test]
+    fn shiny_goto_does_not_fall_through_to_sibling_entry() {
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        let server_uri = Url::parse("file:///app/server.R").unwrap();
+        let ui_uri = Url::parse("file:///app/ui.R").unwrap();
+        add_shiny_document(
+            &mut state,
+            server_uri.clone(),
+            "ui_only\n",
+            "/app",
+            ShinyFileRole::ServerEntry,
+        );
+        add_shiny_document(
+            &mut state,
+            ui_uri,
+            "ui_only <- 1\n",
+            "/app",
+            ShinyFileRole::UiEntry,
+        );
+
+        assert!(
+            goto_definition(&state, &server_uri, Position::new(0, 1)).is_none(),
+            "an unresolved server binding must not jump into the sibling ui environment"
+        );
+    }
+
+    #[test]
+    fn shiny_references_follow_definition_identity_across_entries_and_apps() {
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        let server_uri = Url::parse("file:///app/server.R").unwrap();
+        let ui_uri = Url::parse("file:///app/ui.R").unwrap();
+        let other_uri = Url::parse("file:///other/server.R").unwrap();
+        add_shiny_document(
+            &mut state,
+            server_uri.clone(),
+            "server_only <- 1\nserver_only\n",
+            "/app",
+            ShinyFileRole::ServerEntry,
+        );
+        add_shiny_document(
+            &mut state,
+            ui_uri,
+            "server_only\n",
+            "/app",
+            ShinyFileRole::UiEntry,
+        );
+        add_shiny_document(
+            &mut state,
+            other_uri,
+            "server_only\n",
+            "/other",
+            ShinyFileRole::ServerEntry,
+        );
+
+        let locations = references(&state, &server_uri, Position::new(1, 1))
+            .expect("reference search should run");
+        assert_eq!(locations.len(), 2);
+        assert!(locations.iter().all(|location| location.uri == server_uri));
+        let mut lines: Vec<_> = locations
+            .iter()
+            .map(|location| location.range.start.line)
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![0, 1]);
+    }
+
+    #[test]
+    fn shiny_references_from_shadowed_definition_keep_exact_binding() {
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        let server_uri = Url::parse("file:///app/server.R").unwrap();
+        let ui_uri = Url::parse("file:///app/ui.R").unwrap();
+        add_shiny_document(
+            &mut state,
+            server_uri.clone(),
+            "value <- 1\nvalue\nvalue <- 2\nvalue\n",
+            "/app",
+            ShinyFileRole::ServerEntry,
+        );
+        add_shiny_document(
+            &mut state,
+            ui_uri,
+            "value <- 3\nvalue\n",
+            "/app",
+            ShinyFileRole::UiEntry,
+        );
+
+        let locations = references(&state, &server_uri, Position::new(0, 2))
+            .expect("reference search should run");
+        assert!(locations.iter().all(|location| location.uri == server_uri));
+        let mut lines: Vec<_> = locations
+            .iter()
+            .map(|location| location.range.start.line)
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![0, 1]);
     }
 }
 

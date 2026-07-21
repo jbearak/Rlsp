@@ -164,15 +164,15 @@ Optional post-release packaging jobs are gated by repository variables:
 Cross-file awareness is implemented under `crates/raven/src/cross_file/`.
 
 Rough pipeline:
-1. Extract per-file metadata (directives + AST-detected `source()` / `tar_source()` requests + library calls)
+1. Extract per-file metadata (directives + AST-detected `source()` / source-batch requests + library calls)
 2. Enrich inherited working directories and resolve `system.file()` sources
-3. Expand static `tar_source()` requests off-lock
+3. Discover Shiny application roles and expand filesystem-backed source batches off-lock
 4. Compute per-file artifacts (exported interface, ordered timeline, interface hash)
 5. Update dependency graph edges (forward + backward)
 6. Resolve scope at a position by traversing edges and applying call-site filtering
 7. Revalidate dependents on relevant changes (interface hash / edges / working directory changes)
 
-`tar_source()` expansion is caller-owned and filesystem-backed; it has no
+Source-batch expansion is caller-owned and filesystem-backed; it has no
 process-global cache. A finalized record stores its ordered ordinal sources and
 every existing or potential watch root. `WorldState` derives a bidirectional
 parent/root registry only after successful analysis commits. Ordinary commits
@@ -202,7 +202,7 @@ both the global fence and
 the subject parent's captured root identities at the same write-lock commit
 that installs metadata, artifacts, graph edges, and the rebuilt registry.
 Removed roots remain generation tombstones; workspace replacement never resets
-or reuses an identity. Ordered execution is represented by one `TarBatch`
+or reuses an identity. Ordered execution is represented by one `SourceBatch`
 timeline event, while dependency edges retain individual ordinals so a member's
 backward prefix contains exactly its earlier siblings. Batch members bypass
 URI-only forward/standalone caches because their rolling symbol, removal,
@@ -539,7 +539,58 @@ Scope resolution has two distinct graph traversals:
 - **Parent prefix**: when resolving a file, Raven first walks backward edges to model symbols available at the start of that file. Symbols introduced only by this prefix are tracked separately so they can be filtered when a child is re-exported through a forward `source()` edge. `ForwardSource` and `DependencyEdge` carry `SourceLocality` end to end: `Global` and `CurrentFrame` lend ordinary bindings available through their global/call environments, while `NonInheriting` is declared-only and a hard package barrier. `CurrentFrame` is composed with evaluated capture frames before metadata is stored: caller remains current-frame, global promotes to global, and external/unknown becomes non-inheriting. `ForwardSource` stores only this enum at runtime; custom serde projects the legacy `local`/`sys_source_global_env` booleans on output and normalizes them on input for metadata compatibility. Its serde-defaulted `guarded_by_file_exists` bit is diagnostic-only: graph identity, scope, navigation, and revalidation ignore it, while the path collectors use it to suppress only absent/case-mismatched exact optional sources. Existing outside-workspace targets remain errors. Bare `file.exists` uses the project-wide bounded lexical helper policy: same-file exact/dynamic named bindings are considered, while package- and source-provided masking is deliberately outside this syntax-local proof; `base::file.exists` is unambiguous.
 - **Forward sources**: Raven then applies the file's local timeline. When following `source()` calls, real forward-source execution uses a path-local copy of the visited map so one sourced sibling's recursive walk cannot make a later sibling source look already visited. Parent-prefix discovery keeps shared visited pruning to avoid expanding every possible parent/forward path while collecting inherited context. Non-inheriting targets retain graph edges for diagnostics and revalidation but never enter the lending timeline.
 
-Ordered source batches share the detached expansion, watch-root ownership, generation fencing, graph identity, and left-to-right scope resolver originally built for `{targets}` `tar_source()`. `SourceBatchKind` separates tar's contextual working-directory semantics from ordinary bounded `list.files()` source loops. The serialized `tar_source_ordinal` and `tar_source_expansion_watch_paths` names remain for metadata compatibility, but their runtime contract is batch-generic: kind plus call site plus ordinal identify a member, and expansions replace all derived members atomically. Detection never touches the filesystem; expansion runs only after working-directory enrichment and outside state locks. Request-bearing `didChange` operations enumerate inside the existing detached OpenEdit derivation and await its atomic document/metadata/graph commit. If any source-file event in one normalized watcher notification belongs to an open source-batch parent, every normalized source-file event in that notification runs as one invocation-owned watched transaction (including any package projection). Config-layer mutations are applied first, but their diagnostic publication joins the same completion boundary. This prevents the parent from publishing after its batch member lands but before an ordinary dependency event from the same notification commits. The owned transaction drains its diagnostic reservations before completing the receipt-backed parent refresh; if package convergence crosses the existing coalesced retry boundary, the parent-refresh obligation moves with that owner and the original handler awaits the shared terminal receipt. A cancelled parent refresh cancels the outer receipt and withholds sysdata admission. Sysdata continuation otherwise keeps the ordinary watcher contract: admission is ordered after the owned transaction, but convergence remains lifecycle-owned. Workspace-replay refreshes use the same generation-owned parent receipts. Workspace graph derivations reuse the expansion already owned by the scan candidate, keeping the complete-graph pin pass and final graph pass on one filesystem observation. Unsafe enumeration and member-cap overflow fail closed without publishing a partial batch; traversal-budget overflow uses the deterministic ordered fallback described below.
+Ordered source batches share the detached expansion, watch-root ownership, generation fencing, graph identity, and left-to-right scope resolver originally built for `{targets}` `tar_source()`. `SourceBatchKind` separates tar's contextual working-directory semantics, ordinary bounded `list.files()` source loops, legacy Shiny global loading, and Shiny's shared helper support environment. The serialized `tar_source_ordinal` and `tar_source_expansion_watch_paths` names remain for metadata compatibility, but their runtime contract is batch-generic: kind plus call site plus ordinal identify a member, and expansions replace all derived members atomically. Detection never touches the filesystem; expansion runs only after working-directory enrichment and outside state locks. Request-bearing `didChange` operations enumerate inside the existing detached OpenEdit derivation and await its atomic document/metadata/graph commit. If any source-file event in one normalized watcher notification belongs to an open source-batch parent, every normalized source-file event in that notification runs as one invocation-owned watched transaction (including any package projection). Config-layer mutations are applied first, but their diagnostic publication joins the same completion boundary. This prevents the parent from publishing after its batch member lands but before an ordinary dependency event from the same notification commits. The owned transaction drains its diagnostic reservations before completing the receipt-backed parent refresh; if package convergence crosses the existing coalesced retry boundary, the parent-refresh obligation moves with that owner and the original handler awaits the shared terminal receipt. A cancelled parent refresh cancels the outer receipt and withholds sysdata admission. Sysdata continuation otherwise keeps the ordinary watcher contract: admission is ordered after the owned transaction, but convergence remains lifecycle-owned. Workspace-replay refreshes use the same generation-owned parent receipts. Workspace graph derivations reuse the expansion already owned by the scan candidate, keeping the complete-graph pin pass and final graph pass on one filesystem observation. Each expansion records the project exclusion patterns used to select its members; reuse fails and re-finalizes both open and closed metadata when those patterns change. Unsafe enumeration and member-cap overflow fail closed without publishing a partial batch; traversal-budget overflow uses the deterministic ordered fallback described below.
+
+Shiny layout discovery is an enrichment-time filesystem operation in
+`cross_file/shiny.rs`; scope queries never rediscover mode or membership. The
+candidate gate is intentionally narrow, while discovery reads only the direct
+application directory and exact direct `R/` directory. The captured project
+exclusion matcher filters the current candidate and directory entries before any
+mode, marker, ordinal, or batch decision. Selection is case-insensitive with
+exact-spelling precedence and ambiguity failing closed; `server.R` selects
+legacy mode before `app.R` is considered. Active entries receive pre-entry
+source batches: legacy `global.R` is a one-member global batch, then helpers
+form an ordered shared-support batch. Single-file mode omits the global batch.
+Candidate metadata survives incomplete layouts and inactive conventional files
+so watcher ownership can observe entry creation and mode transitions. Candidate
+roles remain semantically ordinary: they neither join application identity and
+declaration filtering nor receive the application working directory. Semantic
+identity for active members is canonical, while `application_working_directory`
+keeps the lexical application root; lexical and canonical watch roots map back
+to the one raw parent URI.
+Discovery also retains the exact selected entry transiently. When a helper or
+legacy global is opened before workspace indexing, the existing open-install
+prerequisite loop indexes that host and its forward batch, recaptures the
+analysis basis, and only then commits the open document and starts diagnostics.
+
+The scope resolver treats pre-entry batches as explicit environment stages.
+Legacy global contributions seed support; helper top-level evaluation receives
+only its ordered prefix; entry roots receive completed support. Function bodies
+inside helpers resolve against completed support to model R's late binding.
+Helper removals are layer-local: removing a support shadow reveals an inherited
+global binding, while removing a support-only name leaves it absent. `ui.R` and
+`server.R` remain sibling environments and never lend entry-local bindings to
+one another. Cross-file `# raven: nse` / `# raven: func` collection applies the
+same roles in two phases: eager policies use only preceding helper declarations,
+while deferred function-body policies may use the completed helper set.
+Revalidation deliberately remains a conservative graph superset.
+
+`application_working_directory` is derived during the same enrichment and sits
+between explicit `# raven: cd` and inherited working-directory state in
+`PathContext`. It is a hard forward-resolution base, suppresses the workspace
+fallback, and propagates through ordinary nested sources until `chdir = TRUE`
+reanchors at the child directory. Backward `PathContext::new` remains unchanged.
+The generic source-batch root registry owns Shiny entry/global/helper/marker
+refreshes, so watched mode changes reuse the same generation fences, open-buffer
+authority, closed-file indexing, atomic graph commit, and diagnostic receipt
+boundary as tar/list batches. Registry overlap is recursively conservative, so
+Shiny owner selection refines it with an ASCII-case-insensitive direct-child
+check: incomplete candidates react only to `server.R` / `app.R` mode selection,
+while selected layouts also react to direct `ui.R`, `global.R`, `R/`, helper, and
+disable-marker events. The shared component comparator also equates normal and
+extended-length Windows disk/UNC prefixes, so canonical symlink roots match
+ordinary file-URI events. Unrelated application-root descendants therefore stay
+in the ordinary watcher transaction.
 
 `tar_option_set(packages = ...)` uses a distinct durable metadata channel,
 `CrossFileMetadata::targets_pipeline_packages`, rather than synthetic

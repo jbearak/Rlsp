@@ -216,10 +216,11 @@ fn open_disk_fallback_target(
         let lib_paths = state.package_library.lib_paths();
         crate::cross_file::resolve_system_file_sources(&mut meta, ws_name, ws_root, lib_paths);
     }
-    crate::cross_file::tar_source::finalize_tar_source_requests(
+    let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
         &mut meta,
         uri,
         workspace_root.as_ref(),
+        &state.workspace_exclusions,
     );
     state.open_document_with_language_id_and_metadata(
         uri.clone(),
@@ -391,10 +392,11 @@ fn materialize_cli_contextual_provider(
             state.package_library.lib_paths(),
         );
     }
-    crate::cross_file::tar_source::finalize_tar_source_requests(
+    let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
         &mut metadata,
         &execution.uri,
         workspace_root,
+        &state.workspace_exclusions,
     );
     let artifacts = std::sync::Arc::new(match tree.as_ref() {
         Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
@@ -3283,6 +3285,151 @@ infixContinuationStyle = "indented"
                 .any(|(_, diagnostic)| diagnostic.message == "helper_fn is not defined"),
             "tar member symbols must be visible to the report: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn raven_check_single_file_shiny_loads_helpers_but_not_global() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("R")).unwrap();
+        fs::write(workspace.path().join("R/helper.R"), "helper_value <- 1\n").unwrap();
+        fs::write(workspace.path().join("global.R"), "global_only <- 1\n").unwrap();
+        let target = workspace.path().join("app.R");
+        fs::write(&target, "helper_value\nglobal_only\n").unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.paths = vec![target];
+        let diagnostics = collect_diagnostics_blocking(&args);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|(_, diagnostic)| diagnostic.message == "helper_value is not defined"),
+            "single-file helpers must be visible: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(_, diagnostic)| diagnostic.message == "global_only is not defined"),
+            "single-file mode must not implicitly load adjacent global.R: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn raven_check_legacy_shiny_wins_and_keeps_entries_isolated() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("R")).unwrap();
+        fs::write(workspace.path().join("R/helper.R"), "helper_value <- 1\n").unwrap();
+        fs::write(workspace.path().join("global.R"), "global_value <- 1\n").unwrap();
+        fs::write(workspace.path().join("ui.R"), "ui_only <- 1\n").unwrap();
+        fs::write(workspace.path().join("app.R"), "app_only <- 1\n").unwrap();
+        let target = workspace.path().join("server.R");
+        fs::write(&target, "helper_value\nglobal_value\nui_only\napp_only\n").unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.paths = vec![target];
+        let diagnostics = collect_diagnostics_blocking(&args);
+        for visible in ["helper_value", "global_value"] {
+            assert!(
+                !diagnostics.iter().any(
+                    |(_, diagnostic)| diagnostic.message == format!("{visible} is not defined")
+                ),
+                "legacy support/global binding {visible} must be visible: {diagnostics:?}"
+            );
+        }
+        for isolated in ["ui_only", "app_only"] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|(_, diagnostic)| diagnostic.message
+                        == format!("{isolated} is not defined")),
+                "legacy mode must not borrow {isolated}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn raven_check_shiny_disable_marker_suppresses_helper_batch() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("R")).unwrap();
+        fs::write(workspace.path().join("R/helper.R"), "helper_value <- 1\n").unwrap();
+        fs::write(workspace.path().join("R/_DISABLE_AUTOLOAD.r"), "").unwrap();
+        let target = workspace.path().join("app.R");
+        fs::write(&target, "helper_value\n").unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.paths = vec![target];
+        let diagnostics = collect_diagnostics_blocking(&args);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(_, diagnostic)| diagnostic.message == "helper_value is not defined"),
+            "the disable marker must remove implicit helper scope: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn raven_check_shiny_exclusions_apply_before_layout_selection() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("R")).unwrap();
+        fs::write(
+            workspace.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"server.R\", \"R/_disable_autoload.R\", \"R/excluded.R\"]\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("server.R"), "legacy_only <- 1\n").unwrap();
+        fs::write(workspace.path().join("global.R"), "global_only <- 1\n").unwrap();
+        fs::write(workspace.path().join("R/_disable_autoload.R"), "").unwrap();
+        fs::write(workspace.path().join("R/included.R"), "included <- 1\n").unwrap();
+        fs::write(workspace.path().join("R/excluded.R"), "excluded <- 1\n").unwrap();
+        let target = workspace.path().join("app.R");
+        fs::write(&target, "included\nexcluded\nglobal_only\nlegacy_only\n").unwrap();
+
+        let mut args = base_args(workspace.path());
+        args.no_config = false;
+        args.paths = vec![target.clone()];
+        let (state, _) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(setup_check_state_and_targets(&args));
+        let target_uri = Url::from_file_path(target.canonicalize().unwrap()).unwrap();
+        assert!(
+            !state.workspace_exclusions.is_excluded_uri(&target_uri),
+            "app itself must remain included: {:?}",
+            state.workspace_exclusions.patterns()
+        );
+        let server_uri =
+            Url::from_file_path(workspace.path().join("server.R").canonicalize().unwrap()).unwrap();
+        assert!(
+            state.workspace_exclusions.is_excluded_uri(&server_uri),
+            "server exclusion must compile: {:?}",
+            state.workspace_exclusions.patterns()
+        );
+        let metadata = state
+            .workspace_index
+            .get_metadata(&target_uri)
+            .expect("app metadata is indexed");
+        assert!(
+            metadata.sources.iter().any(|source| {
+                source.source_batch_kind == Some(crate::cross_file::SourceBatchKind::Shiny)
+                    && source.path.ends_with("included.R")
+            }),
+            "included helper must remain in finalized metadata: shiny={:?}, sources={:?}",
+            metadata.shiny_application,
+            metadata.sources
+        );
+        let diagnostics = collect_diagnostics_blocking(&args);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|(_, diagnostic)| diagnostic.message == "included is not defined"),
+            "an excluded marker must not suppress included helpers: {diagnostics:?}"
+        );
+        for absent in ["excluded", "global_only", "legacy_only"] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|(_, diagnostic)| diagnostic.message == format!("{absent} is not defined")),
+                "excluded server/helper selection must leave {absent} unavailable: {diagnostics:?}"
+            );
+        }
     }
 
     #[test]

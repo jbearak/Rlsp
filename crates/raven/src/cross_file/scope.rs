@@ -707,9 +707,10 @@ pub enum ScopeEvent {
     /// environment in ordinal order. Scope resolution therefore treats the
     /// call as one batch: member state is threaded left-to-right and later
     /// definitions replace earlier ones.
-    TarBatch {
+    SourceBatch {
         line: u32,
         column: u32,
+        kind: super::types::SourceBatchKind,
         members: Vec<ForwardSource>,
     },
     /// A function invocation frame spanning formals/defaults through the body
@@ -1721,6 +1722,15 @@ fn active_function_scopes_at(
 /// order — for example, the `rm(x)` inside `x <- { rm(x); 1 }` is processed
 /// *before* the `Def x` it sits inside, so the new binding is not silently
 /// dropped at positions past the assignment.
+fn event_sort_key(event: &ScopeEvent) -> (u8, u32, u32) {
+    let pre_entry = matches!(
+        event,
+        ScopeEvent::SourceBatch { kind, .. } if kind.is_pre_entry()
+    );
+    let (line, column) = event_effect_position(event);
+    (u8::from(!pre_entry), line, column)
+}
+
 pub(super) fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
     match event {
         ScopeEvent::Def {
@@ -1732,8 +1742,15 @@ pub(super) fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
         // effect position is one column past the call — matching the strict-<
         // check in `scope_at_position_with_graph_recursive` (line 3448).
         // `saturating_add` guards against the (theoretical) u32::MAX column.
-        ScopeEvent::Source { line, column, .. } | ScopeEvent::TarBatch { line, column, .. } => {
-            (*line, column.saturating_add(1))
+        ScopeEvent::Source { line, column, .. } => (*line, column.saturating_add(1)),
+        ScopeEvent::SourceBatch {
+            line, column, kind, ..
+        } => {
+            if kind.is_pre_entry() {
+                (0, 0)
+            } else {
+                (*line, column.saturating_add(1))
+            }
         }
         ScopeEvent::FunctionScope {
             start_line,
@@ -2122,7 +2139,7 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts, line_index: &L
                     None
                 };
             }
-            ScopeEvent::TarBatch { .. } | ScopeEvent::FunctionScope { .. } => {}
+            ScopeEvent::SourceBatch { .. } | ScopeEvent::FunctionScope { .. } => {}
         }
     }
 }
@@ -2517,25 +2534,31 @@ pub fn compute_artifacts_with_metadata(
         // `Source` path (whose graph lookup and streaming cache are call-site
         // keyed) and emit one adjudicated batch event per call.
         let mut batch_members: Vec<ForwardSource> = Vec::new();
-        let mut batch_site: Option<(u32, u32, Option<super::types::SourceBatchKind>)> = None;
-        let flush_batch =
-            |artifacts: &mut ScopeArtifacts,
-             batch_site: &mut Option<(u32, u32, Option<super::types::SourceBatchKind>)>,
-             batch_members: &mut Vec<ForwardSource>| {
-                if let Some((line, column, _kind)) = batch_site.take() {
-                    artifacts.timeline.push(ScopeEvent::TarBatch {
-                        line,
-                        column,
-                        members: std::mem::take(batch_members),
-                    });
-                }
-            };
+        let mut batch_site: Option<(u32, u32, super::types::SourceBatchKind)> = None;
+        let flush_batch = |artifacts: &mut ScopeArtifacts,
+                           batch_site: &mut Option<(u32, u32, super::types::SourceBatchKind)>,
+                           batch_members: &mut Vec<ForwardSource>| {
+            if let Some((line, column, kind)) = batch_site.take() {
+                artifacts.timeline.push(ScopeEvent::SourceBatch {
+                    line,
+                    column,
+                    kind,
+                    members: std::mem::take(batch_members),
+                });
+            }
+        };
         for source in meta
             .sources
             .iter()
             .filter(|source| source.tar_source_ordinal.is_some())
         {
-            let site = (source.line, source.column, source.source_batch_kind);
+            let site = (
+                source.line,
+                source.column,
+                source
+                    .source_batch_kind
+                    .unwrap_or(super::types::SourceBatchKind::TarSource),
+            );
             if batch_site.is_some_and(|existing| existing != site) {
                 flush_batch(&mut artifacts, &mut batch_site, &mut batch_members);
             }
@@ -2696,6 +2719,7 @@ pub fn compute_artifacts_with_metadata(
         &artifacts.conditional_shiny_deferred_scopes,
         &source_interfaces,
         metadata.is_some_and(|m| m.standalone),
+        metadata.and_then(|m| m.shiny_application.as_ref()),
     );
 
     artifacts
@@ -2781,7 +2805,7 @@ pub fn scope_at_position(
                     scope.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
             }
-            ScopeEvent::Source { .. } | ScopeEvent::TarBatch { .. } => {
+            ScopeEvent::Source { .. } | ScopeEvent::SourceBatch { .. } => {
                 // Source events are handled by the cross-file traversal in
                 // scope_at_position_with_graph
             }
@@ -3048,7 +3072,7 @@ where
                     scope.symbols.insert(symbol.name.clone(), symbol.clone());
                 }
             }
-            ScopeEvent::Source { .. } | ScopeEvent::TarBatch { .. } => {
+            ScopeEvent::Source { .. } | ScopeEvent::SourceBatch { .. } => {
                 // Source events are handled by the cross-file traversal in
                 // scope_at_position_with_graph
             }
@@ -3807,7 +3831,7 @@ fn append_synthetic_function_scopes<'tree, 'text>(
 /// after every real and synthetic `FunctionScope` and every effect event has
 /// been appended.
 fn finalize_scope_timeline(artifacts: &mut ScopeArtifacts, line_index: &LineIndex) {
-    artifacts.timeline.sort_by_key(event_effect_position);
+    artifacts.timeline.sort_by_key(event_sort_key);
     rebuild_function_scope_index(artifacts, line_index);
 }
 
@@ -5800,6 +5824,7 @@ fn compute_interface_hash(
     conditional_shiny_deferred_scopes: &[ConditionalShinyDeferredScope],
     sources: &[FinalizedSourceInterface],
     standalone: bool,
+    shiny_application: Option<&super::types::ShinyApplicationMetadata>,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
 
@@ -5810,6 +5835,7 @@ fn compute_interface_hash(
     // backward edges. Dependents must therefore revalidate when the directive is
     // toggled in any connected file, so include it in the interface hash.
     standalone.hash(&mut hasher);
+    shiny_application.hash(&mut hasher);
 
     // Sort keys for deterministic hashing of symbols
     let mut keys: Vec<_> = interface.keys().collect();
@@ -6206,6 +6232,7 @@ where
         package_query_uri,
         data_alias_provider,
         false,
+        None,
         &forward_child_memo,
     )
 }
@@ -6525,6 +6552,7 @@ where
         package_query_uri,
         data_alias_provider,
         false,
+        None,
         &forward_child_memo,
     )
 }
@@ -6589,6 +6617,13 @@ impl ParentPrefix {
             && targets_only_attached_packages.is_empty()
             && package_origins.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceBatchBoundary {
+    line: u32,
+    column: u32,
+    kind: super::types::SourceBatchKind,
 }
 
 /// STEP 1 of `scope_at_position_with_graph_recursive`: collect parent (backward)
@@ -6868,6 +6903,13 @@ where
             // literal-stem `Def` fallback still flows through the prefix.
             None,
             false,
+            edge.source_batch_kind
+                .filter(|kind| kind.is_pre_entry())
+                .map(|kind| SourceBatchBoundary {
+                    line: call_site_line,
+                    column: call_site_col,
+                    kind,
+                }),
             forward_child_memo,
         );
 
@@ -6876,11 +6918,11 @@ where
         // incoming edge, and never evaluate the member itself.
         if let Some(ordinal) = edge.tar_source_ordinal
             && let Some(parent_artifacts) = get_artifacts(&edge.from)
-            && let Some(ScopeEvent::TarBatch { members, .. }) =
+            && let Some(ScopeEvent::SourceBatch { members, .. }) =
                 parent_artifacts.timeline.iter().find(|event| {
                     matches!(
                         event,
-                        ScopeEvent::TarBatch { line, column, members }
+                        ScopeEvent::SourceBatch { line, column, members, .. }
                             if *line == call_site_line
                                 && *column == call_site_col
                                 && members.first().is_some_and(|source| {
@@ -6889,9 +6931,15 @@ where
                     )
                 })
         {
-            let cutoff = usize::try_from(ordinal)
-                .unwrap_or(usize::MAX)
-                .min(members.len());
+            let cutoff = if query_inside_function
+                && edge.source_batch_kind == Some(super::types::SourceBatchKind::Shiny)
+            {
+                members.len()
+            } else {
+                usize::try_from(ordinal)
+                    .unwrap_or(usize::MAX)
+                    .min(members.len())
+            };
             let contribution = resolve_tar_batch_contribution(
                 &edge.from,
                 &members[..cutoff],
@@ -7194,7 +7242,16 @@ where
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
     let mut contribution = ChildSourceContribution::default();
-    let mut rolling_symbols = initial_scope.symbols.clone();
+    let initial_symbols = initial_scope.symbols.clone();
+    let mut rolling_symbols = initial_symbols.clone();
+    // Shiny helpers evaluate in a support child of the global environment. A
+    // helper `rm(x)` can remove only a support binding; when no such binding
+    // exists, an inherited global `x` remains visible. Keep the initial layer so
+    // removing an earlier helper's shadow reveals the original global instead
+    // of flattening the removal across both environments.
+    let shiny_support = members.first().is_some_and(|source| {
+        source.source_batch_kind == Some(super::types::SourceBatchKind::Shiny)
+    });
     let mut rolling_packages: HashSet<String> = initial_scope
         .inherited_packages
         .iter()
@@ -7293,6 +7350,7 @@ where
             None,
             child_provider,
             true,
+            None,
             &member_forward_memo,
         );
 
@@ -7308,11 +7366,22 @@ where
             .extend(member_scope.depth_exceeded.iter().cloned());
 
         // Removals cross member boundaries because every script evaluates in
-        // the same targets environment.
+        // the same targets environment. Shiny's target is a support CHILD of
+        // global, so a removal affects only that child layer and may reveal an
+        // inherited global binding of the same name.
         for name in &member_scope.removed_names {
-            rolling_symbols.remove(name);
             contribution.symbols.remove(name);
-            contribution.removed_names.insert(name.clone());
+            if shiny_support {
+                contribution.removed_names.remove(name);
+                if let Some(symbol) = initial_symbols.get(name) {
+                    rolling_symbols.insert(name.clone(), symbol.clone());
+                } else {
+                    rolling_symbols.remove(name);
+                }
+            } else {
+                rolling_symbols.remove(name);
+                contribution.removed_names.insert(name.clone());
+            }
         }
 
         // Parent-prefix-only names are inherited environment, not bindings
@@ -7463,6 +7532,10 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // call-site/ordinal identity. `system.file` stays pre-resolved, and a
     // standalone child severs caller context.
     prefer_supplied_path_context: bool,
+    // While reconstructing a source-batch member's parent prefix, apply only
+    // pre-entry batches ordered before this boundary. Ordinary root queries use
+    // `None` and receive every pre-entry batch.
+    pre_entry_batch_cutoff: Option<SourceBatchBoundary>,
     // Per-query memo of forward-sourced child EOF scopes (issue #472). Threaded
     // through STEP 1's parent walk and STEP 2's forward children so each
     // distinct `(child, path context, loaded package set, attached package
@@ -8257,6 +8330,7 @@ where
                                         None,
                                         child_provider,
                                         child_prefer_supplied_path_context,
+                                        None,
                                         forward_child_memo,
                                     )
                                 },
@@ -8287,6 +8361,7 @@ where
                                 None,
                                 child_provider,
                                 child_prefer_supplied_path_context,
+                                None,
                                 forward_child_memo,
                             )
                         };
@@ -8391,13 +8466,23 @@ where
                     }
                 }
             }
-            ScopeEvent::TarBatch {
+            ScopeEvent::SourceBatch {
                 line: batch_line,
                 column: batch_column,
+                kind,
                 members,
             } => {
-                let passes_position = (*batch_line, *batch_column) < (line, column);
-                if !(passes_position || query_inside_function) {
+                let boundary = SourceBatchBoundary {
+                    line: *batch_line,
+                    column: *batch_column,
+                    kind: *kind,
+                };
+                let passes_position = if kind.is_pre_entry() {
+                    pre_entry_batch_cutoff.is_none_or(|cutoff| boundary < cutoff)
+                } else {
+                    (*batch_line, *batch_column) < (line, column) || query_inside_function
+                };
+                if !passes_position {
                     continue;
                 }
                 if current_depth + 1 >= max_depth {
@@ -9518,7 +9603,8 @@ where
     /// Ordered `targets::tar_source()` batch contributions. Kept separate
     /// from ordinary source contributions because the two event kinds have
     /// different merge semantics.
-    tar_batch_contributions: HashMap<(u32, u32, bool), ChildSourceContribution>,
+    tar_batch_contributions:
+        HashMap<(u32, u32, super::types::SourceBatchKind, bool), ChildSourceContribution>,
     /// Durable file/pipeline-level targets worker package set, copied once from
     /// metadata at stream construction. It is projected into snapshots and
     /// TarSource batch initial scopes without rescanning syntax.
@@ -10371,12 +10457,13 @@ where
                     }
                 }
             }
-            ScopeEvent::TarBatch {
+            ScopeEvent::SourceBatch {
                 line,
                 column,
+                kind,
                 members,
             } => {
-                let key = (line, column, false);
+                let key = (line, column, kind, false);
                 if !self.tar_batch_contributions.contains_key(&key) {
                     let mut initial_scope =
                         Self::tar_batch_initial_scope(&self.prefix_top, &self.global_strict_frame);
@@ -10876,12 +10963,12 @@ where
             }
         }
         let inside = self.query_inside_function();
-        for (&(batch_line, batch_col, late), contrib) in &self.tar_batch_contributions {
+        for (&(batch_line, batch_col, kind, late), contrib) in &self.tar_batch_contributions {
             if late != inside {
                 continue;
             }
             let effect_col = batch_col.saturating_add(1);
-            if late || (batch_line, effect_col) <= self.cursor {
+            if late || kind.is_pre_entry() || (batch_line, effect_col) <= self.cursor {
                 extend_chain_first_seen(&mut scope.chain, contrib.chain.iter().cloned());
                 extend_visible_positions(&mut scope.visible_positions, &contrib.visible_positions);
                 scope
@@ -11197,12 +11284,13 @@ where
                         .extend(origins);
                 }
             }
-            ScopeEvent::TarBatch {
+            ScopeEvent::SourceBatch {
                 line,
                 column,
+                kind,
                 members,
             } => {
-                let key = (*line, *column, true);
+                let key = (*line, *column, *kind, true);
                 if !self.tar_batch_contributions.contains_key(&key) {
                     let mut initial_scope =
                         Self::tar_batch_initial_scope(&self.prefix_in_function, frame);
@@ -11453,6 +11541,7 @@ where
                     None,
                     child_provider,
                     false,
+                    None,
                     &self.forward_child_memo,
                 )
             },
@@ -11936,7 +12025,7 @@ mod tests {
         );
         assert!(artifacts.timeline.iter().any(|event| matches!(
             event,
-            ScopeEvent::TarBatch { members, .. }
+            ScopeEvent::SourceBatch { members, .. }
                 if members.iter().map(|source| source.tar_source_ordinal).collect::<Vec<_>>()
                     == [Some(0), Some(1)]
         )));
@@ -15581,7 +15670,7 @@ outside_var <- 2"#;
         parent_artifacts.timeline.sort_by_key(|event| match event {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::TarBatch { line, column, .. } => (*line, *column),
+            ScopeEvent::SourceBatch { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope {
                 start_line,
                 start_column,
@@ -16012,7 +16101,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
         parent_artifacts.timeline.sort_by_key(|event| match event {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::TarBatch { line, column, .. } => (*line, *column),
+            ScopeEvent::SourceBatch { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope {
                 start_line,
                 start_column,
@@ -17209,7 +17298,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
         // use their own anchor). See `event_effect_position`.
-        events.sort_by_key(event_effect_position);
+        events.sort_by_key(event_sort_key);
 
         // Verify order: (2,0), (5,5), (5,10), (10,0)
         let positions: Vec<(u32, u32)> = events
@@ -17253,7 +17342,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
         // use their own anchor). See `event_effect_position`.
-        events.sort_by_key(event_effect_position);
+        events.sort_by_key(event_sort_key);
 
         // Verify order by column: 5, 10, 20
         let columns: Vec<u32> = events
@@ -17320,7 +17409,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
         // use their own anchor). See `event_effect_position`.
-        events.sort_by_key(event_effect_position);
+        events.sort_by_key(event_sort_key);
 
         // Verify order: Def(1,0), Removal(3,0), Def(5,0)
         let event_types: Vec<&str> = events
@@ -17387,14 +17476,14 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
         // use their own anchor). See `event_effect_position`.
-        events.sort_by_key(event_effect_position);
+        events.sort_by_key(event_sort_key);
 
         // Verify order: Source(1,0), Removal(2,0), Removal(4,0)
         let event_types: Vec<&str> = events
             .iter()
             .map(|e| match e {
                 ScopeEvent::Source { .. } => "Source",
-                ScopeEvent::TarBatch { .. } => "TarBatch",
+                ScopeEvent::SourceBatch { .. } => "SourceBatch",
                 ScopeEvent::Removal { .. } => "Removal",
                 _ => "Other",
             })
@@ -17469,7 +17558,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
         // use their own anchor). See `event_effect_position`.
-        events.sort_by_key(event_effect_position);
+        events.sort_by_key(event_sort_key);
 
         // Verify order: Def(1,0), Source(3,0), Removal(5,0), FunctionScope(7,0), Removal(9,0)
         let event_types: Vec<&str> = events
@@ -17477,7 +17566,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
             .map(|e| match e {
                 ScopeEvent::Def { .. } => "Def",
                 ScopeEvent::Source { .. } => "Source",
-                ScopeEvent::TarBatch { .. } => "TarBatch",
+                ScopeEvent::SourceBatch { .. } => "SourceBatch",
                 ScopeEvent::FunctionScope { .. } => "FunctionScope",
                 ScopeEvent::Removal { .. } => "Removal",
                 ScopeEvent::PackageLoad { .. } => "PackageLoad",
@@ -17497,7 +17586,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
             .map(|e| match e {
                 ScopeEvent::Def { line, .. } => *line,
                 ScopeEvent::Source { line, .. } => *line,
-                ScopeEvent::TarBatch { line, .. } => *line,
+                ScopeEvent::SourceBatch { line, .. } => *line,
                 ScopeEvent::FunctionScope { start_line, .. } => *start_line,
                 ScopeEvent::Removal { line, .. } => *line,
                 ScopeEvent::PackageLoad { line, .. } => *line,
@@ -17545,7 +17634,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
         // Sort by each event's *effect* position so test ordering matches the
         // production timeline sort (Def events use `visible_from_*`, all others
         // use their own anchor). See `event_effect_position`.
-        events.sort_by_key(event_effect_position);
+        events.sort_by_key(event_sort_key);
 
         // Both events should be at position (2, 0) - order between them is stable but not guaranteed
         // The important thing is that both are present and at the same position
@@ -18114,7 +18203,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
             .map(|e| match e {
                 ScopeEvent::Def { line, .. } => ("Def", *line),
                 ScopeEvent::Source { line, .. } => ("Source", *line),
-                ScopeEvent::TarBatch { line, .. } => ("TarBatch", *line),
+                ScopeEvent::SourceBatch { line, .. } => ("SourceBatch", *line),
                 ScopeEvent::FunctionScope { start_line, .. } => ("FunctionScope", *start_line),
                 ScopeEvent::Removal { line, .. } => ("Removal", *line),
                 ScopeEvent::PackageLoad { line, .. } => ("PackageLoad", *line),
@@ -33840,6 +33929,185 @@ mod package_contribution_tests {
     }
 
     #[test]
+    fn shiny_single_file_support_is_pre_entry_and_late_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_root = temp.path().canonicalize().unwrap();
+        let root = canonical_root.as_path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        let first_code = "earlier <- 1\nf <- function() later\n";
+        let second_code = "later <- 2\n";
+        let app_code = "use <- earlier + later\n";
+        std::fs::write(root.join("R/01-first.R"), first_code).unwrap();
+        std::fs::write(root.join("R/02-second.r"), second_code).unwrap();
+        std::fs::write(root.join("app.R"), app_code).unwrap();
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let app_uri = Url::from_file_path(root.join("app.R")).unwrap();
+        let first_uri = Url::from_file_path(root.join("R/01-first.R")).unwrap();
+        let second_uri = Url::from_file_path(root.join("R/02-second.r")).unwrap();
+        let files = [
+            (app_uri.clone(), app_code),
+            (first_uri.clone(), first_code),
+            (second_uri.clone(), second_code),
+        ];
+        let mut metadata = HashMap::new();
+        let mut artifacts = HashMap::new();
+        for (uri, code) in &files {
+            let mut meta = crate::cross_file::extract_metadata(code);
+            crate::cross_file::tar_source::finalize_tar_source_requests(
+                &mut meta,
+                uri,
+                Some(&root_uri),
+            );
+            artifacts.insert(
+                uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    uri,
+                    &parse_r(code),
+                    code,
+                    Some(&meta),
+                )),
+            );
+            metadata.insert(uri.clone(), Arc::new(meta));
+        }
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(
+            &app_uri,
+            metadata[&app_uri].as_ref(),
+            Some(&root_uri),
+            |_| None,
+        );
+        let resolve = |uri: &Url, line, column| {
+            scope_at_position_with_graph(
+                uri,
+                line,
+                column,
+                &|uri| artifacts.get(uri).cloned(),
+                &|uri| metadata.get(uri).cloned(),
+                &graph,
+                Some(&root_uri),
+                10,
+                &HashSet::new(),
+                true,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+
+        let app_start = resolve(&app_uri, 0, 0);
+        assert!(app_start.symbols.contains_key("earlier"));
+        assert!(app_start.symbols.contains_key("later"));
+
+        let first_eager = resolve(&first_uri, 0, 0);
+        assert!(!first_eager.symbols.contains_key("later"));
+        let first_function = resolve(&first_uri, 1, 17);
+        assert!(
+            first_function.symbols.contains_key("later"),
+            "a helper function must close over the completed shared support environment"
+        );
+    }
+
+    #[test]
+    fn shiny_legacy_global_support_and_entries_keep_directionality() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_root = temp.path().canonicalize().unwrap();
+        let root = canonical_root.as_path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        let global_code = "global_value <- 1\nshadowed <- 'global'\ng <- function() helper_value\n";
+        let helper_code = "helper_value <- 2\nshadowed <- 'helper'\nsupport_only <- 3\n";
+        let remover_code = "rm(shadowed, support_only)\n";
+        let ui_code = "ui_local <- global_value + helper_value\n";
+        let server_code = "server_local <- global_value + helper_value\n";
+        std::fs::write(root.join("global.R"), global_code).unwrap();
+        std::fs::write(root.join("R/01-helper.R"), helper_code).unwrap();
+        std::fs::write(root.join("R/02-remover.R"), remover_code).unwrap();
+        std::fs::write(root.join("ui.R"), ui_code).unwrap();
+        std::fs::write(root.join("server.R"), server_code).unwrap();
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let global_uri = Url::from_file_path(root.join("global.R")).unwrap();
+        let helper_uri = Url::from_file_path(root.join("R/01-helper.R")).unwrap();
+        let remover_uri = Url::from_file_path(root.join("R/02-remover.R")).unwrap();
+        let ui_uri = Url::from_file_path(root.join("ui.R")).unwrap();
+        let server_uri = Url::from_file_path(root.join("server.R")).unwrap();
+        let files = [
+            (global_uri.clone(), global_code),
+            (helper_uri.clone(), helper_code),
+            (remover_uri.clone(), remover_code),
+            (ui_uri.clone(), ui_code),
+            (server_uri.clone(), server_code),
+        ];
+        let mut metadata = HashMap::new();
+        let mut artifacts = HashMap::new();
+        for (uri, code) in &files {
+            let mut meta = crate::cross_file::extract_metadata(code);
+            crate::cross_file::tar_source::finalize_tar_source_requests(
+                &mut meta,
+                uri,
+                Some(&root_uri),
+            );
+            artifacts.insert(
+                uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    uri,
+                    &parse_r(code),
+                    code,
+                    Some(&meta),
+                )),
+            );
+            metadata.insert(uri.clone(), Arc::new(meta));
+        }
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        for entry in [&ui_uri, &server_uri] {
+            graph.update_file(entry, metadata[entry].as_ref(), Some(&root_uri), |_| None);
+        }
+        let resolve = |uri: &Url, line, column| {
+            scope_at_position_with_graph(
+                uri,
+                line,
+                column,
+                &|uri| artifacts.get(uri).cloned(),
+                &|uri| metadata.get(uri).cloned(),
+                &graph,
+                Some(&root_uri),
+                10,
+                &HashSet::new(),
+                true,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            )
+        };
+
+        let helper_start = resolve(&helper_uri, 0, 0);
+        assert!(helper_start.symbols.contains_key("global_value"));
+        let global_function = resolve(&global_uri, 1, 20);
+        assert!(!global_function.symbols.contains_key("helper_value"));
+
+        let server_start = resolve(&server_uri, 0, 0);
+        assert!(server_start.symbols.contains_key("global_value"));
+        assert!(server_start.symbols.contains_key("helper_value"));
+        assert_eq!(
+            server_start
+                .symbols
+                .get("shadowed")
+                .map(|symbol| &symbol.source_uri),
+            Some(&global_uri),
+            "removing a helper shadow must reveal the inherited global binding"
+        );
+        assert!(
+            !server_start.symbols.contains_key("support_only"),
+            "removing a support-only binding must keep it absent"
+        );
+        assert!(!server_start.symbols.contains_key("ui_local"));
+        let ui_start = resolve(&ui_uri, 0, 0);
+        assert!(!ui_start.symbols.contains_key("server_local"));
+    }
+
+    #[test]
     fn tar_batch_is_sequential_with_later_winner_and_removal() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -35448,7 +35716,7 @@ mod package_contribution_tests {
         );
         assert!(
             artifacts[&parent_uri].timeline.iter().any(|event| {
-                matches!(event, ScopeEvent::TarBatch { members, .. } if members.len() == 3)
+                matches!(event, ScopeEvent::SourceBatch { members, .. } if members.len() == 3)
             }),
             "parent artifacts must retain the ordered tar batch: {:?}",
             artifacts[&parent_uri].timeline
@@ -35715,7 +35983,7 @@ mod package_contribution_tests {
                 Some(&root),
                 10,
                 &HashSet::new(),
-                false,
+                true,
                 super::super::config::BackwardDependencyMode::Auto,
                 &|| false,
                 None,
