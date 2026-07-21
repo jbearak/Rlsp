@@ -718,13 +718,8 @@ fn scan_workspace_referenced_packages(root: &std::path::Path) -> Vec<String> {
             let Some(required) = call.requires_attached.as_deref() else {
                 continue;
             };
-            let (line, column) = if call.column > 0 {
-                (call.line, call.column - 1)
-            } else if call.line > 0 {
-                (call.line - 1, u32::MAX)
-            } else {
-                (0, 0)
-            };
+            let (line, column) =
+                crate::cross_file::source_detect::position_before_library_call(call);
             let key = (uri.clone(), line, column, required.to_string());
             let active = *activation_cache.entry(key).or_insert_with(|| {
                 crate::cross_file::scope::scope_at_position_with_graph(

@@ -1104,10 +1104,7 @@ fn active_conditional_packages_for_uri(state: &crate::state::WorldState, uri: &U
             .map(|record| record.metadata().clone())
             .or_else(|| state.workspace_index.get_metadata(target))
     };
-    let workspace_root = state
-        .workspace_folders
-        .iter()
-        .find(|root| uri.path().starts_with(root.path()));
+    let workspace_root = deepest_workspace_root(&state.workspace_folders, uri);
     let mut active = Vec::new();
     let mut attachment_cache = std::collections::HashMap::new();
     let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
@@ -1121,13 +1118,7 @@ fn active_conditional_packages_for_uri(state: &crate::state::WorldState, uri: &U
         let Some(required) = call.requires_attached.as_deref() else {
             continue;
         };
-        let (line, column) = if call.column > 0 {
-            (call.line, call.column - 1)
-        } else if call.line > 0 {
-            (call.line - 1, u32::MAX)
-        } else {
-            (0, 0)
-        };
+        let (line, column) = crate::cross_file::source_detect::position_before_library_call(call);
         let attached_packages = attachment_cache.entry((line, column)).or_insert_with(|| {
             crate::cross_file::scope::scope_at_position_with_graph_cached(
                 uri,
@@ -1148,11 +1139,25 @@ fn active_conditional_packages_for_uri(state: &crate::state::WorldState, uri: &U
             )
             .attached_packages
         });
-        if attached_packages.contains(required) {
+        if attached_packages.contains(required)
+            && crate::r_subprocess::is_valid_package_name(&call.package)
+        {
             active.push(call.package.clone());
         }
     }
     active
+}
+
+/// Select the most specific workspace folder containing `uri` by filesystem
+/// path components, never by a raw URI-string prefix.
+fn deepest_workspace_root<'a>(roots: &'a [Url], uri: &Url) -> Option<&'a Url> {
+    let path = uri.to_file_path().ok()?;
+    roots
+        .iter()
+        .filter_map(|root| root.to_file_path().ok().map(|root_path| (root, root_path)))
+        .filter(|(_, root_path)| path.starts_with(root_path))
+        .max_by_key(|(_, root_path)| root_path.components().count())
+        .map(|(root, _)| root)
 }
 
 fn has_package_metadata_sensitive_undefined_diagnostic(
@@ -3597,7 +3602,7 @@ infixContinuationStyle = "indented"
         let inactive_path = tmp.path().join("inactive.R");
         fs::write(
             &active_path,
-            "library(pacman)\np_load(activeSyntheticPackage)\n",
+            "library(pacman)\np_load(activeSyntheticPackage)\np_load(\"../bad\")\n",
         )
         .unwrap();
         fs::write(&inactive_path, "p_load(inactiveSyntheticPackage)\n").unwrap();
@@ -3614,6 +3619,34 @@ infixContinuationStyle = "indented"
         assert!(
             active_conditional_packages_for_uri(&state, &inactive_uri).is_empty(),
             "permissive warming must not make an inactive conditional package report as loaded"
+        );
+    }
+
+    #[test]
+    fn workspace_root_selection_is_segment_aware_and_prefers_deepest_root() {
+        let tmp = TempDir::new().unwrap();
+        let foo = tmp.path().join("foo");
+        let foobar = tmp.path().join("foobar");
+        let nested = foo.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&foobar).unwrap();
+        let foo_uri = Url::from_file_path(&foo).unwrap();
+        let foobar_uri = Url::from_file_path(&foobar).unwrap();
+        let nested_uri = Url::from_file_path(&nested).unwrap();
+        let roots = vec![foo_uri.clone(), foobar_uri.clone(), nested_uri.clone()];
+
+        let nested_file = Url::from_file_path(nested.join("analysis.R")).unwrap();
+        assert_eq!(
+            deepest_workspace_root(&roots, &nested_file),
+            Some(&nested_uri),
+            "the most specific containing workspace must win"
+        );
+
+        let sibling_file = Url::from_file_path(foobar.join("analysis.R")).unwrap();
+        assert_eq!(
+            deepest_workspace_root(&roots, &sibling_file),
+            Some(&foobar_uri),
+            "a sibling whose name shares a raw prefix must not match foo"
         );
     }
 

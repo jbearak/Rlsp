@@ -195,6 +195,20 @@ pub struct LibraryCall {
     pub requires_attached: Option<String>,
 }
 
+/// Position immediately before a package-loader effect becomes visible.
+///
+/// Conditional loaders use this point to ask whether their prerequisite was
+/// already attached without accidentally observing the loader's own effect.
+pub(crate) fn position_before_library_call(call: &LibraryCall) -> (u32, u32) {
+    if call.column > 0 {
+        (call.line, call.column - 1)
+    } else if call.line > 0 {
+        (call.line - 1, u32::MAX)
+    } else {
+        (0, 0)
+    }
+}
+
 /// A source range in LSP coordinates: 0-based line, **UTF-16** column.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRange {
@@ -2235,7 +2249,6 @@ fn is_base_return_function(function: Node, content: &str) -> bool {
     is_plain_name(lhs, "base") && is_plain_name(rhs, "return")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn visit_p_load_evaluated_arguments(
     node: Node,
     content: &str,
@@ -8883,6 +8896,22 @@ p_load(tidyr)
                 ("tidyr", Some("pacman"), true),
             ]
         );
+    }
+
+    #[test]
+    fn position_before_library_call_handles_same_line_and_line_boundaries() {
+        let call = |line, column| LibraryCall {
+            package: "pkg".to_string(),
+            line,
+            column,
+            function_scope: None,
+            attaches: true,
+            requires_attached: None,
+        };
+
+        assert_eq!(position_before_library_call(&call(4, 9)), (4, 8));
+        assert_eq!(position_before_library_call(&call(4, 0)), (3, u32::MAX));
+        assert_eq!(position_before_library_call(&call(0, 0)), (0, 0));
     }
 
     #[test]
