@@ -22220,7 +22220,7 @@ fn active_shiny_application(
     state
         .get_enriched_metadata(uri)
         .and_then(|metadata| metadata.shiny_application.clone())
-        .filter(|application| application.mode.is_some())
+        .filter(|application| application.is_active_participant())
 }
 
 /// Locate the definition location for the identifier at the given position by searching
@@ -69593,7 +69593,7 @@ mod computed_source_path_navigation_tests {
 
 #[cfg(test)]
 mod shiny_navigation_isolation_tests {
-    use super::{goto_definition, references};
+    use super::{active_shiny_application, goto_definition, references};
     use crate::cross_file::types::{ShinyApplicationMetadata, ShinyApplicationMode, ShinyFileRole};
     use crate::state::WorldState;
     use std::sync::Arc;
@@ -69621,6 +69621,21 @@ mod shiny_navigation_isolation_tests {
             Arc::new(metadata),
             None,
         );
+    }
+
+    #[test]
+    fn shiny_candidate_keeps_ordinary_navigation_semantics() {
+        let mut state = WorldState::new();
+        let candidate_uri = Url::parse("file:///app/global.R").unwrap();
+        add_shiny_document(
+            &mut state,
+            candidate_uri.clone(),
+            "ordinary_name\n",
+            "/app",
+            ShinyFileRole::Candidate,
+        );
+
+        assert!(active_shiny_application(&state, &candidate_uri).is_none());
     }
 
     #[test]

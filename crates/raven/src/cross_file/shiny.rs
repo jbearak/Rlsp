@@ -162,13 +162,15 @@ pub(crate) fn discover_shiny_application(
     };
 
     let active_entry = role.is_entry();
-    result.metadata = Some(ShinyApplicationMetadata {
+    let metadata = ShinyApplicationMetadata {
         application_root: application_root.to_string_lossy().into_owned(),
         application_identity: Some(application_identity.to_string_lossy().into_owned()),
         mode,
         role,
-    });
-    if mode.is_some() {
+    };
+    let active_participant = metadata.is_active_participant();
+    result.metadata = Some(metadata);
+    if active_participant {
         result.application_working_directory = Some(application_root);
         result.selected_entry = match mode {
             Some(ShinyApplicationMode::Legacy) => server.map(|path| canonical_identity_path(&path)),
@@ -373,6 +375,14 @@ mod tests {
         let expansion = discover(&uri(&root.path().join("server.R")));
         assert!(expansion.global.is_some());
         assert!(expansion.helpers.is_empty());
+
+        let disabled_helper = discover(&uri(&root.path().join("R/helper.R")));
+        let metadata = disabled_helper.metadata.unwrap();
+        assert_eq!(metadata.mode, Some(ShinyApplicationMode::Legacy));
+        assert_eq!(metadata.role, ShinyFileRole::Candidate);
+        assert!(!metadata.is_active_participant());
+        assert!(disabled_helper.application_working_directory.is_none());
+        assert!(disabled_helper.selected_entry.is_none());
     }
 
     #[test]
@@ -387,6 +397,14 @@ mod tests {
             Some(ShinyApplicationMode::SingleFile)
         );
         assert!(expansion.global.is_none());
+
+        let ignored_global = discover(&uri(&root.path().join("global.R")));
+        assert_eq!(
+            ignored_global.metadata.as_ref().unwrap().role,
+            ShinyFileRole::Candidate
+        );
+        assert!(ignored_global.application_working_directory.is_none());
+        assert!(ignored_global.selected_entry.is_none());
     }
 
     #[test]

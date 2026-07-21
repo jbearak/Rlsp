@@ -551,10 +551,13 @@ exact-spelling precedence and ambiguity failing closed; `server.R` selects
 legacy mode before `app.R` is considered. Active entries receive pre-entry
 source batches: legacy `global.R` is a one-member global batch, then helpers
 form an ordered shared-support batch. Single-file mode omits the global batch.
-Candidate metadata survives incomplete layouts so watcher ownership can observe
-entry creation and mode transitions. Semantic application/member identity is
-canonical, while `application_working_directory` keeps the lexical application
-root; lexical and canonical watch roots map back to the one raw parent URI.
+Candidate metadata survives incomplete layouts and inactive conventional files
+so watcher ownership can observe entry creation and mode transitions. Candidate
+roles remain semantically ordinary: they neither join application identity and
+declaration filtering nor receive the application working directory. Semantic
+identity for active members is canonical, while `application_working_directory`
+keeps the lexical application root; lexical and canonical watch roots map back
+to the one raw parent URI.
 Discovery also retains the exact selected entry transiently. When a helper or
 legacy global is opened before workspace indexing, the existing open-install
 prerequisite loop indexes that host and its forward batch, recaptures the

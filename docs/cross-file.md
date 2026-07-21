@@ -94,7 +94,10 @@ Raven deliberately does not execute R or guess historical process-global
 `options(shiny.autoload.r = ...)` state. Project exclusions are applied before
 layout selection: an excluded `server.R` cannot select legacy mode, and excluded
 entries, globals, helpers, or disable markers do not participate in implicit
-loading. Negated exclusion rules can re-include individual helpers.
+loading. Negated exclusion rules can re-include individual helpers. Conventional
+files that are inactive in the selected layout—such as `global.R` beside
+`app.R`, `app.R` in legacy mode, or helpers suppressed by the disable marker—keep
+ordinary standalone-file path and navigation behavior.
 
 Convention-loaded global, helper, and entry files execute with the application
 directory as their working directory. Relative `source()` calls therefore

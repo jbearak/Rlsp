@@ -16495,8 +16495,13 @@ async fn did_open_transactional(
             )
         };
         if needs_package_library {
-            let Some(attempt) = backend
-                .coordinated_package_library_initialization(LibraryRoutingDeadline::foreground())
+            // Keep the large package-initialization future off didOpen's stack.
+            // Source-batch prerequisites add state to this already-wide async
+            // transaction, and tower-lsp nests the resulting future deeply.
+            let Some(attempt) =
+                Box::pin(backend.coordinated_package_library_initialization(
+                    LibraryRoutingDeadline::foreground(),
+                ))
                 .await
             else {
                 log::warn!("didOpen package initialization coordinator deadline expired for {uri}");
@@ -16554,9 +16559,7 @@ async fn did_open_transactional(
                 continue;
             }
             convergence_seed_uris.extend(
-                backend
-                    .converge_open_install_prerequisites(derived.prerequisites)
-                    .await,
+                Box::pin(backend.converge_open_install_prerequisites(derived.prerequisites)).await,
             );
             convergence_seed_uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
             convergence_seed_uris.dedup();

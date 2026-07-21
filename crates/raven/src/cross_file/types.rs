@@ -442,8 +442,19 @@ impl ShinyApplicationMetadata {
             .unwrap_or(&self.application_root)
     }
 
+    /// Whether this file participates in the selected implicit runtime layout.
+    ///
+    /// Candidate metadata is retained to watch incomplete and mode-incompatible
+    /// conventional paths, but candidates must keep ordinary file semantics.
+    pub(crate) fn is_active_participant(&self) -> bool {
+        self.mode.is_some() && !matches!(self.role, ShinyFileRole::Candidate)
+    }
+
     pub(crate) fn is_same_active_application(&self, other: &Self) -> bool {
-        self.mode.is_some() && self.mode == other.mode && self.identity() == other.identity()
+        self.is_active_participant()
+            && other.is_active_participant()
+            && self.mode == other.mode
+            && self.identity() == other.identity()
     }
 
     /// Classify declaration visibility from `declaration` into `self`.
@@ -847,7 +858,7 @@ mod tests {
     #[test]
     fn shiny_declaration_visibility_matches_environment_phases() {
         use ShinyDeclarationVisibility::{Always, DeferredOnly, Never};
-        use ShinyFileRole::{AppEntry, Helper, LegacyGlobal, ServerEntry, UiEntry};
+        use ShinyFileRole::{AppEntry, Candidate, Helper, LegacyGlobal, ServerEntry, UiEntry};
 
         let global = shiny(LegacyGlobal, ShinyApplicationMode::Legacy);
         let first = shiny(Helper { ordinal: 0 }, ShinyApplicationMode::Legacy);
@@ -872,6 +883,13 @@ mod tests {
             Some(Always)
         );
         assert_eq!(single_helper.declaration_visibility_from(&app), Some(Never));
+
+        let candidate = shiny(Candidate, ShinyApplicationMode::Legacy);
+        assert!(!candidate.is_active_participant());
+        assert!(!candidate.is_same_active_application(&server));
+        assert!(!server.is_same_active_application(&candidate));
+        assert_eq!(candidate.declaration_visibility_from(&server), None);
+        assert_eq!(server.declaration_visibility_from(&candidate), None);
 
         let mut other = second.clone();
         other.application_root = "/workspace/other".to_string();
