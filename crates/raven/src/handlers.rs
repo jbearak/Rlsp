@@ -6313,14 +6313,14 @@ fn collect_missing_package_diagnostics_from_snapshot(
     );
 }
 
+type LibraryActivationCache = HashMap<(Url, u32, u32, String), bool>;
+
 /// Whether a conditional loader's prerequisite is present in resolved scope
 /// immediately before its effect position.
 ///
 /// `None` is used only by focused legacy unit tests that do not retain their
 /// query URI; unconditional calls remain active and conditional calls fail
 /// closed. Production diagnostics always provide the URI.
-type LibraryActivationCache = HashMap<(Url, u32, u32, String), bool>;
-
 fn library_call_activation_satisfied(
     snapshot: &DiagnosticsSnapshot,
     uri: Option<&Url>,
@@ -6338,13 +6338,7 @@ fn library_call_activation_satisfied(
     if let Some(active) = cache.get(&key) {
         return *active;
     }
-    let (line, column) = if call.column > 0 {
-        (call.line, call.column - 1)
-    } else if call.line > 0 {
-        (call.line - 1, u32::MAX)
-    } else {
-        (0, 0)
-    };
+    let (line, column) = crate::cross_file::source_detect::position_before_library_call(call);
     let scope = snapshot.get_scope(uri, line, column, cancel);
     let active = scope.attached_packages.contains(required);
     cache.insert(key, active);
@@ -7047,7 +7041,11 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
 /// packages. Deliberately file-level rather than position-aware — the
 /// conservative "unresolved callee suppresses its arguments" fallback keeps the
 /// approximation safe.
-fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<String> {
+fn collect_in_play_packages(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    cancel: &DiagCancelToken,
+) -> Vec<String> {
     let mut packages: HashSet<String> = HashSet::new();
     let mut attached_packages_for_meta: HashSet<String> = HashSet::new();
     let mut activation_cache = LibraryActivationCache::new();
@@ -7056,7 +7054,7 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
             snapshot,
             Some(uri),
             call,
-            &DiagCancelToken::never(),
+            cancel,
             &mut activation_cache,
         ) {
             continue;
@@ -7108,7 +7106,7 @@ fn collect_in_play_packages(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Vec<St
                             snapshot,
                             Some(meta_uri),
                             call,
-                            &DiagCancelToken::never(),
+                            cancel,
                             &mut activation_cache,
                         ) {
                             continue;
@@ -7485,7 +7483,7 @@ fn collect_undefined_variables_from_snapshot(
     // should be skipped) instead of blanket-suppressing every call-like
     // argument. Built once from the file's local definitions and the file/
     // workspace package context.
-    let in_play_packages = collect_in_play_packages(snapshot, uri);
+    let in_play_packages = collect_in_play_packages(snapshot, uri, cancel);
     // Only walk the source graph for foreign NSE/func declarations when call-
     // argument checking is on: with it off, `NseAnalysis::build` returns before
     // it ever translates directives, so the declarations (and the two graph
@@ -7734,7 +7732,30 @@ fn collect_undefined_variables_from_snapshot(
 
     // Reusable buffer for position-aware packages; avoids per-iteration allocation.
     let mut position_aware_packages_buf: Vec<String> = Vec::new();
-    let mut library_activation_cache = LibraryActivationCache::new();
+    let active_library_call_positions =
+        if snapshot.cross_file_config.packages_enabled && !snapshot.package_library_ready {
+            let mut activation_cache = LibraryActivationCache::new();
+            snapshot
+                .directive_meta
+                .library_calls
+                .iter()
+                .filter(|call| {
+                    library_call_activation_satisfied(
+                        snapshot,
+                        Some(uri),
+                        call,
+                        cancel,
+                        &mut activation_cache,
+                    )
+                })
+                .map(|call| (call.line, call.column))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+    if cancel.is_cancelled() {
+        return;
+    }
 
     for (idx, (name, usage_node)) in used.into_iter().enumerate() {
         if idx & 63 == 0 && cancel.is_cancelled() {
@@ -7986,16 +8007,10 @@ fn collect_undefined_variables_from_snapshot(
                 continue;
             }
         } else {
-            let has_prior_library_call = snapshot.directive_meta.library_calls.iter().any(|call| {
-                library_call_activation_satisfied(
-                    snapshot,
-                    Some(uri),
-                    call,
-                    &DiagCancelToken::never(),
-                    &mut library_activation_cache,
-                ) && (call.line < usage_line
-                    || (call.line == usage_line && call.column <= usage_col_utf16))
-            });
+            let has_prior_library_call =
+                active_library_call_positions.iter().any(|(line, column)| {
+                    *line < usage_line || (*line == usage_line && *column <= usage_col_utf16)
+                });
             let has_prior_library_call = has_prior_library_call
                 || has_prior_package_loader_call(
                     &package_loader_call_end_offsets,
