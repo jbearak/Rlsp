@@ -11934,6 +11934,7 @@ pub(crate) fn derive_workspace_dependency_graph(
                 previous,
                 uri,
                 workspace_root,
+                &context.exclusions,
             )
         });
         if !reused {
@@ -11964,6 +11965,7 @@ pub(crate) fn derive_workspace_dependency_graph(
                     previous,
                     uri,
                     workspace_root,
+                    &context.exclusions,
                 )
             });
         if !reused {
@@ -14372,6 +14374,112 @@ mod tests {
                 .iter()
                 .any(|path| path.ends_with("generated/ignored.R")),
             "excluded generated directory must be skipped; got {indexed_paths:?}"
+        );
+    }
+
+    #[test]
+    fn changed_exclusions_refinalize_open_shiny_and_closed_tar_source_batches() {
+        use serde_json::json;
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shiny_root = tmp.path().join("shiny");
+        let pipeline_root = tmp.path().join("pipeline");
+        fs::create_dir_all(shiny_root.join("R")).unwrap();
+        fs::create_dir_all(pipeline_root.join("R")).unwrap();
+        fs::write(shiny_root.join("app.R"), "shiny_helper\n").unwrap();
+        fs::write(shiny_root.join("R/helper.R"), "shiny_helper <- 1\n").unwrap();
+        fs::write(
+            pipeline_root.join("_targets.R"),
+            "targets::tar_source(\"R\")\ntar_helper\n",
+        )
+        .unwrap();
+        fs::write(pipeline_root.join("R/helper.R"), "tar_helper <- 1\n").unwrap();
+
+        let root_uri = Url::from_directory_path(tmp.path()).unwrap();
+        let app_uri = Url::from_file_path(shiny_root.join("app.R")).unwrap();
+        let targets_uri = Url::from_file_path(pipeline_root.join("_targets.R")).unwrap();
+        let mut entries = scan_workspace(std::slice::from_ref(&root_uri), 20);
+
+        let app_entry = entries.get(&app_uri).unwrap();
+        let shiny_helper_uri = app_entry
+            .metadata
+            .sources
+            .iter()
+            .find_map(|source| {
+                source
+                    .is_source_batch_member()
+                    .then_some(source.resolved_uri.clone())
+            })
+            .flatten()
+            .expect("initial Shiny expansion must contain its helper");
+        let tar_helper_uri = entries[&targets_uri]
+            .metadata
+            .sources
+            .iter()
+            .find_map(|source| {
+                source
+                    .is_source_batch_member()
+                    .then_some(source.resolved_uri.clone())
+            })
+            .flatten()
+            .expect("initial tar_source expansion must contain its helper");
+        let open_overlay = WorkspaceGraphOverlay {
+            uri: app_uri.clone(),
+            content: app_entry.contents.clone(),
+            chunk_kind: ChunkKind::R,
+            metadata: Some(app_entry.metadata.clone()),
+            graph_roots: vec![app_uri.clone()],
+            excluded: false,
+        };
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &json!({
+                "workspace": {
+                    "exclude": ["shiny/R/**", "pipeline/R/**"]
+                }
+            }),
+            vec![tmp.path().to_path_buf()],
+        );
+        let context = WorkspaceGraphDerivationContext {
+            workspace_root: Some(root_uri),
+            max_depth: 20,
+            exclusions,
+            system_file_workspace_name: None,
+            system_file_workspace_root: None,
+            system_file_library_paths: Vec::new(),
+        };
+
+        let (graph, open_metadata) =
+            derive_workspace_dependency_graph(&mut entries, None, &[open_overlay], &context, false);
+
+        assert!(
+            open_metadata[&app_uri]
+                .sources
+                .iter()
+                .all(|source| source.resolved_uri.as_ref() != Some(&shiny_helper_uri)),
+            "changed exclusions must invalidate the open Shiny expansion"
+        );
+        assert!(
+            entries[&targets_uri]
+                .metadata
+                .sources
+                .iter()
+                .all(|source| source.resolved_uri.as_ref() != Some(&tar_helper_uri)),
+            "changed exclusions must invalidate the closed tar_source expansion"
+        );
+        assert!(
+            graph
+                .get_dependencies(&app_uri)
+                .iter()
+                .all(|edge| edge.to != shiny_helper_uri),
+            "excluded Shiny helpers must leave the dependency graph"
+        );
+        assert!(
+            graph
+                .get_dependencies(&targets_uri)
+                .iter()
+                .all(|edge| edge.to != tar_helper_uri),
+            "excluded tar_source members must leave the dependency graph"
         );
     }
 

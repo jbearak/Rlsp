@@ -36,6 +36,8 @@ pub struct TarSourceExpansion {
     pub sources: Vec<ForwardSource>,
     /// Existing and potential membership roots, including symlink targets.
     pub watch_paths: Vec<PathBuf>,
+    /// Project exclusion patterns applied while selecting members.
+    pub exclusion_patterns: Vec<String>,
     /// Filesystem-derived Shiny context for the enriched file.
     pub shiny_application: Option<ShinyApplicationMetadata>,
     /// Lexical Shiny application directory used for runtime path resolution.
@@ -367,6 +369,7 @@ pub fn expand_tar_source_requests_with_exclusions(
     };
     let mut result = TarSourceExpansion {
         watch_paths: shiny.watch_paths,
+        exclusion_patterns: exclusions.patterns().to_vec(),
         shiny_application: shiny.metadata,
         application_working_directory: shiny.application_working_directory,
         selected_shiny_entry: shiny.selected_entry,
@@ -375,7 +378,12 @@ pub fn expand_tar_source_requests_with_exclusions(
     for request in &metadata.tar_source_requests {
         let expansion = expand_request(request, &context);
         result.watch_paths.extend(expansion.watch_paths);
-        for (ordinal, path) in expansion.files.into_iter().enumerate() {
+        for (ordinal, path) in expansion
+            .files
+            .into_iter()
+            .filter(|path| !exclusions.is_excluded_path(path))
+            .enumerate()
+        {
             let Some(resolved_uri) = path_to_uri(&path) else {
                 continue;
             };
@@ -399,7 +407,12 @@ pub fn expand_tar_source_requests_with_exclusions(
     for request in &metadata.list_files_source_requests {
         let expansion = expand_list_files_request(request, &context, workspace_root);
         result.watch_paths.extend(expansion.watch_paths);
-        for (ordinal, path) in expansion.files.into_iter().enumerate() {
+        for (ordinal, path) in expansion
+            .files
+            .into_iter()
+            .filter(|path| !exclusions.is_excluded_path(path))
+            .enumerate()
+        {
             let Some(resolved_uri) = path_to_uri(&path) else {
                 continue;
             };
@@ -461,6 +474,7 @@ pub fn apply_tar_source_expansion(metadata: &mut CrossFileMetadata, expansion: T
         .retain(|source| !source.is_source_batch_member());
     metadata.sources.extend(expansion.sources);
     metadata.tar_source_expansion_watch_paths = expansion.watch_paths;
+    metadata.source_batch_exclusion_patterns = expansion.exclusion_patterns;
     metadata.application_working_directory = expansion
         .application_working_directory
         .map(|path| path.to_string_lossy().into_owned());
@@ -503,8 +517,8 @@ pub fn finalize_tar_source_requests_with_exclusions(
     selected_shiny_entry
 }
 
-/// Reuse a prior record's derived expansion when its syntax and effective path
-/// context are identical.
+/// Reuse a prior record's derived expansion when its syntax, effective path
+/// context, and project exclusions are identical.
 ///
 /// This is the only cache-like seam in the module: ownership and freshness stay
 /// with the caller's authoritative record. Returns `true` when reuse occurred.
@@ -513,7 +527,11 @@ pub fn reuse_tar_source_expansion(
     previous: &CrossFileMetadata,
     uri: &Url,
     workspace_root: Option<&Url>,
+    exclusions: &CompiledWorkspaceExclusions,
 ) -> bool {
+    if previous.source_batch_exclusion_patterns.as_slice() != exclusions.patterns() {
+        return false;
+    }
     if metadata.tar_source_requests != previous.tar_source_requests
         || metadata.list_files_source_requests != previous.list_files_source_requests
     {
@@ -538,6 +556,7 @@ pub fn reuse_tar_source_expansion(
             .cloned()
             .collect(),
         watch_paths: previous.tar_source_expansion_watch_paths.clone(),
+        exclusion_patterns: previous.source_batch_exclusion_patterns.clone(),
         shiny_application: previous.shiny_application.clone(),
         application_working_directory: previous
             .application_working_directory
@@ -1362,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn reuse_requires_identical_requests_and_path_context() {
+    fn reuse_requires_identical_requests_path_context_and_exclusions() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         touch(&root.join("R/a.R"), "");
@@ -1371,13 +1390,15 @@ mod tests {
         let root_uri = Url::from_directory_path(root).unwrap();
         let parent_uri = Url::from_file_path(&parent).unwrap();
         let previous = finalize(root, &parent, "targets::tar_source(\"R\")");
+        let no_exclusions = CompiledWorkspaceExclusions::default();
 
         let mut same = crate::cross_file::extract_metadata("targets::tar_source(\"R\")");
         assert!(reuse_tar_source_expansion(
             &mut same,
             &previous,
             &parent_uri,
-            Some(&root_uri)
+            Some(&root_uri),
+            &no_exclusions,
         ));
         assert_eq!(relative_sources(root, &same), ["R/a.R"]);
 
@@ -1388,7 +1409,21 @@ mod tests {
             &mut changed,
             &previous,
             &parent_uri,
-            Some(&root_uri)
+            Some(&root_uri),
+            &no_exclusions,
+        ));
+
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["R/**"] } }),
+            vec![root.to_path_buf()],
+        );
+        let mut newly_excluded = crate::cross_file::extract_metadata("targets::tar_source(\"R\")");
+        assert!(!reuse_tar_source_expansion(
+            &mut newly_excluded,
+            &previous,
+            &parent_uri,
+            Some(&root_uri),
+            &exclusions,
         ));
     }
 

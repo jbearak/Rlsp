@@ -9795,6 +9795,7 @@ fn extract_enriched_live_metadata_with_contexts(
             previous.as_ref(),
             uri,
             workspace_root.as_ref(),
+            &state.workspace_exclusions,
         );
     }
 

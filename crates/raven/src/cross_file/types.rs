@@ -221,6 +221,12 @@ pub struct CrossFileMetadata {
     /// The historical field name is retained for metadata compatibility.
     #[serde(default)]
     pub tar_source_expansion_watch_paths: Vec<std::path::PathBuf>,
+    /// Project exclusion patterns used by the last filesystem expansion.
+    ///
+    /// Reuse is valid only when these match the current compiled exclusions;
+    /// otherwise entries, helpers, or disable markers may remain stale.
+    #[serde(default)]
+    pub source_batch_exclusion_patterns: Vec<String>,
     /// Implicit Shiny application context derived during filesystem enrichment.
     ///
     /// This is retained even for candidate files in an incomplete layout so the
