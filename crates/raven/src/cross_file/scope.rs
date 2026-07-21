@@ -984,6 +984,9 @@ fn append_targets_pipeline_packages<'a>(
     packages: impl IntoIterator<Item = &'a str>,
 ) {
     for package in packages {
+        if package.is_empty() {
+            continue;
+        }
         if !scope.inherited_packages.contains(package) && !scope.loaded_packages.contains(package) {
             scope
                 .targets_only_loaded_packages
@@ -34062,6 +34065,36 @@ mod package_contribution_tests {
                 .map(|symbol| &symbol.source_uri),
             Some(&member_uri),
             "the tar member definition must flow back into `_targets.R` after the batch"
+        );
+    }
+
+    #[test]
+    fn targets_pipeline_packages_skip_empty_names() {
+        let origin_uri = Url::parse("file:///workspace/_targets.R").unwrap();
+        let mut scope = ScopeAtPosition::default();
+
+        append_targets_pipeline_packages(&mut scope, &origin_uri, ["", "dplyr"]);
+
+        assert_eq!(scope.loaded_packages, HashSet::from(["dplyr".to_string()]));
+        assert_eq!(
+            scope.attached_packages,
+            HashSet::from(["dplyr".to_string()])
+        );
+        assert_eq!(
+            scope.targets_only_loaded_packages,
+            HashSet::from(["dplyr".to_string()])
+        );
+        assert_eq!(
+            scope.targets_only_attached_packages,
+            HashSet::from(["dplyr".to_string()])
+        );
+        assert_eq!(
+            scope
+                .package_origins
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            HashSet::from(["dplyr".to_string()])
         );
     }
 
