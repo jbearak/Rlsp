@@ -34,12 +34,12 @@
 //! data-masking and tidy-select verbs, `tibble`/`targets` constructors and
 //! target-name helpers, `gt`/`gtsummary` table-column selectors, `recipes`
 //! step/role column captures, ggplot2 mapping helpers (`aes`/`vars`/`qplot`),
-//! `tidytext`/`modelr`/`drake` column- and target-name captures, rlang capture
-//! helpers, the plyr `.()` quoting helper and `*ply` split-apply verbs (whose
-//! `...` are suppressed only when `.fun` is a data-masking verb — see
-//! `is_plyr_split_apply_verb` and the call-site upgrade in `handlers.rs`), and a
-//! few established DSLs); it is intentionally extensible rather
-//! than exhaustive. A handful of large, uniform export families
+//! Haven reader `col_select` arguments, `tidytext`/`modelr`/`drake` column- and
+//! target-name captures, rlang capture helpers, the plyr `.()` quoting helper
+//! and `*ply` split-apply verbs (whose `...` are suppressed only when `.fun` is
+//! a data-masking verb — see `is_plyr_split_apply_verb` and the call-site
+//! upgrade in `handlers.rs`), and a few established DSLs); it is intentionally
+//! extensible rather than exhaustive. A handful of large, uniform export families
 //! (`recipes::step_*`, `gt::fmt_*`/`sub_*`/`cells_*`) are matched by name
 //! prefix rather than enumerated, since every member shares one empirically
 //! verified contract.
@@ -306,6 +306,70 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
         "data.table" => match name {
             // Column-name NSE; the `v`-suffixed variants take character vectors.
             "setkey" | "setorder" | "setindex" => ArgPolicy::per_formal(&["x", "..."], &[], true),
+            _ => return None,
+        },
+        "haven" => match name {
+            // Haven 2.5.5 evaluates only `col_select` through tidyselect. Keep
+            // the complete exported signatures here so positional calls bind
+            // that one captured formal while file paths, row controls, and
+            // name-repair expressions remain checked.
+            "read_dta" | "read_stata" => ArgPolicy::per_formal(
+                &[
+                    "file",
+                    "encoding",
+                    "col_select",
+                    "skip",
+                    "n_max",
+                    ".name_repair",
+                ],
+                &["col_select"],
+                false,
+            ),
+            "read_sav" => ArgPolicy::per_formal(
+                &[
+                    "file",
+                    "encoding",
+                    "user_na",
+                    "col_select",
+                    "skip",
+                    "n_max",
+                    ".name_repair",
+                ],
+                &["col_select"],
+                false,
+            ),
+            "read_spss" | "read_por" => ArgPolicy::per_formal(
+                &[
+                    "file",
+                    "user_na",
+                    "col_select",
+                    "skip",
+                    "n_max",
+                    ".name_repair",
+                ],
+                &["col_select"],
+                false,
+            ),
+            "read_sas" => ArgPolicy::per_formal(
+                &[
+                    "data_file",
+                    "catalog_file",
+                    "encoding",
+                    "catalog_encoding",
+                    "col_select",
+                    "skip",
+                    "n_max",
+                    "cols_only",
+                    ".name_repair",
+                ],
+                &["col_select"],
+                false,
+            ),
+            "read_xpt" => ArgPolicy::per_formal(
+                &["file", "col_select", "skip", "n_max", ".name_repair"],
+                &["col_select"],
+                false,
+            ),
             _ => return None,
         },
         "pacman" => match name {
@@ -1744,6 +1808,109 @@ mod tests {
         let p = package_policy("drake", "readd").unwrap();
         let mask = suppressed_arguments(&p, &labels(&[None, Some("character_only")]), false);
         assert_eq!(mask, vec![true, false]);
+    }
+
+    #[test]
+    fn haven_reader_signatures_capture_only_col_select() {
+        let cases: &[(&str, &[&str], &[bool])] = &[
+            (
+                "read_dta",
+                &[
+                    "file",
+                    "encoding",
+                    "col_select",
+                    "skip",
+                    "n_max",
+                    ".name_repair",
+                ],
+                &[false, false, true, false, false, false],
+            ),
+            (
+                "read_stata",
+                &[
+                    "file",
+                    "encoding",
+                    "col_select",
+                    "skip",
+                    "n_max",
+                    ".name_repair",
+                ],
+                &[false, false, true, false, false, false],
+            ),
+            (
+                "read_sav",
+                &[
+                    "file",
+                    "encoding",
+                    "user_na",
+                    "col_select",
+                    "skip",
+                    "n_max",
+                    ".name_repair",
+                ],
+                &[false, false, false, true, false, false, false],
+            ),
+            (
+                "read_spss",
+                &[
+                    "file",
+                    "user_na",
+                    "col_select",
+                    "skip",
+                    "n_max",
+                    ".name_repair",
+                ],
+                &[false, false, true, false, false, false],
+            ),
+            (
+                "read_por",
+                &[
+                    "file",
+                    "user_na",
+                    "col_select",
+                    "skip",
+                    "n_max",
+                    ".name_repair",
+                ],
+                &[false, false, true, false, false, false],
+            ),
+            (
+                "read_sas",
+                &[
+                    "data_file",
+                    "catalog_file",
+                    "encoding",
+                    "catalog_encoding",
+                    "col_select",
+                    "skip",
+                    "n_max",
+                    "cols_only",
+                    ".name_repair",
+                ],
+                &[false, false, false, false, true, false, false, false, false],
+            ),
+            (
+                "read_xpt",
+                &["file", "col_select", "skip", "n_max", ".name_repair"],
+                &[false, true, false, false, false],
+            ),
+        ];
+
+        for (name, formals, expected_mask) in cases {
+            let policy = package_policy("haven", name).unwrap();
+            assert_eq!(
+                policy,
+                ArgPolicy::per_formal(formals, &["col_select"], false),
+                "haven::{name} exact policy"
+            );
+            assert_eq!(
+                suppressed_arguments(&policy, &vec![None; formals.len()], false),
+                *expected_mask,
+                "haven::{name} positional mask"
+            );
+        }
+
+        assert_eq!(package_policy("haven", "write_dta"), None);
     }
 
     #[test]

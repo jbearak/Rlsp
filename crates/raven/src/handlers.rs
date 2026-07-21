@@ -65693,6 +65693,59 @@ my_func <- function(a = default_value) {
         );
     }
 
+    /// Issue #689: attaching Haven makes its reader policies available to bare
+    /// calls. `col_select` is tidy-selected, but the file and row controls are
+    /// ordinary evaluated arguments and must continue to report typos.
+    #[test]
+    fn nse_haven_attached_reader_captures_bare_col_select_only_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(haven)\nread_dta(typo_path, col_select = mpg, skip = typo_skip)",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("mpg is not defined")),
+            "bare selected column should be suppressed; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("typo_path is not defined")),
+            "evaluated file argument should be checked; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("typo_skip is not defined")),
+            "evaluated skip argument should be checked; got {messages:?}"
+        );
+    }
+
+    /// Issue #689: a qualified Haven reader receives the same per-formal
+    /// policy without an attachment. The tidyselect helper supplied inside
+    /// `col_select` is part of that captured expression, while evaluated
+    /// arguments remain visible to the collector.
+    #[test]
+    fn nse_haven_qualified_reader_captures_all_of_col_select_only_end_to_end() {
+        let messages = collect_undefined_messages(
+            "vars <- \"mpg\"\nhaven::read_sas(typo_path, col_select = all_of(vars), skip = typo_skip)",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("all_of is not defined")),
+            "tidyselect helper should be suppressed in col_select; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("typo_path is not defined")),
+            "evaluated data_file argument should be checked; got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("typo_skip is not defined")),
+            "evaluated skip argument should be checked; got {messages:?}"
+        );
+    }
+
     #[test]
     fn nse_targets_make_suppresses_only_target_name_selectors_end_to_end() {
         for code in [
