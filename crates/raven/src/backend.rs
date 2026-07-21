@@ -31,15 +31,15 @@ use crate::handlers;
 use crate::indentation;
 use crate::state::{
     AnalysisBasis, AnalysisTransferCandidate, AnalysisTransferFinalization, AnalysisTransferHandle,
-    AnalysisTransferRejection, DiagnosticsTrigger, IndentationSettings, OpenCloseCommitOutcome,
-    OpenCloseDiskObservation, OpenCloseIntentToken, OpenCloseResyncTicket, OpenInstallIntentToken,
-    PackageProjectionBasis, PackageRoutingCommitEffects, PackageSeedInstalledIdentity,
-    PostSeedRefreshOwnerRegistration, PreparedAnalysisCommit, PreparedOpenAliasReconcileAnalysis,
-    PreparedOpenCloseAnalysis, PreparedOpenCloseDiskInstall, PreparedOpenCommitPlan,
-    PreparedOpenEditAnalysis, PreparedOpenGraphProjection, PreparedOpenInstallAnalysis,
-    PreparedOpenLifecycleBatch, PreparedPackageProjection, PreparedWatchedBatchAnalysis,
-    PreparedWorkspaceOpenMetadata, PreparedWorkspaceScanAnalysis, SymbolConfig,
-    SysdataFallbackBasis, SysdataFallbackOwner, SystemFileRoutingOwnerIdentity,
+    AnalysisTransferRejection, DiagnosticsCoherenceGuard, DiagnosticsTrigger, IndentationSettings,
+    OpenCloseCommitOutcome, OpenCloseDiskObservation, OpenCloseIntentToken, OpenCloseResyncTicket,
+    OpenInstallIntentToken, PackageProjectionBasis, PackageRoutingCommitEffects,
+    PackageSeedInstalledIdentity, PostSeedRefreshOwnerRegistration, PreparedAnalysisCommit,
+    PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis, PreparedOpenCloseDiskInstall,
+    PreparedOpenCommitPlan, PreparedOpenEditAnalysis, PreparedOpenGraphProjection,
+    PreparedOpenInstallAnalysis, PreparedOpenLifecycleBatch, PreparedPackageProjection,
+    PreparedWatchedBatchAnalysis, PreparedWorkspaceOpenMetadata, PreparedWorkspaceScanAnalysis,
+    SymbolConfig, SysdataFallbackBasis, SysdataFallbackOwner, SystemFileRoutingOwnerIdentity,
     SystemFileTransferredEffects, WorkspaceGraphDerivationContext, WorkspaceGraphOverlay,
     WorkspaceScanDerivationBasis, WorkspaceScanInputBasis, WorkspaceScanIntentToken,
     WorkspaceScanTransferredEffects, WorldState, derive_workspace_dependency_graph,
@@ -1693,6 +1693,7 @@ pub struct Backend {
     /// on every task exit (including unwind) without awaiting a state lock.
     open_tar_source_coordinators: Arc<std::sync::Mutex<std::collections::HashMap<Url, u64>>>,
     open_tar_source_coordinator_generation: Arc<AtomicU64>,
+    open_tar_source_refresh_completions: Arc<OpenTarSourceRefreshCompletions>,
     /// Coalesces concurrent same-key on-demand package initialization. A
     /// waiter rechecks readiness/current inputs after the winning transaction
     /// releases the gate, so one key never launches duplicate R/provider work.
@@ -1706,6 +1707,8 @@ pub struct Backend {
     #[cfg(test)]
     open_tar_source_derivations_for_test:
         Arc<std::sync::Mutex<std::collections::HashMap<Url, u64>>>,
+    #[cfg(test)]
+    open_tar_source_refresh_cancel_remaining_for_test: Arc<AtomicU64>,
 }
 
 /// Linearizes root routing-task spawn with shutdown.
@@ -1832,6 +1835,75 @@ impl OpenTarSourceCoordinatorGuard {
 impl Drop for OpenTarSourceCoordinatorGuard {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+#[derive(Debug, Clone)]
+enum OpenTarSourceRefreshOutcome {
+    Committed(Vec<crate::state::AnalysisRevalidationTicket>),
+    Cancelled,
+}
+
+type OpenTarSourceRefreshWaiter = (
+    u64,
+    tokio::sync::oneshot::Sender<OpenTarSourceRefreshOutcome>,
+);
+
+#[derive(Default)]
+struct OpenTarSourceRefreshCompletions {
+    waiters: std::sync::Mutex<std::collections::HashMap<Url, Vec<OpenTarSourceRefreshWaiter>>>,
+}
+
+impl OpenTarSourceRefreshCompletions {
+    fn register(&self, uri: Url, generation: u64) -> OpenTarSourceRefreshReceipt {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.waiters
+            .lock()
+            .unwrap()
+            .entry(uri)
+            .or_default()
+            .push((generation, sender));
+        OpenTarSourceRefreshReceipt { receiver }
+    }
+
+    fn complete_through(&self, uri: &Url, generation: u64, outcome: OpenTarSourceRefreshOutcome) {
+        let mut waiters = self.waiters.lock().unwrap();
+        let Some(uri_waiters) = waiters.get_mut(uri) else {
+            return;
+        };
+        let mut retained = Vec::new();
+        for (waiting_generation, sender) in uri_waiters.drain(..) {
+            if waiting_generation <= generation {
+                let _ = sender.send(outcome.clone());
+            } else {
+                retained.push((waiting_generation, sender));
+            }
+        }
+        if retained.is_empty() {
+            waiters.remove(uri);
+        } else {
+            *uri_waiters = retained;
+        }
+    }
+
+    fn cancel_uri(&self, uri: &Url) {
+        let waiters = self.waiters.lock().unwrap().remove(uri);
+        for (_, sender) in waiters.into_iter().flatten() {
+            let _ = sender.send(OpenTarSourceRefreshOutcome::Cancelled);
+        }
+    }
+}
+
+struct OpenTarSourceRefreshReceipt {
+    receiver: tokio::sync::oneshot::Receiver<OpenTarSourceRefreshOutcome>,
+}
+
+impl OpenTarSourceRefreshReceipt {
+    async fn wait(self, shutdown: CancellationToken) -> OpenTarSourceRefreshOutcome {
+        tokio::select! {
+            outcome = self.receiver => outcome.unwrap_or(OpenTarSourceRefreshOutcome::Cancelled),
+            _ = shutdown.cancelled() => OpenTarSourceRefreshOutcome::Cancelled,
+        }
     }
 }
 
@@ -2442,6 +2514,9 @@ impl Backend {
                 std::collections::HashMap::new(),
             )),
             open_tar_source_coordinator_generation: Arc::new(AtomicU64::new(0)),
+            open_tar_source_refresh_completions: Arc::new(
+                OpenTarSourceRefreshCompletions::default(),
+            ),
             package_init_coordinator: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             test_home_dir: Arc::new(std::sync::Mutex::new(None)),
@@ -2453,6 +2528,8 @@ impl Backend {
             open_tar_source_derivations_for_test: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            #[cfg(test)]
+            open_tar_source_refresh_cancel_remaining_for_test: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -3869,7 +3946,7 @@ async fn prepare_workspace_scan(
     inputs: &WorkspaceScanInputs,
     result: crate::state::WorkspaceScanResult,
 ) -> Option<PreparedWorkspaceScanAnalysis> {
-    let (open_overlays, mut open_captures, basis, retained_entries, chunk_kind_overrides) = {
+    let (mut open_overlays, mut open_captures, basis, retained_entries, chunk_kind_overrides) = {
         let state = state_arc.read().await;
         let index_snapshot = state.workspace_index.authority_snapshot();
         let basis =
@@ -3948,8 +4025,13 @@ async fn prepare_workspace_scan(
         system_file_workspace_root: package_workspace_root,
         system_file_library_paths: library_paths,
     };
-    let (complete_graph, _) =
-        derive_workspace_dependency_graph(&mut graph_entries, None, &open_overlays, &context);
+    let (complete_graph, complete_open_metadata) =
+        derive_workspace_dependency_graph(&mut graph_entries, None, &open_overlays, &context, true);
+    for overlay in &mut open_overlays {
+        if let Some(metadata) = complete_open_metadata.get(&overlay.uri) {
+            overlay.metadata = Some(metadata.clone());
+        }
+    }
     let workspace_index_pins = prospective_workspace_pins(&complete_graph, &open_overlays, inputs);
     let artifact_roots =
         prepare_resident_artifact_uris(&graph_entries, &basis, &workspace_index_pins);
@@ -3958,6 +4040,7 @@ async fn prepare_workspace_scan(
         Some(&artifact_roots),
         &open_overlays,
         &context,
+        false,
     );
     complete_entries.retain(|uri, _| artifact_roots.contains(uri));
     let resident_entries =
@@ -6243,7 +6326,7 @@ pub async fn run_system_file_convergence_for_test(
 /// must be recomputed when it becomes included again. Keep this helper shared by
 /// startup post-scan completion and live `[workspace].exclude` reloads so their
 /// open-buffer-authoritative behavior cannot drift.
-async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldState) {
+async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldState) -> Vec<Url> {
     let mut open_docs: Vec<_> = state
         .documents
         .uris()
@@ -6256,10 +6339,14 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
         .collect();
     open_docs.sort_unstable_by(|(a, ..), (b, ..)| a.as_str().cmp(b.as_str()));
 
+    let mut source_batch_parents = Vec::new();
     for (uri, analysis_text, generation) in open_docs {
         if state.is_project_excluded_uri(&uri) {
             let workspace_root = state.workspace_folders.first().cloned();
             let meta = extract_enriched_live_metadata(state, &uri, &analysis_text);
+            if !meta.tar_source_requests.is_empty() || !meta.list_files_source_requests.is_empty() {
+                source_batch_parents.push(uri.clone());
+            }
             state
                 .replace_open_document_metadata_if_current(&uri, generation, Arc::new(meta.clone()))
                 .expect("workspace replay basis remains current under the state write lock");
@@ -6271,6 +6358,9 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
         }
 
         let meta = extract_enriched_live_metadata(state, &uri, &analysis_text);
+        if !meta.tar_source_requests.is_empty() || !meta.list_files_source_requests.is_empty() {
+            source_batch_parents.push(uri.clone());
+        }
         let workspace_root = state.workspace_folders.first().cloned();
 
         state
@@ -6283,6 +6373,7 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
     }
 
     state.recompute_open_neighborhood_pins();
+    source_batch_parents
 }
 
 /// Complete startup without an index-backed scan.
@@ -9694,11 +9785,18 @@ fn extract_enriched_live_metadata_with_contexts(
     let ws_root = ws.map(|w| w.root.as_path());
     let lib_paths = state.package_library.lib_paths();
     crate::cross_file::resolve_system_file_sources(&mut meta, ws_name, ws_root, lib_paths);
-    crate::cross_file::tar_source::finalize_tar_source_requests(
-        &mut meta,
-        uri,
-        workspace_root.as_ref(),
-    );
+    // This helper is called while callers hold `WorldState` locks. Reusing a
+    // record-owned expansion is stat-free; changed/new requests are expanded
+    // by the detached open-parent refresh coordinator after the edit/replay
+    // transaction commits.
+    if let Some(previous) = state.get_enriched_metadata(uri) {
+        crate::cross_file::tar_source::reuse_tar_source_expansion(
+            &mut meta,
+            previous.as_ref(),
+            uri,
+            workspace_root.as_ref(),
+        );
+    }
 
     (meta, attempted.into_inner())
 }
@@ -9895,6 +9993,7 @@ fn prepare_open_graph_plan(
 
 struct CapturedOpenEditFallback {
     analysis_text: String,
+    precomputed_metadata: Option<crate::cross_file::CrossFileMetadata>,
     old_metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
     workspace_root: Option<Url>,
     workspace_name: Option<String>,
@@ -9958,6 +10057,7 @@ fn capture_open_edit_fallback(
         .extend(state.documents.keys().cloned());
     CapturedOpenEditFallback {
         analysis_text: prepared.document().analysis_text(),
+        precomputed_metadata: None,
         old_metadata,
         workspace_root: state.workspace_folders.first().cloned(),
         workspace_name,
@@ -9980,20 +10080,23 @@ fn capture_open_edit_fallback(
 fn derive_open_edit_fallback(
     captured: CapturedOpenEditFallback,
 ) -> (crate::cross_file::CrossFileMetadata, PreparedOpenCommitPlan) {
-    let mut local_metadata = crate::cross_file::extract_metadata(&captured.analysis_text);
-    crate::cross_file::resolve_system_file_sources(
-        &mut local_metadata,
-        captured.workspace_name.as_deref(),
-        captured.package_root.as_deref(),
-        &captured.library_paths,
-    );
-    if let Some(primary_uri) = captured.graph_roots.first() {
-        crate::cross_file::tar_source::finalize_tar_source_requests(
-            &mut local_metadata,
-            primary_uri,
-            captured.workspace_root.as_ref(),
+    let local_metadata = captured.precomputed_metadata.unwrap_or_else(|| {
+        let mut metadata = crate::cross_file::extract_metadata(&captured.analysis_text);
+        crate::cross_file::resolve_system_file_sources(
+            &mut metadata,
+            captured.workspace_name.as_deref(),
+            captured.package_root.as_deref(),
+            &captured.library_paths,
         );
-    }
+        if let Some(primary_uri) = captured.graph_roots.first() {
+            crate::cross_file::tar_source::finalize_tar_source_requests(
+                &mut metadata,
+                primary_uri,
+                captured.workspace_root.as_ref(),
+            );
+        }
+        metadata
+    });
     let graph = captured
         .graph_roots
         .iter()
@@ -10058,15 +10161,15 @@ struct CapturedLivePackageOpenEdit {
     preamble_fanout_uris: Vec<Url>,
 }
 
-fn capture_live_package_open_edit(
+fn capture_live_package_open_edit_with_metadata(
     state: &WorldState,
     uri: &Url,
     prepared: crate::state::PreparedOpenEdit,
+    metadata: crate::cross_file::CrossFileMetadata,
+    mut attempted_contexts: Vec<Url>,
 ) -> CapturedLivePackageOpenEdit {
     let old_meta = state.get_enriched_metadata(uri);
-    let text = prepared.document().analysis_text();
-    let (metadata, mut attempted_contexts) =
-        extract_enriched_live_metadata_with_contexts(state, uri, &text);
+    let subject_excluded = state.is_project_excluded_uri(uri);
     let workspace_root = state.workspace_folders.first().cloned();
     let packages_to_prefetch = if state.cross_file_config.packages_enabled {
         let mut packages =
@@ -10086,19 +10189,23 @@ fn capture_live_package_open_edit(
     );
     attempted_contexts.extend(graph_contexts);
 
-    let package_event_uri = state
-        .package_inputs
-        .workspace_root
-        .as_ref()
-        .and_then(|root| {
-            authoritative_package_input_uri_for_open_document(state, uri, root)
-                .map(|package_input| package_input.uri().clone())
-        });
+    let package_event_uri = (!subject_excluded)
+        .then(|| {
+            state
+                .package_inputs
+                .workspace_root
+                .as_ref()
+                .and_then(|root| {
+                    authoritative_package_input_uri_for_open_document(state, uri, root)
+                        .map(|package_input| package_input.uri().clone())
+                })
+        })
+        .flatten();
     let package_text = package_event_uri
         .as_ref()
         .map(|_| Arc::<str>::from(prepared.document().text()));
     let (package_fanout_uris, package_source_interface_fanout) =
-        if let Some(package) = state.package_workspace() {
+        if !subject_excluded && let Some(package) = state.package_workspace() {
             let fanout = state
                 .documents
                 .keys()
@@ -10129,8 +10236,9 @@ fn capture_live_package_open_edit(
                 "didChange for {uri} exceeded the open-analysis authority ceiling; \
                  deriving local graph facts while retaining the atomic package projection"
             );
-            let captured =
+            let mut captured =
                 capture_open_edit_fallback(state, uri, &prepared, state.get_enriched_metadata(uri));
+            captured.precomputed_metadata = Some(metadata);
             let (local_metadata, local_plan) = derive_open_edit_fallback(captured);
             plan = local_plan;
             return capture_live_package_open_edit_tail(
@@ -10154,7 +10262,9 @@ fn capture_live_package_open_edit_tail(
     plan: PreparedOpenCommitPlan,
     package_fanout_uris: Vec<Url>,
 ) -> CapturedLivePackageOpenEdit {
-    let root = state.package_inputs.workspace_root.clone();
+    let root = (!state.is_project_excluded_uri(uri))
+        .then(|| state.package_inputs.workspace_root.clone())
+        .flatten();
     let mut package_text_overrides = snapshot_preamble_text_overrides(state);
     let mut candidate_paths = file_paths_for_open_document(state, uri);
     candidate_paths.sort();
@@ -10361,8 +10471,9 @@ fn derive_live_package_open_edit(
     }
 }
 
-/// Prepare source-following package inputs off-lock and commit them with the
-/// exact OpenEdit that supplied the buffer override.
+/// Prepare filesystem-derived source batches and source-following package
+/// inputs off-lock, then commit them with the exact OpenEdit that supplied the
+/// buffer override.
 ///
 /// Any package/config/open-context drift rebases the still-current edit and
 /// recomputes the complete projection. A newer edit or close/reopen changes the
@@ -10371,12 +10482,48 @@ async fn commit_detached_live_package_open_edit(
     state_arc: &Arc<RwLock<WorldState>>,
     uri: &Url,
     mut prepared: crate::state::PreparedOpenEdit,
+    shutdown: CancellationToken,
 ) -> Option<crate::state::AnalysisCommitEffects> {
-    for _attempt in 0..3 {
-        let captured = {
+    let mut rejected_rounds = 0u32;
+    loop {
+        if shutdown.is_cancelled() {
+            return None;
+        }
+        let (mut metadata, attempted_contexts, workspace_root) = {
             let state = state_arc.read().await;
             prepared = state.rebase_open_edit_if_subject_current(prepared)?;
-            capture_live_package_open_edit(&state, uri, prepared)
+            let text = prepared.document().analysis_text();
+            let (metadata, attempted_contexts) =
+                extract_enriched_live_metadata_with_contexts(&state, uri, &text);
+            (
+                metadata,
+                attempted_contexts,
+                state.workspace_folders.first().cloned(),
+            )
+        };
+        let expansion_uri = uri.clone();
+        metadata = tokio::task::spawn_blocking(move || {
+            crate::cross_file::tar_source::finalize_tar_source_requests(
+                &mut metadata,
+                &expansion_uri,
+                workspace_root.as_ref(),
+            );
+            metadata
+        })
+        .await
+        .ok()?;
+        let captured = {
+            let state = state_arc.read().await;
+            if !state.open_edit_basis_is_current(&prepared) {
+                continue;
+            }
+            capture_live_package_open_edit_with_metadata(
+                &state,
+                uri,
+                prepared,
+                metadata,
+                attempted_contexts,
+            )
         };
         let derived = tokio::task::spawn_blocking(move || derive_live_package_open_edit(captured))
             .await
@@ -10396,11 +10543,24 @@ async fn commit_detached_live_package_open_edit(
         }
         if !derived.disk.is_current() {
             prepared = derived.analysis.into_prepared_edit();
+            rejected_rounds = rejected_rounds.saturating_add(1);
+            let shift = rejected_rounds.saturating_sub(1).min(4);
+            tokio::select! {
+                _ = shutdown.cancelled() => return None,
+                _ = tokio::time::sleep(std::time::Duration::from_millis((10u64 << shift).min(160))) => {}
+            }
             continue;
         }
         let mut state = state_arc.write().await;
         if !state.open_edit_analysis_basis_is_current(&derived.analysis) {
             prepared = derived.analysis.into_prepared_edit();
+            drop(state);
+            rejected_rounds = rejected_rounds.saturating_add(1);
+            let shift = rejected_rounds.saturating_sub(1).min(4);
+            tokio::select! {
+                _ = shutdown.cancelled() => return None,
+                _ = tokio::time::sleep(std::time::Duration::from_millis((10u64 << shift).min(160))) => {}
+            }
             continue;
         }
         let effects = state
@@ -10409,7 +10569,6 @@ async fn commit_detached_live_package_open_edit(
         state.cross_file_activity.record_recent(uri.clone());
         return Some(effects);
     }
-    None
 }
 
 /// Commit one over-ceiling edit with at most one fresh detached retry.
@@ -12228,6 +12387,16 @@ enum WatchedResyncBatchMode {
     DelayedUndecodableRetry,
 }
 
+#[derive(Clone)]
+enum WatchedResyncCompletion {
+    Detached,
+    InvocationOwned {
+        post_commit: Option<OpenSourceBatchPostCommit>,
+        receipt: OpenSourceBatchCompletionReceipt,
+        boundary_waiter: bool,
+    },
+}
+
 #[derive(Clone, Copy)]
 enum WatchedTaskAdmission {
     /// The caller is already registered with [`RoutingTaskOwner`].
@@ -12257,11 +12426,122 @@ struct WatchedResyncBatch {
     deletions: Vec<WatchedResyncItem>,
     reserved_tickets: Vec<crate::state::AnalysisRevalidationTicket>,
     transfer_handles: Vec<AnalysisTransferHandle>,
+    completion: WatchedResyncCompletion,
     mode: WatchedResyncBatchMode,
     attempts_remaining: usize,
     #[cfg(test)]
     final_handoff_test_capture:
         Option<crate::state::FinalHandoffClaimLineage<crate::state::WatchedFinalHandoffForTest>>,
+}
+
+#[derive(Clone)]
+struct OpenSourceBatchPostCommit {
+    backend: Backend,
+    parents: Vec<Url>,
+    refresh_sysdata_fallback: bool,
+}
+
+#[derive(Clone)]
+struct OpenSourceBatchCompletionReceipt {
+    state: Arc<AtomicU64>,
+    notify: Arc<tokio::sync::Notify>,
+    diagnostics_coherence_guard: Arc<std::sync::Mutex<Option<DiagnosticsCoherenceGuard>>>,
+}
+
+impl OpenSourceBatchCompletionReceipt {
+    const PENDING: u64 = 0;
+    const COMMITTED: u64 = 1;
+    const CANCELLED: u64 = 2;
+
+    fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU64::new(Self::PENDING)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            diagnostics_coherence_guard: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn install_diagnostics_coherence_guard(&self, guard: DiagnosticsCoherenceGuard) {
+        let replaced = self
+            .diagnostics_coherence_guard
+            .lock()
+            .unwrap()
+            .replace(guard);
+        assert!(
+            replaced.is_none(),
+            "one invocation receipt owns at most one diagnostics coherence guard"
+        );
+    }
+
+    fn take_diagnostics_coherence_guard(&self) -> Option<DiagnosticsCoherenceGuard> {
+        self.diagnostics_coherence_guard.lock().unwrap().take()
+    }
+
+    fn has_diagnostics_coherence_guard(&self) -> bool {
+        self.diagnostics_coherence_guard.lock().unwrap().is_some()
+    }
+
+    fn apply_cancel_suppression(&self) {
+        if let Some(guard) = self.diagnostics_coherence_guard.lock().unwrap().as_ref() {
+            guard.suppress_deferred_on_cancel();
+        }
+    }
+
+    fn complete(&self, outcome: u64) {
+        if self
+            .state
+            .compare_exchange(Self::PENDING, outcome, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if outcome == Self::CANCELLED {
+                self.apply_cancel_suppression();
+            }
+            drop(self.take_diagnostics_coherence_guard());
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait(&self, shutdown: CancellationToken) {
+        loop {
+            let notified = self.notify.notified();
+            if self.state.load(Ordering::Acquire) != Self::PENDING {
+                return;
+            }
+            tokio::select! {
+                () = notified => {}
+                () = shutdown.cancelled() => {
+                    self.complete(Self::CANCELLED);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn committed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::COMMITTED
+    }
+}
+
+struct OpenSourceBatchCompletionGuard {
+    receipt: Option<OpenSourceBatchCompletionReceipt>,
+}
+
+impl OpenSourceBatchCompletionGuard {
+    fn new(receipt: Option<OpenSourceBatchCompletionReceipt>) -> Self {
+        Self { receipt }
+    }
+
+    fn disarm(&mut self) {
+        self.receipt = None;
+    }
+}
+
+impl Drop for OpenSourceBatchCompletionGuard {
+    fn drop(&mut self) {
+        if let Some(receipt) = &self.receipt {
+            receipt.complete(OpenSourceBatchCompletionReceipt::CANCELLED);
+        }
+    }
 }
 
 struct WatchedClosedBatchOverlay {
@@ -12340,6 +12620,7 @@ fn rederive_watched_closed_batch_overlay(
         None,
         &overlay.open_overlays,
         &overlay.context,
+        false,
     );
     let peer_content: HashMap<_, _> = overlay
         .entries
@@ -12455,6 +12736,9 @@ const WATCHED_UNDECODABLE_RETRY_DELAY: std::time::Duration = std::time::Duration
 #[cfg(test)]
 const WATCHED_PACKAGE_PRE_COMMIT_PAUSE_URI: &str = "raven-test://watched-package-pre-commit";
 #[cfg(test)]
+const WATCHED_UNDECODABLE_RETRY_PRE_DELAY_PAUSE_URI: &str =
+    "raven-test://watched-undecodable-retry-pre-delay";
+#[cfg(test)]
 const WATCHED_BATCH_PRE_FINALIZE_PAUSE_URI: &str = "raven-test://watched-batch-pre-finalize";
 #[cfg(test)]
 const WATCHED_BATCH_FALLBACK_AFTER_UPDATES_PAUSE_URI: &str =
@@ -12487,6 +12771,131 @@ fn watched_resync_batch_generations_are_current(
         .iter()
         .chain(deletions)
         .all(|item| watched_file_resync_generation_matches(state, &item.uri, item.generation))
+}
+
+/// Commit one item from an invocation-owned traversal-budget fallback.
+///
+/// A current generation has no arbitrary deadline: transient disk/read
+/// failures retry until the exact item commits, becomes open, is superseded,
+/// or shutdown begins. This keeps the invocation completion receipt honest
+/// without serializing unrelated watcher notifications.
+async fn resync_invocation_fallback_item(
+    state_arc: &Arc<RwLock<WorldState>>,
+    routing_tasks: &RoutingTaskOwner,
+    item: &WatchedResyncItem,
+    mode: WatchedResyncBatchMode,
+    deletion: bool,
+    reserved_tickets: &mut Vec<crate::state::AnalysisRevalidationTicket>,
+    transfer_candidates: &mut Vec<crate::state::AnalysisTransferCandidate>,
+) -> bool {
+    let shutdown = routing_tasks.shutdown_token();
+    loop {
+        if shutdown.is_cancelled() || state_arc.read().await.routing_is_shutdown() {
+            return false;
+        }
+        let old_meta = state_arc.read().await.get_enriched_metadata(&item.uri);
+        let outcome = resync_file_from_disk(
+            state_arc,
+            &item.uri,
+            None,
+            old_meta,
+            deletion || mode.undecodable_as_missing(),
+            Some(item.generation),
+            ResyncCommitMode::Batch,
+        )
+        .await;
+        match outcome {
+            ResyncOutcome::Updated { effects, .. } | ResyncOutcome::Removed { effects } => {
+                reserved_tickets.extend(effects.revalidations);
+                let state = state_arc.read().await;
+                transfer_candidates.extend(
+                    state.capture_analysis_transfer_candidates(effects.affected_candidates),
+                );
+                return true;
+            }
+            ResyncOutcome::Vetoed => return true,
+            ResyncOutcome::Prepared { mutation, disk } => {
+                let mut disk_is_current = true;
+                if let Some(observation) = &disk
+                    && !observation.is_current().await
+                {
+                    disk_is_current = false;
+                }
+                if !disk_is_current {
+                    tokio::select! {
+                        () = tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY) => {}
+                        () = shutdown.cancelled() => return false,
+                    }
+                    continue;
+                }
+                let (committed, candidates) = {
+                    let mut state = state_arc.write().await;
+                    let committed = state.try_commit_analysis(
+                        crate::state::PreparedAnalysisCommit::WatchedBatch(Box::new(
+                            PreparedWatchedBatchAnalysis {
+                                mutations: vec![mutation],
+                                package: None,
+                                package_open_records: std::collections::BTreeMap::new(),
+                                watched_generations: vec![(item.uri.clone(), item.generation)],
+                                durable_package_handoff: false,
+                            },
+                        )),
+                    );
+                    let candidates = committed
+                        .as_ref()
+                        .map(|effects| {
+                            state.capture_analysis_transfer_candidates(
+                                effects.affected_candidates.clone(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    (committed, candidates)
+                };
+                match committed {
+                    Ok(effects) => {
+                        reserved_tickets.extend(effects.revalidations);
+                        transfer_candidates.extend(candidates);
+                        return true;
+                    }
+                    Err(_) => {
+                        if !watched_file_resync_generation_matches(
+                            &*state_arc.read().await,
+                            &item.uri,
+                            item.generation,
+                        ) {
+                            return false;
+                        }
+                        tokio::select! {
+                            () = tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY) => {}
+                            () = shutdown.cancelled() => return false,
+                        }
+                    }
+                }
+            }
+            ResyncOutcome::SkippedInvalidEncoding | ResyncOutcome::Skipped => {
+                if !deletion
+                    && item
+                        .uri
+                        .to_file_path()
+                        .ok()
+                        .is_some_and(|path| path.is_dir())
+                {
+                    return true;
+                }
+                if !watched_file_resync_generation_matches(
+                    &*state_arc.read().await,
+                    &item.uri,
+                    item.generation,
+                ) {
+                    return false;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY) => {}
+                    () = shutdown.cancelled() => return false,
+                }
+            }
+        }
+    }
 }
 
 fn expected_watched_generation_is_current(
@@ -12794,17 +13203,11 @@ async fn resync_file_from_disk(
     let snapshot =
         crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
 
-    // Prepare every state-derived input under one coherent read lock. Content
-    // parsing happened above and the transaction below performs no path
-    // resolution or metadata enrichment while holding the write lock.
-    let (
-        analysis_basis,
-        workspace_root,
-        graph_metadata,
-        parent_content,
-        additional_graph,
-        wd_children,
-    ) = {
+    // Capture the analysis basis and metadata-enrichment authorities before
+    // source-batch enumeration. The directory walk below is detached from
+    // `WorldState`; the captured basis makes any intervening state change veto
+    // the eventual commit.
+    let (analysis_basis, workspace_root, mut consumed_context_uris) = {
         let state = state_arc.read().await;
         if state.is_document_open_or_alias(uri) {
             log::trace!("Disk resync preparation vetoed by reopen: {}", uri);
@@ -12840,19 +13243,39 @@ async fn resync_file_from_disk(
             },
             state.cross_file_config.max_chain_depth,
         );
-        crate::cross_file::tar_source::finalize_tar_source_requests(
-            &mut cross_file_meta,
-            uri,
-            workspace_root.as_ref(),
-        );
+        let basis = state.capture_closed_removal_analysis_basis(uri);
+        (basis, workspace_root, consumed_context_uris.into_inner())
+    };
 
+    crate::cross_file::tar_source::finalize_tar_source_requests(
+        &mut cross_file_meta,
+        uri,
+        workspace_root.as_ref(),
+    );
+
+    // Snapshot the remaining graph inputs after the walk without weakening the
+    // pre-walk basis. If anything changed between the two read sections, the
+    // central commit rejects that older basis.
+    let (analysis_basis, graph_metadata, parent_content, additional_graph, wd_children) = {
+        let state = state_arc.read().await;
+        if state.is_document_open_or_alias(uri) {
+            log::trace!("Disk resync graph preparation vetoed by reopen: {}", uri);
+            return ResyncOutcome::Vetoed;
+        }
+        if !expected_watched_generation_is_current(&state, uri, expected_watched_generation) {
+            log::trace!(
+                "Disk resync graph preparation skipped because a newer watched event superseded it: {}",
+                uri
+            );
+            return ResyncOutcome::Skipped;
+        }
         let (parent_content, attempted_parents) = collect_backward_parent_content_with(
             uri,
             workspace_root.as_ref(),
             &cross_file_meta,
             |parent_uri| state.content_provider().get_content(parent_uri),
         );
-        consumed_context_uris.borrow_mut().extend(attempted_parents);
+        consumed_context_uris.extend(attempted_parents);
         let graph_metadata = Arc::new(
             state
                 .metadata_for_dependency_graph(uri, &cross_file_meta, workspace_root.as_ref())
@@ -12891,7 +13314,7 @@ async fn resync_file_from_disk(
                     &parent_meta,
                     |parent_uri| state.content_provider().get_content(parent_uri),
                 );
-                consumed_context_uris.borrow_mut().extend(attempted_parents);
+                consumed_context_uris.extend(attempted_parents);
                 let metadata = Arc::new(
                     state
                         .metadata_for_dependency_graph(
@@ -12917,16 +13340,14 @@ async fn resync_file_from_disk(
                 &cross_file_meta,
                 &state.cross_file_graph,
             );
-        let basis = state.capture_closed_removal_analysis_basis(uri);
         let Some(basis) =
-            state.attach_analysis_context_authorities(basis, consumed_context_uris.into_inner())
+            state.attach_analysis_context_authorities(analysis_basis, consumed_context_uris)
         else {
             log::trace!("Disk resync context authority budget exceeded: {}", uri);
             return ResyncOutcome::Skipped;
         };
         (
             basis,
-            workspace_root,
             graph_metadata,
             parent_content,
             additional_graph,
@@ -13382,6 +13803,7 @@ fn spawn_watched_undecodable_retry(
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 #[cfg(test)]
@@ -13392,6 +13814,102 @@ fn spawn_watched_undecodable_retry(
     }) {
         log::debug!("Shutdown rejected delayed undecodable watched retry");
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the retry boundary keeps task admission and invocation completion ownership explicit"
+)]
+fn spawn_watched_invocation_undecodable_retry(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    traversal_truncation: Arc<TraversalTruncationState>,
+    routing_tasks: RoutingTaskOwner,
+    admission: WatchedTaskAdmission,
+    mut batch: WatchedResyncBatch,
+    completion_receipt: OpenSourceBatchCompletionReceipt,
+) -> bool {
+    batch.mode = WatchedResyncBatchMode::DelayedUndecodableRetry;
+    batch.attempts_remaining = 2;
+    if let WatchedResyncCompletion::InvocationOwned {
+        boundary_waiter, ..
+    } = &mut batch.completion
+    {
+        *boundary_waiter = false;
+    }
+    let shutdown = routing_tasks.shutdown_token();
+    let child_tasks = routing_tasks.clone();
+    let worker_receipt = completion_receipt.clone();
+    let admitted = admission.spawn(&routing_tasks, async move {
+        let mut worker_guard = OpenSourceBatchCompletionGuard::new(Some(worker_receipt));
+        #[cfg(test)]
+        {
+            let pause = state_arc
+                .read()
+                .await
+                .watched_undecodable_retry_pre_delay_test_pause
+                .take_armed(&Url::parse(WATCHED_UNDECODABLE_RETRY_PRE_DELAY_PAUSE_URI).unwrap());
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(WATCHED_UNDECODABLE_RETRY_DELAY) => {}
+            () = shutdown.cancelled() => return,
+        }
+        if state_arc.read().await.routing_is_shutdown() {
+            return;
+        }
+        worker_guard.disarm();
+        run_watched_resync_batch_owned(
+            state_arc,
+            client,
+            traversal_truncation,
+            child_tasks,
+            WatchedTaskAdmission::TrackedParent,
+            batch,
+        )
+        .await;
+    });
+    if !admitted {
+        completion_receipt.complete(OpenSourceBatchCompletionReceipt::CANCELLED);
+        log::debug!("Shutdown rejected invocation-owned undecodable watched retry");
+    }
+    admitted
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the retry boundary keeps task admission and invocation completion ownership explicit"
+)]
+async fn transfer_watched_invocation_undecodable_retry(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    traversal_truncation: Arc<TraversalTruncationState>,
+    routing_tasks: RoutingTaskOwner,
+    admission: WatchedTaskAdmission,
+    batch: WatchedResyncBatch,
+    completion_receipt: OpenSourceBatchCompletionReceipt,
+    boundary_waiter: bool,
+    completion_guard: &mut OpenSourceBatchCompletionGuard,
+) -> bool {
+    let shutdown = routing_tasks.shutdown_token();
+    let admitted = spawn_watched_invocation_undecodable_retry(
+        state_arc,
+        client,
+        traversal_truncation,
+        routing_tasks,
+        admission,
+        batch,
+        completion_receipt.clone(),
+    );
+    if admitted {
+        completion_guard.disarm();
+        if boundary_waiter {
+            completion_receipt.wait(shutdown).await;
+        }
+    }
+    admitted
 }
 
 #[allow(
@@ -13408,13 +13926,26 @@ fn spawn_watched_package_retry(
     retry_lifecycle: Arc<crate::package_state::PackageSeedRetryLifecycle>,
     generation: u64,
     token: tokio_util::sync::CancellationToken,
-) {
+) -> bool {
     batch.attempts_remaining = 2;
+    let completion_receipt = match &mut batch.completion {
+        WatchedResyncCompletion::Detached => None,
+        WatchedResyncCompletion::InvocationOwned {
+            receipt,
+            boundary_waiter,
+            ..
+        } => {
+            *boundary_waiter = false;
+            Some(receipt.clone())
+        }
+    };
     let shutdown = routing_tasks.shutdown_token();
     let child_tasks = routing_tasks.clone();
     let refusal_token = token.clone();
     let completion_lifecycle = retry_lifecycle.clone();
-    if !admission.spawn(&routing_tasks, async move {
+    let worker_receipt = completion_receipt.clone();
+    let admitted = admission.spawn(&routing_tasks, async move {
+        let mut completion_guard = OpenSourceBatchCompletionGuard::new(worker_receipt);
         let _retry_owner = LibraryRoutingRetryOwner {
             lifecycle: retry_lifecycle,
             generation,
@@ -13427,6 +13958,10 @@ fn spawn_watched_package_retry(
         if state_arc.read().await.routing_is_shutdown() {
             return;
         }
+        // The nested runner installs its guard before its first suspension
+        // point. Transfer responsibility as we enter it so every admitted
+        // successor has exactly one fail-closed owner.
+        completion_guard.disarm();
         run_watched_resync_batch_owned(
             state_arc.clone(),
             client,
@@ -13436,11 +13971,59 @@ fn spawn_watched_package_retry(
             batch,
         )
         .await;
-    }) {
+    });
+    if !admitted {
         refusal_token.cancel();
         completion_lifecycle.complete(generation);
+        if let Some(receipt) = completion_receipt {
+            receipt.complete(OpenSourceBatchCompletionReceipt::CANCELLED);
+        }
         log::debug!("Shutdown rejected delayed watched-package retry");
     }
+    admitted
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the retry boundary keeps task admission and invocation completion ownership explicit"
+)]
+async fn transfer_watched_package_retry(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    traversal_truncation: Arc<TraversalTruncationState>,
+    routing_tasks: RoutingTaskOwner,
+    admission: WatchedTaskAdmission,
+    batch: WatchedResyncBatch,
+    retry_lifecycle: Arc<crate::package_state::PackageSeedRetryLifecycle>,
+    generation: u64,
+    token: tokio_util::sync::CancellationToken,
+    completion_receipt: Option<OpenSourceBatchCompletionReceipt>,
+    boundary_waiter: bool,
+    completion_guard: &mut OpenSourceBatchCompletionGuard,
+) -> bool {
+    let shutdown = routing_tasks.shutdown_token();
+    let admitted = spawn_watched_package_retry(
+        state_arc,
+        client,
+        traversal_truncation,
+        routing_tasks,
+        admission,
+        batch,
+        retry_lifecycle,
+        generation,
+        token,
+    );
+    if admitted {
+        // Admission transfers terminal-state responsibility to the spawned
+        // worker. Disarm synchronously before the first suspension point so
+        // aborting this boundary waiter cannot cancel a receipt the worker
+        // already owns.
+        completion_guard.disarm();
+        if boundary_waiter && let Some(receipt) = completion_receipt {
+            receipt.wait(shutdown).await;
+        }
+    }
+    admitted
 }
 
 fn schedule_additive_watched_package_retry(
@@ -13464,6 +14047,19 @@ struct WatchedFinalizationBundle {
         Option<crate::state::FinalHandoffClaimLineage<crate::state::WatchedFinalHandoffForTest>>,
 }
 
+fn retire_watched_diagnostic_tickets(
+    state: &WorldState,
+    tickets: &[crate::state::AnalysisRevalidationTicket],
+) {
+    for ticket in tickets {
+        if let Some(epoch) = ticket.trigger.epoch {
+            state
+                .diagnostics_gate
+                .retire_force_republish(&ticket.uri, epoch);
+        }
+    }
+}
+
 #[cfg(test)]
 async fn record_watched_final_handoff_for_test(
     capture: &Option<
@@ -13485,6 +14081,10 @@ async fn record_watched_final_handoff_for_test(
     None
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the finalizer keeps routing, diagnostic, and invocation receipt ownership explicit"
+)]
 async fn run_watched_deferred_routing_finalization(
     state_arc: Arc<RwLock<WorldState>>,
     client: Client,
@@ -13493,7 +14093,18 @@ async fn run_watched_deferred_routing_finalization(
     mut routing: crate::state::PackageRoutingCommitEffects,
     mut bundle: WatchedFinalizationBundle,
     await_reserved_tickets: bool,
+    post_commit_source_refresh: Option<OpenSourceBatchPostCommit>,
+    completion_receipt: Option<OpenSourceBatchCompletionReceipt>,
+    mut invocation_commit_complete: bool,
 ) {
+    let mut completion_guard = OpenSourceBatchCompletionGuard::new(completion_receipt.clone());
+    let source_parents: std::collections::HashSet<Url> = post_commit_source_refresh
+        .as_ref()
+        .map(|post_commit| post_commit.parents.iter().cloned().collect())
+        .unwrap_or_default();
+    let source_replay = post_commit_source_refresh
+        .as_ref()
+        .map(|post_commit| (post_commit.backend.clone(), post_commit.parents.clone()));
     let transfer = loop {
         if shutdown.is_cancelled() || state_arc.read().await.routing_is_shutdown() {
             return;
@@ -13511,7 +14122,11 @@ async fn run_watched_deferred_routing_finalization(
                     SystemFileConvergenceOutcome::Committed(transfer)
                 }
                 SystemFileOwnerOutcome::Deferred => SystemFileConvergenceOutcome::Deferred,
-                SystemFileOwnerOutcome::Superseded => return,
+                SystemFileOwnerOutcome::Superseded => {
+                    routing.owner = state_arc.read().await.system_file_routing_owner_identity();
+                    routing.handoff = None;
+                    continue;
+                }
             }
         } else {
             run_system_file_convergence_transaction_for_routing_owner(&state_arc, routing.owner)
@@ -13532,7 +14147,8 @@ async fn run_watched_deferred_routing_finalization(
                 if routing.handoff.is_none() {
                     routing.owner = state.system_file_routing_owner_identity();
                 } else if state.system_file_routing_owner_identity() != routing.owner {
-                    return;
+                    routing.owner = state.system_file_routing_owner_identity();
+                    routing.handoff = None;
                 }
             }
         }
@@ -13540,34 +14156,120 @@ async fn run_watched_deferred_routing_finalization(
     if bundle.transfer_handles.is_empty() {
         bundle.transfer_handles.push(transfer.handle);
     }
-    let tickets = {
+    let mut tickets = {
         let mut state = state_arc.write().await;
         if state.routing_is_shutdown() {
             return;
         }
-        let reserved_current_uris: std::collections::HashSet<Url> = bundle
-            .reserved_tickets
-            .iter()
-            .filter(|ticket| !ticket.trigger.is_stale(&state, &ticket.uri))
-            .map(|ticket| ticket.uri.clone())
-            .collect();
+        bundle.reserved_tickets.retain(|ticket| {
+            if source_parents.contains(&ticket.uri) {
+                if let Some(epoch) = ticket.trigger.epoch {
+                    state
+                        .diagnostics_gate
+                        .retire_force_republish(&ticket.uri, epoch);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        bundle
+            .candidates
+            .retain(|candidate| !source_parents.contains(&candidate.uri));
+        let reserved_current_uris: std::collections::HashSet<Url> = if invocation_commit_complete {
+            bundle
+                .reserved_tickets
+                .iter()
+                .filter(|ticket| !ticket.trigger.is_stale(&state, &ticket.uri))
+                .map(|ticket| ticket.uri.clone())
+                .collect()
+        } else {
+            retire_watched_diagnostic_tickets(&state, &bundle.reserved_tickets);
+            state.documents.keys().cloned().collect()
+        };
+        if !invocation_commit_complete {
+            bundle.candidates.clear();
+        }
         bundle
             .candidates
             .retain(|candidate| !reserved_current_uris.contains(&candidate.uri));
-        let fallback: Vec<_> = state
-            .documents
-            .keys()
-            .filter(|uri| !reserved_current_uris.contains(*uri))
-            .cloned()
-            .collect();
+        let fallback: Vec<_> = if invocation_commit_complete {
+            state
+                .documents
+                .keys()
+                .filter(|uri| {
+                    !reserved_current_uris.contains(*uri) && !source_parents.contains(*uri)
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut excluded_uris = reserved_current_uris.clone();
+        excluded_uris.extend(source_parents.iter().cloned());
         finalize_analysis_handoff_candidates_excluding_or_fallback(
             &mut state,
             bundle.transfer_handles,
             bundle.candidates,
             fallback,
-            &reserved_current_uris,
+            &excluded_uris,
         )
     };
+    if !invocation_commit_complete {
+        let state = state_arc.read().await;
+        retire_watched_diagnostic_tickets(&state, &tickets);
+        bundle.reserved_tickets.clear();
+        tickets.clear();
+    }
+    let mut source_refresh_tickets = Vec::new();
+    if invocation_commit_complete && let Some(post_commit) = post_commit_source_refresh {
+        if let Some(tickets) = post_commit
+            .backend
+            .finish_open_source_batch_post_commit(
+                post_commit.parents,
+                post_commit.refresh_sysdata_fallback,
+            )
+            .await
+        {
+            source_refresh_tickets = tickets;
+        } else {
+            invocation_commit_complete = false;
+        }
+    }
+    if !invocation_commit_complete && let Some(receipt) = completion_receipt.as_ref() {
+        receipt.apply_cancel_suppression();
+    }
+    let diagnostics_coherence_guard = completion_receipt
+        .as_ref()
+        .and_then(OpenSourceBatchCompletionReceipt::take_diagnostics_coherence_guard);
+    let replay_source_after_barrier =
+        invocation_commit_complete && diagnostics_coherence_guard.is_some();
+    drop(diagnostics_coherence_guard);
+    if invocation_commit_complete {
+        Backend::publish_diagnostics_for_tickets_bounded(
+            state_arc.clone(),
+            client.clone(),
+            source_refresh_tickets,
+            Some(traversal_truncation.clone()),
+        )
+        .await;
+    }
+    if replay_source_after_barrier && let Some((backend, parents)) = source_replay {
+        Backend::publish_diagnostics_for_uris_bounded(
+            backend.state.clone(),
+            backend.client.clone(),
+            parents,
+            Some(backend.traversal_truncation.clone()),
+        )
+        .await;
+    }
+    if !invocation_commit_complete {
+        let state = state_arc.read().await;
+        retire_watched_diagnostic_tickets(&state, &bundle.reserved_tickets);
+        retire_watched_diagnostic_tickets(&state, &tickets);
+        bundle.reserved_tickets.clear();
+        tickets.clear();
+    }
     #[cfg(test)]
     let final_handoff_completion = record_watched_final_handoff_for_test(
         &bundle.final_handoff_test_capture,
@@ -13575,6 +14277,8 @@ async fn run_watched_deferred_routing_finalization(
         &tickets,
     )
     .await;
+    const MAX_CONCURRENT_RESERVED_DIAGNOSTICS: usize = 8;
+    let mut reserved_join_set = tokio::task::JoinSet::new();
     for ticket in bundle.reserved_tickets {
         #[cfg(test)]
         let completion = final_handoff_completion
@@ -13593,11 +14297,15 @@ async fn run_watched_deferred_routing_finalization(
             run_with_diagnostic_final_handoff_completion(completion, task).await;
         };
         if await_reserved_tickets {
-            task.await;
+            while reserved_join_set.len() >= MAX_CONCURRENT_RESERVED_DIAGNOSTICS {
+                let _ = reserved_join_set.join_next().await;
+            }
+            reserved_join_set.spawn(task);
         } else {
             tokio::spawn(task);
         }
     }
+    while reserved_join_set.join_next().await.is_some() {}
     let transferred_publish = Backend::publish_diagnostics_for_tickets_bounded(
         state_arc,
         client,
@@ -13612,6 +14320,14 @@ async fn run_watched_deferred_routing_finalization(
         transferred_publish,
     );
     transferred_publish.await;
+    if let Some(receipt) = completion_receipt {
+        receipt.complete(if invocation_commit_complete {
+            OpenSourceBatchCompletionReceipt::COMMITTED
+        } else {
+            OpenSourceBatchCompletionReceipt::CANCELLED
+        });
+        completion_guard.disarm();
+    }
     #[cfg(test)]
     if let Some(completion) = final_handoff_completion {
         completion.finish();
@@ -13661,28 +14377,41 @@ async fn run_watched_resync_batch_owned(
     admission: WatchedTaskAdmission,
     batch: WatchedResyncBatch,
 ) {
-    if state_arc.read().await.routing_is_shutdown() {
-        return;
-    }
     let WatchedResyncBatch {
         updates: uris_to_update,
         affected: affected_for_async,
         deletions: deleted_uris,
         mut reserved_tickets,
         mut transfer_handles,
+        completion,
         mode,
         attempts_remaining,
         #[cfg(test)]
         final_handoff_test_capture,
     } = batch;
+    let (post_commit_source_refresh, completion_receipt, boundary_waiter) = match &completion {
+        WatchedResyncCompletion::Detached => (None, None, false),
+        WatchedResyncCompletion::InvocationOwned {
+            post_commit,
+            receipt,
+            boundary_waiter,
+        } => (post_commit.clone(), Some(receipt.clone()), *boundary_waiter),
+    };
+    let mut completion_guard = OpenSourceBatchCompletionGuard::new(completion_receipt.clone());
+    if state_arc.read().await.routing_is_shutdown() {
+        return;
+    }
     let await_reserved_tickets =
-        matches!(mode, WatchedResyncBatchMode::Immediate) && uris_to_update.is_empty();
+        matches!(completion, WatchedResyncCompletion::InvocationOwned { .. })
+            || (matches!(mode, WatchedResyncBatchMode::Immediate) && uris_to_update.is_empty());
+    let invocation_owned = matches!(completion, WatchedResyncCompletion::InvocationOwned { .. });
     let full_retry_batch = WatchedResyncBatch {
         updates: uris_to_update.clone(),
         affected: affected_for_async.clone(),
         deletions: deleted_uris.clone(),
         reserved_tickets: reserved_tickets.clone(),
         transfer_handles: transfer_handles.clone(),
+        completion: completion.clone(),
         mode,
         attempts_remaining: attempts_remaining.saturating_sub(1),
         #[cfg(test)]
@@ -13692,9 +14421,12 @@ async fn run_watched_resync_batch_owned(
     let mut deferred_routing = None;
     let mut ordered_fallback_routing = None;
     let mut committed_outer_batch = false;
+    let mut invocation_commit_complete = true;
     let mut prepared_mutations = Vec::new();
     let mut watched_disk_observations = Vec::new();
     let mut eligible_update_indices = std::collections::HashSet::new();
+    let mut invocation_retry_needed = false;
+    let mut invocation_undecodable_retry_needed = false;
     for (item_index, item) in uris_to_update.iter().enumerate() {
         // Capture old metadata before the disk read (for WD change
         // detection). The file was never open — the sync pass skips open
@@ -13735,18 +14467,32 @@ async fn run_watched_resync_batch_owned(
                 eligible_update_indices.insert(item_index);
             }
             ResyncOutcome::SkippedInvalidEncoding if mode.schedule_undecodable_retries() => {
-                spawn_watched_undecodable_retry(
-                    state_arc.clone(),
-                    client.clone(),
-                    traversal_truncation.clone(),
-                    routing_tasks.clone(),
-                    admission,
-                    item.clone(),
-                );
+                if invocation_owned {
+                    invocation_undecodable_retry_needed = true;
+                } else {
+                    spawn_watched_undecodable_retry(
+                        state_arc.clone(),
+                        client.clone(),
+                        traversal_truncation.clone(),
+                        routing_tasks.clone(),
+                        admission,
+                        item.clone(),
+                    );
+                }
             }
-            ResyncOutcome::Vetoed
-            | ResyncOutcome::SkippedInvalidEncoding
-            | ResyncOutcome::Skipped => {}
+            ResyncOutcome::Vetoed => {}
+            ResyncOutcome::SkippedInvalidEncoding | ResyncOutcome::Skipped => {
+                if item
+                    .uri
+                    .to_file_path()
+                    .ok()
+                    .is_some_and(|path| path.is_dir())
+                {
+                    eligible_update_indices.insert(item_index);
+                } else if invocation_owned {
+                    invocation_retry_needed = true;
+                }
+            }
         }
     }
 
@@ -13770,10 +14516,78 @@ async fn run_watched_resync_batch_owned(
             ResyncOutcome::Updated { effects, .. } | ResyncOutcome::Removed { effects } => {
                 reserved_tickets.extend(effects.revalidations);
             }
-            ResyncOutcome::Vetoed
-            | ResyncOutcome::SkippedInvalidEncoding
-            | ResyncOutcome::Skipped => {}
+            ResyncOutcome::Vetoed => {}
+            ResyncOutcome::SkippedInvalidEncoding | ResyncOutcome::Skipped => {
+                if invocation_owned {
+                    invocation_retry_needed = true;
+                }
+            }
         }
+    }
+
+    if invocation_undecodable_retry_needed {
+        if !watched_resync_batch_generations_are_current(
+            &*state_arc.read().await,
+            &uris_to_update,
+            &deleted_uris,
+        ) {
+            return;
+        }
+        transfer_watched_invocation_undecodable_retry(
+            state_arc,
+            client,
+            traversal_truncation,
+            routing_tasks,
+            admission,
+            full_retry_batch,
+            completion_receipt
+                .expect("invocation-owned undecodable retry has a completion receipt"),
+            boundary_waiter,
+            &mut completion_guard,
+        )
+        .await;
+        return;
+    }
+
+    if invocation_retry_needed {
+        if !watched_resync_batch_generations_are_current(
+            &*state_arc.read().await,
+            &uris_to_update,
+            &deleted_uris,
+        ) {
+            return;
+        }
+        if attempts_remaining > 0 {
+            completion_guard.disarm();
+            Box::pin(run_watched_resync_batch_owned(
+                state_arc,
+                client,
+                traversal_truncation,
+                routing_tasks,
+                admission,
+                full_retry_batch,
+            ))
+            .await;
+        } else {
+            let (retry_lifecycle, generation, token) =
+                schedule_additive_watched_package_retry(&*state_arc.read().await);
+            transfer_watched_package_retry(
+                state_arc,
+                client,
+                traversal_truncation,
+                routing_tasks,
+                admission,
+                full_retry_batch,
+                retry_lifecycle,
+                generation,
+                token,
+                completion_receipt.clone(),
+                boundary_waiter,
+                &mut completion_guard,
+            )
+            .await;
+        }
+        return;
     }
 
     let watched_items: Vec<_> = uris_to_update
@@ -13838,6 +14652,7 @@ async fn run_watched_resync_batch_owned(
                         return;
                     }
                     if attempts_remaining > 0 {
+                        completion_guard.disarm();
                         Box::pin(run_watched_resync_batch_owned(
                             state_arc.clone(),
                             client.clone(),
@@ -13850,7 +14665,7 @@ async fn run_watched_resync_batch_owned(
                     } else {
                         let (retry_lifecycle, generation, token) =
                             schedule_additive_watched_package_retry(&*state_arc.read().await);
-                        spawn_watched_package_retry(
+                        transfer_watched_package_retry(
                             state_arc,
                             client,
                             traversal_truncation,
@@ -13860,7 +14675,11 @@ async fn run_watched_resync_batch_owned(
                             retry_lifecycle,
                             generation,
                             token,
-                        );
+                            completion_receipt.clone(),
+                            boundary_waiter,
+                            &mut completion_guard,
+                        )
+                        .await;
                     }
                     return;
                 }
@@ -13875,6 +14694,7 @@ async fn run_watched_resync_batch_owned(
                     return;
                 }
                 if attempts_remaining > 0 {
+                    completion_guard.disarm();
                     Box::pin(run_watched_resync_batch_owned(
                         state_arc.clone(),
                         client.clone(),
@@ -13887,7 +14707,7 @@ async fn run_watched_resync_batch_owned(
                 } else {
                     let (retry_lifecycle, generation, token) =
                         schedule_additive_watched_package_retry(&*state_arc.read().await);
-                    spawn_watched_package_retry(
+                    transfer_watched_package_retry(
                         state_arc,
                         client,
                         traversal_truncation,
@@ -13897,7 +14717,11 @@ async fn run_watched_resync_batch_owned(
                         retry_lifecycle,
                         generation,
                         token,
-                    );
+                        completion_receipt.clone(),
+                        boundary_waiter,
+                        &mut completion_guard,
+                    )
+                    .await;
                 }
                 return;
             }
@@ -13937,6 +14761,7 @@ async fn run_watched_resync_batch_owned(
                         .collect(),
                     reserved_tickets: reserved_tickets.clone(),
                     transfer_handles: transfer_handles.clone(),
+                    completion: completion.clone(),
                     mode,
                     attempts_remaining: attempts_remaining.saturating_sub(1),
                     #[cfg(test)]
@@ -13986,6 +14811,7 @@ async fn run_watched_resync_batch_owned(
                     return;
                 }
                 if attempts_remaining > 0 {
+                    completion_guard.disarm();
                     Box::pin(run_watched_resync_batch_owned(
                         state_arc.clone(),
                         client.clone(),
@@ -13998,7 +14824,7 @@ async fn run_watched_resync_batch_owned(
                 } else {
                     let (retry_lifecycle, generation, token) =
                         schedule_additive_watched_package_retry(&*state_arc.read().await);
-                    spawn_watched_package_retry(
+                    transfer_watched_package_retry(
                         state_arc.clone(),
                         client.clone(),
                         traversal_truncation.clone(),
@@ -14008,7 +14834,11 @@ async fn run_watched_resync_batch_owned(
                         retry_lifecycle,
                         generation,
                         token,
-                    );
+                        completion_receipt.clone(),
+                        boundary_waiter,
+                        &mut completion_guard,
+                    )
+                    .await;
                 }
                 return;
             }
@@ -14080,6 +14910,7 @@ async fn run_watched_resync_batch_owned(
                         return;
                     }
                     log::trace!("Retrying watched closed batch from a fresh authority snapshot");
+                    completion_guard.disarm();
                     Box::pin(run_watched_resync_batch_owned(
                         state_arc.clone(),
                         client.clone(),
@@ -14101,7 +14932,7 @@ async fn run_watched_resync_batch_owned(
                     }
                     let (retry_lifecycle, generation, token) =
                         schedule_additive_watched_package_retry(&*state_arc.read().await);
-                    spawn_watched_package_retry(
+                    transfer_watched_package_retry(
                         state_arc.clone(),
                         client.clone(),
                         traversal_truncation.clone(),
@@ -14111,7 +14942,11 @@ async fn run_watched_resync_batch_owned(
                         retry_lifecycle,
                         generation,
                         token,
-                    );
+                        completion_receipt.clone(),
+                        boundary_waiter,
+                        &mut completion_guard,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -14120,6 +14955,15 @@ async fn run_watched_resync_batch_owned(
                 "Watched closed batch overlay exceeded the traversal budget; \
                  falling back to ordered single-item commits"
             );
+            if invocation_owned {
+                let receipt = completion_receipt
+                    .as_ref()
+                    .expect("invocation-owned fallback has a completion receipt");
+                if !receipt.has_diagnostics_coherence_guard() {
+                    let guard = begin_diagnostics_coherence(&state_arc).await;
+                    receipt.install_diagnostics_coherence_guard(guard);
+                }
+            }
 
             // Preserve the package half before individual graph commits make
             // its detached basis stale. This is still one exact watched CAS;
@@ -14134,6 +14978,7 @@ async fn run_watched_resync_batch_owned(
                     )
                 {
                     if attempts_remaining > 0 {
+                        completion_guard.disarm();
                         Box::pin(run_watched_resync_batch_owned(
                             state_arc.clone(),
                             client.clone(),
@@ -14146,7 +14991,7 @@ async fn run_watched_resync_batch_owned(
                     } else {
                         let (retry_lifecycle, generation, token) =
                             schedule_additive_watched_package_retry(&*state_arc.read().await);
-                        spawn_watched_package_retry(
+                        transfer_watched_package_retry(
                             state_arc.clone(),
                             client.clone(),
                             traversal_truncation.clone(),
@@ -14156,7 +15001,11 @@ async fn run_watched_resync_batch_owned(
                             retry_lifecycle,
                             generation,
                             token,
-                        );
+                            completion_receipt.clone(),
+                            boundary_waiter,
+                            &mut completion_guard,
+                        )
+                        .await;
                     }
                     return;
                 }
@@ -14212,6 +15061,14 @@ async fn run_watched_resync_batch_owned(
                         }
                     }
                     Err(_) if attempts_remaining > 0 => {
+                        if !watched_resync_batch_generations_are_current(
+                            &*state_arc.read().await,
+                            &uris_to_update,
+                            &deleted_uris,
+                        ) {
+                            return;
+                        }
+                        completion_guard.disarm();
                         Box::pin(run_watched_resync_batch_owned(
                             state_arc.clone(),
                             client.clone(),
@@ -14224,9 +15081,16 @@ async fn run_watched_resync_batch_owned(
                         return;
                     }
                     Err(_) => {
+                        if !watched_resync_batch_generations_are_current(
+                            &*state_arc.read().await,
+                            &uris_to_update,
+                            &deleted_uris,
+                        ) {
+                            return;
+                        }
                         let (retry_lifecycle, generation, token) =
                             schedule_additive_watched_package_retry(&*state_arc.read().await);
-                        spawn_watched_package_retry(
+                        transfer_watched_package_retry(
                             state_arc.clone(),
                             client.clone(),
                             traversal_truncation.clone(),
@@ -14236,13 +15100,34 @@ async fn run_watched_resync_batch_owned(
                             retry_lifecycle,
                             generation,
                             token,
-                        );
+                            completion_receipt.clone(),
+                            boundary_waiter,
+                            &mut completion_guard,
+                        )
+                        .await;
                         return;
                     }
                 }
             }
 
             for item in &uris_to_update {
+                if invocation_owned {
+                    if !resync_invocation_fallback_item(
+                        &state_arc,
+                        &routing_tasks,
+                        item,
+                        mode,
+                        false,
+                        &mut reserved_tickets,
+                        &mut package_transfer_candidates,
+                    )
+                    .await
+                    {
+                        invocation_commit_complete = false;
+                        break;
+                    }
+                    continue;
+                }
                 let old_meta = state_arc.read().await.get_enriched_metadata(&item.uri);
                 match resync_file_from_disk(
                     &state_arc,
@@ -14273,13 +15158,12 @@ async fn run_watched_resync_batch_owned(
                     ResyncOutcome::Prepared { .. } => {
                         unreachable!("sequential fallback uses immediate commits")
                     }
-                    ResyncOutcome::Vetoed
-                    | ResyncOutcome::SkippedInvalidEncoding
-                    | ResyncOutcome::Skipped => {}
+                    ResyncOutcome::Vetoed => {}
+                    ResyncOutcome::SkippedInvalidEncoding | ResyncOutcome::Skipped => {}
                 }
             }
             #[cfg(test)]
-            {
+            if invocation_commit_complete {
                 let pause = state_arc
                     .read()
                     .await
@@ -14292,6 +15176,26 @@ async fn run_watched_resync_batch_owned(
                 }
             }
             for item in &deleted_uris {
+                if !invocation_commit_complete {
+                    break;
+                }
+                if invocation_owned {
+                    if !resync_invocation_fallback_item(
+                        &state_arc,
+                        &routing_tasks,
+                        item,
+                        mode,
+                        true,
+                        &mut reserved_tickets,
+                        &mut package_transfer_candidates,
+                    )
+                    .await
+                    {
+                        invocation_commit_complete = false;
+                        break;
+                    }
+                    continue;
+                }
                 let old_meta = state_arc.read().await.get_enriched_metadata(&item.uri);
                 match resync_file_from_disk(
                     &state_arc,
@@ -14310,20 +15214,24 @@ async fn run_watched_resync_batch_owned(
                     ResyncOutcome::Prepared { .. } => {
                         unreachable!("sequential fallback uses immediate commits")
                     }
-                    ResyncOutcome::Vetoed
-                    | ResyncOutcome::SkippedInvalidEncoding
-                    | ResyncOutcome::Skipped => {}
+                    ResyncOutcome::Vetoed => {}
+                    ResyncOutcome::SkippedInvalidEncoding | ResyncOutcome::Skipped => {}
                 }
             }
 
-            if let Some(routing) = ordered_fallback_routing.take() {
+            if let Some(mut routing) = ordered_fallback_routing.take() {
                 if state_arc.read().await.system_file_routing_owner_identity() != routing.owner {
                     // A foreign routing writer inherited the durable transfer
-                    // installed by our package-only CAS. Its tracked root owns
-                    // convergence; this stale lineage must not touch or
-                    // independently finalize its package candidates. Closed
-                    // mutations and their own ledgers still finish below.
-                    package_transfer_candidates.clear();
+                    // installed by our package-only CAS. Invocation-owned
+                    // completion follows that successor before publishing;
+                    // detached work retains its existing stale-lineage exit.
+                    if invocation_owned {
+                        routing.owner = state_arc.read().await.system_file_routing_owner_identity();
+                        routing.handoff = None;
+                        deferred_routing = Some(routing);
+                    } else {
+                        package_transfer_candidates.clear();
+                    }
                 } else {
                     match run_system_file_convergence_transaction_owned(
                         &state_arc,
@@ -14344,9 +15252,14 @@ async fn run_watched_resync_batch_owned(
                             deferred_routing = Some(routing);
                         }
                         SystemFileOwnerOutcome::Superseded => {
-                            // The successor owns the durable handoff. Preserve
-                            // unrelated immediate tickets/handles below.
-                            package_transfer_candidates.clear();
+                            if invocation_owned {
+                                routing.owner =
+                                    state_arc.read().await.system_file_routing_owner_identity();
+                                routing.handoff = None;
+                                deferred_routing = Some(routing);
+                            } else {
+                                package_transfer_candidates.clear();
+                            }
                         }
                     }
                 }
@@ -14370,6 +15283,9 @@ async fn run_watched_resync_batch_owned(
                 final_handoff_test_capture,
             },
             await_reserved_tickets,
+            post_commit_source_refresh,
+            completion_receipt,
+            invocation_commit_complete,
         );
         if await_reserved_tickets {
             finalization.await;
@@ -14396,32 +15312,124 @@ async fn run_watched_resync_batch_owned(
             pause.pause().await;
         }
     }
-    let transfer_tickets = {
+    let source_parents: std::collections::HashSet<Url> = post_commit_source_refresh
+        .as_ref()
+        .map(|post_commit| post_commit.parents.iter().cloned().collect())
+        .unwrap_or_default();
+    let source_replay = post_commit_source_refresh
+        .as_ref()
+        .map(|post_commit| (post_commit.backend.clone(), post_commit.parents.clone()));
+    let mut transfer_tickets = {
         let mut state = state_arc.write().await;
-        let reserved_current_uris: std::collections::HashSet<Url> = reserved_tickets
-            .iter()
-            .filter(|ticket| !ticket.trigger.is_stale(&state, &ticket.uri))
-            .map(|ticket| ticket.uri.clone())
-            .collect();
+        reserved_tickets.retain(|ticket| {
+            if source_parents.contains(&ticket.uri) {
+                if let Some(epoch) = ticket.trigger.epoch {
+                    state
+                        .diagnostics_gate
+                        .retire_force_republish(&ticket.uri, epoch);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        let reserved_current_uris: std::collections::HashSet<Url> = if invocation_commit_complete {
+            reserved_tickets
+                .iter()
+                .filter(|ticket| !ticket.trigger.is_stale(&state, &ticket.uri))
+                .map(|ticket| ticket.uri.clone())
+                .collect()
+        } else {
+            retire_watched_diagnostic_tickets(&state, &reserved_tickets);
+            state.documents.keys().cloned().collect()
+        };
         let mut additional = package_transfer_candidates;
-        if !committed_outer_batch {
+        if !invocation_commit_complete {
+            additional.clear();
+        } else if !committed_outer_batch {
             additional.extend(state.capture_analysis_transfer_candidates(affected_for_async));
         }
-        additional.retain(|candidate| !reserved_current_uris.contains(&candidate.uri));
-        let fallback: Vec<_> = state
-            .documents
-            .keys()
-            .filter(|uri| !reserved_current_uris.contains(*uri))
-            .cloned()
-            .collect();
+        additional.retain(|candidate| {
+            !reserved_current_uris.contains(&candidate.uri)
+                && !source_parents.contains(&candidate.uri)
+        });
+        let fallback: Vec<_> = if invocation_commit_complete {
+            state
+                .documents
+                .keys()
+                .filter(|uri| {
+                    !reserved_current_uris.contains(*uri) && !source_parents.contains(*uri)
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut excluded_uris = reserved_current_uris.clone();
+        excluded_uris.extend(source_parents.iter().cloned());
         finalize_analysis_handoff_candidates_excluding_or_fallback(
             &mut state,
             transfer_handles,
             additional,
             fallback,
-            &reserved_current_uris,
+            &excluded_uris,
         )
     };
+    if !invocation_commit_complete {
+        let state = state_arc.read().await;
+        retire_watched_diagnostic_tickets(&state, &transfer_tickets);
+        reserved_tickets.clear();
+        transfer_tickets.clear();
+    }
+    let mut source_refresh_tickets = Vec::new();
+    if invocation_commit_complete && let Some(post_commit) = post_commit_source_refresh {
+        if let Some(tickets) = post_commit
+            .backend
+            .finish_open_source_batch_post_commit(
+                post_commit.parents,
+                post_commit.refresh_sysdata_fallback,
+            )
+            .await
+        {
+            source_refresh_tickets = tickets;
+        } else {
+            invocation_commit_complete = false;
+        }
+    }
+    if !invocation_commit_complete && let Some(receipt) = completion_receipt.as_ref() {
+        receipt.apply_cancel_suppression();
+    }
+    let diagnostics_coherence_guard = completion_receipt
+        .as_ref()
+        .and_then(OpenSourceBatchCompletionReceipt::take_diagnostics_coherence_guard);
+    let replay_source_after_barrier =
+        invocation_commit_complete && diagnostics_coherence_guard.is_some();
+    drop(diagnostics_coherence_guard);
+    if invocation_commit_complete {
+        Backend::publish_diagnostics_for_tickets_bounded(
+            state_arc.clone(),
+            client.clone(),
+            source_refresh_tickets,
+            Some(traversal_truncation.clone()),
+        )
+        .await;
+    }
+    if replay_source_after_barrier && let Some((backend, parents)) = source_replay {
+        Backend::publish_diagnostics_for_uris_bounded(
+            backend.state.clone(),
+            backend.client.clone(),
+            parents,
+            Some(backend.traversal_truncation.clone()),
+        )
+        .await;
+    }
+    if !invocation_commit_complete {
+        let state = state_arc.read().await;
+        retire_watched_diagnostic_tickets(&state, &reserved_tickets);
+        retire_watched_diagnostic_tickets(&state, &transfer_tickets);
+        reserved_tickets.clear();
+        transfer_tickets.clear();
+    }
     #[cfg(test)]
     let final_handoff_completion = record_watched_final_handoff_for_test(
         &final_handoff_test_capture,
@@ -14429,6 +15437,8 @@ async fn run_watched_resync_batch_owned(
         &transfer_tickets,
     )
     .await;
+    const MAX_CONCURRENT_RESERVED_DIAGNOSTICS: usize = 8;
+    let mut reserved_join_set = tokio::task::JoinSet::new();
     for ticket in reserved_tickets {
         #[cfg(test)]
         let completion = final_handoff_completion
@@ -14447,11 +15457,15 @@ async fn run_watched_resync_batch_owned(
             run_with_diagnostic_final_handoff_completion(completion, task).await;
         };
         if await_reserved_tickets {
-            task.await;
+            while reserved_join_set.len() >= MAX_CONCURRENT_RESERVED_DIAGNOSTICS {
+                let _ = reserved_join_set.join_next().await;
+            }
+            reserved_join_set.spawn(task);
         } else {
             tokio::spawn(task);
         }
     }
+    while reserved_join_set.join_next().await.is_some() {}
     let transferred_publish = Backend::publish_diagnostics_for_tickets_bounded(
         state_arc,
         client,
@@ -14466,9 +15480,93 @@ async fn run_watched_resync_batch_owned(
         transferred_publish,
     );
     transferred_publish.await;
+    if let Some(receipt) = completion_receipt {
+        receipt.complete(if invocation_commit_complete {
+            OpenSourceBatchCompletionReceipt::COMMITTED
+        } else {
+            OpenSourceBatchCompletionReceipt::CANCELLED
+        });
+        completion_guard.disarm();
+    }
     #[cfg(test)]
     if let Some(completion) = final_handoff_completion {
         completion.finish();
+    }
+}
+
+struct CollectedWatchedResync {
+    updates: Vec<WatchedResyncItem>,
+    affected: Vec<Url>,
+    deletions: Vec<WatchedResyncItem>,
+}
+
+/// Reserve one watched generation per closed URI and capture the pre-update
+/// diagnostic fanout. When any event in one normalized notification belongs
+/// to an open source-batch parent, the backend calls this once for the whole
+/// notification and transfers that transaction's post-commit obligation to
+/// the parent refresh. Notification-wide ownership prevents that parent from
+/// publishing after its batch member lands but before an ordinary dependency
+/// event from the same notification commits.
+fn collect_watched_resync(state: &mut WorldState, changes: &[FileEvent]) -> CollectedWatchedResync {
+    let mut updates = Vec::new();
+    let mut affected = Vec::new();
+    let mut affected_set = std::collections::HashSet::new();
+    let mut deletions = Vec::new();
+
+    for change in changes {
+        let uri = &change.uri;
+        if state.is_document_open_or_alias(uri) {
+            log::trace!("Skipping watched file change for open document: {}", uri);
+            continue;
+        }
+
+        match change.typ {
+            FileChangeType::CREATED | FileChangeType::CHANGED => {
+                if state.is_project_excluded_uri(uri) {
+                    let generation = bump_watched_file_resync_generation(state, uri);
+                    deletions.push(WatchedResyncItem {
+                        uri: uri.clone(),
+                        generation,
+                    });
+                    extend_with_watched_pre_update_dependents(
+                        &mut affected,
+                        &mut affected_set,
+                        state,
+                        uri,
+                    );
+                    log::trace!("Queued excluded file removal in watched closed batch: {uri}");
+                    continue;
+                }
+                let generation = bump_watched_file_resync_generation(state, uri);
+                state.workspace_index.schedule_update(uri.clone());
+                updates.push(WatchedResyncItem {
+                    uri: uri.clone(),
+                    generation,
+                });
+                extend_with_watched_pre_update_dependents(
+                    &mut affected,
+                    &mut affected_set,
+                    state,
+                    uri,
+                );
+                log::trace!("Invalidated caches for changed file: {uri}");
+            }
+            FileChangeType::DELETED => {
+                let generation = bump_watched_file_resync_generation(state, uri);
+                deletions.push(WatchedResyncItem {
+                    uri: uri.clone(),
+                    generation,
+                });
+                log::trace!("Removed deleted file from cross-file state: {uri}");
+            }
+            _ => {}
+        }
+    }
+
+    CollectedWatchedResync {
+        updates,
+        affected,
+        deletions,
     }
 }
 
@@ -14642,6 +15740,46 @@ async fn pause_backstop_respawn_for_test(state_arc: &Arc<RwLock<WorldState>>, ur
     }
 }
 
+fn respawn_after_diagnostics_coherence(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    uri: Url,
+    deferred_generation: u64,
+) {
+    let state_for_claim = Arc::clone(&state_arc);
+    tokio::spawn(async move {
+        let coherence = {
+            let state = state_for_claim.read().await;
+            Arc::clone(&state.diagnostics_coherence)
+        };
+        if !coherence.claim_deferred(&uri, deferred_generation) {
+            return;
+        }
+        coherence.wait_until_quiescent().await;
+        if coherence.release_deferred(&uri, deferred_generation) {
+            return;
+        }
+        if state_arc.read().await.routing_is_shutdown() {
+            return;
+        }
+        publish_diagnostics_inner(&state_arc, &client, &uri).await;
+    });
+}
+
+async fn begin_diagnostics_coherence(
+    state_arc: &Arc<RwLock<WorldState>>,
+) -> DiagnosticsCoherenceGuard {
+    let (publish_lock, coherence) = {
+        let state = state_arc.read().await;
+        (
+            Arc::clone(&state.diagnostics_publish_lock),
+            Arc::clone(&state.diagnostics_coherence),
+        )
+    };
+    let _publish_guard = publish_lock.lock().await;
+    coherence.begin()
+}
+
 /// Run debounced diagnostics for a single URI.
 ///
 /// This is the shared diagnostics pipeline used by both `did_open`/`did_change`
@@ -14772,10 +15910,20 @@ async fn run_debounced_diagnostics(
         let workspace_folder = state.workspace_folders.first().cloned();
         let missing_file_severity = state.cross_file_config.missing_file_severity;
 
-        snapshot.map(|s| (s, workspace_folder, missing_file_severity))
+        let coherence_generation = state.diagnostics_coherence.generation();
+        snapshot.map(|s| {
+            (
+                s,
+                workspace_folder,
+                missing_file_severity,
+                coherence_generation,
+            )
+        })
     }; // Read lock released here
 
-    let Some((snapshot, workspace_folder, missing_file_severity)) = snapshot_data else {
+    let Some((snapshot, workspace_folder, missing_file_severity, coherence_generation)) =
+        snapshot_data
+    else {
         let state = state_arc.read().await;
         state
             .cross_file_revalidation
@@ -14854,7 +16002,7 @@ async fn run_debounced_diagnostics(
         return;
     }
 
-    let (can_publish, open_at_publish) = {
+    let (can_publish, coherence_deferred, open_at_publish) = {
         let state = state_arc.read().await;
 
         // Final cancellation re-check under the state read lock, immediately
@@ -14871,14 +16019,23 @@ async fn run_debounced_diagnostics(
             return;
         }
 
-        let can_publish = if !state.diagnostics_publish_allowed(&affected_uri)
+        let coherence_deferred = (!state
+            .diagnostics_coherence
+            .publish_is_coherent(coherence_generation))
+        .then_some(coherence_generation);
+        let can_publish = if coherence_deferred.is_some()
+            || !state.diagnostics_publish_allowed(&affected_uri)
             || trigger.is_stale(&state, &affected_uri)
         {
             false
         } else {
             trigger.commit_publish(&state.diagnostics_gate, &affected_uri)
         };
-        (can_publish, state.documents.contains_key(&affected_uri))
+        (
+            can_publish,
+            coherence_deferred,
+            state.documents.contains_key(&affected_uri),
+        )
     };
 
     if can_publish {
@@ -14943,6 +16100,21 @@ async fn run_debounced_diagnostics(
             #[cfg(not(test))]
             tokio::spawn(respawn);
         }
+    } else if let Some(deferred_generation) = coherence_deferred {
+        log::trace!(
+            "Deferring diagnostics for {} across an incoherent analysis transition",
+            affected_uri
+        );
+        respawn_after_diagnostics_coherence(
+            Arc::clone(&state_arc),
+            client.clone(),
+            affected_uri.clone(),
+            deferred_generation,
+        );
+        let state = state_arc.read().await;
+        state
+            .cross_file_revalidation
+            .complete(&affected_uri, generation);
     } else if !cancel.is_cancelled() {
         // Gate or eligibility refused the publish and nothing cancelled this
         // task, so nothing else will remove its pending entry — complete it.
@@ -15632,6 +16804,7 @@ async fn did_close_transactional(backend: &Backend, uri: &Url) {
     let (intent, test_captures) = {
         let mut state = backend.state.write().await;
         state.open_tar_source_refreshes.cancel(uri);
+        backend.open_tar_source_refresh_completions.cancel_uri(uri);
         #[cfg(test)]
         let test_captures = DidCloseTestCaptures {
             final_handoff: state.did_close_final_handoff_test_capture.claim(),
@@ -16912,17 +18085,36 @@ impl LanguageServer for Backend {
         // therefore run off-lock. Prepare the exact post-change document now;
         // the detached helper recomputes graph and package projections from one
         // basis and commits them together.
-        let detached_live_package_edit = {
+        let (detached_live_package_edit, detached_excluded_source_batch) = {
             let state = self.state.read().await;
-            (!state.is_project_excluded_uri(&uri)
-                && (rprofile_sourced_root_for_open_document(&state, &uri).is_some()
-                    || preamble_sourced_root_for_open_document(&state, &uri).is_some()))
-            .then(|| state.prepare_document_changes(&uri, changes.clone(), version))
-            .flatten()
+            let prepared = state.prepare_document_changes(&uri, changes.clone(), version);
+            let source_batch_affected = prepared.as_ref().is_some_and(|prepared| {
+                let metadata =
+                    crate::cross_file::extract_metadata(&prepared.document().analysis_text());
+                !metadata.tar_source_requests.is_empty()
+                    || !metadata.list_files_source_requests.is_empty()
+                    || state.get_enriched_metadata(&uri).is_some_and(|previous| {
+                        !previous.tar_source_requests.is_empty()
+                            || !previous.list_files_source_requests.is_empty()
+                    })
+            });
+            let excluded = state.is_project_excluded_uri(&uri);
+            let detached = (source_batch_affected
+                || (!state.is_project_excluded_uri(&uri)
+                    && (rprofile_sourced_root_for_open_document(&state, &uri).is_some()
+                        || preamble_sourced_root_for_open_document(&state, &uri).is_some())))
+            .then_some(prepared)
+            .flatten();
+            (detached, source_batch_affected && excluded)
         };
-        let detached_live_effects = if let Some(prepared) = detached_live_package_edit {
-            let Some(effects) =
-                commit_detached_live_package_open_edit(&self.state, &uri, prepared).await
+        let mut detached_live_effects = if let Some(prepared) = detached_live_package_edit {
+            let Some(effects) = commit_detached_live_package_open_edit(
+                &self.state,
+                &uri,
+                prepared,
+                self.routing_tasks.shutdown_token(),
+            )
+            .await
             else {
                 log::trace!("discarding superseded live package didChange for {uri}");
                 return;
@@ -16931,6 +18123,79 @@ impl LanguageServer for Backend {
         } else {
             None
         };
+
+        if detached_excluded_source_batch {
+            let effects = detached_live_effects
+                .take()
+                .expect("excluded source-batch edit used the detached commit path");
+            let (
+                files_to_index,
+                workspace_root,
+                max_forward_depth,
+                on_demand_enabled,
+                packages_enabled,
+                packages_to_prefetch,
+            ) = {
+                let state = self.state.read().await;
+                let workspace_root = state.workspace_folders.first().cloned();
+                let metadata = state
+                    .get_enriched_metadata(&uri)
+                    .expect("detached edit committed current open metadata");
+                let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
+                let files_to_index = if on_demand_enabled {
+                    source_targets_to_index_for_live_diagnostics(
+                        &state,
+                        &uri,
+                        metadata.as_ref(),
+                        workspace_root.as_ref(),
+                    )
+                } else {
+                    Vec::new()
+                };
+                (
+                    files_to_index,
+                    workspace_root,
+                    state.cross_file_config.max_forward_depth,
+                    on_demand_enabled,
+                    state.cross_file_config.packages_enabled,
+                    effects
+                        .open
+                        .as_ref()
+                        .expect("open edit returns its immutable outcome")
+                        .packages_to_prefetch
+                        .clone(),
+                )
+            };
+            if packages_enabled && !packages_to_prefetch.is_empty() {
+                let _ = self.ensure_package_library_initialized().await;
+                let _ = prefetch_current_package_library(&self.state, &packages_to_prefetch).await;
+            }
+            if on_demand_enabled {
+                for file_uri in files_to_index {
+                    self.index_file_on_demand(&file_uri).await;
+                }
+                if max_forward_depth > 0 {
+                    self.index_forward_chain(&uri, max_forward_depth, workspace_root.as_ref())
+                        .await;
+                }
+            }
+            let mut revalidations = effects.revalidations;
+            revalidations.retain(|ticket| ticket.uri != uri);
+            #[cfg(test)]
+            {
+                self.state
+                    .write()
+                    .await
+                    .did_change_reservation_snapshot_for_test = revalidations
+                    .iter()
+                    .map(|ticket| (ticket.uri.clone(), ticket.debounce_ms))
+                    .collect();
+            }
+            self.spawn_analysis_revalidation_tickets(revalidations)
+                .await;
+            self.publish_diagnostics(&uri).await;
+            return;
+        }
 
         // Compute affected files and debounce config while holding write lock
         let (mut work_items, packages_to_prefetch, packages_enabled, package_routing) =
@@ -17547,7 +18812,7 @@ impl LanguageServer for Backend {
             params.changes.len()
         );
         #[cfg(test)]
-        let (final_handoff_test_capture, config_reload_publish_test_capture) = {
+        let (final_handoff_test_capture, mut config_reload_publish_test_capture) = {
             let state = self.state.read().await;
             (
                 state
@@ -17560,11 +18825,14 @@ impl LanguageServer for Backend {
         let tar_source_parents = if params.changes.is_empty() {
             Vec::new()
         } else {
+            let event_uris: Vec<_> = params
+                .changes
+                .iter()
+                .map(|change| change.uri.clone())
+                .collect();
             let mut state = self.state.write().await;
             state.advance_workspace_scan_generation();
-            state.record_tar_source_filesystem_events(
-                params.changes.iter().map(|change| change.uri.clone()),
-            )
+            state.record_tar_source_filesystem_events(event_uris)
         };
 
         let (project_root, raw_client): (Option<std::path::PathBuf>, serde_json::Value) = {
@@ -17606,6 +18874,12 @@ impl LanguageServer for Backend {
                 &discovery_options,
             )
         });
+        let has_non_config_changes = params
+            .changes
+            .iter()
+            .any(|change| !config_file_change_uris.contains(&change.uri));
+        let mut deferred_config_publish = Vec::new();
+        let mut notification_receipt = None;
 
         if project_config_changed {
             // Step 1 (lock-free I/O): snapshot the workspace root, then run
@@ -17619,6 +18893,13 @@ impl LanguageServer for Backend {
                 })
                 .unwrap_or(crate::config_file::DiscoveredLoad::None);
             log_project_config_warnings(&project_layer);
+            if has_non_config_changes {
+                let receipt = OpenSourceBatchCompletionReceipt::new();
+                receipt.install_diagnostics_coherence_guard(
+                    begin_diagnostics_coherence(&self.state).await,
+                );
+                notification_receipt = Some(receipt);
+            }
 
             // Step 2 (under write lock, no I/O): apply the reload —
             // snapshot prev configs for downstream rebuild gating, swap
@@ -17659,104 +18940,31 @@ impl LanguageServer for Backend {
             };
             self.notify_project_config_loaded(new_path.as_deref());
 
-            // Re-publish diagnostics for every open document. The
-            // force-republish markers set by the helper ensure
-            // `publish_diagnostics` actually emits (rather than being
-            // short-circuited by an unchanged-version check).
-            //
-            // Per-URI publishes are independent: each takes brief read
-            // locks on `state` and the `diagnostics_gate`'s per-URI
-            // `HashMap` entries, then releases before doing the async
-            // missing-file checks and the `client.publish_diagnostics`
-            // send. Running them in parallel — bounded — avoids N×
-            // latency on workspaces with many open files. The
-            // monotonic-publish invariant still holds: distinct URIs
-            // commit to distinct gate entries, and every spawned task is
-            // joined before this handler returns so a later `did_change`
-            // can't race a still-running reload publish.
-            const MAX_CONCURRENT_PUBLISHES: usize = 8;
-            let mut join_set = tokio::task::JoinSet::new();
-            #[cfg(test)]
-            let mut completed = Vec::with_capacity(to_publish.len());
-            #[cfg(test)]
-            let mut scheduled = to_publish.clone();
-            for uri in to_publish {
-                while join_set.len() >= MAX_CONCURRENT_PUBLISHES {
-                    let _joined = join_set.join_next().await;
+            // Config diagnostics share the notification's completion boundary
+            // with any source-file events. This prevents a config marker from
+            // publishing against artifacts that the same notification has not
+            // committed yet.
+            if has_non_config_changes {
+                deferred_config_publish = to_publish;
+            } else {
+                self.publish_config_reload_diagnostics(
+                    to_publish,
                     #[cfg(test)]
-                    if let Some(Ok(uri)) = _joined {
-                        completed.push(uri);
-                    }
-                }
-                let state_arc = self.state.clone();
-                let client = self.client.clone();
-                join_set.spawn(async move {
-                    publish_diagnostics_inner(&state_arc, &client, &uri).await;
-                    #[cfg(test)]
-                    {
-                        uri
-                    }
-                });
-            }
-            while let Some(_joined) = join_set.join_next().await {
-                #[cfg(test)]
-                if let Ok(uri) = _joined {
-                    completed.push(uri);
-                }
-            }
-            #[cfg(test)]
-            if let Some(capture) = &config_reload_publish_test_capture {
-                scheduled.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-                completed.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-                let completion = capture
-                    .record_and_pause(crate::state::ConfigReloadPublishForTest {
-                        scheduled,
-                        completed,
-                    })
-                    .await;
-                if let Some(completion) = completion {
-                    completion.finish();
-                }
+                    config_reload_publish_test_capture.take(),
+                )
+                .await;
             }
         }
 
         // If every change was a config file, the source-file flow below has
         // nothing to do. Otherwise, build a filtered `params` containing
         // only the non-config events and continue.
-        let mut remaining_changes: Vec<FileEvent> = params
+        let remaining_changes: Vec<FileEvent> = params
             .changes
             .iter()
             .filter(|c| !config_file_change_uris.contains(&c.uri))
             .cloned()
             .collect();
-        let open_tar_source_parents: Vec<Url> = {
-            let state = self.state.read().await;
-            tar_source_parents
-                .iter()
-                .filter(|uri| state.is_document_open_or_alias(uri))
-                .cloned()
-                .collect()
-        };
-        for parent in tar_source_parents {
-            if open_tar_source_parents.contains(&parent)
-                || remaining_changes.iter().any(|change| change.uri == parent)
-            {
-                continue;
-            }
-            remaining_changes.push(FileEvent {
-                uri: parent,
-                typ: FileChangeType::CHANGED,
-            });
-        }
-        for parent in open_tar_source_parents {
-            self.schedule_open_tar_source_parent_refresh(parent).await;
-        }
-        if remaining_changes.is_empty() {
-            return;
-        }
-        let sysdata_fallback_watcher_event = project_root
-            .as_ref()
-            .is_some_and(|root| has_sysdata_fallback_watcher_event(root, &remaining_changes));
         let mut params = DidChangeWatchedFilesParams {
             changes: remaining_changes,
         };
@@ -17788,112 +18996,154 @@ impl LanguageServer for Backend {
         for open_uri in alias_reconcile_uris {
             self.reconcile_open_alias_topology(&open_uri).await;
         }
-
-        // Collect URIs to update and affected open documents
-        let (uris_to_update, affected_open_docs, deleted_uris): (
-            Vec<WatchedResyncItem>,
+        let (open_tar_source_authorities, open_tar_source_parents): (
+            std::collections::HashSet<Url>,
             Vec<Url>,
-            Vec<WatchedResyncItem>,
         ) = {
-            let mut state = self.state.write().await;
-            let mut to_update = Vec::new();
-            let mut affected: Vec<Url> = Vec::new();
-            // O(1) dedupe set companion for `affected` — large bursts of
-            // watched-file changes can otherwise spend the lock-hold time
-            // doing Vec::contains scans per dependent.
-            let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
-            // Track whether any deletion touched `package_inputs`, so that
-            // mixed batches (deletions + non-R creates/changes) still trigger
-            // a re-derive. Without this, a batch like
-            // `DELETE R/foo.R + CREATE inst/data.csv` skipped the sync
-            // `apply_package_event` (because `!to_update.is_empty()`) AND
-            // skipped the async path's `has_pkg_files` check (because
-            // `inst/data.csv` is not a package source file) — leaving
-            // symbols from the deleted R file stale in
-            // `scope_contribution.r_internal_symbols` until the next R/
-            // edit happened to trigger a derive.
-            let mut deleted_uris = Vec::new();
-
-            for change in &params.changes {
-                let uri = &change.uri;
-
-                // Skip if document is open (open docs are authoritative)
-                if state.is_document_open_or_alias(uri) {
-                    log::trace!("Skipping watched file change for open document: {}", uri);
-                    continue;
-                }
-
-                // Rmd/Quarto files flow through like plain R since #558:
-                // `resync_file_from_disk` masks path-classified Rmd/Quarto
-                // content (chunk bodies only, never prose — the pollution the
-                // old skip guarded against), and the close resync now
-                // installs graph/index state for closed Rmd documents that a
-                // later external edit or deletion must be able to update or
-                // remove.
-
-                match change.typ {
-                    FileChangeType::CREATED | FileChangeType::CHANGED => {
-                        if state.is_project_excluded_uri(uri) {
-                            let generation = bump_watched_file_resync_generation(&mut state, uri);
-                            deleted_uris.push(WatchedResyncItem {
-                                uri: uri.clone(),
-                                generation,
-                            });
-                            extend_with_watched_pre_update_dependents(
-                                &mut affected,
-                                &mut affected_set,
-                                &state,
-                                uri,
-                            );
-                            log::trace!(
-                                "Queued excluded file removal in watched closed batch: {}",
-                                uri
-                            );
-                            continue;
-                        }
-                        let generation = bump_watched_file_resync_generation(&mut state, uri);
-
-                        // Schedule debounced update in new WorkspaceIndex (Requirement 5.1)
-                        state.workspace_index.schedule_update(uri.clone());
-
-                        // Schedule detached disk/package convergence.
-                        to_update.push(WatchedResyncItem {
-                            uri: uri.clone(),
-                            generation,
-                        });
-
-                        extend_with_watched_pre_update_dependents(
-                            &mut affected,
-                            &mut affected_set,
-                            &state,
-                            uri,
-                        );
-                        log::trace!("Invalidated caches for changed file: {}", uri);
-                    }
-                    FileChangeType::DELETED => {
-                        let generation = bump_watched_file_resync_generation(&mut state, uri);
-                        deleted_uris.push(WatchedResyncItem {
-                            uri: uri.clone(),
-                            generation,
-                        });
-
-                        log::trace!("Removed deleted file from cross-file state: {}", uri);
-                    }
-                    _ => {}
+            let state = self.state.read().await;
+            let mut authorities = std::collections::HashSet::new();
+            let mut exact = Vec::new();
+            for uri in &tar_source_parents {
+                if let Some(open_uri) = state.open_document_uri_for_authoritative_uri(uri) {
+                    authorities.insert(uri.clone());
+                    exact.push(open_uri);
                 }
             }
-
-            // CREATED/CHANGED graph mutations happen in the async disk-read
-            // pass below. When that pass is needed, defer capping and
-            // force-republish marking until after the post-update graph walk
-            // has added newly reachable open documents. For DELETED-only
-            // batches, the graph is already updated here, so cap and mark now.
-            // Watched-file deletions can drop edges that put a closed neighbor
-            // outside the open-document neighborhood; refresh the pin set so
-            // newly unreachable URIs become LRU-evictable again.
-
-            (to_update, affected, deleted_uris)
+            exact.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+            exact.dedup();
+            (authorities, exact)
         };
+        for parent in tar_source_parents {
+            if open_tar_source_authorities.contains(&parent)
+                || params.changes.iter().any(|change| change.uri == parent)
+            {
+                continue;
+            }
+            params.changes.push(FileEvent {
+                uri: parent,
+                typ: FileChangeType::CHANGED,
+            });
+        }
+
+        if !open_tar_source_parents.is_empty() {
+            let source_sysdata_event = project_root
+                .as_ref()
+                .is_some_and(|root| has_sysdata_fallback_watcher_event(root, &params.changes));
+            let source_batch = {
+                let mut state = self.state.write().await;
+                collect_watched_resync(&mut state, &params.changes)
+            };
+            let receipt = if let Some(receipt) = notification_receipt.take() {
+                receipt
+            } else {
+                let receipt = OpenSourceBatchCompletionReceipt::new();
+                receipt.install_diagnostics_coherence_guard(
+                    begin_diagnostics_coherence(&self.state).await,
+                );
+                receipt
+            };
+            run_watched_resync_batch_owned(
+                self.state.clone(),
+                self.client.clone(),
+                self.traversal_truncation.clone(),
+                self.routing_tasks.clone(),
+                WatchedTaskAdmission::UntrackedBoundary,
+                WatchedResyncBatch {
+                    updates: source_batch.updates,
+                    affected: source_batch.affected,
+                    deletions: source_batch.deletions,
+                    reserved_tickets: Vec::new(),
+                    transfer_handles: Vec::new(),
+                    completion: WatchedResyncCompletion::InvocationOwned {
+                        post_commit: Some(OpenSourceBatchPostCommit {
+                            backend: self.clone(),
+                            parents: open_tar_source_parents,
+                            refresh_sysdata_fallback: source_sysdata_event,
+                        }),
+                        receipt: receipt.clone(),
+                        boundary_waiter: true,
+                    },
+                    // A source-batch parent must never publish against stale
+                    // artifacts. Invalid member bytes therefore fail closed in
+                    // this exact transaction instead of leaving the old member
+                    // installed during a delayed retry.
+                    mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
+                    attempts_remaining: 2,
+                    #[cfg(test)]
+                    final_handoff_test_capture: final_handoff_test_capture.clone(),
+                },
+            )
+            .await;
+            let source_committed = receipt.committed();
+            if !deferred_config_publish.is_empty() {
+                if source_committed {
+                    self.publish_config_reload_diagnostics(
+                        deferred_config_publish,
+                        #[cfg(test)]
+                        config_reload_publish_test_capture.take(),
+                    )
+                    .await;
+                } else {
+                    self.retire_config_reload_diagnostics(&deferred_config_publish)
+                        .await;
+                }
+            }
+            return;
+        }
+        let sysdata_fallback_watcher_event = project_root
+            .as_ref()
+            .is_some_and(|root| has_sysdata_fallback_watcher_event(root, &params.changes));
+        let CollectedWatchedResync {
+            updates: uris_to_update,
+            affected: affected_open_docs,
+            deletions: deleted_uris,
+        } = {
+            let mut state = self.state.write().await;
+            collect_watched_resync(&mut state, &params.changes)
+        };
+
+        if let Some(receipt) = notification_receipt.take() {
+            run_watched_resync_batch_owned(
+                self.state.clone(),
+                self.client.clone(),
+                self.traversal_truncation.clone(),
+                self.routing_tasks.clone(),
+                WatchedTaskAdmission::UntrackedBoundary,
+                WatchedResyncBatch {
+                    updates: uris_to_update,
+                    affected: affected_open_docs,
+                    deletions: deleted_uris,
+                    reserved_tickets: Vec::new(),
+                    transfer_handles: Vec::new(),
+                    completion: WatchedResyncCompletion::InvocationOwned {
+                        post_commit: None,
+                        receipt: receipt.clone(),
+                        boundary_waiter: true,
+                    },
+                    mode: WatchedResyncBatchMode::Immediate,
+                    attempts_remaining: 2,
+                    #[cfg(test)]
+                    final_handoff_test_capture,
+                },
+            )
+            .await;
+            if receipt.committed() {
+                if sysdata_fallback_watcher_event {
+                    schedule_current_sysdata_fallback(PackageSeedTaskHandles::from_backend(self))
+                        .await;
+                }
+                self.publish_config_reload_diagnostics(
+                    deferred_config_publish,
+                    #[cfg(test)]
+                    config_reload_publish_test_capture.take(),
+                )
+                .await;
+            } else {
+                self.retire_config_reload_diagnostics(&deferred_config_publish)
+                    .await;
+            }
+            return;
+        }
 
         // Schedule async disk reads to update workspace index for changed files.
         // CREATED/CHANGED graph mutations happen inside the spawned task, so
@@ -17920,6 +19170,7 @@ impl LanguageServer for Backend {
                         deletions: deleted_uris,
                         reserved_tickets: Vec::new(),
                         transfer_handles: Vec::new(),
+                        completion: WatchedResyncCompletion::Detached,
                         mode: WatchedResyncBatchMode::Immediate,
                         attempts_remaining: 2,
                         #[cfg(test)]
@@ -17954,6 +19205,7 @@ impl LanguageServer for Backend {
                     deletions: deleted_uris,
                     reserved_tickets: Vec::new(),
                     transfer_handles: Vec::new(),
+                    completion: WatchedResyncCompletion::Detached,
                     mode: WatchedResyncBatchMode::Immediate,
                     attempts_remaining: 2,
                     #[cfg(test)]
@@ -18479,6 +19731,68 @@ fn help_html_to_json(
 }
 
 impl Backend {
+    async fn publish_config_reload_diagnostics(
+        &self,
+        to_publish: Vec<Url>,
+        #[cfg(test)] capture: Option<
+            crate::state::FinalHandoffCaptureClaim<crate::state::ConfigReloadPublishForTest>,
+        >,
+    ) {
+        const MAX_CONCURRENT_PUBLISHES: usize = 8;
+        let mut join_set = tokio::task::JoinSet::new();
+        #[cfg(test)]
+        let mut completed = Vec::with_capacity(to_publish.len());
+        #[cfg(test)]
+        let mut scheduled = to_publish.clone();
+        for uri in to_publish {
+            while join_set.len() >= MAX_CONCURRENT_PUBLISHES {
+                let _joined = join_set.join_next().await;
+                #[cfg(test)]
+                if let Some(Ok(uri)) = _joined {
+                    completed.push(uri);
+                }
+            }
+            let state_arc = self.state.clone();
+            let client = self.client.clone();
+            join_set.spawn(async move {
+                publish_diagnostics_inner(&state_arc, &client, &uri).await;
+                #[cfg(test)]
+                {
+                    uri
+                }
+            });
+        }
+        while let Some(_joined) = join_set.join_next().await {
+            #[cfg(test)]
+            if let Ok(uri) = _joined {
+                completed.push(uri);
+            }
+        }
+        #[cfg(test)]
+        if let Some(capture) = capture {
+            scheduled.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+            completed.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+            let completion = capture
+                .record_and_pause(crate::state::ConfigReloadPublishForTest {
+                    scheduled,
+                    completed,
+                })
+                .await;
+            if let Some(completion) = completion {
+                completion.finish();
+            }
+        }
+    }
+
+    async fn retire_config_reload_diagnostics(&self, to_retire: &[Url]) {
+        let state = self.state.read().await;
+        for uri in to_retire {
+            if let Some(epoch) = state.diagnostics_gate.current_epoch(uri) {
+                state.diagnostics_gate.retire_force_republish(uri, epoch);
+            }
+        }
+    }
+
     async fn register_external_project_config_watch(
         &self,
         workspace_folders: Vec<Url>,
@@ -18946,8 +20260,21 @@ impl Backend {
                 if !self.state.read().await.cross_file_config.index_workspace {
                     self.state.write().await.workspace_scan_complete = true;
                 }
-                let mut state = self.state.write().await;
-                replay_open_documents_after_workspace_index_apply(&mut state).await;
+                let source_batch_parents = {
+                    let mut state = self.state.write().await;
+                    replay_open_documents_after_workspace_index_apply(&mut state).await
+                };
+                let mut source_batch_receipts = Vec::new();
+                for parent in source_batch_parents {
+                    if let Some(receipt) =
+                        self.schedule_open_tar_source_parent_refresh(parent).await
+                    {
+                        source_batch_receipts.push(receipt);
+                    }
+                }
+                for receipt in source_batch_receipts {
+                    let _ = receipt.wait(self.routing_tasks.shutdown_token()).await;
+                }
             }
 
             if !package_inputs_initialized_by_exclusion_reload
@@ -19379,13 +20706,20 @@ impl Backend {
     /// single-flight admission. If a coordinator already owns the URI, it will
     /// observe that generation after its current uncancellable filesystem walk
     /// finishes; no second walk is launched.
-    async fn schedule_open_tar_source_parent_refresh(&self, uri: Url) {
-        let generation = {
+    async fn schedule_open_tar_source_parent_refresh(
+        &self,
+        uri: Url,
+    ) -> Option<OpenTarSourceRefreshReceipt> {
+        let (generation, receipt) = {
             let state = self.state.read().await;
             if state.routing_is_shutdown() || !state.documents.contains_key(&uri) {
-                return;
+                return None;
             }
-            state.open_tar_source_refreshes.schedule(uri.clone()).0
+            let generation = state.open_tar_source_refreshes.schedule(uri.clone()).0;
+            let receipt = self
+                .open_tar_source_refresh_completions
+                .register(uri.clone(), generation);
+            (generation, receipt)
         };
         let coordinator_id = self
             .open_tar_source_coordinator_generation
@@ -19398,7 +20732,7 @@ impl Backend {
             coordinator_id,
             self.open_tar_source_coordinators.clone(),
         ) else {
-            return;
+            return Some(receipt);
         };
         let backend = self.clone();
         let worker_uri = uri.clone();
@@ -19413,8 +20747,49 @@ impl Backend {
                 .await
                 .open_tar_source_refreshes
                 .complete(&uri, generation);
+            self.open_tar_source_refresh_completions.complete_through(
+                &uri,
+                generation,
+                OpenTarSourceRefreshOutcome::Cancelled,
+            );
             log::debug!("shutdown rejected open tar_source refresh for {uri}");
         }
+        Some(receipt)
+    }
+
+    async fn finish_open_source_batch_post_commit(
+        &self,
+        parents: Vec<Url>,
+        refresh_sysdata_fallback: bool,
+    ) -> Option<Vec<crate::state::AnalysisRevalidationTicket>> {
+        let mut committed = true;
+        let mut tickets = Vec::new();
+        let mut receipts = Vec::new();
+        for parent in parents {
+            if let Some(receipt) = self
+                .schedule_open_tar_source_parent_refresh(parent.clone())
+                .await
+            {
+                receipts.push(receipt);
+            } else {
+                let state = self.state.read().await;
+                if state.routing_is_shutdown() || state.documents.contains_key(&parent) {
+                    committed = false;
+                }
+            }
+        }
+        for receipt in receipts {
+            match receipt.wait(self.routing_tasks.shutdown_token()).await {
+                OpenTarSourceRefreshOutcome::Committed(refresh_tickets) => {
+                    tickets.extend(refresh_tickets);
+                }
+                OpenTarSourceRefreshOutcome::Cancelled => committed = false,
+            }
+        }
+        if committed && refresh_sysdata_fallback {
+            schedule_current_sysdata_fallback(PackageSeedTaskHandles::from_backend(self)).await;
+        }
+        committed.then_some(tickets)
     }
 
     /// Re-expand one open parent until its exact refresh owner converges.
@@ -19452,10 +20827,35 @@ impl Backend {
                 }
                 continue;
             };
+            #[cfg(test)]
+            if self
+                .open_tar_source_refresh_cancel_remaining_for_test
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                self.state
+                    .read()
+                    .await
+                    .open_tar_source_refreshes
+                    .complete(uri, generation);
+                self.open_tar_source_refresh_completions.complete_through(
+                    uri,
+                    generation,
+                    OpenTarSourceRefreshOutcome::Cancelled,
+                );
+                continue;
+            }
             let captured = {
                 let state = self.state.read().await;
                 let Some(record) = state.documents.get_record(uri) else {
                     state.open_tar_source_refreshes.complete(uri, generation);
+                    self.open_tar_source_refresh_completions.complete_through(
+                        uri,
+                        generation,
+                        OpenTarSourceRefreshOutcome::Cancelled,
+                    );
                     continue;
                 };
                 state.capture_open_metadata_derivation(uri, record.generation())
@@ -19469,6 +20869,11 @@ impl Backend {
                     .await
                     .open_tar_source_refreshes
                     .complete(uri, generation);
+                self.open_tar_source_refresh_completions.complete_through(
+                    uri,
+                    generation,
+                    OpenTarSourceRefreshOutcome::Cancelled,
+                );
                 continue;
             };
             let derivation_input = captured.clone();
@@ -19492,6 +20897,11 @@ impl Backend {
                         .await
                         .open_tar_source_refreshes
                         .complete(uri, generation);
+                    self.open_tar_source_refresh_completions.complete_through(
+                        uri,
+                        generation,
+                        OpenTarSourceRefreshOutcome::Cancelled,
+                    );
                     continue;
                 }
             };
@@ -19573,14 +20983,11 @@ impl Backend {
                 .open_tar_source_refreshes
                 .complete(uri, generation);
             rejected_rounds = 0;
-            Backend::publish_diagnostics_for_tickets_bounded(
-                self.state.clone(),
-                self.client.clone(),
-                tickets,
-                Some(self.traversal_truncation.clone()),
-            )
-            .await;
-            self.publish_diagnostics(uri).await;
+            self.open_tar_source_refresh_completions.complete_through(
+                uri,
+                generation,
+                OpenTarSourceRefreshOutcome::Committed(tickets),
+            );
         }
     }
 
@@ -21379,6 +22786,7 @@ pub(crate) async fn publish_diagnostics_inner(
         workspace_folder,
         missing_file_severity,
         case_mismatch_severity,
+        coherence_generation,
     ) = {
         let state = state_arc.read().await;
         // Full trigger capture (version + revision + epoch): the direct
@@ -21458,6 +22866,7 @@ pub(crate) async fn publish_diagnostics_inner(
         let workspace_folder = state.workspace_folders.first().cloned();
         let missing_file_severity = state.cross_file_config.missing_file_severity;
         let case_mismatch_severity = state.cross_file_config.case_mismatch_severity;
+        let coherence_generation = state.diagnostics_coherence.generation();
 
         (
             trigger,
@@ -21467,6 +22876,7 @@ pub(crate) async fn publish_diagnostics_inner(
             workspace_folder,
             missing_file_severity,
             case_mismatch_severity,
+            coherence_generation,
         )
     };
     // Read lock released — scope resolution and async I/O run unlocked.
@@ -21517,7 +22927,7 @@ pub(crate) async fn publish_diagnostics_inner(
     };
     let _publish_guard = publish_lock.lock().await;
     pause_after_diagnostics_publish_lock_for_test(state_arc, uri).await;
-    let open_at_publish = {
+    let (open_at_publish, coherence_deferred) = {
         let state = state_arc.read().await;
         if !state.diagnostics_publish_allowed(uri) {
             log::trace!(
@@ -21533,16 +22943,37 @@ pub(crate) async fn publish_diagnostics_inner(
             );
             return;
         }
-        if !trigger.commit_publish(&state.diagnostics_gate, uri) {
+        let coherence_deferred = (!state
+            .diagnostics_coherence
+            .publish_is_coherent(coherence_generation))
+        .then_some(coherence_generation);
+        if coherence_deferred.is_some() {
+            log::trace!(
+                "Deferring diagnostics for {} across an incoherent analysis transition",
+                uri
+            );
+            (state.documents.contains_key(uri), coherence_deferred)
+        } else if !trigger.commit_publish(&state.diagnostics_gate, uri) {
             log::trace!(
                 "Skipping diagnostics for {}: gate refused after async (version={:?})",
                 uri,
                 trigger.version
             );
             return;
+        } else {
+            (state.documents.contains_key(uri), None)
         }
-        state.documents.contains_key(uri)
     };
+
+    if let Some(deferred_generation) = coherence_deferred {
+        respawn_after_diagnostics_coherence(
+            Arc::clone(state_arc),
+            client.clone(),
+            uri.clone(),
+            deferred_generation,
+        );
+        return;
+    }
 
     log::trace!(
         "diagnostics lifecycle: publish uri={} count={} path=direct version={:?} open={}",
@@ -24404,6 +25835,7 @@ mod tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: super::WatchedResyncCompletion::Detached,
                 mode: super::WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -24488,6 +25920,9 @@ mod tests {
                     final_handoff_test_capture: None,
                 },
                 false,
+                None,
+                None,
+                true,
             )
         ));
         while backend.state.read().await.system_file_test_commit_attempts < 2 {
@@ -35112,7 +36547,7 @@ mod project_config_initialize_tests {
         {
             let mut state = backend.state.write().await;
             state.apply_workspace_index(scan_result);
-            replay_open_documents_after_workspace_index_apply(&mut state).await;
+            let _ = replay_open_documents_after_workspace_index_apply(&mut state).await;
         }
 
         let state = backend.state.read().await;
@@ -46133,6 +47568,7 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -46190,6 +47626,7 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -46243,6 +47680,7 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -46302,6 +47740,7 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -46378,6 +47817,7 @@ mod project_config_initialize_tests {
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -48857,6 +50297,33 @@ infixContinuationStyle = "aligned"
         opened
     }
 
+    /// Package-disabled fixture whose initial didOpen diagnostics have crossed
+    /// their exact final-handoff receipt.
+    async fn open_in_settled_quiescent_workspace(
+        tmp: &TempDir,
+        rel_path: &str,
+        language_id: &str,
+        content: &str,
+    ) -> (tower_lsp::LspService<Backend>, Url) {
+        let svc = service_in_workspace_with_options_at(
+            tmp.path(),
+            Some(serde_json::json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+        )
+        .await;
+        let uri = Url::from_file_path(tmp.path().join(rel_path)).unwrap();
+        open_doc_with_revalidation_handoff(svc.inner(), &uri, language_id, 1, content).await;
+        assert_eq!(
+            svc.inner()
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire),
+            0
+        );
+        (svc, uri)
+    }
+
     /// Open with package mode enabled and an explicitly installed synthetic
     /// ready library. This preserves package-input/routing behavior without
     /// consulting host R, provider databases, or filesystem watchers.
@@ -48911,7 +50378,7 @@ infixContinuationStyle = "aligned"
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watched_tar_member_creation_refreshes_open_parent_snapshot() {
-        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+        use tower_lsp::lsp_types::FileChangeType;
 
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("R")).unwrap();
@@ -48945,35 +50412,8 @@ infixContinuationStyle = "aligned"
         }
 
         fs::write(tmp.path().join("R/new.R"), "new_fn <- function() 2\n").unwrap();
-        backend
-            .did_change_watched_files(DidChangeWatchedFilesParams {
-                changes: vec![FileEvent {
-                    uri: new_uri.clone(),
-                    typ: FileChangeType::CREATED,
-                }],
-            })
-            .await;
-
-        assert!(
-            wait_for_state(backend, 5_000, |state| {
-                state
-                    .documents
-                    .get_record(&parent_uri)
-                    .is_some_and(|record| {
-                        record.metadata().sources.iter().any(|source| {
-                            source.tar_source_ordinal == Some(0)
-                                && source.resolved_uri.as_ref() == Some(&new_uri)
-                        })
-                    })
-                    && state
-                        .cross_file_graph
-                        .get_dependencies(&parent_uri)
-                        .iter()
-                        .any(|edge| edge.to == new_uri && edge.tar_source_ordinal == Some(0))
-            })
-            .await,
-            "the tracked open-parent refresh must converge before assertions"
-        );
+        let handler = spawn_watched_file_change(backend, new_uri.clone(), FileChangeType::CREATED);
+        handler.await.unwrap();
         let state = backend.state.read().await;
         let record = state
             .documents
@@ -48998,9 +50438,1375 @@ infixContinuationStyle = "aligned"
         );
     }
 
+    fn spawn_watched_file_change(
+        backend: &Backend,
+        uri: Url,
+        typ: tower_lsp::lsp_types::FileChangeType,
+    ) -> tokio::task::JoinHandle<()> {
+        let backend = backend.clone();
+        tokio::spawn(async move {
+            backend
+                .did_change_watched_files(tower_lsp::lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![tower_lsp::lsp_types::FileEvent { uri, typ }],
+                })
+                .await;
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_list_files_member_creation_refreshes_open_parent_snapshot() {
+        use tower_lsp::lsp_types::FileChangeType;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(
+            tmp.path().join("functions/old.R"),
+            "deleted_member_only_fn <- function() 1\n",
+        )
+        .unwrap();
+        let parent_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n\
+             new_fn()\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+
+        let (svc, parent_uri) = open_in_quiescent_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let old_uri = Url::from_file_path(tmp.path().join("functions/old.R")).unwrap();
+        let new_uri = Url::from_file_path(tmp.path().join("functions/00_new.R")).unwrap();
+
+        {
+            let state = backend.state.read().await;
+            let record = state
+                .documents
+                .get_record(&parent_uri)
+                .expect("open parent record");
+            assert!(record.metadata().sources.iter().any(|source| {
+                source.source_batch_kind
+                    == Some(crate::cross_file::types::SourceBatchKind::ListFiles)
+                    && source.resolved_uri.as_ref() == Some(&old_uri)
+            }));
+        }
+
+        fs::write(
+            tmp.path().join("functions/00_new.R"),
+            "new_fn <- function() 2\n",
+        )
+        .unwrap();
+        let watched_generation_before = backend
+            .state
+            .read()
+            .await
+            .watched_file_resync_generation_counter;
+        let handler = spawn_watched_file_change(backend, new_uri.clone(), FileChangeType::CREATED);
+        handler.await.unwrap();
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.watched_file_resync_generation_counter,
+            watched_generation_before + 1,
+            "an attributed watcher event must mint exactly one closed-file owner"
+        );
+        let record = state
+            .documents
+            .get_record(&parent_uri)
+            .expect("refreshed open parent record");
+        assert!(record.metadata().sources.iter().any(|source| {
+            source.source_batch_kind == Some(crate::cross_file::types::SourceBatchKind::ListFiles)
+                && source.tar_source_ordinal == Some(0)
+                && source.resolved_uri.as_ref() == Some(&new_uri)
+        }));
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&parent_uri)
+                .iter()
+                .any(|edge| {
+                    edge.to == new_uri
+                        && edge.source_batch_kind
+                            == Some(crate::cross_file::types::SourceBatchKind::ListFiles)
+                        && edge.tar_source_ordinal == Some(0)
+                })
+        );
+        assert!(record.artifacts().timeline.iter().any(|event| matches!(
+            event,
+            crate::cross_file::scope::ScopeEvent::TarBatch { members, .. }
+                if members.len() == 2
+                    && members[0].resolved_uri.as_ref() == Some(&new_uri)
+                    && members[1].resolved_uri.as_ref() == Some(&old_uri)
+        )));
+        assert!(state.workspace_index.get_artifacts(&new_uri).is_some());
+        assert!(
+            !snapshot_diagnostics(&state, &parent_uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("new_fn is not defined")),
+            "watched completion must include member indexing before parent diagnostics"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri),
+            0,
+            "the handler must consume the parent's diagnostic reservation"
+        );
+        assert!(
+            !state
+                .cross_file_revalidation
+                .has_pending_for_test(&parent_uri),
+            "the handler must not leave a second parent revalidation owner"
+        );
+        drop(state);
+
+        let changed_parent = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n\
+             changed_fn()\n";
+        change_doc(backend, &parent_uri, 2, changed_parent).await;
+        fs::write(
+            tmp.path().join("functions/00_new.R"),
+            "changed_fn <- function() 3\n",
+        )
+        .unwrap();
+        spawn_watched_file_change(backend, new_uri.clone(), FileChangeType::CHANGED)
+            .await
+            .unwrap();
+
+        let state = backend.state.read().await;
+        assert!(
+            !snapshot_diagnostics(&state, &parent_uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("changed_fn is not defined")),
+            "CHANGED completion must flush member artifacts before parent diagnostics"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri),
+            0
+        );
+        assert!(
+            !state
+                .cross_file_revalidation
+                .has_pending_for_test(&parent_uri)
+        );
+        drop(state);
+
+        let deleted_parent = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n\
+             deleted_member_only_fn()\n";
+        change_doc(backend, &parent_uri, 3, deleted_parent).await;
+        fs::remove_file(tmp.path().join("functions/old.R")).unwrap();
+        spawn_watched_file_change(backend, old_uri.clone(), FileChangeType::DELETED)
+            .await
+            .unwrap();
+
+        let state = backend.state.read().await;
+        let record = state.documents.get_record(&parent_uri).unwrap();
+        assert!(
+            record
+                .metadata()
+                .sources
+                .iter()
+                .all(|source| source.resolved_uri.as_ref() != Some(&old_uri)),
+            "DELETED completion must remove the member before refreshing the parent"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&parent_uri)
+                .iter()
+                .all(|edge| edge.to != old_uri)
+        );
+        assert!(
+            state.workspace_index.get_artifacts(&old_uri).is_none(),
+            "the deleted member artifacts must be gone before parent publication"
+        );
+        assert!(
+            record.artifacts().timeline.iter().all(|event| !matches!(
+                event,
+                crate::cross_file::scope::ScopeEvent::TarBatch { members, .. }
+                    if members
+                        .iter()
+                        .any(|member| member.resolved_uri.as_ref() == Some(&old_uri))
+            )),
+            "the refreshed parent timeline must not retain the deleted batch member: {:?}",
+            record.artifacts().timeline
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri),
+            0
+        );
+        assert!(
+            !state
+                .cross_file_revalidation
+                .has_pending_for_test(&parent_uri)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_list_files_package_retry_carries_parent_refresh_obligation() {
+        use tower_lsp::lsp_types::FileChangeType;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("R")).unwrap();
+        fs::write(
+            tmp.path().join("DESCRIPTION"),
+            "Package: sourceloop\nVersion: 0.1.0\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("R/old.R"), "old_value <- 1\n").unwrap();
+        let parent_text = "files <- list.files(\"R\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n\
+             retry_member_fn()\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_package_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let member_uri = Url::from_file_path(tmp.path().join("R/00_retry.R")).unwrap();
+        seed_package_description_input(
+            backend,
+            tmp.path(),
+            "Package: sourceloop\nVersion: 0.1.0\n",
+        )
+        .await;
+        {
+            let mut state = backend.state.write().await;
+            assert_eq!(
+                state.package_inputs.workspace_root.as_deref(),
+                Some(tmp.path())
+            );
+            assert!(watched_items_touch_package_inputs(
+                &state,
+                std::iter::once(member_uri.clone())
+            ));
+            // The initial owner and its first delayed successor each exhaust
+            // all three inline attempts. Completion must survive two spawned
+            // retry generations, not merely the first handoff.
+            state.watched_package_test_compute_fail_remaining = 6;
+        }
+        fs::write(
+            tmp.path().join("R/00_retry.R"),
+            "retry_member_fn <- function() 1\n",
+        )
+        .unwrap();
+
+        let handler =
+            spawn_watched_file_change(backend, member_uri.clone(), FileChangeType::CREATED);
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state.watched_package_retry.has_pending()
+            })
+            .await,
+            "inline exhaustion must retain one coalesced package owner"
+        );
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .documents
+                    .get_record(&parent_uri)
+                    .unwrap()
+                    .metadata()
+                    .sources
+                    .iter()
+                    .all(|source| source.resolved_uri.as_ref() != Some(&member_uri)),
+                "the parent must not publish before the atomic package/member retry commits"
+            );
+        }
+        assert!(
+            !handler.is_finished(),
+            "the invocation boundary must await the durable retry successor"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+            .await
+            .expect("the delayed package owner must finish the invocation boundary")
+            .unwrap();
+        let state = backend.state.read().await;
+        assert!(!state.watched_package_retry.has_pending());
+        assert!(
+            state
+                .documents
+                .get_record(&parent_uri)
+                .is_some_and(|record| {
+                    record
+                        .metadata()
+                        .sources
+                        .iter()
+                        .any(|source| source.resolved_uri.as_ref() == Some(&member_uri))
+                })
+        );
+        assert!(state.workspace_index.get_artifacts(&member_uri).is_some());
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri),
+            0
+        );
+        assert!(
+            !state
+                .cross_file_revalidation
+                .has_pending_for_test(&parent_uri)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_list_files_over_budget_fallback_converges_create_and_delete() {
+        use tower_lsp::lsp_types::FileChangeType;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(
+            tmp.path().join("functions/old.R"),
+            "old_only_fn <- function() 1\n",
+        )
+        .unwrap();
+        let parent_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n\
+             new_only_fn()\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let old_uri = Url::from_file_path(tmp.path().join("functions/old.R")).unwrap();
+        let new_uri = Url::from_file_path(tmp.path().join("functions/00_new.R")).unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.max_transitive_dependents_visited = 1;
+            assert!(
+                state.workspace_index.graph_derivation_entries().len()
+                    + snapshot_workspace_graph_overlays(&state).len()
+                    > state.cross_file_config.max_transitive_dependents_visited,
+                "fixture must force the ordered traversal-budget fallback"
+            );
+        }
+
+        fs::write(
+            tmp.path().join("functions/00_new.R"),
+            "new_only_fn <- function() 2\n",
+        )
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            spawn_watched_file_change(backend, new_uri.clone(), FileChangeType::CREATED),
+        )
+        .await
+        .expect("over-budget CREATE must converge")
+        .unwrap();
+        {
+            let state = backend.state.read().await;
+            let record = state.documents.get_record(&parent_uri).unwrap();
+            assert!(
+                record
+                    .metadata()
+                    .sources
+                    .iter()
+                    .any(|source| source.resolved_uri.as_ref() == Some(&new_uri))
+            );
+            assert!(state.workspace_index.get_artifacts(&new_uri).is_some());
+            assert!(
+                !snapshot_diagnostics(&state, &parent_uri)
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("new_only_fn is not defined"))
+            );
+        }
+
+        fs::remove_file(tmp.path().join("functions/old.R")).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            spawn_watched_file_change(backend, old_uri.clone(), FileChangeType::DELETED),
+        )
+        .await
+        .expect("over-budget DELETE must converge")
+        .unwrap();
+        let state = backend.state.read().await;
+        let record = state.documents.get_record(&parent_uri).unwrap();
+        assert!(
+            record
+                .metadata()
+                .sources
+                .iter()
+                .all(|source| source.resolved_uri.as_ref() != Some(&old_uri))
+        );
+        assert!(state.workspace_index.get_artifacts(&old_uri).is_none());
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri),
+            0
+        );
+        assert!(
+            !state
+                .cross_file_revalidation
+                .has_pending_for_test(&parent_uri)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_list_files_over_budget_barrier_recomputes_foreign_diagnostics() {
+        use tower_lsp::lsp_types::{FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(
+            tmp.path().join("functions/old.R"),
+            "shared_fn <- function() 1\n",
+        )
+        .unwrap();
+        let parent_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n\
+             shared_fn()\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let old_uri = Url::from_file_path(tmp.path().join("functions/old.R")).unwrap();
+        let new_uri = Url::from_file_path(tmp.path().join("functions/00_new.R")).unwrap();
+        fs::write(
+            tmp.path().join("functions/00_new.R"),
+            "shared_fn <- function() 2\n",
+        )
+        .unwrap();
+        fs::remove_file(tmp.path().join("functions/old.R")).unwrap();
+
+        let (diagnostic_pause, fallback_pause) = {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.max_transitive_dependents_visited = 1;
+            state.diagnostics_gate.mark_force_republish(&parent_uri);
+            (
+                state.diagnostics_test_pause.arm(parent_uri.clone()),
+                state
+                    .watched_batch_fallback_after_updates_test_pause
+                    .arm(Url::parse(WATCHED_BATCH_FALLBACK_AFTER_UPDATES_PAUSE_URI).unwrap()),
+            )
+        };
+        let foreign_diagnostic = {
+            let state = backend.state.clone();
+            let client = backend.client.clone();
+            let parent_uri = parent_uri.clone();
+            tokio::spawn(async move {
+                publish_diagnostics_inner(&state, &client, &parent_uri).await;
+            })
+        };
+        diagnostic_pause.wait_arrived().await;
+
+        let handler = {
+            let backend = backend.clone();
+            let old_uri = old_uri.clone();
+            let new_uri = new_uri.clone();
+            tokio::spawn(async move {
+                backend
+                    .did_change_watched_files(DidChangeWatchedFilesParams {
+                        changes: vec![
+                            FileEvent {
+                                uri: new_uri,
+                                typ: FileChangeType::CREATED,
+                            },
+                            FileEvent {
+                                uri: old_uri,
+                                typ: FileChangeType::DELETED,
+                            },
+                        ],
+                    })
+                    .await;
+            })
+        };
+        fallback_pause.wait_arrived().await;
+        let markers_before = backend
+            .state
+            .read()
+            .await
+            .diagnostics_gate
+            .force_republish_count_for_test(&parent_uri);
+        diagnostic_pause.release();
+        foreign_diagnostic.await.unwrap();
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri),
+            markers_before,
+            "a worker computed before the fallback must not consume a marker against partial state"
+        );
+        assert!(
+            !handler.is_finished(),
+            "the invocation boundary must remain pending through the partial fallback"
+        );
+
+        fallback_pause.release();
+        handler.await.unwrap();
+        let state = backend.state.read().await;
+        let record = state.documents.get_record(&parent_uri).unwrap();
+        assert!(
+            record
+                .metadata()
+                .sources
+                .iter()
+                .any(|source| source.resolved_uri.as_ref() == Some(&new_uri))
+        );
+        assert!(
+            record
+                .metadata()
+                .sources
+                .iter()
+                .all(|source| source.resolved_uri.as_ref() != Some(&old_uri))
+        );
+        assert!(
+            !snapshot_diagnostics(&state, &parent_uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("shared_fn is not defined"))
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_list_files_parent_waits_for_entire_mixed_notification() {
+        use crate::content_provider::ContentProvider;
+        use tower_lsp::lsp_types::{FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(tmp.path().join("functions/old.R"), "old_value <- 1\n").unwrap();
+        fs::write(tmp.path().join("helper.R"), "old_helper <- 1\n").unwrap();
+        let parent_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n\
+             source(\"helper.R\")\n\
+             new_member_fn()\n\
+             new_helper_fn()\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let member_uri = Url::from_file_path(tmp.path().join("functions/00_new.R")).unwrap();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        fs::write(
+            tmp.path().join("functions/00_new.R"),
+            "new_member_fn <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("helper.R"),
+            "new_helper_fn <- function() 2\n",
+        )
+        .unwrap();
+        let (parent_pause, final_handoff) = {
+            let state = backend.state.read().await;
+            (
+                state
+                    .open_tar_source_refresh_pre_commit_test_pause
+                    .arm(parent_uri.clone()),
+                state
+                    .watched_final_handoff_test_capture
+                    .arm_for(parent_uri.as_str()),
+            )
+        };
+        let handler = {
+            let backend = backend.clone();
+            let member_uri = member_uri.clone();
+            let helper_uri = helper_uri.clone();
+            tokio::spawn(async move {
+                backend
+                    .did_change_watched_files(DidChangeWatchedFilesParams {
+                        changes: vec![
+                            FileEvent {
+                                uri: member_uri,
+                                typ: FileChangeType::CREATED,
+                            },
+                            FileEvent {
+                                uri: helper_uri,
+                                typ: FileChangeType::CHANGED,
+                            },
+                        ],
+                    })
+                    .await;
+            })
+        };
+        tokio::select! {
+            _ = parent_pause.wait_arrived() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("mixed watcher transaction did not reach its parent refresh")
+            }
+        }
+        {
+            let state = backend.state.read().await;
+            let helper = state
+                .content_provider()
+                .get_artifacts(&helper_uri)
+                .expect("changed helper artifacts must commit before parent refresh");
+            assert!(
+                helper.exported_interface.contains_key("new_helper_fn"),
+                "the ordinary dependency event from the same notification must land first"
+            );
+            assert!(
+                state.workspace_index.get_artifacts(&member_uri).is_some(),
+                "the source-batch member must land in the same transaction"
+            );
+        }
+        assert!(
+            !handler.is_finished(),
+            "the handler must retain the mixed notification through parent commit"
+        );
+        assert!(
+            !final_handoff.status().recorded,
+            "no watched diagnostic handoff may precede the source-parent refresh"
+        );
+        parent_pause.release();
+        let payload = wait_final_handoff_payload(
+            backend,
+            &final_handoff,
+            "watched-mixed-source-parent",
+            &[&parent_uri],
+        )
+        .await;
+        assert!(
+            payload
+                .reserved
+                .iter()
+                .chain(&payload.transferred)
+                .all(|ticket| ticket.uri != parent_uri),
+            "the source parent must publish only through its refreshed metadata owner"
+        );
+        final_handoff.release();
+        wait_final_handoff_completion(
+            backend,
+            &final_handoff,
+            "watched-mixed-source-parent",
+            &[&parent_uri],
+        )
+        .await;
+        handler.await.unwrap();
+        let state = backend.state.read().await;
+        assert!(
+            !snapshot_diagnostics(&state, &parent_uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("new_member_fn is not defined"))
+        );
+        assert!(
+            !snapshot_diagnostics(&state, &parent_uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("new_helper_fn is not defined"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_list_files_over_budget_partial_supersession_retires_diagnostics() {
+        use tower_lsp::lsp_types::{FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(
+            tmp.path().join("functions/old.R"),
+            "old_only_fn <- function() 1\n",
+        )
+        .unwrap();
+        let parent_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n\
+             new_only_fn()\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let old_uri = Url::from_file_path(tmp.path().join("functions/old.R")).unwrap();
+        let new_uri = Url::from_file_path(tmp.path().join("functions/00_new.R")).unwrap();
+        fs::write(
+            tmp.path().join("functions/00_new.R"),
+            "new_only_fn <- function() 2\n",
+        )
+        .unwrap();
+        fs::remove_file(tmp.path().join("functions/old.R")).unwrap();
+        let (diagnostic_pause, fallback_pause) = {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.max_transitive_dependents_visited = 1;
+            state.diagnostics_gate.mark_force_republish(&parent_uri);
+            (
+                state.diagnostics_test_pause.arm(parent_uri.clone()),
+                state
+                    .watched_batch_fallback_after_updates_test_pause
+                    .arm(Url::parse(WATCHED_BATCH_FALLBACK_AFTER_UPDATES_PAUSE_URI).unwrap()),
+            )
+        };
+        let foreign_diagnostic = {
+            let state = backend.state.clone();
+            let client = backend.client.clone();
+            let parent_uri = parent_uri.clone();
+            tokio::spawn(async move {
+                publish_diagnostics_inner(&state, &client, &parent_uri).await;
+            })
+        };
+        diagnostic_pause.wait_arrived().await;
+        let markers_before = backend
+            .state
+            .read()
+            .await
+            .diagnostics_gate
+            .force_republish_count_for_test(&parent_uri);
+        let derivations_before = backend
+            .open_tar_source_derivations_for_test
+            .lock()
+            .unwrap()
+            .get(&parent_uri)
+            .copied()
+            .unwrap_or_default();
+        let handler = {
+            let backend = backend.clone();
+            let new_uri = new_uri.clone();
+            let old_uri = old_uri.clone();
+            tokio::spawn(async move {
+                backend
+                    .did_change_watched_files(DidChangeWatchedFilesParams {
+                        changes: vec![
+                            FileEvent {
+                                uri: new_uri,
+                                typ: FileChangeType::CREATED,
+                            },
+                            FileEvent {
+                                uri: old_uri,
+                                typ: FileChangeType::DELETED,
+                            },
+                        ],
+                    })
+                    .await;
+            })
+        };
+        tokio::select! {
+            _ = fallback_pause.wait_arrived() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("ordered fallback did not pause after its first committed item")
+            }
+        }
+        {
+            let mut state = backend.state.write().await;
+            bump_watched_file_resync_generation(&mut state, &old_uri);
+        }
+        fallback_pause.release();
+        handler.await.unwrap();
+        diagnostic_pause.release();
+        foreign_diagnostic.await.unwrap();
+
+        let state = backend.state.read().await;
+        assert!(
+            state.workspace_index.get_artifacts(&new_uri).is_some(),
+            "the first collect-only fallback mutation may commit"
+        );
+        assert!(
+            state
+                .documents
+                .get_record(&parent_uri)
+                .unwrap()
+                .metadata()
+                .sources
+                .iter()
+                .all(|source| source.resolved_uri.as_ref() != Some(&new_uri)),
+            "partial supersession must withhold parent refresh"
+        );
+        assert_eq!(
+            backend
+                .open_tar_source_derivations_for_test
+                .lock()
+                .unwrap()
+                .get(&parent_uri)
+                .copied()
+                .unwrap_or_default(),
+            derivations_before
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri),
+            markers_before,
+            "a worker captured before the cancelled transition must not consume its marker against partial state"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_list_files_cancelled_parent_refresh_cancels_completion() {
+        use tower_lsp::lsp_types::FileChangeType;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(tmp.path().join("functions/old.R"), "old_value <- 1\n").unwrap();
+        let parent_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let member_uri = Url::from_file_path(tmp.path().join("functions/00_new.R")).unwrap();
+        fs::write(tmp.path().join("functions/00_new.R"), "new_value <- 1\n").unwrap();
+        backend
+            .open_tar_source_refresh_cancel_remaining_for_test
+            .store(1, Ordering::Release);
+
+        spawn_watched_file_change(backend, member_uri.clone(), FileChangeType::CREATED)
+            .await
+            .unwrap();
+        let state = backend.state.read().await;
+        assert!(state.workspace_index.get_artifacts(&member_uri).is_some());
+        assert!(
+            state
+                .documents
+                .get_record(&parent_uri)
+                .unwrap()
+                .metadata()
+                .sources
+                .iter()
+                .all(|source| source.resolved_uri.as_ref() != Some(&member_uri)),
+            "a cancelled parent refresh must not be reported as committed"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_list_files_config_and_source_events_share_publish_boundary() {
+        use tower_lsp::lsp_types::{FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(tmp.path().join("functions/old.R"), "old_value <- 1\n").unwrap();
+        let parent_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n\
+             new_config_member_fn()\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let member_uri = Url::from_file_path(tmp.path().join("functions/00_new.R")).unwrap();
+        let config_uri = Url::from_file_path(tmp.path().join("raven.toml")).unwrap();
+        fs::write(
+            tmp.path().join("functions/00_new.R"),
+            "new_config_member_fn <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 120\n",
+        )
+        .unwrap();
+        let (parent_pause, config_capture) = {
+            let state = backend.state.read().await;
+            (
+                state
+                    .open_tar_source_refresh_pre_commit_test_pause
+                    .arm(parent_uri.clone()),
+                state
+                    .config_reload_publish_test_capture
+                    .arm_for("config-plus-source"),
+            )
+        };
+        let handler = {
+            let backend = backend.clone();
+            let member_uri = member_uri.clone();
+            tokio::spawn(async move {
+                backend
+                    .did_change_watched_files(DidChangeWatchedFilesParams {
+                        changes: vec![
+                            FileEvent {
+                                uri: config_uri,
+                                typ: FileChangeType::CREATED,
+                            },
+                            FileEvent {
+                                uri: member_uri,
+                                typ: FileChangeType::CREATED,
+                            },
+                        ],
+                    })
+                    .await;
+            })
+        };
+        tokio::select! {
+            _ = parent_pause.wait_arrived() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("combined config/source notification did not reach parent refresh")
+            }
+        }
+        assert!(
+            !config_capture.status().recorded,
+            "config diagnostics must not publish before the source transaction commits"
+        );
+        parent_pause.release();
+        let payload = config_capture.wait_payload().await;
+        assert!(payload.scheduled.contains(&parent_uri));
+        assert!(payload.completed.contains(&parent_uri));
+        config_capture.release();
+        config_capture.wait_completed().await;
+        handler.await.unwrap();
+        let state = backend.state.read().await;
+        assert_eq!(state.lint_config.line_length, 120);
+        assert!(
+            !snapshot_diagnostics(&state, &parent_uri)
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("new_config_member_fn is not defined"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watched_config_and_ordinary_invalid_bytes_preserve_delayed_retry_boundary() {
+        use crate::content_provider::ContentProvider;
+        use tower_lsp::lsp_types::{FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        let helper_path = tmp.path().join("helper.R");
+        fs::write(&helper_path, "old_helper_fn <- function() 1\n").unwrap();
+        let parent_text = "source(\"helper.R\")\nnew_helper_fn()\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+        let config_uri = Url::from_file_path(tmp.path().join("raven.toml")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[linting]\nenabled = true\nlineLength = 120\n",
+        )
+        .unwrap();
+        fs::write(&helper_path, [0x78u8, 0x80, 0x79]).unwrap();
+
+        let (retry_pause, config_capture) = {
+            let state = backend.state.read().await;
+            (
+                state
+                    .watched_undecodable_retry_pre_delay_test_pause
+                    .arm(Url::parse(WATCHED_UNDECODABLE_RETRY_PRE_DELAY_PAUSE_URI).unwrap()),
+                state
+                    .config_reload_publish_test_capture
+                    .arm_for("config-plus-ordinary-invalid"),
+            )
+        };
+        let handler = {
+            let backend = backend.clone();
+            let helper_uri = helper_uri.clone();
+            tokio::spawn(async move {
+                backend
+                    .did_change_watched_files(DidChangeWatchedFilesParams {
+                        changes: vec![
+                            FileEvent {
+                                uri: config_uri,
+                                typ: FileChangeType::CREATED,
+                            },
+                            FileEvent {
+                                uri: helper_uri,
+                                typ: FileChangeType::CHANGED,
+                            },
+                        ],
+                    })
+                    .await;
+            })
+        };
+
+        retry_pause.wait_arrived().await;
+        {
+            let state = backend.state.read().await;
+            let artifacts = state
+                .content_provider()
+                .get_artifacts(&helper_uri)
+                .expect("the immediate invalid-byte pass must preserve old helper artifacts");
+            assert!(artifacts.exported_interface.contains_key("old_helper_fn"));
+        }
+        assert!(
+            !config_capture.status().recorded,
+            "config diagnostics must remain behind the invocation-owned delayed retry"
+        );
+        assert!(
+            !handler.is_finished(),
+            "the watched handler must retain the shared completion receipt"
+        );
+
+        fs::write(&helper_path, "new_helper_fn <- function() 2\n").unwrap();
+        retry_pause.release();
+        tokio::time::advance(WATCHED_UNDECODABLE_RETRY_DELAY).await;
+        let payload = config_capture.wait_payload().await;
+        assert!(payload.scheduled.contains(&parent_uri));
+        assert!(payload.completed.contains(&parent_uri));
+        {
+            let state = backend.state.read().await;
+            let artifacts = state
+                .content_provider()
+                .get_artifacts(&helper_uri)
+                .expect("the delayed retry must commit recovered helper bytes");
+            assert!(artifacts.exported_interface.contains_key("new_helper_fn"));
+            assert!(!artifacts.exported_interface.contains_key("old_helper_fn"));
+        }
+        config_capture.release();
+        config_capture.wait_completed().await;
+        handler.await.unwrap();
+        assert_eq!(backend.state.read().await.lint_config.line_length, 120);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn superseded_watched_list_files_owner_withholds_parent_refresh() {
+        use tower_lsp::lsp_types::FileChangeType;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(tmp.path().join("functions/old.R"), "old_value <- 1\n").unwrap();
+        let parent_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let member_uri = Url::from_file_path(tmp.path().join("functions/00_stale.R")).unwrap();
+        fs::write(
+            tmp.path().join("functions/00_stale.R"),
+            "stale_value <- 1\n",
+        )
+        .unwrap();
+        let pause = backend
+            .state
+            .read()
+            .await
+            .watched_package_pre_commit_test_pause
+            .arm(Url::parse(WATCHED_PACKAGE_PRE_COMMIT_PAUSE_URI).unwrap());
+        let derivations_before = backend
+            .open_tar_source_derivations_for_test
+            .lock()
+            .unwrap()
+            .get(&parent_uri)
+            .copied()
+            .unwrap_or_default();
+        let handler =
+            spawn_watched_file_change(backend, member_uri.clone(), FileChangeType::CREATED);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("invocation-owned watched batch did not reach its commit barrier")
+            }
+        }
+        {
+            let mut state = backend.state.write().await;
+            bump_watched_file_resync_generation(&mut state, &member_uri);
+        }
+        pause.release();
+        handler.await.unwrap();
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .documents
+                .get_record(&parent_uri)
+                .unwrap()
+                .metadata()
+                .sources
+                .iter()
+                .all(|source| source.resolved_uri.as_ref() != Some(&member_uri)),
+            "a superseded member owner must not refresh or publish its parent"
+        );
+        assert_eq!(
+            backend
+                .open_tar_source_derivations_for_test
+                .lock()
+                .unwrap()
+                .get(&parent_uri)
+                .copied()
+                .unwrap_or_default(),
+            derivations_before
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri),
+            0
+        );
+        assert!(
+            !state
+                .cross_file_revalidation
+                .has_pending_for_test(&parent_uri)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_final_handoff_receipt_includes_parent_refresh() {
+        use tower_lsp::lsp_types::FileChangeType;
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(tmp.path().join("functions/old.R"), "old_value <- 1\n").unwrap();
+        let parent_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "main.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let member_uri = Url::from_file_path(tmp.path().join("functions/00_new.R")).unwrap();
+        fs::write(tmp.path().join("functions/00_new.R"), "new_value <- 1\n").unwrap();
+        let (handoff, parent_pause) = {
+            let state = backend.state.read().await;
+            (
+                state
+                    .watched_final_handoff_test_capture
+                    .arm_for(member_uri.as_str()),
+                state
+                    .open_tar_source_refresh_pre_commit_test_pause
+                    .arm(parent_uri.clone()),
+            )
+        };
+        let handler =
+            spawn_watched_file_change(backend, member_uri.clone(), FileChangeType::CREATED);
+        tokio::select! {
+            _ = parent_pause.wait_arrived() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("watched transaction did not reach its parent refresh")
+            }
+        }
+        assert!(
+            !handoff.status().recorded,
+            "the watched final handoff must follow the parent refresh"
+        );
+        assert!(
+            !handler.is_finished(),
+            "the LSP handler must remain invocation-owned at the parent barrier"
+        );
+        parent_pause.release();
+        tokio::select! {
+            _ = handoff.wait_payload() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("watched transaction did not record its final handoff")
+            }
+        }
+        assert!(
+            !handoff.status().completed,
+            "the watched transaction must remain pending through its final diagnostic handoff"
+        );
+        handoff.release();
+        handler.await.unwrap();
+        handoff.wait_completed().await;
+        assert!(handoff.status().completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn did_change_list_files_waits_for_atomic_batch_commit() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(
+            tmp.path().join("functions/member.R"),
+            "member_fn <- function() 1\n",
+        )
+        .unwrap();
+        let initial = "before <- 1\n";
+        fs::write(tmp.path().join("main.R"), initial).unwrap();
+        let (svc, parent_uri) = open_in_quiescent_workspace(&tmp, "main.R", "r", initial).await;
+        let backend = svc.inner();
+        let member_uri = Url::from_file_path(tmp.path().join("functions/member.R")).unwrap();
+        let edited = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+                      for (file in files) source(file)\n\
+                      member_fn()\n";
+        let mut pause = backend
+            .state
+            .write()
+            .await
+            .live_package_open_edit_pre_commit_test_pause
+            .arm(parent_uri.clone());
+
+        let change = backend.did_change(tower_lsp::lsp_types::DidChangeTextDocumentParams {
+            text_document: tower_lsp::lsp_types::VersionedTextDocumentIdentifier {
+                uri: parent_uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: edited.into(),
+            }],
+        });
+        tokio::pin!(change);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut change => panic!("didChange returned before its source-batch commit boundary"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("source-batch didChange did not reach its pre-commit boundary")
+            }
+        }
+
+        for conflict in 1..=4 {
+            pause = {
+                let mut state = backend.state.write().await;
+                state.advance_analysis_config_generation();
+                state
+                    .live_package_open_edit_pre_commit_test_pause
+                    .rearm_before_release(parent_uri.clone(), pause)
+            };
+            tokio::select! {
+                _ = pause.wait_arrived() => {}
+                _ = &mut change => {
+                    panic!("didChange returned after only {conflict} forced basis conflicts")
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    panic!("source-batch didChange did not retry conflict {conflict}")
+                }
+            }
+        }
+
+        {
+            let state = backend.state.read().await;
+            let record = state.documents.get_record(&parent_uri).unwrap();
+            assert_eq!(record.document().text(), initial);
+            assert!(record.metadata().list_files_source_requests.is_empty());
+        }
+
+        pause.release();
+        change.await;
+
+        let state = backend.state.read().await;
+        let record = state.documents.get_record(&parent_uri).unwrap();
+        assert_eq!(record.document().text(), edited);
+        assert!(record.metadata().sources.iter().any(|source| {
+            source.source_batch_kind == Some(crate::cross_file::types::SourceBatchKind::ListFiles)
+                && source.resolved_uri.as_ref() == Some(&member_uri)
+        }));
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&parent_uri)
+                .iter()
+                .any(|edge| edge.to == member_uri)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn excluded_list_files_edit_indexes_members_without_lending_or_package_effects() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("R")).unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"R/generated.R\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("DESCRIPTION"),
+            "Package: excludedbatch\nVersion: 0.0.1\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("functions/member.R"),
+            "member_fn <- function() 1\n",
+        )
+        .unwrap();
+        let initial = "before <- 1\n";
+        fs::write(tmp.path().join("R/generated.R"), initial).unwrap();
+        let (svc, parent_uri) =
+            open_in_settled_package_workspace(&tmp, "R/generated.R", "r", initial).await;
+        let backend = svc.inner();
+        let member_uri = Url::from_file_path(tmp.path().join("functions/member.R")).unwrap();
+        let package_generation_before = {
+            let state = backend.state.read().await;
+            assert!(state.is_project_excluded_uri(&parent_uri));
+            state.package_input_generation()
+        };
+        let edited = "files <- list.files(\"../functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n\
+             member_fn()\n";
+
+        backend
+            .did_change(tower_lsp::lsp_types::DidChangeTextDocumentParams {
+                text_document: tower_lsp::lsp_types::VersionedTextDocumentIdentifier {
+                    uri: parent_uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: edited.into(),
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.package_input_generation(),
+            package_generation_before,
+            "project-excluded edits must not mutate package inputs"
+        );
+        assert!(state.workspace_index.get_artifacts(&member_uri).is_some());
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&parent_uri)
+                .iter()
+                .any(|edge| edge.to == member_uri && edge.non_lending)
+        );
+        assert!(
+            !snapshot_diagnostics(&state, &parent_uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("member_fn is not defined"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_refreshes_open_list_files_overlay_without_watcher_event() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("functions")).unwrap();
+        fs::write(tmp.path().join("functions/old.R"), "old_fn <- 1\n").unwrap();
+        let parent_text = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+                           for (file in files) source(file)\n";
+        fs::write(tmp.path().join("main.R"), parent_text).unwrap();
+        let root_uri = Url::from_file_path(tmp.path()).unwrap();
+        let parent_uri = Url::from_file_path(tmp.path().join("main.R")).unwrap();
+        let new_uri = Url::from_file_path(tmp.path().join("functions/new.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_folders = vec![root_uri.clone()];
+            state.raw_client_settings = serde_json::json!({
+                "packages": { "enabled": false }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            state.open_document(parent_uri.clone(), parent_text, Some(1));
+            let mut metadata = crate::cross_file::extract_metadata(parent_text);
+            crate::cross_file::tar_source::finalize_tar_source_requests(
+                &mut metadata,
+                &parent_uri,
+                Some(&root_uri),
+            );
+            let generation = state
+                .documents
+                .get_record(&parent_uri)
+                .unwrap()
+                .generation();
+            state
+                .documents
+                .replace_metadata_if_current(&parent_uri, generation, Arc::new(metadata))
+                .unwrap();
+            state.refresh_tar_source_watch_parents([parent_uri.clone()]);
+        }
+
+        fs::write(tmp.path().join("functions/new.R"), "new_fn <- 1\n").unwrap();
+        run_workspace_scan_transaction(&backend.state)
+            .await
+            .expect_committed();
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .documents
+                .get_record(&parent_uri)
+                .unwrap()
+                .metadata()
+                .sources
+                .iter()
+                .any(|source| source.resolved_uri.as_ref() == Some(&new_uri)),
+            "the first complete-graph pass must refresh the open overlay once"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_tar_refresh_survives_two_consecutive_basis_conflicts() {
-        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+        use tower_lsp::lsp_types::FileChangeType;
 
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("R")).unwrap();
@@ -49020,14 +51826,7 @@ infixContinuationStyle = "aligned"
             .await
             .open_tar_source_refresh_pre_commit_test_pause
             .arm(parent_uri.clone());
-        backend
-            .did_change_watched_files(DidChangeWatchedFilesParams {
-                changes: vec![FileEvent {
-                    uri: new_uri.clone(),
-                    typ: FileChangeType::CREATED,
-                }],
-            })
-            .await;
+        let handler = spawn_watched_file_change(backend, new_uri.clone(), FileChangeType::CREATED);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             first_pause.wait_arrived(),
@@ -49056,31 +51855,31 @@ infixContinuationStyle = "aligned"
             .await
             .advance_analysis_config_generation();
         second_pause.release();
+        handler.await.unwrap();
 
+        let state = backend.state.read().await;
         assert!(
-            wait_for_state(backend, 5_000, |state| {
-                state
-                    .documents
-                    .get_record(&parent_uri)
-                    .is_some_and(|record| {
-                        record
-                            .metadata()
-                            .sources
-                            .iter()
-                            .any(|source| source.resolved_uri.as_ref() == Some(&new_uri))
-                    })
-                    && !state
-                        .open_tar_source_refreshes
-                        .has_pending_for_test(&parent_uri)
-            })
-            .await,
-            "the original membership event must converge after two CAS conflicts"
+            state
+                .documents
+                .get_record(&parent_uri)
+                .is_some_and(|record| {
+                    record
+                        .metadata()
+                        .sources
+                        .iter()
+                        .any(|source| source.resolved_uri.as_ref() == Some(&new_uri))
+                })
+        );
+        assert!(
+            !state
+                .open_tar_source_refreshes
+                .has_pending_for_test(&parent_uri)
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn newer_open_tar_refresh_supersedes_parked_owner() {
-        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+        use tower_lsp::lsp_types::FileChangeType;
 
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("R")).unwrap();
@@ -49099,14 +51898,8 @@ infixContinuationStyle = "aligned"
             .await
             .open_tar_source_refresh_pre_commit_test_pause
             .arm(parent_uri.clone());
-        backend
-            .did_change_watched_files(DidChangeWatchedFilesParams {
-                changes: vec![FileEvent {
-                    uri: first_uri.clone(),
-                    typ: FileChangeType::CREATED,
-                }],
-            })
-            .await;
+        let first_handler =
+            spawn_watched_file_change(backend, first_uri.clone(), FileChangeType::CREATED);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             first_pause.wait_arrived(),
@@ -49122,14 +51915,8 @@ infixContinuationStyle = "aligned"
             .await
             .open_tar_source_refresh_pre_commit_test_pause
             .arm(parent_uri.clone());
-        backend
-            .did_change_watched_files(DidChangeWatchedFilesParams {
-                changes: vec![FileEvent {
-                    uri: second_uri.clone(),
-                    typ: FileChangeType::CREATED,
-                }],
-            })
-            .await;
+        let second_handler =
+            spawn_watched_file_change(backend, second_uri.clone(), FileChangeType::CREATED);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
             backend
@@ -49176,33 +51963,33 @@ infixContinuationStyle = "aligned"
             "retired owner's completion must not remove its successor"
         );
         second_pause.release();
+        first_handler.await.unwrap();
+        second_handler.await.unwrap();
 
+        let state = backend.state.read().await;
+        let record = state.documents.get_record(&parent_uri).unwrap();
         assert!(
-            wait_for_state(backend, 5_000, |state| {
-                state
-                    .documents
-                    .get_record(&parent_uri)
-                    .is_some_and(|record| {
-                        let sources = &record.metadata().sources;
-                        sources
-                            .iter()
-                            .any(|source| source.resolved_uri.as_ref() == Some(&first_uri))
-                            && sources
-                                .iter()
-                                .any(|source| source.resolved_uri.as_ref() == Some(&second_uri))
-                    })
-                    && !state
-                        .open_tar_source_refreshes
-                        .has_pending_for_test(&parent_uri)
-            })
-            .await,
-            "the successor must commit the latest coalesced membership"
+            record
+                .metadata()
+                .sources
+                .iter()
+                .any(|source| source.resolved_uri.as_ref() == Some(&first_uri))
+                && record
+                    .metadata()
+                    .sources
+                    .iter()
+                    .any(|source| source.resolved_uri.as_ref() == Some(&second_uri))
+        );
+        assert!(
+            !state
+                .open_tar_source_refreshes
+                .has_pending_for_test(&parent_uri)
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_tar_refresh_exit_recheck_cannot_strand_new_event() {
-        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+        use tower_lsp::lsp_types::FileChangeType;
 
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("R")).unwrap();
@@ -49221,14 +52008,7 @@ infixContinuationStyle = "aligned"
             .await
             .open_tar_source_refresh_pre_release_test_pause
             .arm(parent_uri.clone());
-        backend
-            .did_change_watched_files(DidChangeWatchedFilesParams {
-                changes: vec![FileEvent {
-                    uri: first_uri,
-                    typ: FileChangeType::CREATED,
-                }],
-            })
-            .await;
+        let first_handler = spawn_watched_file_change(backend, first_uri, FileChangeType::CREATED);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             release_pause.wait_arrived(),
@@ -49245,14 +52025,8 @@ infixContinuationStyle = "aligned"
 
         let second_uri = Url::from_file_path(tmp.path().join("R/second.R")).unwrap();
         fs::write(tmp.path().join("R/second.R"), "second <- 1\n").unwrap();
-        backend
-            .did_change_watched_files(DidChangeWatchedFilesParams {
-                changes: vec![FileEvent {
-                    uri: second_uri.clone(),
-                    typ: FileChangeType::CREATED,
-                }],
-            })
-            .await;
+        let second_handler =
+            spawn_watched_file_change(backend, second_uri.clone(), FileChangeType::CREATED);
         assert_eq!(
             backend
                 .open_tar_source_derivations_for_test
@@ -49264,26 +52038,28 @@ infixContinuationStyle = "aligned"
             "producer must publish desired work without launching a second coordinator"
         );
         release_pause.release();
+        first_handler.await.unwrap();
+        second_handler.await.unwrap();
 
+        let state = backend.state.read().await;
         assert!(
-            wait_for_state(backend, 5_000, |state| {
-                state
-                    .documents
-                    .get_record(&parent_uri)
-                    .is_some_and(|record| {
-                        record
-                            .metadata()
-                            .sources
-                            .iter()
-                            .any(|source| source.resolved_uri.as_ref() == Some(&second_uri))
-                    })
-                    && !state
-                        .open_tar_source_refreshes
-                        .has_pending_for_test(&parent_uri)
-            })
-            .await,
-            "release-then-recheck must reclaim and service the published event"
+            state
+                .documents
+                .get_record(&parent_uri)
+                .is_some_and(|record| {
+                    record
+                        .metadata()
+                        .sources
+                        .iter()
+                        .any(|source| source.resolved_uri.as_ref() == Some(&second_uri))
+                })
         );
+        assert!(
+            !state
+                .open_tar_source_refreshes
+                .has_pending_for_test(&parent_uri)
+        );
+        drop(state);
         assert!(
             backend
                 .open_tar_source_derivations_for_test
@@ -49314,7 +52090,7 @@ infixContinuationStyle = "aligned"
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_reopen_cancels_retired_open_tar_refresh_owner() {
-        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+        use tower_lsp::lsp_types::FileChangeType;
 
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("R")).unwrap();
@@ -49333,14 +52109,7 @@ infixContinuationStyle = "aligned"
             .await
             .open_tar_source_refresh_pre_commit_test_pause
             .arm(parent_uri.clone());
-        backend
-            .did_change_watched_files(DidChangeWatchedFilesParams {
-                changes: vec![FileEvent {
-                    uri: new_uri.clone(),
-                    typ: FileChangeType::CREATED,
-                }],
-            })
-            .await;
+        let handler = spawn_watched_file_change(backend, new_uri.clone(), FileChangeType::CREATED);
         tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_arrived())
             .await
             .expect("retired owner must be parked before close");
@@ -49348,31 +52117,31 @@ infixContinuationStyle = "aligned"
         close_doc(backend, &parent_uri).await;
         open_doc(backend, &parent_uri, "r", 1, parent_text).await;
         pause.release();
+        handler.await.unwrap();
 
+        let state = backend.state.read().await;
         assert!(
-            wait_for_state(backend, 5_000, |state| {
-                state
-                    .documents
-                    .get_record(&parent_uri)
-                    .is_some_and(|record| {
-                        record
-                            .metadata()
-                            .sources
-                            .iter()
-                            .any(|source| source.resolved_uri.as_ref() == Some(&new_uri))
-                    })
-                    && !state
-                        .open_tar_source_refreshes
-                        .has_pending_for_test(&parent_uri)
-            })
-            .await,
-            "old-lifecycle work must not publish into the reopened record"
+            state
+                .documents
+                .get_record(&parent_uri)
+                .is_some_and(|record| {
+                    record
+                        .metadata()
+                        .sources
+                        .iter()
+                        .any(|source| source.resolved_uri.as_ref() == Some(&new_uri))
+                })
+        );
+        assert!(
+            !state
+                .open_tar_source_refreshes
+                .has_pending_for_test(&parent_uri)
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_cancels_parked_open_tar_refresh_owner() {
-        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+        use tower_lsp::lsp_types::FileChangeType;
 
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("R")).unwrap();
@@ -49391,14 +52160,7 @@ infixContinuationStyle = "aligned"
             .await
             .open_tar_source_refresh_pre_commit_test_pause
             .arm(parent_uri.clone());
-        backend
-            .did_change_watched_files(DidChangeWatchedFilesParams {
-                changes: vec![FileEvent {
-                    uri: new_uri,
-                    typ: FileChangeType::CREATED,
-                }],
-            })
-            .await;
+        let handler = spawn_watched_file_change(backend, new_uri, FileChangeType::CREATED);
         tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_arrived())
             .await
             .expect("refresh owner must park before shutdown");
@@ -49415,6 +52177,7 @@ infixContinuationStyle = "aligned"
             .await
             .expect("shutdown must drain the cancelled tracked owner")
             .expect("shutdown task must not panic");
+        handler.await.unwrap();
         assert!(
             !backend
                 .state
@@ -53608,6 +56371,7 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -53689,6 +56453,7 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -53742,6 +56507,7 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -53808,6 +56574,7 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -53868,6 +56635,7 @@ infixContinuationStyle = "aligned"
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -53985,6 +56753,7 @@ infixContinuationStyle = "aligned"
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -54465,6 +57234,7 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -54527,6 +57297,7 @@ infixContinuationStyle = "aligned"
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -54597,6 +57368,7 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -54644,6 +57416,7 @@ infixContinuationStyle = "aligned"
                     deletions: Vec::new(),
                     reserved_tickets: Vec::new(),
                     transfer_handles: Vec::new(),
+                    completion: WatchedResyncCompletion::Detached,
                     mode: WatchedResyncBatchMode::Immediate,
                     attempts_remaining: 0,
                     final_handoff_test_capture: None,
@@ -54699,6 +57472,7 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 0,
                 final_handoff_test_capture: None,
@@ -54732,6 +57506,7 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -54817,6 +57592,7 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: Vec::new(),
                 transfer_handles: vec![transfer.handle],
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,
@@ -54905,6 +57681,7 @@ infixContinuationStyle = "aligned"
                 deletions: Vec::new(),
                 reserved_tickets: vec![old_ticket],
                 transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
                 mode: WatchedResyncBatchMode::Immediate,
                 attempts_remaining: 2,
                 final_handoff_test_capture: None,

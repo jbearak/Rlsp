@@ -682,6 +682,7 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                 system_file: None,
                 resolved_uri: None,
                 tar_source_ordinal: None,
+                source_batch_kind: None,
                 guarded_by_file_exists: false,
             });
             continue;

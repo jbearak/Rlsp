@@ -701,7 +701,7 @@ pub enum ScopeEvent {
         runtime_function_scope: RuntimeFunctionScope,
         function_scope: Option<FunctionScopeInterval>,
     },
-    /// One statically expanded `{targets}` `tar_source()` call.
+    /// One statically expanded ordered source batch.
     ///
     /// Unlike ordinary `Source` events, all members execute in one shared
     /// environment in ordinal order. Scope resolution therefore treats the
@@ -2438,24 +2438,25 @@ pub fn compute_artifacts_with_metadata(
         // `Source` path (whose graph lookup and streaming cache are call-site
         // keyed) and emit one adjudicated batch event per call.
         let mut batch_members: Vec<ForwardSource> = Vec::new();
-        let mut batch_site: Option<(u32, u32)> = None;
-        let flush_batch = |artifacts: &mut ScopeArtifacts,
-                           batch_site: &mut Option<(u32, u32)>,
-                           batch_members: &mut Vec<ForwardSource>| {
-            if let Some((line, column)) = batch_site.take() {
-                artifacts.timeline.push(ScopeEvent::TarBatch {
-                    line,
-                    column,
-                    members: std::mem::take(batch_members),
-                });
-            }
-        };
+        let mut batch_site: Option<(u32, u32, Option<super::types::SourceBatchKind>)> = None;
+        let flush_batch =
+            |artifacts: &mut ScopeArtifacts,
+             batch_site: &mut Option<(u32, u32, Option<super::types::SourceBatchKind>)>,
+             batch_members: &mut Vec<ForwardSource>| {
+                if let Some((line, column, _kind)) = batch_site.take() {
+                    artifacts.timeline.push(ScopeEvent::TarBatch {
+                        line,
+                        column,
+                        members: std::mem::take(batch_members),
+                    });
+                }
+            };
         for source in meta
             .sources
             .iter()
             .filter(|source| source.tar_source_ordinal.is_some())
         {
-            let site = (source.line, source.column);
+            let site = (source.line, source.column, source.source_batch_kind);
             if batch_site.is_some_and(|existing| existing != site) {
                 flush_batch(&mut artifacts, &mut batch_site, &mut batch_members);
             }
@@ -5864,6 +5865,8 @@ fn compute_interface_hash(
         (
             interface.source.line,
             interface.source.column,
+            interface.source.source_batch_kind,
+            interface.source.tar_source_ordinal,
             interface.source.path.as_str(),
         )
     });
@@ -5878,6 +5881,8 @@ fn compute_interface_hash(
         source.is_sys_source.hash(&mut hasher);
         source.is_function_scoped.hash(&mut hasher);
         source.resolved_uri.hash(&mut hasher);
+        source.source_batch_kind.hash(&mut hasher);
+        source.tar_source_ordinal.hash(&mut hasher);
         interface.contributes_to_timeline.hash(&mut hasher);
     }
 
@@ -6587,6 +6592,7 @@ where
         /// the ordinal here prevents the ordinary same-parent substitution
         /// rule from collapsing their lazy sibling cutoffs.
         tar_source_ordinal: Option<u32>,
+        source_batch_kind: Option<super::types::SourceBatchKind>,
     }
     let mut parent_edge_indices: HashMap<ParentInvocationKey, usize> = HashMap::new();
     let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
@@ -6607,6 +6613,7 @@ where
             package_barrier,
             function_invocation,
             tar_source_ordinal: edge.tar_source_ordinal,
+            source_batch_kind: edge.source_batch_kind,
         };
         match parent_edge_indices.get(&key).copied() {
             Some(existing_index) => {
@@ -6769,8 +6776,12 @@ where
                 parent_artifacts.timeline.iter().find(|event| {
                     matches!(
                         event,
-                        ScopeEvent::TarBatch { line, column, .. }
-                            if *line == call_site_line && *column == call_site_col
+                        ScopeEvent::TarBatch { line, column, members }
+                            if *line == call_site_line
+                                && *column == call_site_col
+                                && members.first().is_some_and(|source| {
+                                    source.source_batch_kind == edge.source_batch_kind
+                                })
                     )
                 })
         {
@@ -7057,6 +7068,7 @@ where
             break;
         }
         let ordinal = source.tar_source_ordinal;
+        let source_batch_kind = source.source_batch_kind;
         let child_uri = source.resolved_uri.clone().or_else(|| {
             graph
                 .get_dependencies(parent_uri)
@@ -7065,6 +7077,7 @@ where
                     edge.call_site_line == Some(source.line)
                         && edge.call_site_column == Some(source.column)
                         && edge.tar_source_ordinal == ordinal
+                        && edge.source_batch_kind == source_batch_kind
                 })
                 .map(|edge| edge.to.clone())
         });

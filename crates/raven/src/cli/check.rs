@@ -303,6 +303,7 @@ fn prepare_cli_contextual_providers(
                         edge.call_site_line == Some(source.line)
                             && edge.call_site_column == Some(source.column)
                             && edge.tar_source_ordinal == source.tar_source_ordinal
+                            && edge.source_batch_kind == source.source_batch_kind
                     })
                     .map(|edge| edge.to.clone());
                 crate::cross_file::tar_source::GraphPrefixEdgeLookup::Known(target)
