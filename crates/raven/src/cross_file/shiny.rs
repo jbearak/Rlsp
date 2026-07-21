@@ -194,6 +194,73 @@ pub(crate) fn discover_shiny_application(
     result
 }
 
+/// Whether a filesystem event can change one file's implicit Shiny layout.
+///
+/// Shiny watches direct application children, but the generic source-batch watch
+/// registry stores directory roots whose overlap test is recursive. Filtering at
+/// owner selection prevents unrelated descendants (for example package `data/`
+/// or `R/` changes before an application entry exists) from turning ordinary
+/// watcher notifications into open source-batch transactions. Incomplete
+/// candidates still react to `server.R` / `app.R` creation; once a mode exists,
+/// direct helper and other conventional-file events can change active roles.
+pub(crate) fn filesystem_event_affects_application(
+    application: &ShinyApplicationMetadata,
+    event_path: &Path,
+) -> bool {
+    let lexical_root = Path::new(&application.application_root);
+    if filesystem_event_affects_root(application, event_path, lexical_root) {
+        return true;
+    }
+    application
+        .application_identity
+        .as_deref()
+        .map(Path::new)
+        .is_some_and(|identity_root| {
+            identity_root != lexical_root
+                && filesystem_event_affects_root(application, event_path, identity_root)
+        })
+}
+
+fn filesystem_event_affects_root(
+    application: &ShinyApplicationMetadata,
+    event_path: &Path,
+    application_root: &Path,
+) -> bool {
+    let mut event_components = event_path.components();
+    for root_component in application_root.components() {
+        let Some(event_component) = event_components.next() else {
+            return false;
+        };
+        if !super::tar_source::path_components_eq_ignore_ascii_case(event_component, root_component)
+        {
+            return false;
+        }
+    }
+    let relative: Vec<_> = event_components.collect();
+    match relative.as_slice() {
+        [] => true,
+        [name] => {
+            let name = name.as_os_str();
+            os_str_eq_ignore_ascii_case(name, OsStr::new("server.R"))
+                || os_str_eq_ignore_ascii_case(name, OsStr::new("app.R"))
+                || (application.mode.is_some()
+                    && (os_str_eq_ignore_ascii_case(name, OsStr::new("ui.R"))
+                        || os_str_eq_ignore_ascii_case(name, OsStr::new("global.R"))
+                        || os_str_eq_ignore_ascii_case(name, OsStr::new("R"))))
+        }
+        [directory, name] => {
+            application.mode.is_some()
+                && os_str_eq_ignore_ascii_case(directory.as_os_str(), OsStr::new("R"))
+                && Path::new(name.as_os_str())
+                    .extension()
+                    .is_some_and(|extension| {
+                        os_str_eq_ignore_ascii_case(extension, OsStr::new("R"))
+                    })
+        }
+        _ => false,
+    }
+}
+
 fn canonical_identity_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -339,6 +406,104 @@ mod tests {
             &serde_json::json!({ "workspace": { "exclude": patterns } }),
             vec![root.to_path_buf()],
         )
+    }
+
+    #[test]
+    fn incomplete_candidate_events_only_react_to_mode_selection() {
+        let root = TempDir::new().unwrap();
+        write(&root.path().join("R/candidate.R"));
+        let expansion = discover(&uri(&root.path().join("R/candidate.R")));
+        let application = expansion.metadata.as_ref().unwrap();
+        assert_eq!(application.mode, None);
+
+        assert!(filesystem_event_affects_application(
+            application,
+            &root.path().join("SERVER.r")
+        ));
+        assert!(filesystem_event_affects_application(
+            application,
+            &root.path().join("app.R")
+        ));
+        assert!(!filesystem_event_affects_application(
+            application,
+            &root.path().join("R/new.R")
+        ));
+        assert!(!filesystem_event_affects_application(
+            application,
+            &root.path().join("data/new.csv")
+        ));
+    }
+
+    #[test]
+    fn selected_mode_events_follow_direct_shiny_topology() {
+        let root = TempDir::new().unwrap();
+        write(&root.path().join("server.R"));
+        write(&root.path().join("R/helper.R"));
+        let expansion = discover(&uri(&root.path().join("server.R")));
+        let application = expansion.metadata.as_ref().unwrap();
+
+        assert!(filesystem_event_affects_application(
+            application,
+            &root.path().join("global.r")
+        ));
+        assert!(filesystem_event_affects_application(
+            application,
+            &root.path().join("R/new.R")
+        ));
+        assert!(filesystem_event_affects_application(
+            application,
+            &root.path().join("R/_DISABLE_AUTOLOAD.r")
+        ));
+        assert!(!filesystem_event_affects_application(
+            application,
+            &root.path().join("R/nested/new.R")
+        ));
+        assert!(!filesystem_event_affects_application(
+            application,
+            &root.path().join("data/new.csv")
+        ));
+    }
+
+    #[test]
+    fn filesystem_events_match_application_paths_ascii_case_insensitively() {
+        let incomplete = ShinyApplicationMetadata {
+            application_root: "/Workspace/MyApp".into(),
+            application_identity: None,
+            mode: None,
+            role: ShinyFileRole::Candidate,
+        };
+        assert!(filesystem_event_affects_application(
+            &incomplete,
+            Path::new("/workspace/myapp/SERVER.r")
+        ));
+
+        let active = ShinyApplicationMetadata {
+            mode: Some(ShinyApplicationMode::SingleFile),
+            ..incomplete
+        };
+        assert!(filesystem_event_affects_application(
+            &active,
+            Path::new("/WORKSPACE/MYAPP/r/new.r")
+        ));
+        assert!(filesystem_event_affects_application(
+            &active,
+            Path::new("/workspace/myapp/GLOBAL.R")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_events_match_verbatim_canonical_windows_root() {
+        let application = ShinyApplicationMetadata {
+            application_root: r"C:\linked-app".into(),
+            application_identity: Some(r"\\?\C:\real-app".into()),
+            mode: Some(ShinyApplicationMode::SingleFile),
+            role: ShinyFileRole::AppEntry,
+        };
+        assert!(filesystem_event_affects_application(
+            &application,
+            Path::new(r"c:\REAL-APP\r\helper.R")
+        ));
     }
 
     #[test]

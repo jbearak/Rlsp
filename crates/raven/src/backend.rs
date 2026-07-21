@@ -50445,6 +50445,94 @@ infixContinuationStyle = "aligned"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_shiny_entry_creation_activates_open_candidate() {
+        use tower_lsp::lsp_types::FileChangeType;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("R")).unwrap();
+        let helper_text = "helper_value <- 1\n";
+        std::fs::write(tmp.path().join("R/helper.R"), helper_text).unwrap();
+        let (svc, helper_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "R/helper.R", "r", helper_text).await;
+        let canonical_helper_uri =
+            Url::from_file_path(tmp.path().join("R/helper.R").canonicalize().unwrap()).unwrap();
+        let backend = svc.inner();
+        assert!(matches!(
+            backend
+                .state
+                .read()
+                .await
+                .get_enriched_metadata(&helper_uri)
+                .and_then(|metadata| metadata.shiny_application.clone()),
+            Some(crate::cross_file::types::ShinyApplicationMetadata {
+                mode: None,
+                role: crate::cross_file::types::ShinyFileRole::Candidate,
+                ..
+            })
+        ));
+
+        let app_path = tmp.path().join("app.R");
+        std::fs::write(&app_path, "entry_value <- helper_value\n").unwrap();
+        let app_uri = Url::from_file_path(app_path.canonicalize().unwrap()).unwrap();
+        spawn_watched_file_change(backend, app_uri.clone(), FileChangeType::CREATED)
+            .await
+            .unwrap();
+
+        let state = backend.state.read().await;
+        assert!(matches!(
+            state
+                .get_enriched_metadata(&helper_uri)
+                .and_then(|metadata| metadata.shiny_application.clone()),
+            Some(crate::cross_file::types::ShinyApplicationMetadata {
+                mode: Some(crate::cross_file::types::ShinyApplicationMode::SingleFile),
+                role: crate::cross_file::types::ShinyFileRole::Helper { ordinal: 0 },
+                ..
+            })
+        ));
+        let app = state
+            .workspace_index
+            .get_metadata(&app_uri)
+            .expect("the created app entry must commit before candidate refresh");
+        assert!(
+            app.sources.iter().any(|source| {
+                source.source_batch_kind == Some(crate::cross_file::types::SourceBatchKind::Shiny)
+                    && source.resolved_uri.as_ref() == Some(&canonical_helper_uri)
+            }),
+            "created app metadata did not include open helper: shiny={:?}, sources={:?}",
+            app.shiny_application,
+            app.sources
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_shiny_helper_creation_refreshes_active_entry() {
+        use tower_lsp::lsp_types::FileChangeType;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("R")).unwrap();
+        let app_text = "entry_value <- new_helper_value\n";
+        std::fs::write(tmp.path().join("app.R"), app_text).unwrap();
+        let (svc, app_uri) =
+            open_in_settled_quiescent_workspace(&tmp, "app.R", "r", app_text).await;
+        let backend = svc.inner();
+
+        let helper_path = tmp.path().join("R/new.R");
+        std::fs::write(&helper_path, "new_helper_value <- 1\n").unwrap();
+        let helper_uri = Url::from_file_path(helper_path.canonicalize().unwrap()).unwrap();
+        spawn_watched_file_change(backend, helper_uri.clone(), FileChangeType::CREATED)
+            .await
+            .unwrap();
+
+        let state = backend.state.read().await;
+        let app = state.documents.get_record(&app_uri).unwrap().metadata();
+        assert!(app.sources.iter().any(|source| {
+            source.source_batch_kind == Some(crate::cross_file::types::SourceBatchKind::Shiny)
+                && source.resolved_uri.as_ref() == Some(&helper_uri)
+        }));
+        assert!(state.workspace_index.get_artifacts(&helper_uri).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_legacy_global_open_materializes_server_host() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("R")).unwrap();

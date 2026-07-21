@@ -570,9 +570,54 @@ fn path_starts_with_ascii_case(path: &Path, base: &Path) -> bool {
     let mut path_components = path.components();
     base.components().all(|base_component| {
         path_components.next().is_some_and(|path_component| {
-            os_str_eq_ignore_ascii_case(path_component.as_os_str(), base_component.as_os_str())
+            path_components_eq_ignore_ascii_case(path_component, base_component)
         })
     })
+}
+
+/// Compare path components with the same ASCII case leniency as watch overlap.
+///
+/// Windows canonicalization commonly changes `C:` into the extended-length
+/// `\\?\C:` prefix (and likewise for UNC paths). Those prefix forms identify the
+/// same filesystem root and must compare equal so canonical Shiny watch roots
+/// can match ordinary file-URI event paths.
+pub(crate) fn path_components_eq_ignore_ascii_case(
+    left: std::path::Component<'_>,
+    right: std::path::Component<'_>,
+) -> bool {
+    #[cfg(windows)]
+    if let (std::path::Component::Prefix(left), std::path::Component::Prefix(right)) = (left, right)
+    {
+        use std::path::Prefix;
+
+        return match (left.kind(), right.kind()) {
+            (Prefix::Disk(left), Prefix::VerbatimDisk(right))
+            | (Prefix::VerbatimDisk(left), Prefix::Disk(right))
+            | (Prefix::Disk(left), Prefix::Disk(right))
+            | (Prefix::VerbatimDisk(left), Prefix::VerbatimDisk(right)) => {
+                left.eq_ignore_ascii_case(&right)
+            }
+            (
+                Prefix::UNC(left_server, left_share),
+                Prefix::VerbatimUNC(right_server, right_share),
+            )
+            | (
+                Prefix::VerbatimUNC(left_server, left_share),
+                Prefix::UNC(right_server, right_share),
+            )
+            | (Prefix::UNC(left_server, left_share), Prefix::UNC(right_server, right_share))
+            | (
+                Prefix::VerbatimUNC(left_server, left_share),
+                Prefix::VerbatimUNC(right_server, right_share),
+            ) => {
+                os_str_eq_ignore_ascii_case(left_server, right_server)
+                    && os_str_eq_ignore_ascii_case(left_share, right_share)
+            }
+            _ => os_str_eq_ignore_ascii_case(left.as_os_str(), right.as_os_str()),
+        };
+    }
+
+    os_str_eq_ignore_ascii_case(left.as_os_str(), right.as_os_str())
 }
 
 #[cfg(unix)]
@@ -1393,6 +1438,19 @@ mod tests {
         assert!(!paths_overlap(
             Path::new("/workspace/R"),
             Path::new("/workspace/other")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overlap_equates_normal_and_verbatim_windows_roots() {
+        assert!(paths_overlap(
+            Path::new(r"C:\real-app\R\helper.R"),
+            Path::new(r"\\?\c:\REAL-APP")
+        ));
+        assert!(paths_overlap(
+            Path::new(r"\\server\share\real-app\app.R"),
+            Path::new(r"\\?\UNC\SERVER\SHARE\real-app")
         ));
     }
 

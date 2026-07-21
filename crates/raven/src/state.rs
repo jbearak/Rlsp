@@ -6205,13 +6205,59 @@ impl WorldState {
         for event_path in &event_paths {
             for (watch_path, owners) in &self.tar_source_parents_by_watch_path {
                 if crate::cross_file::tar_source::paths_overlap(event_path, watch_path) {
-                    parents.extend(owners.iter().cloned());
+                    parents.extend(
+                        owners
+                            .iter()
+                            .filter(|parent| {
+                                self.source_batch_filesystem_event_affects_parent(
+                                    parent, event_path,
+                                )
+                            })
+                            .cloned(),
+                    );
                 }
             }
         }
         let mut parents: Vec<_> = parents.into_iter().collect();
         parents.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
         parents
+    }
+
+    /// Refine generic recursive watch-root overlap for implicit Shiny layouts.
+    ///
+    /// Explicit `tar_source()` and `list.files()` batches retain their existing
+    /// recursive matching. A Shiny-only owner instead follows the convention's
+    /// direct-child topology so unrelated application-root descendants do not
+    /// force an open-parent refresh.
+    fn source_batch_filesystem_event_affects_parent(
+        &self,
+        parent: &Url,
+        event_path: &Path,
+    ) -> bool {
+        let metadata = if let Some(record) = self.documents.get_record(parent) {
+            Some(Arc::clone(record.metadata()))
+        } else if self.is_document_open_or_alias(parent) {
+            None
+        } else {
+            self.workspace_index.get_metadata(parent)
+        };
+        let Some(metadata) = metadata else {
+            return true;
+        };
+        if !metadata.tar_source_requests.is_empty()
+            || !metadata.list_files_source_requests.is_empty()
+        {
+            return true;
+        }
+        metadata
+            .shiny_application
+            .as_ref()
+            .is_none_or(|application| {
+                crate::cross_file::shiny::filesystem_event_affects_application(
+                    application,
+                    event_path,
+                )
+            })
     }
 
     fn bump_tar_source_watch_path_generation(&mut self, path: &Path) {

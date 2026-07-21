@@ -583,7 +583,14 @@ reanchors at the child directory. Backward `PathContext::new` remains unchanged.
 The generic source-batch root registry owns Shiny entry/global/helper/marker
 refreshes, so watched mode changes reuse the same generation fences, open-buffer
 authority, closed-file indexing, atomic graph commit, and diagnostic receipt
-boundary as tar/list batches.
+boundary as tar/list batches. Registry overlap is recursively conservative, so
+Shiny owner selection refines it with an ASCII-case-insensitive direct-child
+check: incomplete candidates react only to `server.R` / `app.R` mode selection,
+while selected layouts also react to direct `ui.R`, `global.R`, `R/`, helper, and
+disable-marker events. The shared component comparator also equates normal and
+extended-length Windows disk/UNC prefixes, so canonical symlink roots match
+ordinary file-URI events. Unrelated application-root descendants therefore stay
+in the ordinary watcher transaction.
 
 `tar_option_set(packages = ...)` uses a distinct durable metadata channel,
 `CrossFileMetadata::targets_pipeline_packages`, rather than synthetic
