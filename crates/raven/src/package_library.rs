@@ -148,8 +148,8 @@ fn is_readable_file(path: &Path) -> bool {
 /// `DESCRIPTION` whose `Package:` field exactly agrees with the directory
 /// name. Lock/staging directories, symlinks, invalid names, and malformed
 /// metadata fail closed.
-fn validated_package_names(lib_paths: &[PathBuf]) -> HashSet<String> {
-    let mut names = HashSet::new();
+fn validated_package_directories(lib_paths: &[PathBuf]) -> HashMap<String, PathBuf> {
+    let mut packages = HashMap::new();
     for lib_path in lib_paths {
         let Ok(entries) = std::fs::read_dir(lib_path) else {
             continue;
@@ -185,26 +185,53 @@ fn validated_package_names(lib_paths: &[PathBuf]) -> HashSet<String> {
                 continue;
             };
             if declared.trim() == name {
-                names.insert(name);
+                // Match `.libPaths()` lookup precedence when duplicate package
+                // names exist across vanilla libraries.
+                packages.entry(name).or_insert_with(|| entry.path());
             }
         }
     }
-    names
+    packages
+}
+
+fn validated_package_names(lib_paths: &[PathBuf]) -> HashSet<String> {
+    validated_package_directories(lib_paths)
+        .into_keys()
+        .collect()
 }
 
 fn build_renv_outside_active_overlay(
     transition: crate::r_subprocess::RenvLibraryPathTransition,
     active_paths: &[PathBuf],
 ) -> Option<RenvOutsideActiveOverlay> {
-    let mut package_names = validated_package_names(&transition.outside_paths);
+    let outside_packages = validated_package_directories(&transition.outside_paths);
+    let mut package_names: HashSet<String> = outside_packages.keys().cloned().collect();
     let active_names = validated_package_names(active_paths);
     let base_names: HashSet<_> = crate::r_subprocess::get_base_priority_packages()
         .into_iter()
         .collect();
     package_names.retain(|name| !active_names.contains(name) && !base_names.contains(name));
+    let mut explicit_exports = HashMap::new();
+    for name in &package_names {
+        // Preserve `.libPaths()` precedence: the first validated installation
+        // supplies positive export evidence. Pattern exports deliberately stay
+        // unexpanded; the explicit subset remains safe to use for suppression.
+        let exports = outside_packages
+            .get(name)
+            .map(|dir| {
+                crate::namespace_parser::parse_namespace_attachment_visible_explicit_exports(
+                    &dir.join("NAMESPACE"),
+                )
+                .into_iter()
+                .collect()
+            })
+            .unwrap_or_default();
+        explicit_exports.insert(name.clone(), exports);
+    }
     (!package_names.is_empty()).then_some(RenvOutsideActiveOverlay {
         _project_root: transition.project_root,
         package_names,
+        explicit_exports,
     })
 }
 
@@ -458,14 +485,21 @@ enum CachedCompletionEntry {
     },
 }
 
-/// Names visible in vanilla R but removed by this workspace's active renv
-/// library. Paths are deliberately discarded after construction so this
+/// Packages visible in vanilla R but removed by this workspace's active renv
+/// library, with positive-only explicit export evidence for cascade
+/// suppression. Paths are deliberately discarded after construction so this
 /// diagnostic overlay cannot affect package resolution or metadata routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RenvOutsideActiveOverlay {
     /// Retained as lifecycle identity for the workspace-specific discovery.
     _project_root: PathBuf,
     package_names: HashSet<String>,
+    /// Explicit exports captured from each validated outside installation.
+    ///
+    /// This is positive-only diagnostic evidence. It is deliberately kept out
+    /// of the ordinary package caches so an unavailable package cannot feed
+    /// completion, namespace resolution, `system.file()`, or runtime routing.
+    explicit_exports: HashMap<String, HashSet<String>>,
 }
 
 /// Package library manager
@@ -524,8 +558,9 @@ pub struct PackageLibrary {
     /// Consulted by the three resolution chokepoints before the installed caches.
     /// Refreshed by the shared derived-package installer.
     local_dev_overlay: ArcSwap<Option<Arc<LocalDevPackage>>>,
-    /// Diagnostic-only names removed from `.libPaths()` by a successfully
-    /// activated renv project. Never consulted by package resolution.
+    /// Diagnostic-only package and attachment-visible export evidence removed
+    /// from `.libPaths()` by a successfully activated renv project. Never
+    /// consulted by package resolution.
     renv_outside_active_overlay: Option<Arc<RenvOutsideActiveOverlay>>,
     /// Operation-level ownership for cache mutations.
     ///
@@ -1834,9 +1869,14 @@ impl PackageLibrary {
         let Some(overlay) = self.renv_outside_active_overlay.as_mut() else {
             return;
         };
-        Arc::make_mut(overlay)
+        let overlay = Arc::make_mut(overlay);
+        overlay
             .package_names
             .retain(|name| !active_names.contains(name) && !base_packages.contains(name));
+        let retained_names = &overlay.package_names;
+        overlay
+            .explicit_exports
+            .retain(|name, _| retained_names.contains(name));
         if overlay.package_names.is_empty() {
             self.renv_outside_active_overlay = None;
         }
@@ -2742,14 +2782,34 @@ impl PackageLibrary {
     /// a vanilla library path removed by this workspace's renv activation.
     ///
     /// Active availability always wins, including after configured library
-    /// paths are added. The overlay contains names only and cannot participate
-    /// in export lookup, completion, package loading, or filesystem watching.
+    /// paths are added. The overlay's package names and diagnostic-only export
+    /// evidence cannot participate in ordinary export lookup, completion,
+    /// package loading, or filesystem watching.
     pub(crate) fn package_available_outside_active_renv(&self, name: &str) -> bool {
         !self.package_exists(name)
             && self
                 .renv_outside_active_overlay
                 .as_ref()
                 .is_some_and(|overlay| overlay.package_names.contains(name))
+    }
+
+    /// Whether a package unavailable in the active renv library explicitly
+    /// exports `symbol` from a validated outside installation.
+    ///
+    /// This query is diagnostic-only. Keeping it separate from the ordinary
+    /// caches and export APIs prevents outside installations from contributing
+    /// completion, namespace resolution, or runtime/path-sensitive behavior.
+    pub(crate) fn outside_active_renv_has_explicit_export(
+        &self,
+        package: &str,
+        symbol: &str,
+    ) -> bool {
+        self.package_available_outside_active_renv(package)
+            && self
+                .renv_outside_active_overlay
+                .as_ref()
+                .and_then(|overlay| overlay.explicit_exports.get(package))
+                .is_some_and(|exports| exports.contains(symbol))
     }
 
     #[cfg(test)]
@@ -2761,6 +2821,21 @@ impl PackageLibrary {
         self.renv_outside_active_overlay = Some(Arc::new(RenvOutsideActiveOverlay {
             _project_root: project_root,
             package_names,
+            explicit_exports: HashMap::new(),
+        }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_renv_outside_active_exports_for_test(
+        &mut self,
+        project_root: PathBuf,
+        package: String,
+        exports: HashSet<String>,
+    ) {
+        self.renv_outside_active_overlay = Some(Arc::new(RenvOutsideActiveOverlay {
+            _project_root: project_root,
+            package_names: HashSet::from([package.clone()]),
+            explicit_exports: HashMap::from([(package, exports)]),
         }));
     }
 
@@ -3711,6 +3786,11 @@ mod tests {
             std::fs::create_dir(path).unwrap();
         }
         write_synthetic_package(&outside, "plotpkg", "plotpkg");
+        std::fs::write(
+            outside.join("plotpkg").join("NAMESPACE"),
+            "export(known_plot)\nexportPattern(\"^generated_\")\n",
+        )
+        .unwrap();
         write_synthetic_package(&outside, "sharedpkg", "sharedpkg");
         write_synthetic_package(&outside, "misleading", "differentpkg");
         write_synthetic_package(&outside, "00LOCK-stagedpkg", "stagedpkg");
@@ -3729,6 +3809,13 @@ mod tests {
         assert_eq!(
             overlay.package_names,
             HashSet::from(["plotpkg".to_string()])
+        );
+        assert_eq!(
+            overlay.explicit_exports,
+            HashMap::from([(
+                "plotpkg".to_string(),
+                HashSet::from(["known_plot".to_string()]),
+            )])
         );
     }
 
@@ -3751,6 +3838,41 @@ mod tests {
         library.add_library_paths(&[active]);
         assert!(library.package_exists("plotpkg"));
         assert!(!library.package_available_outside_active_renv("plotpkg"));
+    }
+
+    #[test]
+    fn outside_active_exports_are_diagnostic_only_and_pruned_with_availability() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let active = temp.path().join("active");
+        let initial_active = temp.path().join("initial-active");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&active).unwrap();
+        std::fs::create_dir(&initial_active).unwrap();
+
+        let mut library = PackageLibrary::new_empty();
+        library.set_lib_paths(vec![initial_active]);
+        library.set_renv_outside_active_exports_for_test(
+            project,
+            "plotpkg".to_string(),
+            HashSet::from(["known_plot".to_string()]),
+        );
+
+        assert!(library.outside_active_renv_has_explicit_export("plotpkg", "known_plot"));
+        assert!(!library.outside_active_renv_has_explicit_export("plotpkg", "unknown_plot"));
+        assert!(!library.package_exists("plotpkg"));
+        assert_eq!(library.find_package_directory("plotpkg"), None);
+        assert_eq!(library.get_exports_sync("plotpkg"), None);
+        assert!(
+            library
+                .get_owned_exports_for_completions(&["plotpkg".to_string()])
+                .is_empty()
+        );
+        assert!(!library.is_symbol_from_loaded_packages("known_plot", &["plotpkg".to_string()]));
+
+        write_synthetic_package(&active, "plotpkg", "plotpkg");
+        library.add_library_paths(&[active]);
+        assert!(!library.outside_active_renv_has_explicit_export("plotpkg", "known_plot"));
     }
 
     fn provider_load_key_for_test(name: &str) -> ProviderLoadKey {

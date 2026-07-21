@@ -6374,6 +6374,26 @@ fn package_available_outside_active_renv(snapshot: &DiagnosticsSnapshot, package
             .package_available_outside_active_renv(package)
 }
 
+/// Whether a true search-path attachment supplies `name` from an installation
+/// hidden by this workspace's active renv library.
+///
+/// This is intentionally narrower than ordinary package resolution: the
+/// single-workspace gate matches the actionable environment diagnostic, and
+/// callers pass `ScopeAtPosition::attached_packages` so `loadNamespace()` and
+/// NAMESPACE imports cannot acquire bare-name attachment semantics.
+fn attached_outside_active_renv_exports(
+    snapshot: &DiagnosticsSnapshot,
+    name: &str,
+    attached_packages: &HashSet<String>,
+) -> bool {
+    snapshot.workspace_folders.len() == 1
+        && attached_packages.iter().any(|package| {
+            snapshot
+                .package_library
+                .outside_active_renv_has_explicit_export(package, name)
+        })
+}
+
 /// Emit `namespace-member-not-found` for `pkg::member` references whose package
 /// has a *complete* export set that does not contain `member`. Exports-
 /// authoritative: a `Partial`/`Unknown` set (or a never-warmed package) stays
@@ -6973,6 +6993,9 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                     .cloned()
                     .collect();
                 if !pkgs.is_empty() && is_package_export(name, &pkgs, &snapshot.package_library) {
+                    break;
+                }
+                if attached_outside_active_renv_exports(snapshot, name, &scope.attached_packages) {
                     break;
                 }
             }
@@ -7936,6 +7959,9 @@ fn collect_undefined_variables_from_snapshot(
                 &position_aware_packages_buf,
                 &snapshot.package_library,
             ) {
+                continue;
+            }
+            if attached_outside_active_renv_exports(snapshot, &name, &scope.attached_packages) {
                 continue;
             }
 
@@ -54630,6 +54656,168 @@ pacman::p_load(__qualified_missing_package__)";
         }));
     }
 
+    fn outside_active_export_diagnostics(
+        code: &str,
+        workspace_folders: Vec<Url>,
+        exports: std::collections::HashSet<String>,
+    ) -> Vec<Diagnostic> {
+        let main_url = Url::parse("file:///synthetic-project/main.R").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = workspace_folders;
+        state.workspace_scan_complete = true;
+        state.package_library_ready = true;
+        state.cross_file_config.packages_report_generic_uninstalled = false;
+        let mut package_library = crate::package_library::PackageLibrary::new_empty();
+        package_library.set_lib_paths(vec![std::path::PathBuf::from(
+            "/nonexistent-active-library",
+        )]);
+        package_library.set_renv_outside_active_exports_for_test(
+            std::path::PathBuf::from("/synthetic-project"),
+            "plotpkg".to_string(),
+            exports,
+        );
+        state.package_library = std::sync::Arc::new(package_library);
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        diagnostics_from_snapshot(&snapshot, &main_url, &DiagCancelToken::never())
+            .expect("diagnostics completed")
+    }
+
+    #[test]
+    fn renv_outside_active_exports_suppress_only_attached_cascades() {
+        let diagnostics = outside_active_export_diagnostics(
+            "known_plot()\nlibrary(plotpkg)\nknown_plot()\nunknown_plot()\n\
+             plotpkg::known_plot\nplotpkg::unknown_member\n",
+            vec![Url::parse("file:///synthetic-project").unwrap()],
+            std::collections::HashSet::from(["known_plot".to_string()]),
+        );
+
+        let outside: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                crate::diagnostic_code::diagnostic_has_code(
+                    &diagnostic.code,
+                    crate::diagnostic_code::PACKAGE_OUTSIDE_ACTIVE_LIBRARY,
+                )
+            })
+            .collect();
+        assert_eq!(
+            outside.len(),
+            1,
+            "one actionable root diagnostic: {diagnostics:?}"
+        );
+
+        let known_undefined: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == "known_plot is not defined")
+            .collect();
+        assert_eq!(
+            known_undefined.len(),
+            1,
+            "only the use before library() remains undefined: {diagnostics:?}"
+        );
+        assert_eq!(known_undefined[0].range.start.line, 0);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "unknown_plot is not defined")
+        );
+        assert!(diagnostics.iter().all(|diagnostic| {
+            !crate::diagnostic_code::diagnostic_has_code(
+                &diagnostic.code,
+                crate::diagnostic_code::NAMESPACE_MEMBER_NOT_FOUND,
+            )
+        }));
+
+        let require_diagnostics = outside_active_export_diagnostics(
+            "require(plotpkg)\nknown_plot()\n",
+            vec![Url::parse("file:///synthetic-project").unwrap()],
+            std::collections::HashSet::from(["known_plot".to_string()]),
+        );
+        assert!(
+            require_diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.message != "known_plot is not defined")
+        );
+    }
+
+    #[test]
+    fn renv_outside_active_exports_do_not_attach_load_namespace_or_multi_root() {
+        let single_root = outside_active_export_diagnostics(
+            "loadNamespace(plotpkg)\nknown_plot()\n",
+            vec![Url::parse("file:///synthetic-project").unwrap()],
+            std::collections::HashSet::from(["known_plot".to_string()]),
+        );
+        assert!(
+            single_root
+                .iter()
+                .any(|diagnostic| diagnostic.message == "known_plot is not defined")
+        );
+
+        let multi_root = outside_active_export_diagnostics(
+            "library(plotpkg)\nknown_plot()\n",
+            vec![
+                Url::parse("file:///synthetic-project").unwrap(),
+                Url::parse("file:///synthetic-project/nested").unwrap(),
+            ],
+            std::collections::HashSet::from(["known_plot".to_string()]),
+        );
+        assert!(
+            multi_root
+                .iter()
+                .any(|diagnostic| diagnostic.message == "known_plot is not defined")
+        );
+        assert!(multi_root.iter().all(|diagnostic| {
+            !crate::diagnostic_code::diagnostic_has_code(
+                &diagnostic.code,
+                crate::diagnostic_code::PACKAGE_OUTSIDE_ACTIVE_LIBRARY,
+            )
+        }));
+    }
+
+    #[test]
+    fn renv_outside_active_s3_registration_is_not_attachment_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = temp.path().join("NAMESPACE");
+        std::fs::write(
+            &namespace,
+            "export(plain_fn)\nexportMethods(s4_method)\n\
+             exportClasses(S4Class)\nS3method(print, plotpkg)\n",
+        )
+        .unwrap();
+        let exports = crate::namespace_parser::parse_namespace_attachment_visible_explicit_exports(
+            &namespace,
+        )
+        .into_iter()
+        .collect();
+
+        let diagnostics = outside_active_export_diagnostics(
+            "library(plotpkg)\nplain_fn()\ns4_method()\nS4Class()\nprint.plotpkg()\n",
+            vec![Url::parse("file:///synthetic-project").unwrap()],
+            exports,
+        );
+
+        for attached_export in ["plain_fn", "s4_method", "S4Class"] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.message
+                        != format!("{attached_export} is not defined")),
+                "true explicit export should suppress its cascade: {diagnostics:?}"
+            );
+        }
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "print.plotpkg is not defined"),
+            "an S3 registration alone must not suppress a bare-name diagnostic: {diagnostics:?}"
+        );
+    }
+
     #[test]
     fn renv_outside_active_package_fails_closed_in_multi_root_session() {
         let code = "library(plotpkg)\n";
@@ -60176,6 +60364,64 @@ source(\"helpers.R\")
                 .iter()
                 .map(|d| (d.message.clone(), d.range))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Outside-active export evidence must also suppress the out-of-scope
+    /// collector's alternate `undefined-variable` cascade when a later source
+    /// happens to export the same attached name.
+    #[test]
+    fn outside_active_attached_export_is_not_misattributed_to_later_source() {
+        let mut state = create_test_state();
+        state.workspace_folders = vec![Url::parse("file:///synthetic-project").unwrap()];
+        state.workspace_scan_complete = true;
+        state.package_library_ready = true;
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = Some(DiagnosticSeverity::WARNING);
+        let mut package_library = crate::package_library::PackageLibrary::new_empty();
+        package_library.set_lib_paths(vec![std::path::PathBuf::from(
+            "/nonexistent-active-library",
+        )]);
+        package_library.set_renv_outside_active_exports_for_test(
+            std::path::PathBuf::from("/synthetic-project"),
+            "plotpkg".to_string(),
+            std::collections::HashSet::from(["known_plot".to_string()]),
+        );
+        state.package_library = std::sync::Arc::new(package_library);
+
+        let main_uri = Url::parse("file:///synthetic-project/main.R").unwrap();
+        let helper_uri = Url::parse("file:///synthetic-project/helper.R").unwrap();
+        let main_code = "library(plotpkg)\nknown_plot()\nsource(\"helper.R\")\n";
+        let helper_code = "known_plot <- function() NULL\n";
+        for (uri, code) in [(&main_uri, main_code), (&helper_uri, helper_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                Some(&state.workspace_folders[0]),
+                |_| None,
+            );
+        }
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_uri).expect("snapshot built for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("diagnostics completed");
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                !diagnostic
+                    .message
+                    .contains("'known_plot' is used before it's available")
+            }),
+            "outside-attached known export must not be blamed on the later source: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| { diagnostic.message != "known_plot is not defined" })
         );
     }
 

@@ -766,15 +766,17 @@ output, missing paths, or a project mismatch fail closed to no renv evidence;
 the ordinary active-path/fallback contract remains unchanged.
 
 The pre-activation paths never enter `PackageLibrary.lib_paths`. They are
-reduced immediately to conservative package-name evidence: a real package
-directory with a readable regular `DESCRIPTION` whose `Package:` field agrees
-with its valid directory name. Names present in the active paths, configured
-additional paths, or the base-priority set are removed. The surviving
-names-only `renv_outside_active_overlay` drives only the
-`package-outside-active-library` diagnostic. It must never feed export lookup,
-completion, `package_exists()`, `system.file()`, watchers, enumeration, or
-freeze/build commands. Library forks retain it, full rebuilds recompute it, and
-`clear_cache` leaves it intact; adding an active library path prunes it
+reduced immediately to conservative package evidence: a real package directory
+with a readable regular `DESCRIPTION` whose `Package:` field agrees with its
+valid directory name, plus its explicitly declared `NAMESPACE` exports. Names
+present in the active paths, configured additional paths, or the base-priority
+set are removed. The surviving `renv_outside_active_overlay` drives the
+`package-outside-active-library` diagnostic and supplies positive-only export
+evidence solely to the undefined-variable collectors after a true search-path
+attachment. It must never feed ordinary export lookup, completion,
+`package_exists()`, `system.file()`, watchers, enumeration, or freeze/build
+commands. Library forks retain it, full rebuilds recompute it, and `clear_cache`
+leaves it intact; adding an active library path prunes its names and exports
 immediately. Outside-library filesystem changes intentionally require an
 explicit package refresh. Diagnostic collection consults the overlay only when
 the snapshot has exactly one workspace folder; multi-root routing activates the
