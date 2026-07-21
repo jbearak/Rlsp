@@ -858,6 +858,8 @@ pub struct WorldState {
     pub signature_cache: Arc<SignatureCache>,
     pub cross_file_file_cache: CrossFileFileCache,
     pub diagnostics_gate: CrossFileDiagnosticsGate,
+    /// Counted publication barrier for multi-commit analysis transitions.
+    pub(crate) diagnostics_coherence: Arc<DiagnosticsCoherenceGate>,
     /// Serializes each final diagnostic eligibility check + client publish
     /// with editor-resource removal and document-close clears.
     ///
@@ -919,6 +921,11 @@ pub struct WorldState {
         crate::cross_file::revalidation::DiagnosticsPublishPause,
     #[cfg(test)]
     pub(crate) watched_package_pre_commit_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic barrier after an invocation-owned invalid-byte retry is
+    /// admitted and before its existing delayed-retry timer starts.
+    #[cfg(test)]
+    pub(crate) watched_undecodable_retry_pre_delay_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
     #[cfg(test)]
     pub(crate) watched_batch_pre_finalize_test_pause:
@@ -1361,6 +1368,128 @@ pub(crate) struct DiagnosticsTrigger {
     pub(crate) version: Option<i32>,
     pub(crate) revision: Option<u64>,
     pub(crate) epoch: Option<DiagnosticsEpoch>,
+}
+
+#[derive(Debug, Default)]
+struct DiagnosticsCoherenceState {
+    generation: u64,
+    active: u32,
+    deferred: HashSet<(Url, u64)>,
+    suppressed_generation_through: Option<u64>,
+}
+
+/// Fail-closed publication barrier for a bounded sequence of globally visible
+/// analysis commits that is coherent only as a whole.
+///
+/// Diagnostic computation remains lock-free. A worker captures
+/// [`Self::generation`] with its analysis snapshot, then may publish only when
+/// no barrier is active and that generation is still current. Advancing the
+/// generation on both admission and release rejects workers that straddle the
+/// boundary as well as workers that snapshot an intermediate commit.
+#[derive(Debug, Default)]
+pub(crate) struct DiagnosticsCoherenceGate {
+    state: parking_lot::Mutex<DiagnosticsCoherenceState>,
+    quiescent: tokio::sync::Notify,
+}
+
+impl DiagnosticsCoherenceGate {
+    pub(crate) fn generation(&self) -> u64 {
+        self.state.lock().generation
+    }
+
+    pub(crate) fn publish_is_coherent(&self, captured_generation: u64) -> bool {
+        let state = self.state.lock();
+        state.active == 0 && state.generation == captured_generation
+    }
+
+    pub(crate) fn begin(self: &Arc<Self>) -> DiagnosticsCoherenceGuard {
+        let mut state = self.state.lock();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("diagnostics coherence generation exhausted");
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("diagnostics coherence barrier count exhausted");
+        DiagnosticsCoherenceGuard {
+            gate: Some(Arc::clone(self)),
+            begin_generation: state.generation,
+        }
+    }
+
+    pub(crate) async fn wait_until_quiescent(&self) {
+        loop {
+            let notified = self.quiescent.notified();
+            if self.state.lock().active == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn claim_deferred(&self, uri: &Url, generation: u64) -> bool {
+        let mut state = self.state.lock();
+        if state
+            .suppressed_generation_through
+            .is_some_and(|through| generation <= through)
+        {
+            return false;
+        }
+        state.deferred.insert((uri.clone(), generation))
+    }
+
+    pub(crate) fn release_deferred(&self, uri: &Url, generation: u64) -> bool {
+        let mut state = self.state.lock();
+        state.deferred.remove(&(uri.clone(), generation));
+        state
+            .suppressed_generation_through
+            .is_some_and(|through| generation <= through)
+    }
+}
+
+/// RAII ownership for one counted diagnostics-coherence reservation.
+pub(crate) struct DiagnosticsCoherenceGuard {
+    gate: Option<Arc<DiagnosticsCoherenceGate>>,
+    begin_generation: u64,
+}
+
+impl DiagnosticsCoherenceGuard {
+    pub(crate) fn suppress_deferred_on_cancel(&self) {
+        let Some(gate) = &self.gate else {
+            return;
+        };
+        let mut state = gate.state.lock();
+        let through = state.generation.max(self.begin_generation);
+        state.suppressed_generation_through = Some(
+            state
+                .suppressed_generation_through
+                .map_or(through, |suppressed| suppressed.max(through)),
+        );
+    }
+}
+
+impl Drop for DiagnosticsCoherenceGuard {
+    fn drop(&mut self) {
+        let Some(gate) = self.gate.take() else {
+            return;
+        };
+        let quiescent = {
+            let mut state = gate.state.lock();
+            state.active = state
+                .active
+                .checked_sub(1)
+                .expect("diagnostics coherence guard released exactly once");
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .expect("diagnostics coherence generation exhausted");
+            state.active == 0
+        };
+        if quiescent {
+            gate.quiescent.notify_waiters();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6760,6 +6889,7 @@ impl WorldState {
             signature_cache: Arc::new(SignatureCache::new(500)),
             cross_file_file_cache: CrossFileFileCache::new(),
             diagnostics_gate: CrossFileDiagnosticsGate::new(),
+            diagnostics_coherence: Arc::new(DiagnosticsCoherenceGate::default()),
             diagnostics_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(any(test, feature = "test-support"))]
             diagnostics_test_pause:
@@ -6805,6 +6935,9 @@ impl WorldState {
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
             watched_package_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            watched_undecodable_retry_pre_delay_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
             watched_batch_pre_finalize_test_pause:
@@ -11647,6 +11780,7 @@ pub(crate) fn derive_workspace_dependency_graph(
     graph_roots: Option<&HashSet<Url>>,
     open_overlays: &[WorkspaceGraphOverlay],
     context: &WorkspaceGraphDerivationContext,
+    refresh_open_source_batches: bool,
 ) -> (
     DependencyGraph,
     HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
@@ -11678,6 +11812,7 @@ pub(crate) fn derive_workspace_dependency_graph(
             );
         }
     }
+    let previous_open_metadata = base_open_metadata.clone();
 
     for entry in entries.values_mut() {
         if entry
@@ -11694,6 +11829,10 @@ pub(crate) fn derive_workspace_dependency_graph(
             );
         }
     }
+    let previous_closed_metadata: HashMap<_, _> = entries
+        .iter()
+        .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+        .collect();
     let mut base_closed_metadata: HashMap<_, _> = entries
         .iter()
         .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
@@ -11731,16 +11870,28 @@ pub(crate) fn derive_workspace_dependency_graph(
         }
     }
 
-    // Tar expansion is the final metadata derivation stage: inherited WD and
-    // system.file resolution are already stable. Rebuild artifacts from the
-    // finalized metadata so the timeline and interface hash contain the
-    // ordered batch rather than the syntax-only request.
+    // Source-batch expansion is the final metadata derivation stage: inherited
+    // WD and system.file resolution are already stable. A scan entry or open
+    // overlay normally arrives with an expansion from the same candidate.
+    // Reuse it when the effective path context is unchanged so one candidate
+    // observes each directory only once.
     for (uri, entry) in entries.iter_mut() {
-        crate::cross_file::tar_source::finalize_tar_source_requests(
-            Arc::make_mut(&mut entry.metadata),
-            uri,
-            workspace_root,
-        );
+        let metadata = Arc::make_mut(&mut entry.metadata);
+        let reused = previous_closed_metadata.get(uri).is_some_and(|previous| {
+            crate::cross_file::tar_source::reuse_tar_source_expansion(
+                metadata,
+                previous,
+                uri,
+                workspace_root,
+            )
+        });
+        if !reused {
+            crate::cross_file::tar_source::finalize_tar_source_requests(
+                metadata,
+                uri,
+                workspace_root,
+            );
+        }
         let analysis = entry.contents.to_string();
         entry.artifacts = Arc::new(match entry.tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
@@ -11753,11 +11904,23 @@ pub(crate) fn derive_workspace_dependency_graph(
         });
     }
     for (uri, metadata) in &mut open_metadata {
-        crate::cross_file::tar_source::finalize_tar_source_requests(
-            Arc::make_mut(metadata),
-            uri,
-            workspace_root,
-        );
+        let metadata = Arc::make_mut(metadata);
+        let reused = !refresh_open_source_batches
+            && previous_open_metadata.get(uri).is_some_and(|previous| {
+                crate::cross_file::tar_source::reuse_tar_source_expansion(
+                    metadata,
+                    previous,
+                    uri,
+                    workspace_root,
+                )
+            });
+        if !reused {
+            crate::cross_file::tar_source::finalize_tar_source_requests(
+                metadata,
+                uri,
+                workspace_root,
+            );
+        }
     }
 
     let mut content: HashMap<Url, String> = entries

@@ -198,12 +198,13 @@ pub fn extract_metadata_with_tree(
 
         // Detect library(), require(), loadNamespace(), and static
         // targets::tar_source() calls with one shared lazy binding table.
-        let (mut library_calls, tar_source_requests) =
+        let (mut library_calls, tar_source_requests, list_files_source_requests) =
             source_detect::detect_library_and_tar_source_requests(tree, content);
         // Sort by line/column for document order (Requirement 1.8)
         library_calls.sort_by_key(|lc| (lc.line, lc.column));
         meta.library_calls = library_calls;
         meta.tar_source_requests = tar_source_requests;
+        meta.list_files_source_requests = list_files_source_requests;
         meta.namespace_references = source_detect::detect_namespace_references(tree, content);
     } else {
         log::warn!("Failed to parse R code with tree-sitter during metadata extraction");

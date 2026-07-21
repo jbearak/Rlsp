@@ -195,8 +195,13 @@ pub struct CrossFileMetadata {
     /// after working-directory enrichment.
     #[serde(default)]
     pub tar_source_requests: Vec<TarSourceRequest>,
-    /// Existing and potential filesystem roots retained by the last
-    /// `tar_source()` expansion, including real targets of followed symlinks.
+    /// Statically recognized bounded `list.files()` / `for` source batches.
+    #[serde(default)]
+    pub list_files_source_requests: Vec<ListFilesSourceRequest>,
+    /// Existing and potential filesystem roots retained by the last detached
+    /// source-batch expansion, including real targets of followed symlinks.
+    ///
+    /// The historical field name is retained for metadata compatibility.
     #[serde(default)]
     pub tar_source_expansion_watch_paths: Vec<std::path::PathBuf>,
     /// Working directory override (explicit `# raven: cd`)
@@ -284,6 +289,31 @@ pub struct TarSourceRequest {
     /// Static `change_directory = TRUE` value.
     #[serde(default)]
     pub change_directory: bool,
+}
+
+/// One bounded top-level `list.files()` / `for (...) source(...)` request.
+///
+/// Detection is filesystem-free. Expansion enumerates the immediate members
+/// of `directory` after working-directory enrichment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+pub struct ListFilesSourceRequest {
+    /// Literal directory passed to `list.files()`.
+    pub directory: String,
+    /// 0-based line of the `source(iterator)` call.
+    pub line: u32,
+    /// 0-based UTF-16 column of the `source(iterator)` call.
+    pub column: u32,
+}
+
+/// Origin of an ordered source batch.
+///
+/// `tar_source_ordinal` remains the serialized ordinal carrier for backward
+/// compatibility; this discriminator keeps tar-only contextual path behavior
+/// from leaking into ordinary `list.files()` source loops.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SourceBatchKind {
+    TarSource,
+    ListFiles,
 }
 
 impl CrossFileMetadata {
@@ -403,11 +433,15 @@ pub struct ForwardSource {
     /// calling `resolve_path` (which can't handle true absolute paths outside
     /// the workspace). Set by `resolve_system_file_sources` for branch-2 hits.
     pub resolved_uri: Option<tower_lsp::lsp_types::Url>,
-    /// Ordered child index within one expanded `tar_source()` call.
+    /// Ordered child index within one expanded source batch.
     ///
-    /// `Some` also identifies this source as tar-derived. The call identity is
-    /// `(line, column)` and the ordinal disambiguates members sharing it.
+    /// The historical name is retained for wire compatibility. The call
+    /// identity is `(line, column, source_batch_kind)`, and the ordinal
+    /// disambiguates members sharing it.
     pub tar_source_ordinal: Option<u32>,
+    /// Explicit source-batch origin. Legacy metadata with an ordinal and no
+    /// kind is interpreted as [`SourceBatchKind::TarSource`].
+    pub source_batch_kind: Option<SourceBatchKind>,
     /// Whether this exact source call is the sole consequence of
     /// `if (file.exists("path"))` for the same literal path.
     ///
@@ -457,6 +491,8 @@ struct ForwardSourceWire {
     #[serde(default)]
     tar_source_ordinal: Option<u32>,
     #[serde(default)]
+    source_batch_kind: Option<SourceBatchKind>,
+    #[serde(default)]
     guarded_by_file_exists: bool,
 }
 
@@ -467,7 +503,7 @@ impl Serialize for ForwardSource {
     {
         let local = !self.is_sys_source && self.locality != SourceLocality::Global;
         let sys_source_global_env = !self.is_sys_source || self.locality == SourceLocality::Global;
-        let mut state = serializer.serialize_struct("ForwardSource", 17)?;
+        let mut state = serializer.serialize_struct("ForwardSource", 18)?;
         state.serialize_field("path", &self.path)?;
         state.serialize_field("line", &self.line)?;
         state.serialize_field("column", &self.column)?;
@@ -484,6 +520,7 @@ impl Serialize for ForwardSource {
         state.serialize_field("system_file", &self.system_file)?;
         state.serialize_field("resolved_uri", &self.resolved_uri)?;
         state.serialize_field("tar_source_ordinal", &self.tar_source_ordinal)?;
+        state.serialize_field("source_batch_kind", &self.source_batch_kind)?;
         state.serialize_field("guarded_by_file_exists", &self.guarded_by_file_exists)?;
         state.end()
     }
@@ -519,12 +556,26 @@ impl<'de> Deserialize<'de> for ForwardSource {
             system_file: wire.system_file,
             resolved_uri: wire.resolved_uri,
             tar_source_ordinal: wire.tar_source_ordinal,
+            source_batch_kind: wire.source_batch_kind,
             guarded_by_file_exists: wire.guarded_by_file_exists,
         })
     }
 }
 
 impl ForwardSource {
+    /// Whether this source is one member of an ordered expansion batch.
+    pub fn is_source_batch_member(&self) -> bool {
+        self.tar_source_ordinal.is_some()
+    }
+
+    /// Whether this source uses `{targets}` contextual path semantics.
+    pub fn is_tar_source_member(&self) -> bool {
+        self.tar_source_ordinal.is_some()
+            && self
+                .source_batch_kind
+                .is_none_or(|kind| kind == SourceBatchKind::TarSource)
+    }
+
     /// True when missing-file/path diagnostics must skip this source.
     ///
     /// `system.file()` sources mostly carry no literal path to diagnose: a
@@ -834,6 +885,29 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ForwardSource>(value).unwrap(),
             guarded
+        );
+    }
+
+    #[test]
+    fn source_batch_kind_round_trips_and_legacy_ordinals_mean_tar() {
+        let legacy: ForwardSource =
+            serde_json::from_str(r#"{"path":"child.R","tar_source_ordinal":0}"#).unwrap();
+        assert!(legacy.is_source_batch_member());
+        assert!(legacy.is_tar_source_member());
+
+        let list_files = ForwardSource {
+            path: "child.R".to_string(),
+            tar_source_ordinal: Some(0),
+            source_batch_kind: Some(SourceBatchKind::ListFiles),
+            ..Default::default()
+        };
+        assert!(list_files.is_source_batch_member());
+        assert!(!list_files.is_tar_source_member());
+        let value = serde_json::to_value(&list_files).unwrap();
+        assert_eq!(value["source_batch_kind"], "ListFiles");
+        assert_eq!(
+            serde_json::from_value::<ForwardSource>(value).unwrap(),
+            list_files
         );
     }
 

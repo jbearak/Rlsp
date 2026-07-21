@@ -1,8 +1,9 @@
-//! Filesystem-backed expansion of static `{targets}` `tar_source()` requests.
+//! Filesystem-backed expansion of ordered static source-batch requests.
 //!
-//! Detection is filesystem-free and stores ordered [`TarSourceRequest`] values
-//! in metadata. This module classifies those requests after working-directory
-//! enrichment and recursively enumerates `.R`/`.r` scripts.
+//! Detection is filesystem-free and stores ordered [`TarSourceRequest`] and
+//! bounded `list.files()` loop requests in metadata. This module classifies
+//! those requests after working-directory enrichment. Tar requests recursively
+//! enumerate `.R`/`.r`; list-files requests enumerate immediate `.R` members.
 //!
 //! Expansion has no process-global cache or lifecycle state. Callers own both
 //! the prior authoritative metadata and any event-generation fencing needed
@@ -15,10 +16,16 @@ use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::Url;
 
 use super::path_resolve::{
-    PathContext, forward_child_path_context, forward_path_candidate_tiers, normalize_path_public,
-    path_to_uri, resolve_path_with_workspace_fallback,
+    CaseMismatchRegime, PathContext, forward_child_path_context, forward_path_candidate_tiers,
+    normalize_path_public, path_to_uri, resolve_path_with_workspace_fallback,
+    resolve_source_path_rich,
 };
-use super::types::{CrossFileMetadata, ForwardSource, SourceLocality, TarSourceRequest};
+use super::types::{
+    CrossFileMetadata, ForwardSource, ListFilesSourceRequest, SourceBatchKind, SourceLocality,
+    TarSourceRequest,
+};
+
+const MAX_LIST_FILES_SOURCE_MEMBERS: usize = 256;
 
 /// Detached result of expanding all requests in one metadata record.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -202,7 +209,7 @@ where
             && metadata
                 .sources
                 .iter()
-                .any(|source| source.tar_source_ordinal.is_some())
+                .any(ForwardSource::is_tar_source_member)
         {
             result.divergence = true;
         }
@@ -216,7 +223,7 @@ where
         for source in &metadata.sources {
             let child_uri = match visit.mode {
                 ContextualProviderMode::GraphPrefix => {
-                    if source.tar_source_ordinal.is_some() {
+                    if source.is_tar_source_member() {
                         contextual_source_uri(source, &visit.context, true)
                     } else if let Some(uri) = source.resolved_uri.clone() {
                         Some(uri)
@@ -251,7 +258,7 @@ where
                 continue;
             };
             let child_mode = match visit.mode {
-                ContextualProviderMode::GraphPrefix if source.tar_source_ordinal.is_none() => {
+                ContextualProviderMode::GraphPrefix if !source.is_tar_source_member() => {
                     ContextualProviderMode::GraphPrefix
                 }
                 ContextualProviderMode::GraphPrefix => ContextualProviderMode::Contextual {
@@ -260,7 +267,7 @@ where
                 ContextualProviderMode::Contextual {
                     prefer_supplied_path_context,
                 } => ContextualProviderMode::Contextual {
-                    prefer_supplied_path_context: (source.tar_source_ordinal.is_some()
+                    prefer_supplied_path_context: (source.is_tar_source_member()
                         || prefer_supplied_path_context)
                         && !child_is_standalone,
                 },
@@ -291,7 +298,7 @@ fn contextual_source_uri(
     if source.system_file.is_some() {
         return source.resolved_uri.clone();
     }
-    if source.tar_source_ordinal.is_some() {
+    if source.is_tar_source_member() {
         return source.resolved_uri.clone().or_else(|| {
             resolve_path_with_workspace_fallback(&source.path, context)
                 .and_then(|path| path_to_uri(&path))
@@ -348,15 +355,40 @@ pub fn expand_tar_source_requests(
                 is_sys_source: false,
                 resolved_uri: Some(resolved_uri),
                 tar_source_ordinal: Some(ordinal as u32),
+                source_batch_kind: Some(SourceBatchKind::TarSource),
+                ..Default::default()
+            });
+        }
+    }
+    for request in &metadata.list_files_source_requests {
+        let expansion = expand_list_files_request(request, &context, workspace_root);
+        result.watch_paths.extend(expansion.watch_paths);
+        for (ordinal, path) in expansion.files.into_iter().enumerate() {
+            let Some(resolved_uri) = path_to_uri(&path) else {
+                continue;
+            };
+            result.sources.push(ForwardSource {
+                path: path.to_string_lossy().into_owned(),
+                line: request.line,
+                column: request.column,
+                locality: SourceLocality::Global,
+                resolved_uri: Some(resolved_uri),
+                tar_source_ordinal: Some(ordinal as u32),
+                source_batch_kind: Some(SourceBatchKind::ListFiles),
                 ..Default::default()
             });
         }
     }
     result.watch_paths.sort();
     result.watch_paths.dedup();
-    result
-        .sources
-        .sort_by_key(|source| (source.line, source.column, source.tar_source_ordinal));
+    result.sources.sort_by_key(|source| {
+        (
+            source.line,
+            source.column,
+            source.source_batch_kind,
+            source.tar_source_ordinal,
+        )
+    });
     result
 }
 
@@ -366,12 +398,17 @@ pub fn expand_tar_source_requests(
 pub fn apply_tar_source_expansion(metadata: &mut CrossFileMetadata, expansion: TarSourceExpansion) {
     metadata
         .sources
-        .retain(|source| source.tar_source_ordinal.is_none());
+        .retain(|source| !source.is_source_batch_member());
     metadata.sources.extend(expansion.sources);
     metadata.tar_source_expansion_watch_paths = expansion.watch_paths;
-    metadata
-        .sources
-        .sort_by_key(|source| (source.line, source.column, source.tar_source_ordinal));
+    metadata.sources.sort_by_key(|source| {
+        (
+            source.line,
+            source.column,
+            source.source_batch_kind,
+            source.tar_source_ordinal,
+        )
+    });
 }
 
 /// Expand and install all static requests into caller-owned metadata.
@@ -395,7 +432,14 @@ pub fn reuse_tar_source_expansion(
     uri: &Url,
     workspace_root: Option<&Url>,
 ) -> bool {
-    if metadata.tar_source_requests != previous.tar_source_requests {
+    if metadata.tar_source_requests != previous.tar_source_requests
+        || metadata.list_files_source_requests != previous.list_files_source_requests
+    {
+        return false;
+    }
+    if (!previous.tar_source_requests.is_empty() || !previous.list_files_source_requests.is_empty())
+        && previous.tar_source_expansion_watch_paths.is_empty()
+    {
         return false;
     }
     let current_context = PathContext::from_metadata(uri, metadata, workspace_root);
@@ -407,7 +451,7 @@ pub fn reuse_tar_source_expansion(
         sources: previous
             .sources
             .iter()
-            .filter(|source| source.tar_source_ordinal.is_some())
+            .filter(|source| source.is_source_batch_member())
             .cloned()
             .collect(),
         watch_paths: previous.tar_source_expansion_watch_paths.clone(),
@@ -487,6 +531,11 @@ pub fn tar_source_watch_paths(
             }
         }
     }
+    for request in &metadata.list_files_source_requests {
+        if let Some(path) = resolve_path_with_workspace_fallback(&request.directory, &context) {
+            paths.push(path);
+        }
+    }
     paths.sort();
     paths.dedup();
     paths
@@ -507,6 +556,9 @@ pub(crate) fn tar_source_lexical_watch_paths(
             paths.extend(forward_path_candidate_tiers(raw, &context));
         }
     }
+    for request in &metadata.list_files_source_requests {
+        paths.extend(forward_path_candidate_tiers(&request.directory, &context));
+    }
     paths.extend(metadata.tar_source_expansion_watch_paths.iter().cloned());
     // Preserve the previous successful spelling until an authoritative
     // replacement commits. This catches a deletion after a case-lenient or
@@ -515,7 +567,7 @@ pub(crate) fn tar_source_lexical_watch_paths(
         metadata
             .sources
             .iter()
-            .filter(|source| source.tar_source_ordinal.is_some())
+            .filter(|source| source.is_source_batch_member())
             .filter_map(|source| source.resolved_uri.as_ref())
             .filter_map(|uri| uri.to_file_path().ok()),
     );
@@ -579,6 +631,110 @@ fn expand_request(request: &TarSourceRequest, context: &PathContext) -> RequestE
     expansion
 }
 
+fn expand_list_files_request(
+    request: &ListFilesSourceRequest,
+    context: &PathContext,
+    workspace_root: Option<&Url>,
+) -> RequestExpansion {
+    expand_list_files_request_with_probe(request, context, workspace_root, |path| {
+        std::fs::File::open(path).is_ok()
+    })
+}
+
+fn expand_list_files_request_with_probe(
+    request: &ListFilesSourceRequest,
+    context: &PathContext,
+    workspace_root: Option<&Url>,
+    can_open: impl Fn(&Path) -> bool,
+) -> RequestExpansion {
+    let mut expansion = RequestExpansion::default();
+    let candidates = candidate_watch_paths(&request.directory, context);
+    expansion.watch_paths.extend(candidates.iter().cloned());
+    for candidate in &candidates {
+        if std::fs::symlink_metadata(candidate)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            record_symlink_watch_paths(candidate, &mut expansion.watch_paths);
+        }
+    }
+    let outcome = resolve_source_path_rich(&request.directory, context);
+    if outcome.case_mismatch == Some(CaseMismatchRegime::CaseSensitiveFs) {
+        return expansion;
+    }
+    let Some(directory) = outcome.path else {
+        return expansion;
+    };
+    if !directory.is_dir() || !path_is_within_workspace(&directory, workspace_root) {
+        return expansion;
+    }
+    record_symlink_watch_paths(&directory, &mut expansion.watch_paths);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(_) => return expansion,
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            expansion.files.clear();
+            return expansion;
+        };
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.')
+            || Path::new(&name)
+                .extension()
+                .and_then(|value| value.to_str())
+                != Some("R")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(symlink_metadata) = std::fs::symlink_metadata(&path) else {
+            expansion.files.clear();
+            return expansion;
+        };
+        if symlink_metadata.file_type().is_symlink() {
+            record_symlink_watch_paths(&path, &mut expansion.watch_paths);
+        }
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            expansion.files.clear();
+            return expansion;
+        };
+        if !metadata.is_file()
+            || !path_is_within_workspace(&path, workspace_root)
+            || !can_open(&path)
+        {
+            expansion.files.clear();
+            return expansion;
+        }
+        files.push(path);
+        if files.len() > MAX_LIST_FILES_SOURCE_MEMBERS {
+            expansion.files.clear();
+            return expansion;
+        }
+    }
+    files.sort_by_cached_key(|file| relative_full_path_key(&directory, file));
+    if files.iter().any(|file| path_to_uri(file).is_none()) {
+        return expansion;
+    }
+    expansion.files = files;
+    expansion.watch_paths.sort();
+    expansion.watch_paths.dedup();
+    expansion
+}
+
+fn path_is_within_workspace(path: &Path, workspace_root: Option<&Url>) -> bool {
+    let Some(root) = workspace_root.and_then(|uri| uri.to_file_path().ok()) else {
+        return false;
+    };
+    let Ok(resolved) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    resolved.starts_with(root)
+}
+
 /// Retain both lexical and canonical target spellings of a symlink.
 fn record_symlink_watch_paths(path: &Path, watch_paths: &mut Vec<PathBuf>) {
     if let Ok(target) = std::fs::read_link(path) {
@@ -622,7 +778,7 @@ pub fn remap_tar_sources_for_graph_root(
     }
 
     for source in &mut root_meta.sources {
-        if source.tar_source_ordinal.is_none() {
+        if !source.is_tar_source_member() {
             continue;
         }
         let Some(path) = source
@@ -750,6 +906,178 @@ mod tests {
                     .replace('\\', "/")
             })
             .collect()
+    }
+
+    #[test]
+    fn list_files_loop_expands_immediate_uppercase_r_members_in_c_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        touch(&root.join("functions/b.R"), "b <- 1\n");
+        touch(&root.join("functions/a.R"), "a <- 1\n");
+        touch(&root.join("functions/lower.r"), "lower <- 1\n");
+        touch(&root.join("functions/.hidden.R"), "hidden <- 1\n");
+        touch(&root.join("functions/nested/deep.R"), "deep <- 1\n");
+        let parent = root.join("main.R");
+        let code = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+                    for (file in files) source(file)\n";
+        touch(&parent, code);
+
+        let metadata = finalize(root, &parent, code);
+        assert_eq!(
+            relative_sources(root, &metadata),
+            ["functions/a.R", "functions/b.R"]
+        );
+        assert!(
+            metadata.sources.iter().all(|source| {
+                source.source_batch_kind == Some(SourceBatchKind::ListFiles)
+                    && !source.is_tar_source_member()
+            }),
+            "{:?}",
+            metadata.sources
+        );
+        assert_eq!(
+            metadata
+                .sources
+                .iter()
+                .filter_map(|source| source.tar_source_ordinal)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn missing_list_files_directory_remains_watchable_then_refreshes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let parent = root.join("main.R");
+        let code = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+                    for (file in files) source(file)\n";
+        touch(&parent, code);
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(&parent).unwrap();
+        let mut metadata = crate::cross_file::extract_metadata(code);
+
+        finalize_tar_source_requests(&mut metadata, &parent_uri, Some(&root_uri));
+        assert!(metadata.sources.is_empty());
+        assert!(
+            metadata
+                .tar_source_expansion_watch_paths
+                .contains(&root.join("functions"))
+        );
+
+        touch(&root.join("functions/later.R"), "later <- 1\n");
+        finalize_tar_source_requests(&mut metadata, &parent_uri, Some(&root_uri));
+        assert_eq!(relative_sources(root, &metadata), ["functions/later.R"]);
+    }
+
+    #[test]
+    fn matching_directory_drops_the_whole_list_files_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        touch(&root.join("functions/good.R"), "good <- 1\n");
+        fs::create_dir_all(root.join("functions/not-a-file.R")).unwrap();
+        let parent = root.join("main.R");
+        let code = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+                    for (file in files) source(file)\n";
+        touch(&parent, code);
+
+        let metadata = finalize(root, &parent, code);
+        assert!(
+            metadata.sources.is_empty(),
+            "a partial prefix would model the wrong execution: {:?}",
+            metadata.sources
+        );
+    }
+
+    #[test]
+    fn unopenable_member_drops_the_whole_list_files_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        touch(&root.join("functions/good.R"), "good <- 1\n");
+        touch(&root.join("functions/unopenable.R"), "unopenable <- 1\n");
+        let parent = root.join("main.R");
+        let code = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+                    for (file in files) source(file)\n";
+        touch(&parent, code);
+        let workspace_root = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(&parent).unwrap();
+        let metadata = crate::cross_file::extract_metadata(code);
+        let context =
+            PathContext::from_metadata(&parent_uri, &metadata, Some(&workspace_root)).unwrap();
+
+        let expansion = expand_list_files_request_with_probe(
+            &metadata.list_files_source_requests[0],
+            &context,
+            Some(&workspace_root),
+            |path| path.file_name().and_then(|name| name.to_str()) != Some("unopenable.R"),
+        );
+
+        assert!(
+            expansion.files.is_empty(),
+            "an unreadable member must reject the entire batch: {:?}",
+            expansion.files
+        );
+    }
+
+    #[test]
+    fn list_files_directory_case_follows_runtime_existence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        touch(&root.join("Functions/member.R"), "member <- 1\n");
+        let typed_directory = root.join("functions");
+        let parent = root.join("main.R");
+        let code = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+                    for (file in files) source(file)\n";
+        touch(&parent, code);
+
+        let metadata = finalize(root, &parent, code);
+        assert_eq!(
+            metadata.sources.len(),
+            usize::from(typed_directory.exists()),
+            "a wrong-case directory executes only when that spelling exists on this host"
+        );
+    }
+
+    #[test]
+    fn list_files_member_cap_drops_the_whole_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for index in 0..=MAX_LIST_FILES_SOURCE_MEMBERS {
+            touch(
+                &root.join(format!("functions/member-{index:03}.R")),
+                "value <- 1\n",
+            );
+        }
+        let parent = root.join("main.R");
+        let code = "files <- list.files(\"functions\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+                    for (file in files) source(file)\n";
+        touch(&parent, code);
+
+        let metadata = finalize(root, &parent, code);
+        assert!(metadata.sources.is_empty());
+    }
+
+    #[test]
+    fn list_files_without_workspace_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        touch(&root.join("functions/member.R"), "member <- 1\n");
+        let parent = root.join("main.R");
+        let directory = root
+            .join("functions")
+            .to_string_lossy()
+            .replace('\\', "\\\\");
+        let code = format!(
+            "files <- list.files(\"{directory}\", pattern = \"\\\\.R$\", full.names = TRUE)\n\
+             for (file in files) source(file)\n"
+        );
+        touch(&parent, &code);
+        let parent_uri = Url::from_file_path(&parent).unwrap();
+        let mut metadata = crate::cross_file::extract_metadata(&code);
+
+        finalize_tar_source_requests(&mut metadata, &parent_uri, None);
+
+        assert!(metadata.sources.is_empty());
     }
 
     #[test]
@@ -1058,6 +1386,7 @@ mod tests {
                         edge.call_site_line == Some(source.line)
                             && edge.call_site_column == Some(source.column)
                             && edge.tar_source_ordinal == source.tar_source_ordinal
+                            && edge.source_batch_kind == source.source_batch_kind
                     })
                     .map(|edge| edge.to.clone());
                 GraphPrefixEdgeLookup::Known(target)
@@ -1166,6 +1495,7 @@ mod tests {
                         edge.call_site_line == Some(source.line)
                             && edge.call_site_column == Some(source.column)
                             && edge.tar_source_ordinal == source.tar_source_ordinal
+                            && edge.source_batch_kind == source.source_batch_kind
                     })
                     .map(|edge| edge.to.clone());
                 GraphPrefixEdgeLookup::Known(target)

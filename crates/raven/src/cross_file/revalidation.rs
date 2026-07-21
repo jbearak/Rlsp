@@ -370,6 +370,26 @@ impl CrossFileDiagnosticsGate {
         log::trace!("Marking {} for force republish (count={})", uri, count);
     }
 
+    /// Retire one exact lifecycle's reserved force-republish marker without
+    /// claiming that diagnostics were published.
+    ///
+    /// Cancellation paths use this after a multi-file transaction partially
+    /// commits but must withhold publication. Epoch validation prevents an
+    /// obsolete ticket from consuming a marker minted for a reopened URI.
+    pub fn retire_force_republish(&self, uri: &Url, epoch: DiagnosticsEpoch) {
+        let current = self.current_epoch.read().unwrap();
+        if current.get(uri) != Some(&epoch) {
+            return;
+        }
+        let mut force = self.force_republish.write().unwrap();
+        if let Some(count) = force.get_mut(uri) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                force.remove(uri);
+            }
+        }
+    }
+
     /// Clear all outstanding force-republish markers for this URI
     pub fn clear_force_republish(&self, uri: &Url) {
         let mut force = self.force_republish.write().unwrap();
@@ -1315,6 +1335,21 @@ mod tests {
             gate.try_consume_publish(&uri, 1, new),
             "the live lifecycle must still get the marker's publish"
         );
+    }
+
+    #[test]
+    fn retire_force_republish_is_exactly_lifecycle_scoped() {
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = test_uri("test.R");
+        let retired = gate.begin_epoch(&uri);
+        let current = gate.begin_epoch(&uri);
+        gate.mark_force_republish(&uri);
+
+        gate.retire_force_republish(&uri, retired);
+        assert_eq!(gate.force_republish_count_for_test(&uri), 1);
+
+        gate.retire_force_republish(&uri, current);
+        assert_eq!(gate.force_republish_count_for_test(&uri), 0);
     }
 
     #[test]

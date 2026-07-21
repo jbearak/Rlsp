@@ -12,7 +12,7 @@ use super::parent_resolve::{infer_call_site_from_parent, resolve_match_pattern};
 use super::path_resolve::{
     PathContext, path_to_uri, resolve_path, resolve_path_with_workspace_fallback,
 };
-use super::types::{CallSiteSpec, CrossFileMetadata, SourceLocality};
+use super::types::{CallSiteSpec, CrossFileMetadata, SourceBatchKind, SourceLocality};
 
 /// Resolve the effective working directory of a parent file for inheritance,
 /// with depth tracking and cycle detection to prevent infinite chains.
@@ -439,6 +439,8 @@ pub struct DependencyEdge {
     /// represented by the same R expression and makes reorder-only changes
     /// visible to graph revision and dependent revalidation.
     pub tar_source_ordinal: Option<u32>,
+    /// Ordered-batch origin; legacy ordinal-only metadata means tar.
+    pub source_batch_kind: Option<SourceBatchKind>,
     /// Precise source destination class. Unlike the legacy metadata `local`
     /// boolean, this distinguishes a proven current frame from an unknown or
     /// external environment that must not inherit ordinary parent bindings.
@@ -503,6 +505,7 @@ struct SourceCallSiteIdentity {
     line: Option<u32>,
     column: Option<u32>,
     tar_source_ordinal: Option<u32>,
+    source_batch_kind: Option<SourceBatchKind>,
 }
 
 impl SourceCallSiteIdentity {
@@ -606,6 +609,7 @@ impl DependencyEdge {
             line: self.call_site_line,
             column: self.call_site_column,
             tar_source_ordinal: self.tar_source_ordinal,
+            source_batch_kind: self.source_batch_kind,
         }
     }
 
@@ -992,6 +996,7 @@ impl DependencyGraph {
                             call_site_line: Some(source.line),
                             call_site_column: Some(source.column),
                             tar_source_ordinal: source.tar_source_ordinal,
+                            source_batch_kind: source.source_batch_kind,
                             locality: source.locality,
                             chdir: source.chdir,
                             is_sys_source: source.is_sys_source,
@@ -1066,6 +1071,7 @@ impl DependencyGraph {
                     call_site_line,
                     call_site_column,
                     tar_source_ordinal: None,
+                    source_batch_kind: None,
                     locality: SourceLocality::Global,
                     chdir: false,
                     is_sys_source: false,
@@ -1096,6 +1102,7 @@ impl DependencyGraph {
                     call_site_line: Some(source.line),
                     call_site_column: Some(source.column),
                     tar_source_ordinal: source.tar_source_ordinal,
+                    source_batch_kind: source.source_batch_kind,
                     locality: source.locality,
                     chdir: source.chdir,
                     is_sys_source: source.is_sys_source,
@@ -5192,6 +5199,7 @@ z <- 3
             call_site_line: Some(3),
             call_site_column: Some(7),
             tar_source_ordinal: None,
+            source_batch_kind: None,
             locality: SourceLocality::Global,
             chdir: false,
             is_sys_source: false,

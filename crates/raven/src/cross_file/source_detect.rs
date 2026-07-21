@@ -11,7 +11,10 @@ use tree_sitter::{Node, Tree};
 
 use super::binding::RuntimeFunctionScope;
 use super::scope::FunctionScopeInterval;
-use super::types::{ForwardSource, SourceLocality, TarSourceRequest, byte_offset_to_utf16_column};
+use super::types::{
+    ForwardSource, ListFilesSourceRequest, SourceLocality, TarSourceRequest,
+    byte_offset_to_utf16_column,
+};
 
 /// Maximum depth followed by suppressive-only static source-closure scans.
 pub(crate) const STATIC_SOURCE_MAX_DEPTH: usize = 64;
@@ -670,6 +673,7 @@ fn try_parse_source_call<'tree, 'text>(
         system_file,
         resolved_uri: None,
         tar_source_ordinal: None,
+        source_batch_kind: None,
         guarded_by_file_exists: false,
     })
 }
@@ -3193,12 +3197,232 @@ fn detect_tar_source_requests_with_bindings(
 pub(crate) fn detect_library_and_tar_source_requests(
     tree: &Tree,
     content: &str,
-) -> (Vec<LibraryCall>, Vec<TarSourceRequest>) {
+) -> (
+    Vec<LibraryCall>,
+    Vec<TarSourceRequest>,
+    Vec<ListFilesSourceRequest>,
+) {
     let root = tree.root_node();
     let mut bindings = super::static_path::LazyStaticBindings::new(root, content);
     let library_calls = detect_library_calls_with_bindings(tree, content, &mut bindings);
     let requests = detect_tar_source_requests_with_bindings(root, content, &mut bindings);
-    (library_calls, requests)
+    let list_files_requests =
+        detect_list_files_source_requests_with_bindings(root, content, &mut bindings);
+    (library_calls, requests, list_files_requests)
+}
+
+/// Detect the deliberately bounded directory-source idiom:
+///
+/// ```r
+/// files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+/// for (file in files) source(file)
+/// ```
+///
+/// The assignment and loop must be adjacent executable top-level statements.
+/// This keeps evaluation order, helper shadowing, and the sequence binding
+/// syntax-local; filesystem enumeration remains a detached later phase.
+pub fn detect_list_files_source_requests(
+    tree: &Tree,
+    content: &str,
+) -> Vec<ListFilesSourceRequest> {
+    let root = tree.root_node();
+    let mut bindings = super::static_path::LazyStaticBindings::new(root, content);
+    detect_list_files_source_requests_with_bindings(root, content, &mut bindings)
+}
+
+fn detect_list_files_source_requests_with_bindings(
+    root: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> Vec<ListFilesSourceRequest> {
+    if !content.contains("list.files") || !content.contains("source") {
+        return Vec::new();
+    }
+    let mut cursor = root.walk();
+    let statements: Vec<_> = root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() != "comment")
+        .collect();
+    statements
+        .windows(2)
+        .filter_map(|pair| parse_list_files_source_pair(pair[0], pair[1], content, bindings))
+        .collect()
+}
+
+fn parse_list_files_source_pair(
+    assignment: Node,
+    loop_node: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> Option<ListFilesSourceRequest> {
+    if assignment.kind() != "binary_operator" || loop_node.kind() != "for_statement" {
+        return None;
+    }
+    let operator = assignment.child_by_field_name("operator")?;
+    if !matches!(node_text(operator, content), "<-" | "=") {
+        return None;
+    }
+    let assigned_name =
+        super::binding::plain_identifier_name(assignment.child_by_field_name("lhs")?, content)?;
+    let sequence_name =
+        super::binding::plain_identifier_name(loop_node.child_by_field_name("sequence")?, content)?;
+    if assigned_name != sequence_name {
+        return None;
+    }
+    let directory =
+        parse_bounded_list_files_call(assignment.child_by_field_name("rhs")?, content, bindings)?;
+
+    let iterator =
+        super::binding::plain_identifier_name(loop_node.child_by_field_name("variable")?, content)?;
+    let body = loop_node.child_by_field_name("body")?;
+    let source_call = if body.kind() == "call" {
+        body
+    } else if body.kind() == "braced_expression" {
+        let mut cursor = body.walk();
+        let mut statements = body
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() != "comment");
+        let call = statements.next()?;
+        if statements.next().is_some() {
+            return None;
+        }
+        call
+    } else {
+        return None;
+    };
+    if !is_bounded_iterator_source_call(source_call, iterator, loop_node, content, bindings) {
+        return None;
+    }
+    let start = source_call.start_position();
+    let line_text = content.lines().nth(start.row).unwrap_or("");
+    Some(ListFilesSourceRequest {
+        directory,
+        line: start.row as u32,
+        column: byte_offset_to_utf16_column(line_text, start.column),
+    })
+}
+
+fn parse_bounded_list_files_call(
+    node: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> Option<String> {
+    if node.kind() != "call" || node.has_error() {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    let bare = match function.kind() {
+        "identifier" if node_text(function, content) == "list.files" => true,
+        "namespace_operator" => {
+            let lhs = function.child_by_field_name("lhs")?;
+            let rhs = function.child_by_field_name("rhs")?;
+            if node_text(lhs, content) != "base" || node_text(rhs, content) != "list.files" {
+                return None;
+            }
+            false
+        }
+        _ => return None,
+    };
+    if bare
+        && bindings
+            .get()
+            .named_local_binding_may_shadow_without_helper_uncertainty("list.files", node, false)
+    {
+        return None;
+    }
+
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut directory = None;
+    let mut pattern = None;
+    let mut full_names = false;
+    let mut cursor = arguments.walk();
+    for argument in arguments.children(&mut cursor) {
+        if argument.kind() != "argument" {
+            continue;
+        }
+        let value = argument.child_by_field_name("value")?;
+        match argument
+            .child_by_field_name("name")
+            .map(|name| node_text(name, content))
+        {
+            None if directory.is_none() => {
+                directory = Some(extract_string_literal(value, content)?)
+            }
+            Some("path") if directory.is_none() => {
+                directory = Some(extract_string_literal(value, content)?);
+            }
+            Some("pattern") if pattern.is_none() => {
+                pattern = Some(extract_string_literal(value, content)?);
+            }
+            Some("full.names") if !full_names && node_text(value, content) == "TRUE" => {
+                full_names = true;
+            }
+            _ => return None,
+        }
+    }
+    if pattern.as_deref() != Some(r"\\.R$") || !full_names {
+        return None;
+    }
+    directory
+}
+
+fn is_bounded_iterator_source_call(
+    node: Node,
+    iterator: &str,
+    loop_node: Node,
+    content: &str,
+    bindings: &mut super::static_path::LazyStaticBindings,
+) -> bool {
+    if node.kind() != "call" || node.has_error() {
+        return false;
+    }
+    let Some(function) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let bare = match function.kind() {
+        "identifier" if node_text(function, content) == "source" => true,
+        "namespace_operator" => {
+            let Some(lhs) = function.child_by_field_name("lhs") else {
+                return false;
+            };
+            let Some(rhs) = function.child_by_field_name("rhs") else {
+                return false;
+            };
+            if node_text(lhs, content) != "base" || node_text(rhs, content) != "source" {
+                return false;
+            }
+            false
+        }
+        _ => return false,
+    };
+    if bare
+        && (iterator == "source"
+            || bindings
+                .get()
+                .named_local_binding_may_shadow_without_helper_uncertainty(
+                    "source", loop_node, false,
+                ))
+    {
+        return false;
+    }
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut values = Vec::new();
+    let mut cursor = arguments.walk();
+    for argument in arguments.children(&mut cursor) {
+        if argument.kind() != "argument" {
+            continue;
+        }
+        if argument.child_by_field_name("name").is_some() {
+            return false;
+        }
+        let Some(value) = argument.child_by_field_name("value") else {
+            return false;
+        };
+        values.push(value);
+    }
+    values.len() == 1 && super::binding::plain_identifier_name(values[0], content) == Some(iterator)
 }
 
 fn visit_node_for_tar_source(
@@ -3421,6 +3645,73 @@ mod tests {
 
     fn tar_requests(code: &str) -> Vec<TarSourceRequest> {
         detect_tar_source_requests(&parse_r(code), code)
+    }
+
+    fn list_files_requests(code: &str) -> Vec<ListFilesSourceRequest> {
+        detect_list_files_source_requests(&parse_r(code), code)
+    }
+
+    #[test]
+    fn detects_bounded_top_level_list_files_source_loops() {
+        for (code, expected_line) in [
+            (
+                r#"files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+                   for (file in files) source(file)"#,
+                1,
+            ),
+            (
+                r#"files = base::list.files(path = "functions", full.names = TRUE, pattern = "\\.R$")
+                   # comments do not break adjacency
+                   for (file in files) { base:::source(file) }"#,
+                2,
+            ),
+        ] {
+            let requests = list_files_requests(code);
+            assert_eq!(requests.len(), 1, "{code}: {requests:?}");
+            assert_eq!(requests[0].directory, "functions");
+            assert_eq!(requests[0].line, expected_line);
+        }
+    }
+
+    #[test]
+    fn list_files_source_loops_fail_closed_outside_the_bounded_shape() {
+        for code in [
+            r#"files <- list.files("functions", pattern = "\\.R$")
+               for (file in files) source(file)"#,
+            r#"files <- list.files("functions", pattern = "\\.R$", full.names = FALSE)
+               for (file in files) source(file)"#,
+            r#"files <- list.files("functions", pattern = "\\.[Rr]$", full.names = TRUE)
+               for (file in files) source(file)"#,
+            r#"files <- list.files(directory, pattern = "\\.R$", full.names = TRUE)
+               for (file in files) source(file)"#,
+            r#"files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+               message("intervening")
+               for (file in files) source(file)"#,
+            r#"files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+               for (file in files) { source(file); message(file) }"#,
+            r#"files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+               for (file in files) source(file, chdir = FALSE)"#,
+            r#"source <- function(...) NULL
+               files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+               for (file in files) source(file)"#,
+            r#"list.files <- function(...) "wrong.R"
+               files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+               for (file in files) source(file)"#,
+            r#"files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+               for (file in other) source(file)"#,
+            r#"files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+               for (source in files) source(source)"#,
+            r#"f <- function() {
+                 files <- list.files("functions", pattern = "\\.R$", full.names = TRUE)
+                 for (file in files) source(file)
+               }"#,
+        ] {
+            assert!(
+                list_files_requests(code).is_empty(),
+                "{code}: {:?}",
+                list_files_requests(code)
+            );
+        }
     }
 
     #[test]
