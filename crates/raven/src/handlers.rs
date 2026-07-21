@@ -6393,8 +6393,8 @@ fn library_call_activation_satisfied(
 fn missing_package_message(package: &str, outside_active_renv: bool) -> String {
     if outside_active_renv {
         format!(
-            "Package '{package}' is available outside this active renv project library, \
-             but is unavailable here; run renv::restore() or install it into the project library"
+            "Package '{package}' is installed outside this active renv project library; \
+             run renv::hydrate() to add installed packages to the project library."
         )
     } else {
         format!("No installed package named '{package}'")
@@ -54994,10 +54994,11 @@ pacman::p_load(__qualified_missing_package__)";
                     crate::diagnostic_code::PACKAGE_OUTSIDE_ACTIVE_LIBRARY.to_string(),
                 ))
         }));
-        assert!(diagnostics.iter().all(|diagnostic| {
-            diagnostic.message.contains("active renv project library")
-                && diagnostic.message.contains("renv::restore()")
-        }));
+        assert_eq!(
+            diagnostics[0].message,
+            "Package 'plotpkg' is installed outside this active renv project library; \
+             run renv::hydrate() to add installed packages to the project library."
+        );
     }
 
     fn outside_active_export_diagnostics(
