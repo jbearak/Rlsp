@@ -41,6 +41,15 @@ Cross-file awareness ([Cross-File Analysis](./cross-file.md)) reads only chunk b
 
 The relationship also works in the other direction: a plain `.R` file can declare `# raven: sourced-by analysis.Rmd`, and Raven will read the Rmd's chunks (not its prose) to supply the helper's inherited scope. `.Rmd` / `.Rmarkdown` / `.qmd` files are not added to the proactive workspace scan, so this incoming direction is established by the directive on the `.R` file, or by opening the Rmd itself.
 
+A targets pipeline can also connect a document through a literal
+`tarchetypes::tar_render()`, `tar_knit()`, or single-document `tar_quarto()`
+path. In that relationship the document does **not** inherit ordinary pipeline
+variables or packages. Instead, its R chunks share only the pipeline's static
+target-name authority: `targets::tar_read(model)` and statically enumerable
+`tar_load()` names are diagnosed and navigable against declarations in the
+pipeline. See [Cross-file awareness — tarchetypes target factories and report
+documents](./cross-file.md#tarchetypes-target-factories-and-report-documents).
+
 ### Suppressing diagnostics in a chunk
 
 Two ways to silence Raven's diagnostics for an entire chunk:

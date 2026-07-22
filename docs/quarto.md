@@ -49,6 +49,16 @@ Quarto Preview and Render are available when Raven's R-session features are
 enabled through `raven.rConsole.activation`. Because Quarto may execute code
 from the document, both commands require a trusted workspace.
 
+Separately from preview/render, the language server recognizes a literal
+single-document `tarchetypes::tar_quarto()` path ending in `.qmd`, `.Rmd`, or
+`.Rmarkdown`. It connects that document to the targets pipeline for static
+target-name diagnostics and navigation: `tar_read()` and statically enumerable
+`tar_load()` references in R chunks resolve against pipeline declarations, but
+ordinary pipeline variables and packages do not leak into the document. Quarto
+project-directory paths and computed paths are deliberately not inferred. This
+analysis never invokes Quarto or tarchetypes. See [Cross-file awareness —
+tarchetypes target factories and report documents](cross-file.md#tarchetypes-target-factories-and-report-documents).
+
 ## Requirements and Quarto discovery
 
 Install the [Quarto CLI](https://quarto.org/docs/get-started/) on the machine

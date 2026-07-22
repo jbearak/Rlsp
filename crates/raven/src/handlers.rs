@@ -149,6 +149,11 @@ pub(crate) struct DiagnosticsSnapshot {
     // Pre-collected scope data for all reachable files
     pub artifacts_map: HashMap<Url, Arc<scope::ScopeArtifacts>>,
     pub metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    /// Non-empty static target namespace reachable from every authoritative URI
+    /// spelling of this document. `None` also covers traversal truncation, so
+    /// diagnostics fail closed rather than declaring a runtime-store target
+    /// missing from an incomplete static neighborhood.
+    pub target_authority_names: Option<HashSet<String>>,
 
     // Cycle detection result (pre-computed from the full graph, not the trimmed subgraph,
     // so cycles longer than max_chain_depth are still detected)
@@ -508,7 +513,13 @@ impl DiagnosticsSnapshot {
         let mut directive_meta = state
             .get_enriched_metadata(uri)
             .map(std::sync::Arc::unwrap_or_clone)
-            .unwrap_or_else(|| crate::cross_file::extract_metadata_with_tree(&text, Some(&tree)));
+            .unwrap_or_else(|| {
+                crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
+                    doc.chunk_kind,
+                    &text,
+                    Some(&tree),
+                )
+            });
         let metadata_elapsed = build_start.elapsed();
 
         // F2 Step 4: chunk-level suppression for Rmd/Quarto. The chunk header
@@ -545,6 +556,8 @@ impl DiagnosticsSnapshot {
                 .cached_neighborhood_subgraph(uri, max_depth, max_visited);
         let neighborhood_elapsed = neighborhood_start.elapsed();
         let content_provider = state.content_provider_with_documents(open_documents);
+        let target_authority_names =
+            collect_target_authority_names(state, uri, &content_provider, max_depth, max_visited);
         // The dependency graph remains URI-global, but ordered tar execution
         // may reach one provider URI under multiple PathContexts. Collect the
         // ordinary graph-prefix-to-tar closure for every snapshot so LSP and
@@ -684,6 +697,7 @@ impl DiagnosticsSnapshot {
             any_nse_or_func_directives,
             artifacts_map,
             metadata_map,
+            target_authority_names,
             cycle_detection,
             cycle_closing_snippet,
             package_library: state.package_library.clone(),
@@ -922,6 +936,21 @@ pub(crate) fn diagnostics_from_snapshot(
 
     // Missing file diagnostics (sync check from snapshot metadata)
     collect_missing_file_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
+
+    // Explicit target-name reads use a separate namespace from ordinary R
+    // bindings. Resolve them against the connected pipeline/report authority set.
+    if let Some(severity) = snapshot.cross_file_config.undefined_variable_severity {
+        collect_missing_target_reference_diagnostics(
+            snapshot,
+            severity,
+            &mut diagnostics,
+            if track_unused {
+                Some(&mut suppressed_pairs)
+            } else {
+                None
+            },
+        );
+    }
 
     // Static `box::use()` module/export diagnostics.
     collect_box_import_diagnostics_from_snapshot(
@@ -6144,6 +6173,96 @@ fn collect_max_depth_diagnostics_from_snapshot(
     }
 }
 
+/// Snapshot the statically known target namespace from every authoritative URI
+/// spelling of `uri` while the state lock is held.
+///
+/// Each root gets its own bounded cached neighborhood so a symlink/case alias can
+/// discover the canonical pipeline edge. Any truncated root fails closed. The
+/// provider is alias-aware, so canonical graph members still read live-buffer
+/// metadata when an equivalent document is open.
+fn collect_target_authority_names(
+    state: &WorldState,
+    uri: &Url,
+    provider: &impl ContentProvider,
+    max_depth: usize,
+    max_visited: usize,
+) -> Option<HashSet<String>> {
+    let mut names = HashSet::new();
+    for root in state.authoritative_revalidation_roots_for_uri(uri) {
+        let payload =
+            state
+                .cross_file_graph
+                .cached_neighborhood_subgraph(&root, max_depth, max_visited);
+        if payload.truncation.is_truncated() {
+            return None;
+        }
+        for member in payload
+            .subgraph
+            .target_authority_providers(&root, max_depth, max_visited)
+        {
+            let Some(metadata) = provider.get_metadata(&member) else {
+                continue;
+            };
+            names.extend(
+                metadata
+                    .target_declarations
+                    .iter()
+                    .map(|declaration| declaration.name.clone()),
+            );
+        }
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+fn target_names_from_snapshot(snapshot: &DiagnosticsSnapshot) -> Option<&HashSet<String>> {
+    snapshot.target_authority_names.as_ref()
+}
+
+fn collect_missing_target_reference_diagnostics(
+    snapshot: &DiagnosticsSnapshot,
+    severity: DiagnosticSeverity,
+    diagnostics: &mut Vec<Diagnostic>,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
+) {
+    let Some(target_names) = target_names_from_snapshot(snapshot) else {
+        return;
+    };
+    for reference in &snapshot.directive_meta.target_references {
+        if target_names.contains(&reference.name) {
+            continue;
+        }
+        let suppressed = crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            reference.line,
+            Some(crate::diagnostic_code::UNDEFINED_VARIABLE),
+        );
+        if suppressed {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((
+                    reference.line,
+                    crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+                ));
+            }
+            continue;
+        }
+        diagnostics.push(Diagnostic {
+            range: Range::new(
+                Position::new(reference.line, reference.column),
+                Position::new(reference.line, reference.end_column),
+            ),
+            severity: Some(severity),
+            message: format!(
+                "Target '{}' is not declared in the connected targets pipeline",
+                reference.name
+            ),
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string(),
+            )),
+            ..Default::default()
+        });
+    }
+}
+
 fn collect_missing_file_diagnostics_from_snapshot(
     snapshot: &DiagnosticsSnapshot,
     uri: &Url,
@@ -6187,6 +6306,26 @@ fn collect_missing_file_diagnostics_from_snapshot(
                 },
                 severity: Some(severity),
                 message,
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                )),
+                ..Default::default()
+            });
+        }
+    }
+
+    for link in &meta.tarchetypes_document_links {
+        let resolved = forward_ctx.as_ref().and_then(|ctx| {
+            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&link.path, ctx)
+        });
+        if resolved.as_ref().is_none_or(|path| !path.exists()) {
+            diagnostics.push(Diagnostic {
+                range: Range::new(
+                    Position::new(link.line, link.column),
+                    Position::new(link.line, link.end_column),
+                ),
+                severity: Some(severity),
+                message: format!("Cannot resolve report document: '{}'", link.path),
                 code: Some(NumberOrString::String(
                     crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
                 )),
@@ -8917,6 +9056,7 @@ fn is_structural_non_reference(node: Node, text: &str) -> bool {
         || is_structural_label(node)
         || is_static_box_declaration_identifier(node, text)
         || is_static_import_declaration_identifier(node, text)
+        || crate::cross_file::targets::is_qualified_target_declaration_name(node, text)
 }
 
 /// Returns true when `node` is a default-parameter-expression identifier that
@@ -22702,6 +22842,98 @@ fn import_module_spec_definition(
     })
 }
 
+fn tarchetypes_document_definition(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    metadata: &crate::cross_file::CrossFileMetadata,
+) -> Option<Location> {
+    let link = metadata.tarchetypes_document_links.iter().find(|link| {
+        position.line == link.line
+            && position.character >= link.column
+            && position.character <= link.end_column
+    })?;
+    let context = crate::cross_file::path_resolve::PathContext::from_metadata(
+        uri,
+        metadata,
+        state.workspace_folders.first(),
+    )?;
+    let path = crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+        &link.path, &context,
+    )?;
+    if !path.exists() {
+        return None;
+    }
+    let resolved_uri = crate::cross_file::path_resolve::path_to_uri(&path)?;
+    Some(Location {
+        uri: state
+            .open_document_uri_for_authoritative_uri(&resolved_uri)
+            .unwrap_or(resolved_uri),
+        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+    })
+}
+
+fn target_reference_definition(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    metadata: &crate::cross_file::CrossFileMetadata,
+) -> Option<Location> {
+    let reference = metadata.target_references.iter().find(|reference| {
+        position.line == reference.line
+            && position.character >= reference.column
+            && position.character <= reference.end_column
+    })?;
+    let provider = state.content_provider();
+    let mut definitions = Vec::new();
+    for root in state.authoritative_revalidation_roots_for_uri(uri) {
+        for member in state.cross_file_graph.target_authority_providers(
+            &root,
+            state.cross_file_config.max_chain_depth,
+            state.cross_file_config.max_transitive_dependents_visited,
+        ) {
+            let member_metadata = if member == *uri {
+                Some(std::sync::Arc::new(metadata.clone()))
+            } else {
+                provider.get_metadata(&member)
+            };
+            let Some(member_metadata) = member_metadata else {
+                continue;
+            };
+            let location_uri = state
+                .open_document_uri_for_authoritative_uri(&member)
+                .unwrap_or_else(|| member.clone());
+            definitions.extend(
+                member_metadata
+                    .target_declarations
+                    .iter()
+                    .filter(|declaration| declaration.name == reference.name)
+                    .map(|declaration| Location {
+                        uri: location_uri.clone(),
+                        range: Range::new(
+                            Position::new(declaration.line, declaration.column),
+                            Position::new(declaration.line, declaration.end_column),
+                        ),
+                    }),
+            );
+        }
+    }
+    definitions.sort_by(|left, right| {
+        (
+            left.uri.as_str(),
+            left.range.start.line,
+            left.range.start.character,
+        )
+            .cmp(&(
+                right.uri.as_str(),
+                right.range.start.line,
+                right.range.start.character,
+            ))
+    });
+    definitions.dedup();
+    definitions.into_iter().next()
+}
+
 pub fn goto_definition(
     state: &WorldState,
     uri: &Url,
@@ -22769,6 +23001,18 @@ pub fn goto_definition_with_cancel(
         ) {
             return Some(GotoDefinitionResponse::Scalar(location));
         }
+    }
+
+    // Literal tarchetypes report paths and explicit target-name reads are
+    // metadata-backed navigation surfaces. Check them before ordinary R symbol
+    // resolution because target names intentionally occupy a separate namespace.
+    if let Some(metadata) = state
+        .get_enriched_metadata(uri)
+        .or_else(|| content_provider.get_metadata(uri))
+        && let Some(location) = tarchetypes_document_definition(state, uri, position, &metadata)
+            .or_else(|| target_reference_definition(state, uri, position, &metadata))
+    {
+        return Some(GotoDefinitionResponse::Scalar(location));
     }
 
     let point = lsp_position_to_ts_point(&text, position);
@@ -62499,6 +62743,41 @@ source(\"helpers.R\")
     }
 
     #[test]
+    fn test_is_structural_non_reference_qualified_target_declarations() {
+        check_predicate(
+            "targets::tar_target(model, command_value)\n",
+            "model",
+            0,
+            true,
+        );
+        check_predicate(
+            "targets::tar_target(model, command_value)\n",
+            "command_value",
+            0,
+            false,
+        );
+        check_predicate(
+            "tarchetypes::tar_render(report, path_value)\n",
+            "report",
+            0,
+            true,
+        );
+        check_predicate(
+            "tarchetypes::tar_render(report, path_value)\n",
+            "path_value",
+            0,
+            false,
+        );
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_bare_factory_can_be_user_defined() {
+        let code = "tar_render <- function(...) NULL\ntar_render(user_target, command_value)\n";
+        check_predicate(code, "user_target", 0, false);
+        check_predicate(code, "command_value", 0, false);
+    }
+
+    #[test]
     fn test_is_structural_non_reference_static_box_declarations() {
         let use_code = "box::use(./mod[attached = public, computed()])\n";
         check_predicate(use_code, "mod", 0, true);
@@ -72278,6 +72557,317 @@ mod issue_459_backtick_navigation_tests {
         assert!(
             text.contains("fruit <- list(`macintosh apple` = 1)"),
             "hover should show the construction statement; got: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tarchetypes_target_integration_tests {
+    use super::{DiagCancelToken, DiagnosticsSnapshot, diagnostics_from_snapshot, goto_definition};
+    use crate::state::{Document, WorldState};
+    use tower_lsp::lsp_types::{GotoDefinitionResponse, Position, Url};
+
+    fn insert_document(state: &mut WorldState, uri: &Url, text: &str) {
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(text, None, uri));
+        let metadata = crate::cross_file::extract_metadata_for_path(uri.path(), text);
+        state
+            .cross_file_graph
+            .update_file(uri, &metadata, state.workspace_folders.first(), |_| None);
+    }
+
+    #[test]
+    fn connected_rmd_uses_pipeline_target_authority_for_diagnostics_and_goto() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = Url::from_file_path(temp.path()).unwrap();
+        let pipeline = Url::from_file_path(temp.path().join("_targets.R")).unwrap();
+        let report = Url::from_file_path(temp.path().join("report.Rmd")).unwrap();
+        let report_helper = Url::from_file_path(temp.path().join("report-helper.R")).unwrap();
+        let pipeline_text = "targets::tar_target(model, 1)\n\
+                             tarchetypes::tar_render(report, \"report.Rmd\")\n";
+        let report_text = "```{r}\n\
+                           source(\"report-helper.R\")\n\
+                           targets::tar_read(model)\n\
+                           targets::tar_load(missing)\n\
+                           targets::tar_target(fake, 1)\n\
+                           targets::tar_read(fake)\n\
+                           targets::tar_read(helper_only)\n\
+                           ```\n";
+        let report_helper_text = "targets::tar_target(helper_only, 1)\n";
+        std::fs::write(pipeline.to_file_path().unwrap(), pipeline_text).unwrap();
+        std::fs::write(report.to_file_path().unwrap(), report_text).unwrap();
+        std::fs::write(report_helper.to_file_path().unwrap(), report_helper_text).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root];
+        state.workspace_scan_complete = true;
+        insert_document(&mut state, &pipeline, pipeline_text);
+        insert_document(&mut state, &report, report_text);
+        insert_document(&mut state, &report_helper, report_helper_text);
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &report).expect("report snapshot");
+        let diagnostics = diagnostics_from_snapshot(&snapshot, &report, &DiagCancelToken::never())
+            .expect("report diagnostics");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("Target 'missing' is not declared")),
+            "missing target diagnostic absent: {diagnostics:?}"
+        );
+        assert!(
+            !diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("Target 'model' is not declared")),
+            "pipeline target must be authoritative in the report: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Target 'fake' is not declared")),
+            "constructing a target in a report chunk must not declare it: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("Target 'helper_only' is not declared")),
+            "a helper sourced only while rendering must not lend target authority: {diagnostics:?}"
+        );
+
+        let metadata = crate::cross_file::extract_metadata_for_path(report.path(), report_text);
+        assert!(metadata.target_declarations.is_empty());
+        let model = metadata
+            .target_references
+            .iter()
+            .find(|reference| reference.name == "model")
+            .unwrap();
+        let response = goto_definition(&state, &report, Position::new(model.line, model.column))
+            .expect("target reference definition");
+        let GotoDefinitionResponse::Scalar(location) = response else {
+            panic!("expected scalar target definition")
+        };
+        assert_eq!(location.uri, pipeline);
+        assert_eq!(location.range.start.line, 0);
+    }
+
+    #[test]
+    fn connected_qmd_recognizes_tar_read_and_tar_load_references() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = Url::from_file_path(temp.path()).unwrap();
+        let pipeline = Url::from_file_path(temp.path().join("_targets.R")).unwrap();
+        let report = Url::from_file_path(temp.path().join("report.qmd")).unwrap();
+        let pipeline_text = "targets::tar_target(model, 1)\n\
+                             tarchetypes::tar_quarto(report, \"report.qmd\")\n";
+        let report_text = "```{r}\n\
+                           targets::tar_read(model)\n\
+                           targets::tar_load(c(model, missing))\n\
+                           ```\n";
+        std::fs::write(pipeline.to_file_path().unwrap(), pipeline_text).unwrap();
+        std::fs::write(report.to_file_path().unwrap(), report_text).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root];
+        state.workspace_scan_complete = true;
+        insert_document(&mut state, &pipeline, pipeline_text);
+        insert_document(&mut state, &report, report_text);
+
+        let metadata = crate::cross_file::extract_metadata_for_path(report.path(), report_text);
+        assert_eq!(
+            metadata
+                .target_references
+                .iter()
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model", "model", "missing"]
+        );
+        let snapshot = DiagnosticsSnapshot::build(&state, &report).expect("QMD snapshot");
+        let diagnostics = diagnostics_from_snapshot(&snapshot, &report, &DiagCancelToken::never())
+            .expect("QMD diagnostics");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("Target 'missing'"))
+                .count(),
+            1,
+            "missing tar_load target should be diagnosed once: {diagnostics:?}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Target 'model'")),
+            "both QMD target references should resolve through the pipeline: {diagnostics:?}"
+        );
+
+        for reference in metadata
+            .target_references
+            .iter()
+            .filter(|reference| reference.name == "model")
+        {
+            let response = goto_definition(
+                &state,
+                &report,
+                Position::new(reference.line, reference.column),
+            )
+            .expect("QMD target reference definition");
+            let GotoDefinitionResponse::Scalar(location) = response else {
+                panic!("expected scalar QMD target definition")
+            };
+            assert_eq!(location.uri, pipeline);
+            assert_eq!(location.range.start.line, 0);
+        }
+    }
+
+    #[test]
+    fn connected_report_alias_uses_canonical_authority_and_live_navigation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = Url::from_file_path(temp.path()).unwrap();
+        let pipeline = Url::from_file_path(temp.path().join("_targets.R")).unwrap();
+        let canonical_report = Url::from_file_path(temp.path().join("report.qmd")).unwrap();
+        let alias_report = Url::from_file_path(temp.path().join("report-alias.qmd")).unwrap();
+        let pipeline_text = "targets::tar_target(model, 1)\n\
+                             tarchetypes::tar_quarto(report, \"report.qmd\")\n";
+        let report_text = "```{r}\ntargets::tar_read(model)\n```\n";
+        std::fs::write(pipeline.to_file_path().unwrap(), pipeline_text).unwrap();
+        std::fs::write(canonical_report.to_file_path().unwrap(), report_text).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root];
+        state.workspace_scan_complete = true;
+        insert_document(&mut state, &pipeline, pipeline_text);
+        insert_document(&mut state, &alias_report, report_text);
+        state
+            .open_document_aliases
+            .open(alias_report.clone(), vec![canonical_report.clone()]);
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &alias_report).unwrap();
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &alias_report, &DiagCancelToken::never()).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("Target 'model'")),
+            "the canonical report edge must authorize its live alias: {diagnostics:?}"
+        );
+
+        let report_metadata =
+            crate::cross_file::extract_metadata_for_path(alias_report.path(), report_text);
+        let reference = report_metadata.target_references.first().unwrap();
+        let response = goto_definition(
+            &state,
+            &alias_report,
+            Position::new(reference.line, reference.column),
+        )
+        .unwrap();
+        let GotoDefinitionResponse::Scalar(location) = response else {
+            panic!("expected scalar target definition")
+        };
+        assert_eq!(location.uri, pipeline);
+
+        let pipeline_metadata = crate::cross_file::extract_metadata(pipeline_text);
+        let link = pipeline_metadata
+            .tarchetypes_document_links
+            .first()
+            .unwrap();
+        let response =
+            goto_definition(&state, &pipeline, Position::new(link.line, link.column)).unwrap();
+        let GotoDefinitionResponse::Scalar(location) = response else {
+            panic!("expected scalar report definition")
+        };
+        assert_eq!(
+            location.uri, alias_report,
+            "path navigation should prefer the live alias over the canonical closed URI"
+        );
+    }
+
+    #[test]
+    fn standalone_targets_reads_do_not_assume_static_pipeline_authority() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = Url::from_file_path(temp.path()).unwrap();
+        let script = Url::from_file_path(temp.path().join("analysis.R")).unwrap();
+        let text = "targets::tar_read(model)\n";
+        std::fs::write(script.to_file_path().unwrap(), text).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root];
+        state.workspace_scan_complete = true;
+        insert_document(&mut state, &script, text);
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &script).expect("script snapshot");
+        let diagnostics = diagnostics_from_snapshot(&snapshot, &script, &DiagCancelToken::never())
+            .expect("script diagnostics");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("Target 'model'")),
+            "a standalone store read has no static pipeline authority: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn literal_report_path_navigates_and_missing_report_is_diagnosed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = Url::from_file_path(temp.path()).unwrap();
+        let pipeline = Url::from_file_path(temp.path().join("_targets.R")).unwrap();
+        let report = Url::from_file_path(temp.path().join("report.qmd")).unwrap();
+        let pipeline_text = "tarchetypes::tar_quarto(report, \"report.qmd\")\n";
+        std::fs::write(pipeline.to_file_path().unwrap(), pipeline_text).unwrap();
+        std::fs::write(report.to_file_path().unwrap(), "```{r}\n1\n```\n").unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root.clone()];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.missing_file_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        insert_document(&mut state, &pipeline, pipeline_text);
+        insert_document(&mut state, &report, "```{r}\n1\n```\n");
+        let metadata = crate::cross_file::extract_metadata(pipeline_text);
+        let link = metadata.tarchetypes_document_links.first().unwrap();
+        let response = goto_definition(&state, &pipeline, Position::new(link.line, link.column))
+            .expect("report path definition");
+        let GotoDefinitionResponse::Scalar(location) = response else {
+            panic!("expected scalar report definition")
+        };
+        assert_eq!(location.uri, report);
+
+        let missing_pipeline = Url::from_file_path(temp.path().join("missing-targets.R")).unwrap();
+        let missing_text = "tarchetypes::tar_render(report, \"missing.Rmd\")\n";
+        std::fs::write(missing_pipeline.to_file_path().unwrap(), missing_text).unwrap();
+        insert_document(&mut state, &missing_pipeline, missing_text);
+        assert_eq!(
+            crate::cross_file::extract_metadata(missing_text)
+                .tarchetypes_document_links
+                .len(),
+            1
+        );
+        let snapshot = DiagnosticsSnapshot::build(&state, &missing_pipeline).unwrap();
+        assert_eq!(
+            snapshot.cross_file_config.missing_file_severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+        );
+        let context = crate::cross_file::path_resolve::PathContext::from_metadata(
+            &missing_pipeline,
+            &snapshot.directive_meta,
+            state.workspace_folders.first(),
+        )
+        .unwrap();
+        assert!(
+            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                "missing.Rmd",
+                &context,
+            )
+            .is_some_and(|path| !path.exists())
+        );
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &missing_pipeline, &DiagCancelToken::never())
+                .unwrap();
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("Cannot resolve report document: 'missing.Rmd'")
+            }),
+            "missing report diagnostics: {diagnostics:?}; metadata: {:?}",
+            snapshot.directive_meta.tarchetypes_document_links
         );
     }
 }

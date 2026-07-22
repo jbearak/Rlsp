@@ -6340,6 +6340,7 @@ async fn replay_open_documents_after_workspace_index_apply(
                 let metadata = extract_enriched_live_metadata(
                     &state,
                     &uri,
+                    record.document().chunk_kind,
                     &record.document().analysis_text(),
                 );
                 Some((uri, record.generation(), metadata))
@@ -9783,17 +9784,20 @@ fn collect_backward_parent_content_with(
 fn extract_enriched_live_metadata(
     state: &WorldState,
     uri: &Url,
+    chunk_kind: crate::chunks::ChunkKind,
     analysis_text: &str,
 ) -> crate::cross_file::CrossFileMetadata {
-    extract_enriched_live_metadata_with_contexts(state, uri, analysis_text).0
+    extract_enriched_live_metadata_with_contexts(state, uri, chunk_kind, analysis_text).0
 }
 
 fn extract_enriched_live_metadata_with_contexts(
     state: &WorldState,
     uri: &Url,
+    chunk_kind: crate::chunks::ChunkKind,
     analysis_text: &str,
 ) -> (crate::cross_file::CrossFileMetadata, Vec<Url>) {
-    let mut meta = crate::cross_file::extract_metadata(analysis_text);
+    let mut meta =
+        crate::cross_file::extract_metadata_from_analysis_for_kind(chunk_kind, analysis_text);
     let workspace_root = state.workspace_folders.first().cloned();
     let max_chain_depth = state.cross_file_config.max_chain_depth;
     let attempted = std::cell::RefCell::new(Vec::new());
@@ -10039,6 +10043,7 @@ fn prepare_open_graph_plan(
 }
 
 struct CapturedOpenEditFallback {
+    chunk_kind: crate::chunks::ChunkKind,
     analysis_text: String,
     precomputed_metadata: Option<crate::cross_file::CrossFileMetadata>,
     old_metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
@@ -10103,6 +10108,7 @@ fn capture_open_edit_fallback(
     plan.seed_revalidation_uris
         .extend(state.documents.keys().cloned());
     CapturedOpenEditFallback {
+        chunk_kind: prepared.document().chunk_kind,
         analysis_text: prepared.document().analysis_text(),
         precomputed_metadata: None,
         old_metadata,
@@ -10128,7 +10134,10 @@ fn derive_open_edit_fallback(
     captured: CapturedOpenEditFallback,
 ) -> (crate::cross_file::CrossFileMetadata, PreparedOpenCommitPlan) {
     let mut local_metadata = captured.precomputed_metadata.unwrap_or_else(|| {
-        let mut metadata = crate::cross_file::extract_metadata(&captured.analysis_text);
+        let mut metadata = crate::cross_file::extract_metadata_from_analysis_for_kind(
+            captured.chunk_kind,
+            &captured.analysis_text,
+        );
         crate::cross_file::resolve_system_file_sources(
             &mut metadata,
             captured.workspace_name.as_deref(),
@@ -10545,9 +10554,14 @@ async fn commit_detached_live_package_open_edit(
         let (mut metadata, attempted_contexts, workspace_root, exclusions) = {
             let state = state_arc.read().await;
             prepared = state.rebase_open_edit_if_subject_current(prepared)?;
-            let text = prepared.document().analysis_text();
-            let (metadata, attempted_contexts) =
-                extract_enriched_live_metadata_with_contexts(&state, uri, &text);
+            let document = prepared.document();
+            let text = document.analysis_text();
+            let (metadata, attempted_contexts) = extract_enriched_live_metadata_with_contexts(
+                &state,
+                uri,
+                document.chunk_kind,
+                &text,
+            );
             (
                 metadata,
                 attempted_contexts,
@@ -11247,7 +11261,11 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
         let analysis =
             crate::cross_file::analysis_text_for_kind(captured.chunk_kind, &content).into_owned();
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(&analysis, None));
-        let mut metadata = crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
+        let mut metadata = crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
+            captured.chunk_kind,
+            &analysis,
+            tree.as_ref(),
+        );
         crate::cross_file::resolve_system_file_sources(
             &mut metadata,
             captured.system_file_workspace_name.as_deref(),
@@ -11799,7 +11817,10 @@ fn derive_open_install_analysis(
         })
     };
     let analysis_text = captured.document.analysis_text();
-    let mut metadata = crate::cross_file::extract_metadata(&analysis_text);
+    let mut metadata = crate::cross_file::extract_metadata_from_analysis_for_kind(
+        captured.document.chunk_kind,
+        &analysis_text,
+    );
     if !local_only {
         crate::cross_file::enrich_metadata_with_inherited_wd(
             &mut metadata,
@@ -12238,7 +12259,10 @@ fn derive_open_metadata_reenrichment(
         })
     };
 
-    let mut metadata = crate::cross_file::extract_metadata(&captured.analysis_text);
+    let mut metadata = crate::cross_file::extract_metadata_from_analysis_for_kind(
+        captured.chunk_kind,
+        &captured.analysis_text,
+    );
     crate::cross_file::enrich_metadata_with_inherited_wd(
         &mut metadata,
         &captured.uri,
@@ -13298,8 +13322,11 @@ async fn resync_file_from_disk(
     // artifacts from the same tree.
     let analysis = crate::cross_file::analysis_text_for_kind(effective_chunk_kind, &content);
     let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None));
-    let mut cross_file_meta =
-        crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
+    let mut cross_file_meta = crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
+        effective_chunk_kind,
+        &analysis,
+        tree.as_ref(),
+    );
 
     let snapshot =
         crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
@@ -18392,8 +18419,11 @@ impl LanguageServer for Backend {
             let state = self.state.read().await;
             let prepared = state.prepare_document_changes(&uri, changes.clone(), version);
             let detached_analysis_affected = prepared.as_ref().is_some_and(|prepared| {
-                let metadata =
-                    crate::cross_file::extract_metadata(&prepared.document().analysis_text());
+                let document = prepared.document();
+                let metadata = crate::cross_file::extract_metadata_from_analysis_for_kind(
+                    document.chunk_kind,
+                    &document.analysis_text(),
+                );
                 metadata.has_source_batch_topology()
                     || !metadata.box_imports.is_empty()
                     || !metadata.import_calls.is_empty()
@@ -18535,9 +18565,15 @@ impl LanguageServer for Backend {
                         log::warn!("Ignoring didChange for unopened document {uri}");
                         return;
                     };
-                    let analysis_text = prepared.document().analysis_text();
+                    let document = prepared.document();
+                    let analysis_text = document.analysis_text();
                     let (meta, mut attempted_contexts) =
-                        extract_enriched_live_metadata_with_contexts(&state, &uri, &analysis_text);
+                        extract_enriched_live_metadata_with_contexts(
+                            &state,
+                            &uri,
+                            document.chunk_kind,
+                            &analysis_text,
+                        );
                     let mut files_to_index = if on_demand_enabled {
                         source_targets_to_index_for_live_diagnostics(
                             &state,
@@ -18667,9 +18703,14 @@ impl LanguageServer for Backend {
 
                 // Extract and enrich metadata from the prepared document's exact
                 // analysis view, then atomically install one coherent record.
-                let text = prepared.document().analysis_text();
-                let (meta, mut attempted_contexts) =
-                    extract_enriched_live_metadata_with_contexts(&state, &uri, &text);
+                let document = prepared.document();
+                let text = document.analysis_text();
+                let (meta, mut attempted_contexts) = extract_enriched_live_metadata_with_contexts(
+                    &state,
+                    &uri,
+                    document.chunk_kind,
+                    &text,
+                );
                 let workspace_root = state.workspace_folders.first().cloned();
                 let packages_to_prefetch: Vec<String> = if packages_enabled {
                     let mut packages = edited_document_warm_packages(&meta, prepared.document());
@@ -21714,7 +21755,11 @@ impl Backend {
         let analysis_text: &str = &analysis_text_cow;
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis_text, None));
         let mut cross_file_meta =
-            crate::cross_file::extract_metadata_with_tree(analysis_text, tree.as_ref());
+            crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
+                chunk_kind,
+                analysis_text,
+                tree.as_ref(),
+            );
 
         let (
             workspace_root,
@@ -22235,7 +22280,11 @@ impl Backend {
         let analysis_text: &str = &analysis_text_cow;
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis_text, None));
         let mut cross_file_meta =
-            crate::cross_file::extract_metadata_with_tree(analysis_text, tree.as_ref());
+            crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
+                chunk_kind,
+                analysis_text,
+                tree.as_ref(),
+            );
         if cross_file_meta.working_directory.is_none()
             && cross_file_meta.inherited_working_directory.is_none()
         {

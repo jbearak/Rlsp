@@ -441,6 +441,121 @@ When separate executions truly need distinct nested batches, directives, NSE
 contracts, navigation, or edit revalidation, route them through distinct small
 wrapper/loader scripts so each execution has its own URI.
 
+### tarchetypes target factories and report documents
+
+Raven extends the same static `{targets}` pipeline model to common
+[`{tarchetypes}`](https://docs.ropensci.org/tarchetypes/) archetypes. Target
+names form a separate namespace from ordinary R variables: a declaration can
+satisfy `tar_read()` / `tar_load()` without making the name an R binding, and a
+report relationship never lends the pipeline's ordinary variables, packages,
+or `# raven: nse` / `# raven: func` declarations into the document.
+
+Direct `targets::` / `targets:::` and `tarchetypes::` / `tarchetypes:::` calls
+are recognized without an attachment. A bare call requires the corresponding
+package to be attached by a top-level `library()` / `require()` and no local
+binding may shadow the callee. User-defined same-named functions therefore keep
+ordinary R semantics. Aliases and programmatic invocation are not followed.
+
+#### Static target declarations
+
+Raven records direct symbol names from `targets::tar_target()` and these
+statically modelled tarchetypes factories:
+
+- storage/file factories: `tar_url()`, `tar_file()`, `tar_file_fast()`,
+  `tar_rds()`, `tar_qs()`, `tar_keras()`, `tar_torch()`,
+  `tar_arrow_feather()`, `tar_parquet()`, `tar_fst()` and its data-frame/data-
+  table/tibble variants, `tar_nanoparquet()`, and the superseded `tar_aws_*()`
+  variants;
+- control/group factories: `tar_file_read()` (the requested name plus its
+  `_file` helper), `tar_change()` and `tar_force()` (the requested name plus
+  their `_change` helper), `tar_skip()`, `tar_group_by()`, `tar_group_select()`,
+  `tar_group_count()`, `tar_group_size()`, and `tar_combine()`;
+- document factories: `tar_render()`, `tar_knit()`, and `tar_quarto()`.
+
+`tar_plan()` contributes each exact named argument as a target declaration:
+
+```r
+tarchetypes::tar_plan(
+  prepared = clean(raw_data),
+  tarchetypes::tar_render(report, "report.Rmd")
+)
+```
+
+The named command is delayed code. Unnamed factory objects remain independently
+analyzable, so their own target and path policies still apply. Partial argument
+matching, missing values, computed names, and calls inside functions or quoted
+code fail closed.
+
+#### Static `tar_map()` names
+
+For `tar_map()`, Raven records only the generated declarations that exist at
+runtime; the unsuffixed target objects supplied through `...` are not separate
+pipeline targets. Generated declarations are predicted only for a bounded
+literal table grammar:
+
+- `values` is a literal `list()`, `data.frame()`, or `tibble()` call (including
+  the corresponding direct namespace-qualified constructor);
+- every column is explicitly and uniquely named and contains scalar literals or
+  an unshadowed literal `c(...)` vector of strings, integers, booleans, or simple
+  decimal numbers whose R character spelling is unambiguous; constructor controls
+  such as `data.frame(check.names = ...)` and `tibble(.name_repair = ...)` fail
+  closed;
+- scalar columns may recycle, while non-scalar column lengths must agree;
+- target-definition objects may be unnamed or named arguments in `...`; exact
+  formal matching is applied before deciding which arguments belong to dots;
+- `names` is omitted, one column identifier, `c(column, ...)`, or an unshadowed
+  `everything()` (the qualified `tidyselect::everything()` form is always
+  authoritative); and
+- `delimiter` is omitted or one non-empty ASCII string literal.
+
+A base target name that collides with a values-table column is rejected, matching
+`tar_map()`'s runtime validation. Raven mirrors tarchetypes' quote stripping,
+`make.unique(..., sep = delimiter)`, and the ASCII subset of `make.names()`. The
+whole expansion is transactional: if any selected suffix or generated target
+name is not reproducible, Raven contributes no generated declarations or nested
+report links. A reference to a generated name navigates to the base target-name
+token because the generated spelling does not occur in source.
+
+Dynamic tables/selections/delimiters, empty selections (the runtime hash
+fallback), non-ASCII generated spellings, incompatible lengths, arbitrary
+metaprogramming, and replication/dynamic-branching factories are not predicted.
+Unsupported `tar_map()` name generation contributes no base or generated target
+declaration.
+
+#### Connected R Markdown and Quarto documents
+
+A document factory creates a dependency edge when both its target name and path
+are static and the literal path names a document Raven can analyze:
+
+- `tar_render()` / `tar_knit()`: `.Rmd` or `.Rmarkdown`;
+- single-document `tar_quarto()`: `.qmd`, `.Rmd`, or `.Rmarkdown`.
+
+Paths use ordinary forward-path rules: an explicit/inherited `# raven: cd`
+applies, and otherwise Raven may use the workspace-root fallback. Cmd-click on
+the literal opens an existing document. A missing document reports
+`unresolved-source-path` at the configured missing-file severity and remains a
+watched graph target, so creating or deleting it refreshes the relationship.
+Quarto project directories and computed paths are deliberately not inferred.
+
+Inside connected R chunks, `targets::tar_read(name)` and direct names in
+`targets::tar_load(name)` / `targets::tar_load(c(name1, name2))` resolve against
+the pipeline's static target declarations. Target constructors written inside a
+report chunk do not declare pipeline targets or create nested report links. Bare
+calls follow the same attachment-and-shadowing rule. Missing names use the `undefined-variable`
+severity and suppression controls, with a target-specific message, and
+cmd-click navigates to the declaration. Dynamic tidyselect expressions such as
+`tar_load(starts_with(prefix))` are left unresolved rather than expanded.
+
+The report edge participates in watching and edit-triggered revalidation in
+both directions but is intentionally non-lending for ordinary R scope. Target
+authority starts from the declaring pipeline and its ordinary lending source
+relationships: a helper sourced only while rendering the report cannot declare
+pipeline targets. Editing a pipeline declaration republishes connected reports;
+editing a report target reference republishes the declaring pipeline and its
+connected target-authority set. Canonical filesystem identities are shared
+across case/symlink aliases, while navigation prefers the URI of a matching live
+open document.
+
 ### Keeping Packages in Sync
 
 Raven watches `.libPaths()` directories and invalidates caches when packages are installed, upgraded, or removed. If the watcher misses a change (e.g., after `renv::activate()`), run **Raven: Refresh package cache** from the command palette.

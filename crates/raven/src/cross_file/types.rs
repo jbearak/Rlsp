@@ -198,6 +198,42 @@ pub struct TargetsPackageDeclaration {
     pub column: u32,
 }
 
+/// One statically known `{targets}` target declaration.
+///
+/// Target names form a separate namespace from ordinary R bindings. The source
+/// range identifies the declaration token used by target-reference navigation;
+/// generated `tar_map()` names intentionally point back to the base declaration
+/// token because no generated spelling exists in source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct TargetDeclaration {
+    pub name: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
+/// One statically known `tar_read()` / `tar_load()` target-name reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct TargetReference {
+    pub name: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
+/// A literal report document declared by `tar_render()`, `tar_knit()`, or
+/// single-document `tar_quarto()`.
+///
+/// These links participate in dependency lifecycle and target-name authority,
+/// but they never lend ordinary R scope in either direction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct TarchetypesDocumentLink {
+    pub path: String,
+    pub line: u32,
+    pub column: u32,
+    pub end_column: u32,
+}
+
 /// Complete cross-file metadata for a document
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrossFileMetadata {
@@ -270,6 +306,16 @@ pub struct CrossFileMetadata {
     /// top-level `tar_option_set(packages = ...)` calls.
     #[serde(default)]
     pub targets_pipeline_packages: Vec<TargetsPackageDeclaration>,
+    /// Static target declarations from `{targets}` and supported `{tarchetypes}`
+    /// factories, including conservative `tar_plan()` / `tar_map()` expansion.
+    #[serde(default)]
+    pub target_declarations: Vec<TargetDeclaration>,
+    /// Static target-name reads through `targets::tar_read()` / `tar_load()`.
+    #[serde(default)]
+    pub target_references: Vec<TargetReference>,
+    /// Literal report documents linked by supported `{tarchetypes}` factories.
+    #[serde(default)]
+    pub tarchetypes_document_links: Vec<TarchetypesDocumentLink>,
     /// Variables declared via `# raven: var` directives
     #[serde(default)]
     pub declared_variables: Vec<DeclaredSymbol>,

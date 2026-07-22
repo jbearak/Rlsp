@@ -2191,6 +2191,85 @@ mod tests {
     }
 
     #[test]
+    fn tarchetypes_document_edits_revalidate_both_directions() {
+        let mut graph = DependencyGraph::new();
+        let pipeline = affected_url("_targets.R");
+        let report = affected_url("report.qmd");
+        let metadata = CrossFileMetadata {
+            tarchetypes_document_links: vec![crate::cross_file::types::TarchetypesDocumentLink {
+                path: "report.qmd".to_string(),
+                line: 1,
+                column: 10,
+                end_column: 22,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(
+            &pipeline,
+            &metadata,
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+        let open = std::collections::HashSet::from([pipeline.clone(), report.clone()]);
+
+        let after_pipeline_edit = compute_affected_dependents_after_edit(
+            &pipeline,
+            true,
+            false,
+            &graph,
+            |uri| open.contains(uri),
+            10,
+            200,
+        );
+        assert!(
+            after_pipeline_edit.contains(&report),
+            "a target declaration edit must revalidate its linked report"
+        );
+
+        let old_report = "targets::tar_read(old)\n";
+        let new_report = "targets::tar_read(new)\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        let old_tree = parser.parse(old_report, None).unwrap();
+        let new_tree = parser.parse(new_report, None).unwrap();
+        let old_metadata =
+            crate::cross_file::extract_metadata_with_tree(old_report, Some(&old_tree));
+        let new_metadata =
+            crate::cross_file::extract_metadata_with_tree(new_report, Some(&new_tree));
+        let old_hash = crate::cross_file::scope::compute_artifacts_with_metadata(
+            &report,
+            &old_tree,
+            old_report,
+            Some(&old_metadata),
+        )
+        .interface_hash;
+        let new_hash = crate::cross_file::scope::compute_artifacts_with_metadata(
+            &report,
+            &new_tree,
+            new_report,
+            Some(&new_metadata),
+        )
+        .interface_hash;
+        assert_ne!(old_hash, new_hash);
+
+        let after_report_edit = compute_affected_dependents_after_edit(
+            &report,
+            old_hash != new_hash,
+            false,
+            &graph,
+            |uri| open.contains(uri),
+            10,
+            200,
+        );
+        assert!(
+            after_report_edit.contains(&pipeline),
+            "a target-reference edit must revalidate its declaring pipeline"
+        );
+    }
+
+    #[test]
     fn locality_only_edge_change_revalidates_child() {
         use crate::cross_file::types::SourceLocality;
 

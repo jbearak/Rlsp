@@ -454,6 +454,10 @@ pub enum DependencyEdgeKind {
     /// A selective local-module import edge from a `box::use(./mod...)`. Present
     /// for graph structure and revalidation but never lends ordinary scope.
     SelectiveModule,
+    /// A literal report-document relationship declared by a supported
+    /// `{tarchetypes}` factory. Present for graph structure, target-name
+    /// authority, watching, and revalidation, but never lends ordinary R scope.
+    TarchetypesDocument,
 }
 
 /// Which edge kinds a transitive graph walk may cross.
@@ -475,8 +479,13 @@ pub enum DependencyEdgeKind {
 enum EdgeTraversalFilter {
     /// Cross every edge regardless of kind.
     All,
-    /// Cross only ordinary source edges (skip selective-module import edges).
+    /// Cross only ordinary source edges. Trimmed graphs already remove
+    /// project-excluded backward lending, so NSE/func collection uses this form.
     OrdinarySourceOnly,
+    /// Cross only ordinary source edges that are also allowed to lend from their
+    /// parent. Target authority runs on both full and trimmed graphs and must
+    /// reject project-excluded `non_lending` edges explicitly.
+    TargetProvider,
 }
 
 impl EdgeTraversalFilter {
@@ -485,6 +494,7 @@ impl EdgeTraversalFilter {
         match self {
             EdgeTraversalFilter::All => true,
             EdgeTraversalFilter::OrdinarySourceOnly => edge.is_ordinary_source(),
+            EdgeTraversalFilter::TargetProvider => edge.is_ordinary_source() && !edge.non_lending,
         }
     }
 }
@@ -680,9 +690,14 @@ impl DependencyEdge {
         matches!(self.kind, DependencyEdgeKind::SelectiveModule)
     }
 
-    /// Whether this is an ordinary lending source edge (the negation of
-    /// [`Self::is_selective_module`]). Ordinary edges are the only edges that
-    /// may lend scope; module edges never do.
+    /// Whether this is a non-lending tarchetypes report-document edge.
+    pub fn is_tarchetypes_document(&self) -> bool {
+        matches!(self.kind, DependencyEdgeKind::TarchetypesDocument)
+    }
+
+    /// Whether this is an ordinary lending source edge. Ordinary edges are the
+    /// only typed edges that may lend scope; selective-module and report-document
+    /// edges never do.
     pub fn is_ordinary_source(&self) -> bool {
         matches!(self.kind, DependencyEdgeKind::OrdinarySource)
     }
@@ -1305,14 +1320,38 @@ impl DependencyGraph {
             });
         }
 
-        // Deduplicate and add all edges. Module edges dedup independently of
-        // ordinary source edges because `kind` is part of the dedup key, so a
-        // file that both `source()`s and `box::use`s the same target keeps both.
+        // Process literal report-document links from supported `{tarchetypes}`
+        // factories. They use the same forward path semantics as `source()` but
+        // carry a dedicated non-lending kind: report chunks share target-name
+        // authority with the pipeline, not its ordinary R execution scope.
+        let report_edges = meta.tarchetypes_document_links.iter().filter_map(|link| {
+            do_resolve(&link.path).map(|to| DependencyEdge {
+                from: uri.clone(),
+                to,
+                call_site_line: Some(link.line),
+                call_site_column: Some(link.column),
+                tar_source_ordinal: None,
+                source_batch_kind: None,
+                locality: SourceLocality::Global,
+                chdir: false,
+                is_sys_source: false,
+                is_function_scoped: false,
+                is_directive: false,
+                is_backward_directive: false,
+                non_lending: false,
+                kind: DependencyEdgeKind::TarchetypesDocument,
+            })
+        });
+
+        // Deduplicate and add all edges. Typed non-source edges dedup
+        // independently of ordinary source edges because `kind` is part of the
+        // key, so multiple relationship dialects to one URI remain explicit.
         let mut seen_keys = HashSet::new();
         for edge in directive_edges
             .into_iter()
             .chain(ast_edges)
             .chain(module_edges)
+            .chain(report_edges)
         {
             if seen_keys.insert(edge.graph_dedup_key()) {
                 self.add_edge(edge);
@@ -1884,6 +1923,50 @@ impl DependencyGraph {
             max_visited,
             EdgeTraversalFilter::OrdinarySourceOnly,
         )
+    }
+
+    /// Statically authoritative target-declaration providers for `root`.
+    ///
+    /// A linked report first steps backward over its direct typed report edge to
+    /// each declaring pipeline node. From those owners, authority follows only
+    /// ordinary source relationships using the same ancestor-plus-descendant
+    /// shape as cross-file declaration propagation. Crucially, the walk never
+    /// starts an ordinary descendant traversal from the report itself: helpers
+    /// sourced only by report chunks execute while rendering and cannot register
+    /// pipeline targets. If `root` is not a linked report, it is treated as a
+    /// pipeline-side seed directly. The queried file is always included for local
+    /// declarations; Rmd/Qmd metadata filtering ensures report-local constructors
+    /// contribute none.
+    pub fn target_authority_providers(
+        &self,
+        root: &Url,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> impl Iterator<Item = Url> {
+        let report_owners: Vec<Url> = self
+            .get_dependents(root)
+            .into_iter()
+            .filter(|edge| edge.is_tarchetypes_document() && !edge.non_lending)
+            .map(|edge| edge.from.clone())
+            .collect();
+        let seeds = if report_owners.is_empty() {
+            vec![root.clone()]
+        } else {
+            report_owners
+        };
+        let mut providers = HashSet::from([root.clone()]);
+        for seed in seeds {
+            providers.insert(seed.clone());
+            providers.extend(self.revalidation_consistent_set_filtered(
+                &seed,
+                max_depth,
+                max_visited,
+                EdgeTraversalFilter::TargetProvider,
+            ));
+        }
+        let mut providers: Vec<_> = providers.into_iter().collect();
+        providers.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        providers.into_iter()
     }
 
     /// Shared core for the revalidation-consistent set, parameterized by which
@@ -2756,6 +2839,64 @@ mod tests {
         assert!(
             !ordinary_only.contains(&importer),
             "selective edges must not propagate ordinary source scope or NSE/func declarations"
+        );
+    }
+
+    #[test]
+    fn tarchetypes_report_edges_revalidate_and_share_only_target_authority() {
+        let (temp, root) = create_temp_workspace(&[
+            "_targets.R",
+            "pipeline-helper.R",
+            "report.Rmd",
+            "report-helper.R",
+        ]);
+        let pipeline = temp_url(&temp, "_targets.R");
+        let pipeline_helper = temp_url(&temp, "pipeline-helper.R");
+        let report = temp_url(&temp, "report.Rmd");
+        let report_helper = temp_url(&temp, "report-helper.R");
+        let metadata = crate::cross_file::extract_metadata(
+            "source(\"pipeline-helper.R\")\ntarchetypes::tar_render(report_target, \"report.Rmd\")\n",
+        );
+        let report_metadata = crate::cross_file::extract_metadata_for_kind(
+            crate::chunks::ChunkKind::Rmd,
+            "```{r}\nsource(\"report-helper.R\")\n```\n",
+        );
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&pipeline, &metadata, Some(&root), |_| None);
+        graph.update_file(&report, &report_metadata, Some(&root), |_| None);
+
+        let dependencies = graph.get_dependencies(&pipeline);
+        assert_eq!(dependencies.len(), 2);
+        let edge = dependencies
+            .into_iter()
+            .find(|edge| edge.is_tarchetypes_document())
+            .unwrap();
+        assert_eq!(edge.to, report);
+        assert!(!edge.lends_scope());
+
+        let full: HashSet<_> = graph
+            .revalidation_consistent_set(&report, 16, 128)
+            .collect();
+        assert!(full.contains(&pipeline));
+        let ordinary_only: HashSet<_> = graph
+            .revalidation_consistent_set_over_ordinary_source(&report, 16, 128)
+            .collect();
+        assert!(!ordinary_only.contains(&pipeline));
+        let target_authority: HashSet<_> =
+            graph.target_authority_providers(&report, 16, 128).collect();
+        assert!(target_authority.contains(&pipeline));
+        assert!(target_authority.contains(&pipeline_helper));
+        assert!(
+            !target_authority.contains(&report_helper),
+            "a helper sourced only while rendering must not lend pipeline targets"
+        );
+
+        assert!(graph.make_forward_edges_non_lending(&pipeline));
+        let excluded_authority: HashSet<_> =
+            graph.target_authority_providers(&report, 16, 128).collect();
+        assert!(
+            !excluded_authority.contains(&pipeline),
+            "project-excluded open roots must not lend target authority"
         );
     }
 

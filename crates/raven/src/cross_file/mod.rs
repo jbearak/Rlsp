@@ -19,6 +19,7 @@ pub mod source_detect;
 pub mod standalone_cache;
 pub(crate) mod static_path;
 pub mod tar_source;
+pub(crate) mod targets;
 pub mod types;
 
 #[cfg(test)]
@@ -127,6 +128,42 @@ pub(crate) fn masked_analysis_text(
     }
 }
 
+/// Extract cross-file metadata from an already-derived R analysis view.
+///
+/// `analysis` must be raw R for [`ChunkKind::R`](crate::chunks::ChunkKind::R)
+/// and the geometry-preserving report mask for
+/// [`ChunkKind::Rmd`](crate::chunks::ChunkKind::Rmd). Report chunks may read
+/// pipeline targets, but target constructors and nested report factories do not
+/// register pipeline declarations or links while the report renders. Keeping
+/// that post-extraction rule here gives open and closed documents identical
+/// target-authority semantics without re-masking an open document's analysis
+/// text.
+pub(crate) fn extract_metadata_from_analysis_for_kind(
+    chunk_kind: crate::chunks::ChunkKind,
+    analysis: &str,
+) -> CrossFileMetadata {
+    let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis, None));
+    extract_metadata_with_tree_from_analysis_for_kind(chunk_kind, analysis, tree.as_ref())
+}
+
+/// Tree-reusing sibling of [`extract_metadata_from_analysis_for_kind`].
+///
+/// The supplied tree must have been parsed from `analysis`. Keeping report
+/// authority filtering after the shared tree-aware extractor lets resync and
+/// indexing paths avoid a second parse without bypassing the Rmd/Qmd rule.
+pub(crate) fn extract_metadata_with_tree_from_analysis_for_kind(
+    chunk_kind: crate::chunks::ChunkKind,
+    analysis: &str,
+    tree: Option<&tree_sitter::Tree>,
+) -> CrossFileMetadata {
+    let mut metadata = extract_metadata_with_tree(analysis, tree);
+    if chunk_kind == crate::chunks::ChunkKind::Rmd {
+        metadata.target_declarations.clear();
+        metadata.tarchetypes_document_links.clear();
+    }
+    metadata
+}
+
 /// Extract cross-file metadata from `content` using an already-resolved chunk
 /// kind, masking R Markdown / Quarto prose first so directives, `source()`
 /// calls, and `library()` calls are taken from R chunk bodies only (never from
@@ -142,7 +179,7 @@ pub fn extract_metadata_for_kind(
     content: &str,
 ) -> CrossFileMetadata {
     let analysis = analysis_text_for_kind(chunk_kind, content);
-    extract_metadata(&analysis)
+    extract_metadata_from_analysis_for_kind(chunk_kind, &analysis)
 }
 
 /// Extract cross-file metadata from `content`, masking R Markdown / Quarto
@@ -204,6 +241,7 @@ pub fn extract_metadata_with_tree(
             targets_pipeline_packages,
             tar_source_requests,
             list_files_source_requests,
+            targets_metadata,
         ) = source_detect::detect_library_and_tar_source_requests(tree, content);
         // Sort by line/column for document order (Requirement 1.8)
         library_calls.sort_by_key(|lc| (lc.line, lc.column));
@@ -211,6 +249,9 @@ pub fn extract_metadata_with_tree(
         meta.targets_pipeline_packages = targets_pipeline_packages;
         meta.tar_source_requests = tar_source_requests;
         meta.list_files_source_requests = list_files_source_requests;
+        meta.target_declarations = targets_metadata.declarations;
+        meta.target_references = targets_metadata.references;
+        meta.tarchetypes_document_links = targets_metadata.document_links;
         meta.namespace_references = source_detect::detect_namespace_references(tree, content);
 
         // box::use() imports and box::export() / #' @export interface (#662).
