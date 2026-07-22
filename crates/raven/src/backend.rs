@@ -6326,50 +6326,79 @@ pub async fn run_system_file_convergence_for_test(
 /// must be recomputed when it becomes included again. Keep this helper shared by
 /// startup post-scan completion and live `[workspace].exclude` reloads so their
 /// open-buffer-authoritative behavior cannot drift.
-async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldState) -> Vec<Url> {
-    let mut open_docs: Vec<_> = state
-        .documents
-        .uris()
-        .into_iter()
-        .filter_map(|uri| {
-            let record = state.documents.get_record(&uri)?;
-            let doc = record.document();
-            (uri, doc.analysis_text(), record.generation()).into()
-        })
-        .collect();
-    open_docs.sort_unstable_by(|(a, ..), (b, ..)| a.as_str().cmp(b.as_str()));
+async fn replay_open_documents_after_workspace_index_apply(
+    state_arc: &Arc<RwLock<WorldState>>,
+) -> Vec<Url> {
+    let (mut prepared, workspace_root) = {
+        let state = state_arc.read().await;
+        let mut open_docs: Vec<_> = state
+            .documents
+            .uris()
+            .into_iter()
+            .filter_map(|uri| {
+                let record = state.documents.get_record(&uri)?;
+                let metadata = extract_enriched_live_metadata(
+                    &state,
+                    &uri,
+                    &record.document().analysis_text(),
+                );
+                Some((uri, record.generation(), metadata))
+            })
+            .collect();
+        open_docs.sort_unstable_by(|(a, ..), (b, ..)| a.as_str().cmp(b.as_str()));
+        (open_docs, state.workspace_folders.first().cloned())
+    };
 
+    // Local-module resolution performs filesystem I/O. Keep it outside every
+    // WorldState lock, then generation-check each derived record at commit.
+    let expansion_root = workspace_root.clone();
+    prepared = match tokio::task::spawn_blocking(move || {
+        for (uri, _, metadata) in &mut prepared {
+            crate::cross_file::enrich_selective_import_resolutions(
+                metadata,
+                uri,
+                expansion_root.as_ref(),
+            );
+        }
+        prepared
+    })
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            log::error!("Selective-import enrichment failed during open-document replay: {error}");
+            Vec::new()
+        }
+    };
+
+    let mut state = state_arc.write().await;
     let mut source_batch_parents = Vec::new();
-    for (uri, analysis_text, generation) in open_docs {
-        if state.is_project_excluded_uri(&uri) {
-            let workspace_root = state.workspace_folders.first().cloned();
-            let meta = extract_enriched_live_metadata(state, &uri, &analysis_text);
-            if meta.has_source_batch_topology() {
-                source_batch_parents.push(uri.clone());
-            }
-            state
-                .replace_open_document_metadata_if_current(&uri, generation, Arc::new(meta.clone()))
-                .expect("workspace replay basis remains current under the state write lock");
-            for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
-                remove_file_from_cross_file_state(state, &graph_root);
-            }
-            update_project_excluded_live_graph(state, &uri, &meta, workspace_root.as_ref());
+    for (uri, generation, meta) in prepared {
+        if state
+            .replace_open_document_metadata_if_current(&uri, generation, Arc::new(meta.clone()))
+            .is_err()
+        {
             continue;
         }
-
-        let meta = extract_enriched_live_metadata(state, &uri, &analysis_text);
         if meta.has_source_batch_topology() {
             source_batch_parents.push(uri.clone());
         }
-        let workspace_root = state.workspace_folders.first().cloned();
 
-        state
-            .replace_open_document_metadata_if_current(&uri, generation, Arc::new(meta.clone()))
-            .expect("workspace replay basis remains current under the state write lock");
+        if state.is_project_excluded_uri(&uri) {
+            for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
+                remove_file_from_cross_file_state(&mut state, &graph_root);
+            }
+            update_project_excluded_live_graph(&mut state, &uri, &meta, workspace_root.as_ref());
+            continue;
+        }
 
         let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
-        let _ =
-            update_cross_file_graph_for_roots(state, &graph_roots, &meta, workspace_root.as_ref());
+        let _ = update_cross_file_graph_for_roots(
+            &mut state,
+            &graph_roots,
+            &meta,
+            workspace_root.as_ref(),
+        );
     }
 
     state.recompute_open_neighborhood_pins();
@@ -9834,21 +9863,19 @@ fn source_targets_to_index_for_live_diagnostics(
     }
 
     // Selective local modules need canonical artifacts just like ordinary
-    // source targets, even though their graph edges never lend scope. Resolve
-    // with box's exact-case, file-relative semantics and index only successful
-    // targets; missing candidates are watched separately below.
-    for import in &meta.box_imports {
-        let Some(crate::selective_import::ImportSource::LocalModule(source_uri)) =
-            import.resolved_source()
-        else {
+    // source targets, even though their graph edges never lend scope. Each
+    // dialect has already persisted its own path-resolution result; index only
+    // successful targets, while missing candidates are watched separately below.
+    for request in meta.selective_import_requests(uri) {
+        let crate::selective_import::ImportSource::LocalModule(source) = request.source else {
             continue;
         };
-        if !state.is_project_excluded_uri(&source_uri)
-            && !state.is_document_open_or_alias(&source_uri)
-            && !state.workspace_index.is_complete(&source_uri)
-            && !files_to_index.contains(&source_uri)
+        if !state.is_project_excluded_uri(&source.uri)
+            && !state.is_document_open_or_alias(&source.uri)
+            && !state.workspace_index.is_complete(&source.uri)
+            && !files_to_index.contains(&source.uri)
         {
-            files_to_index.push(source_uri);
+            files_to_index.push(source.uri);
         }
     }
 
@@ -10119,7 +10146,11 @@ fn derive_open_edit_fallback(
         metadata
     });
     if let Some(primary_uri) = captured.graph_roots.first() {
-        crate::cross_file::enrich_box_import_resolutions(&mut local_metadata, primary_uri);
+        crate::cross_file::enrich_selective_import_resolutions(
+            &mut local_metadata,
+            primary_uri,
+            captured.workspace_root.as_ref(),
+        );
     }
     let graph = captured
         .graph_roots
@@ -10526,7 +10557,11 @@ async fn commit_detached_live_package_open_edit(
         };
         let expansion_uri = uri.clone();
         metadata = tokio::task::spawn_blocking(move || {
-            crate::cross_file::enrich_box_import_resolutions(&mut metadata, &expansion_uri);
+            crate::cross_file::enrich_selective_import_resolutions(
+                &mut metadata,
+                &expansion_uri,
+                workspace_root.as_ref(),
+            );
             let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 &mut metadata,
                 &expansion_uri,
@@ -11213,7 +11248,6 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
             crate::cross_file::analysis_text_for_kind(captured.chunk_kind, &content).into_owned();
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(&analysis, None));
         let mut metadata = crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
-        crate::cross_file::enrich_box_import_resolutions(&mut metadata, &root.uri);
         crate::cross_file::resolve_system_file_sources(
             &mut metadata,
             captured.system_file_workspace_name.as_deref(),
@@ -11266,6 +11300,11 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
                     captured.max_chain_depth,
                 );
             }
+            crate::cross_file::enrich_selective_import_resolutions(
+                &mut semantic,
+                &root.uri,
+                captured.workspace_root.as_ref(),
+            );
             let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 &mut semantic,
                 &root.uri,
@@ -11761,7 +11800,6 @@ fn derive_open_install_analysis(
     };
     let analysis_text = captured.document.analysis_text();
     let mut metadata = crate::cross_file::extract_metadata(&analysis_text);
-    crate::cross_file::enrich_box_import_resolutions(&mut metadata, &captured.uri);
     if !local_only {
         crate::cross_file::enrich_metadata_with_inherited_wd(
             &mut metadata,
@@ -11777,6 +11815,11 @@ fn derive_open_install_analysis(
             &captured.library_paths,
         );
     }
+    crate::cross_file::enrich_selective_import_resolutions(
+        &mut metadata,
+        &captured.uri,
+        captured.workspace_root.as_ref(),
+    );
     let selected_shiny_entry =
         crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
             &mut metadata,
@@ -12196,13 +12239,17 @@ fn derive_open_metadata_reenrichment(
     };
 
     let mut metadata = crate::cross_file::extract_metadata(&captured.analysis_text);
-    crate::cross_file::enrich_box_import_resolutions(&mut metadata, &captured.uri);
     crate::cross_file::enrich_metadata_with_inherited_wd(
         &mut metadata,
         &captured.uri,
         captured.workspace_root.as_ref(),
         metadata_lookup,
         captured.max_chain_depth,
+    );
+    crate::cross_file::enrich_selective_import_resolutions(
+        &mut metadata,
+        &captured.uri,
+        captured.workspace_root.as_ref(),
     );
     crate::cross_file::resolve_system_file_sources(
         &mut metadata,
@@ -13253,7 +13300,6 @@ async fn resync_file_from_disk(
     let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None));
     let mut cross_file_meta =
         crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
-    crate::cross_file::enrich_box_import_resolutions(&mut cross_file_meta, uri);
 
     let snapshot =
         crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
@@ -13307,6 +13353,11 @@ async fn resync_file_from_disk(
         )
     };
 
+    crate::cross_file::enrich_selective_import_resolutions(
+        &mut cross_file_meta,
+        uri,
+        workspace_root.as_ref(),
+    );
     let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
         &mut cross_file_meta,
         uri,
@@ -15571,6 +15622,7 @@ struct BoxCandidateImporterRefresh {
     uri: Url,
     metadata: Arc<crate::cross_file::CrossFileMetadata>,
     open_generation: Option<crate::open_document_store::AnalysisGeneration>,
+    workspace_root: Option<Url>,
 }
 
 /// Snapshot importers whose persisted local-module outcome may have changed.
@@ -15602,6 +15654,16 @@ fn box_candidate_importers_for_changes(
                 crate::box_use::path::candidate_set_matches_path(
                     importer_uri,
                     &import.spec,
+                    changed_path,
+                )
+            })
+        }) || metadata.import_calls.iter().any(|import| {
+            changed_paths.iter().any(|changed_path| {
+                crate::import_pkg::path::candidate_set_matches_path(
+                    importer_uri,
+                    metadata,
+                    import,
+                    state.workspace_folders.first(),
                     changed_path,
                 )
             })
@@ -15637,6 +15699,7 @@ fn box_candidate_importers_for_changes(
                 uri,
                 metadata,
                 open_generation,
+                workspace_root: state.workspace_folders.first().cloned(),
             })
         })
         .collect()
@@ -15647,9 +15710,10 @@ fn enrich_box_candidate_importers(
     mut importers: Vec<BoxCandidateImporterRefresh>,
 ) -> Vec<BoxCandidateImporterRefresh> {
     for importer in &mut importers {
-        crate::cross_file::enrich_box_import_resolutions(
+        crate::cross_file::enrich_selective_import_resolutions(
             Arc::make_mut(&mut importer.metadata),
             &importer.uri,
+            importer.workspace_root.as_ref(),
         );
     }
     importers
@@ -18332,8 +18396,11 @@ impl LanguageServer for Backend {
                     crate::cross_file::extract_metadata(&prepared.document().analysis_text());
                 metadata.has_source_batch_topology()
                     || !metadata.box_imports.is_empty()
+                    || !metadata.import_calls.is_empty()
                     || state.get_enriched_metadata(&uri).is_some_and(|previous| {
-                        previous.has_source_batch_topology() || !previous.box_imports.is_empty()
+                        previous.has_source_batch_topology()
+                            || !previous.box_imports.is_empty()
+                            || !previous.import_calls.is_empty()
                     })
             });
             let excluded = state.is_project_excluded_uri(&uri);
@@ -20504,10 +20571,8 @@ impl Backend {
                 if !self.state.read().await.cross_file_config.index_workspace {
                     self.state.write().await.workspace_scan_complete = true;
                 }
-                let source_batch_parents = {
-                    let mut state = self.state.write().await;
-                    replay_open_documents_after_workspace_index_apply(&mut state).await
-                };
+                let source_batch_parents =
+                    replay_open_documents_after_workspace_index_apply(&self.state).await;
                 let mut source_batch_receipts = Vec::new();
                 for parent in source_batch_parents {
                     if let Some(receipt) =
@@ -21722,9 +21787,13 @@ impl Backend {
             )
         };
 
-        // Persist local box-module identities off-lock before artifacts and graph
-        // projections consume them.
-        crate::cross_file::enrich_box_import_resolutions(&mut cross_file_meta, file_uri);
+        // Persist local selective-module identities off-lock after inherited-WD
+        // enrichment and with the captured workspace fallback context.
+        crate::cross_file::enrich_selective_import_resolutions(
+            &mut cross_file_meta,
+            file_uri,
+            workspace_root.as_ref(),
+        );
 
         // Resolve system.file() source entries into concrete paths so
         // transitive on-demand walks don't stop at this hop.
@@ -21961,11 +22030,9 @@ impl Backend {
             // Selective module edges are non-lending, but their targets still
             // need canonical metadata/artifacts. They are always file-relative
             // and deliberately ignore the ordinary source PathContext.
-            for import in &meta.box_imports {
-                if let Some(crate::selective_import::ImportSource::LocalModule(source_uri)) =
-                    import.resolved_source()
-                {
-                    queue.push_back((source_uri, depth.saturating_add(1)));
+            for request in meta.selective_import_requests(&uri) {
+                if let crate::selective_import::ImportSource::LocalModule(source) = request.source {
+                    queue.push_back((source.uri, depth.saturating_add(1)));
                 }
             }
 
@@ -22246,9 +22313,13 @@ impl Backend {
             )
         };
 
-        // Persist local box-module identities off-lock before artifacts and graph
-        // projections consume them.
-        crate::cross_file::enrich_box_import_resolutions(&mut cross_file_meta, file_uri);
+        // Persist local selective-module identities off-lock after inherited-WD
+        // enrichment and with the captured workspace fallback context.
+        crate::cross_file::enrich_selective_import_resolutions(
+            &mut cross_file_meta,
+            file_uri,
+            workspace_root.as_ref(),
+        );
 
         // Resolve system.file() source entries into concrete paths so
         // transitive on-demand walks don't stop at this hop.
@@ -23343,6 +23414,37 @@ fn collect_open_document_packages(
         let line = doc.text().lines().count().saturating_sub(1) as u32;
         docs.push((uri.clone(), line));
     }
+
+    // A package import can live in a closed ordinary source() dependency and/or
+    // inside an indexed selective module reachable from that dependency. Expand
+    // each open document through the same bounded ordinary-source neighborhood
+    // used by cross-file collection, then follow only typed non-lending module
+    // edges from that seed set. This neither treats module edges as lending nor
+    // crosses back from a module into its ordinary source graph.
+    let max_depth = state.cross_file_config.max_chain_depth;
+    let max_visited = state.cross_file_config.max_transitive_dependents_visited;
+    let mut warm_roots: std::collections::HashSet<Url> =
+        state.documents.uris().into_iter().collect();
+    for root in warm_roots.clone() {
+        warm_roots.extend(
+            state
+                .cross_file_graph
+                .revalidation_consistent_set_over_ordinary_source(&root, max_depth, max_visited),
+        );
+    }
+    for module_uri in state.cross_file_graph.selective_module_closure(warm_roots) {
+        let Some(meta) = state.get_enriched_metadata(&module_uri) else {
+            continue;
+        };
+        for package in meta.referenced_packages() {
+            if is_valid_package_name(package)
+                && !crate::package_library::is_load_all_sentinel(package)
+            {
+                doc_pkgs.insert(package.to_string());
+            }
+        }
+    }
+
     (doc_pkgs, docs)
 }
 
@@ -23368,11 +23470,51 @@ fn open_docs_referencing_packages(
                         &import.spec,
                         crate::box_use::BoxSpec::Package(package) if warmed.contains(package)
                     )
-                }))
+                })
+                || meta
+                    .import_calls
+                    .iter()
+                    .filter_map(crate::import_pkg::ImportCall::package_name)
+                    .any(|package| warmed.contains(package)))
         {
             out.push(uri.clone());
         }
     }
+    // A warmed package referenced inside a closed/open local module changes
+    // that module's partial selective interface. Walk the same revalidation-
+    // consistent typed graph used for module edits so open importers refresh
+    // even when they do not name the package directly.
+    let mut module_uris = state.workspace_index.artifact_uris();
+    module_uris.extend(state.documents.uris());
+    module_uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    module_uris.dedup();
+    for module_uri in module_uris {
+        let Some(metadata) = state.get_enriched_metadata(&module_uri) else {
+            continue;
+        };
+        let references_warmed = metadata.box_imports.iter().any(|import| {
+            matches!(&import.spec, crate::box_use::BoxSpec::Package(package) if warmed.contains(package))
+        }) || metadata
+            .import_calls
+            .iter()
+            .filter_map(crate::import_pkg::ImportCall::package_name)
+            .any(|package| warmed.contains(package));
+        if !references_warmed {
+            continue;
+        }
+        out.extend(
+            state
+                .cross_file_graph
+                .revalidation_consistent_set(
+                    &module_uri,
+                    state.cross_file_config.max_chain_depth,
+                    state.cross_file_config.max_transitive_dependents_visited,
+                )
+                .filter(|candidate| state.documents.contains_key(candidate)),
+        );
+    }
+    out.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    out.dedup();
     out
 }
 
@@ -32276,6 +32418,90 @@ mod refresh_packages_tests {
         assert_eq!(docs.len(), 1, "one open document → one scope-probe seed");
     }
 
+    #[test]
+    fn open_document_warm_set_includes_closed_ordinary_source_neighborhood() {
+        use crate::state::{Document, WorldState};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = Url::from_file_path(temp.path()).unwrap();
+        let importer_path = temp.path().join("main.R");
+        let helper_path = temp.path().join("helper.R");
+        let importer_uri = Url::from_file_path(&importer_path).unwrap();
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+        let importer_code = "source('helper.R')\n";
+        let helper_code = "import::here(syntheticSourcedPackage, value)\n";
+        std::fs::write(&importer_path, importer_code).unwrap();
+        std::fs::write(&helper_path, helper_code).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders.push(root.clone());
+        state.insert_workspace_document_for_test(helper_uri, Document::new(helper_code, None));
+        let importer_metadata = crate::cross_file::extract_metadata(importer_code);
+        state.open_document_with_language_id_and_metadata(
+            importer_uri.clone(),
+            importer_code,
+            Some(1),
+            Some("r"),
+            Arc::new(importer_metadata.clone()),
+            None,
+        );
+        state
+            .cross_file_graph
+            .update_file(&importer_uri, &importer_metadata, Some(&root), |_| None);
+
+        let (packages, _) = collect_open_document_packages(&state);
+        assert!(
+            packages.contains("syntheticSourcedPackage"),
+            "a package referenced only in a closed ordinary source dependency must warm: {packages:?}"
+        );
+    }
+
+    #[test]
+    fn open_document_warm_set_traverses_indexed_selective_modules() {
+        use crate::state::{Document, WorldState};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = Url::from_file_path(temp.path()).unwrap();
+        let importer_path = temp.path().join("main.R");
+        let module_path = temp.path().join("module.R");
+        let importer_uri = Url::from_file_path(&importer_path).unwrap();
+        let module_uri = Url::from_file_path(&module_path).unwrap();
+        let importer_code = "import::here('module.R', value)\n";
+        let module_code = "import::here(syntheticImportPackage, value)\n";
+        std::fs::write(&importer_path, importer_code).unwrap();
+        std::fs::write(&module_path, module_code).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders.push(root.clone());
+        state.insert_workspace_document_for_test(
+            module_uri.clone(),
+            Document::new(module_code, None),
+        );
+        let mut importer_metadata = crate::cross_file::extract_metadata(importer_code);
+        crate::cross_file::enrich_selective_import_resolutions(
+            &mut importer_metadata,
+            &importer_uri,
+            Some(&root),
+        );
+        state.open_document_with_language_id_and_metadata(
+            importer_uri.clone(),
+            importer_code,
+            Some(1),
+            Some("r"),
+            Arc::new(importer_metadata.clone()),
+            None,
+        );
+        state
+            .cross_file_graph
+            .update_file(&importer_uri, &importer_metadata, Some(&root), |_| None);
+
+        let (packages, _) = collect_open_document_packages(&state);
+        assert!(
+            packages.contains("syntheticImportPackage"),
+            "a package referenced only inside an indexed local module must warm: {packages:?}"
+        );
+    }
+
     /// Regression for the issue #429 did_change parity gap: the live-editing
     /// warm path must include packages named in `data(..., package = "pkg")`,
     /// not just `library()`/`require()` loads, so the diagnostics-time `data()`
@@ -37020,6 +37246,83 @@ mod project_config_initialize_tests {
         );
     }
 
+    #[test]
+    fn watched_import_script_creation_and_deletion_refresh_open_importer() {
+        let tmp = TempDir::new().unwrap();
+        let importer_path = tmp.path().join("main.R");
+        let module_path = tmp.path().join("mod.R");
+        let importer_code = "import::here('mod.R', public)\npublic()\n";
+        fs::write(&importer_path, importer_code).unwrap();
+
+        let importer_uri = Url::from_file_path(&importer_path).unwrap();
+        let module_uri = Url::from_file_path(&module_path).unwrap();
+        let selective_target = |state: &WorldState| {
+            state
+                .documents
+                .get_record(&importer_uri)
+                .and_then(|record| {
+                    record
+                        .artifacts()
+                        .timeline
+                        .iter()
+                        .find_map(|event| match event {
+                            crate::cross_file::scope::ScopeEvent::SelectiveImport {
+                                request,
+                                ..
+                            } => request.source.local_module_uri().cloned(),
+                            _ => None,
+                        })
+                })
+        };
+        let mut state = WorldState::new();
+        state
+            .workspace_folders
+            .push(Url::from_file_path(tmp.path()).unwrap());
+        state.open_document(importer_uri.clone(), importer_code, Some(1));
+        assert!(selective_target(&state).is_none());
+
+        fs::write(&module_path, "public <- function() 1\n").unwrap();
+        let creation = [FileEvent {
+            uri: module_uri.clone(),
+            typ: FileChangeType::CREATED,
+        }];
+        let candidate_importers = box_candidate_importers_for_changes(&state, &creation);
+        assert!(
+            candidate_importers
+                .iter()
+                .any(|item| item.uri == importer_uri)
+        );
+        let candidate_importers = enrich_box_candidate_importers(candidate_importers);
+        let collected = collect_watched_resync(&mut state, &creation, candidate_importers);
+        assert!(collected.affected.contains(&importer_uri));
+        assert_eq!(selective_target(&state), Some(module_uri.clone()));
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&importer_uri)
+                .iter()
+                .any(|edge| edge.to == module_uri && edge.is_selective_module())
+        );
+
+        fs::remove_file(&module_path).unwrap();
+        let deletion = [FileEvent {
+            uri: module_uri.clone(),
+            typ: FileChangeType::DELETED,
+        }];
+        let candidate_importers = box_candidate_importers_for_changes(&state, &deletion);
+        let candidate_importers = enrich_box_candidate_importers(candidate_importers);
+        let collected = collect_watched_resync(&mut state, &deletion, candidate_importers);
+        assert!(collected.affected.contains(&importer_uri));
+        assert!(selective_target(&state).is_none());
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&importer_uri)
+                .iter()
+                .all(|edge| edge.to != module_uri)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watched_box_candidate_change_rebuilds_unchanged_closed_importer() {
         let tmp = TempDir::new().unwrap();
@@ -37168,11 +37471,12 @@ mod project_config_initialize_tests {
         };
         let scan_result =
             crate::state::scan_workspace_with_exclusions(&folders, max_chain_depth, &exclusions);
-        {
-            let mut state = backend.state.write().await;
-            state.apply_workspace_index(scan_result);
-            let _ = replay_open_documents_after_workspace_index_apply(&mut state).await;
-        }
+        backend
+            .state
+            .write()
+            .await
+            .apply_workspace_index(scan_result);
+        let _ = replay_open_documents_after_workspace_index_apply(&backend.state).await;
 
         let state = backend.state.read().await;
         assert_project_excluded_live_source_non_lending(
@@ -37180,6 +37484,53 @@ mod project_config_initialize_tests {
             &excluded_uri,
             &helper_uri,
             "helper_value",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_index_replay_preserves_import_workspace_fallback_edge() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("scripts")).unwrap();
+        let root = Url::from_file_path(temp.path()).unwrap();
+        let importer_path = temp.path().join("scripts/main.R");
+        let module_path = temp.path().join("module.R");
+        let importer_uri = Url::from_file_path(&importer_path).unwrap();
+        let module_uri = Url::from_file_path(&module_path).unwrap();
+        fs::write(&importer_path, "disk_value <- 1\n").unwrap();
+        fs::write(&module_path, "public <- 1\n").unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders.push(root.clone());
+        state.open_document(
+            importer_uri.clone(),
+            "import::here('module.R', public)\npublic\n",
+            Some(1),
+        );
+        let scan = crate::state::scan_workspace_with_exclusions(
+            &state.workspace_folders,
+            state.cross_file_config.max_chain_depth,
+            &state.workspace_exclusions,
+        );
+        state.apply_workspace_index(scan);
+        let shared = Arc::new(RwLock::new(state));
+
+        replay_open_documents_after_workspace_index_apply(&shared).await;
+
+        let state = shared.read().await;
+        let metadata = state
+            .get_enriched_metadata(&importer_uri)
+            .expect("replayed open metadata");
+        assert!(matches!(
+            metadata.import_calls[0].local_resolution,
+            Some(crate::import_pkg::LocalScriptResolution::Resolved(ref uri)) if uri == &module_uri
+        ));
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&importer_uri)
+                .iter()
+                .any(|edge| edge.to == module_uri && edge.is_selective_module()),
+            "workspace replay must restore the open buffer's selective module edge"
         );
     }
 
@@ -47525,6 +47876,45 @@ mod project_config_initialize_tests {
     /// open for the whole call this exercises the preflight veto; the
     /// commit-time veto is the same check replayed under the write lock, and
     /// the close-then-reopen e2e test covers the racing case.)
+    #[tokio::test]
+    async fn closed_resync_preserves_import_workspace_fallback_edge() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("scripts")).unwrap();
+        fs::write(tmp.path().join("anchor.R"), "anchor <- 1\n").unwrap();
+        fs::write(tmp.path().join("mod.R"), "public <- function() 1\n").unwrap();
+        fs::write(
+            tmp.path().join("scripts/main.R"),
+            "import::here('mod.R', public)\npublic()\n",
+        )
+        .unwrap();
+        let (svc, _anchor_uri) =
+            open_in_quiescent_workspace(&tmp, "anchor.R", "r", "anchor <- 1\n").await;
+        let backend = svc.inner();
+        let importer_uri = Url::from_file_path(tmp.path().join("scripts/main.R")).unwrap();
+        let module_uri = Url::from_file_path(tmp.path().join("mod.R")).unwrap();
+
+        let outcome = resync_file_from_disk(
+            &backend.state,
+            &importer_uri,
+            None,
+            None,
+            true,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
+        assert!(matches!(outcome, ResyncOutcome::Updated { .. }));
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&importer_uri)
+                .iter()
+                .any(|edge| edge.to == module_uri && edge.is_selective_module()),
+            "closed resync must retain the workspace-root selective-module edge"
+        );
+    }
+
     #[tokio::test]
     async fn resync_vetoes_commit_when_document_is_open() {
         let tmp = TempDir::new().unwrap();

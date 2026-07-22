@@ -222,7 +222,7 @@ fn open_disk_fallback_target(
         workspace_root.as_ref(),
         &state.workspace_exclusions,
     );
-    crate::cross_file::enrich_box_import_resolutions(&mut meta, uri);
+    crate::cross_file::enrich_selective_import_resolutions(&mut meta, uri, workspace_root.as_ref());
     state.open_document_with_language_id_and_metadata(
         uri.clone(),
         text,
@@ -399,7 +399,11 @@ fn materialize_cli_contextual_provider(
         workspace_root,
         &state.workspace_exclusions,
     );
-    crate::cross_file::enrich_box_import_resolutions(&mut metadata, &execution.uri);
+    crate::cross_file::enrich_selective_import_resolutions(
+        &mut metadata,
+        &execution.uri,
+        workspace_root,
+    );
     let artifacts = std::sync::Arc::new(match tree.as_ref() {
         Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
             &execution.uri,
@@ -992,6 +996,11 @@ fn reported_packages_to_warm(
     targets: &[PathBuf],
 ) -> std::collections::HashSet<String> {
     let mut packages: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let workspace_root = state.workspace_folders.first();
+    let mut selective_roots = targets
+        .iter()
+        .filter_map(|path| Url::from_file_path(path).ok())
+        .collect::<Vec<_>>();
     // Package mode: NAMESPACE `import(pkg)` puts every export of `pkg` in
     // scope for the package's own R files, so warm those exports too.
     packages.extend(
@@ -1062,6 +1071,14 @@ fn reported_packages_to_warm(
                     | crate::box_use::BoxSpec::Unsupported(_) => None,
                 },
             ));
+            packages.extend(
+                entry
+                    .metadata
+                    .import_calls
+                    .iter()
+                    .filter_map(crate::import_pkg::ImportCall::package_name)
+                    .map(str::to_string),
+            );
         } else if is_chunk_file(path) {
             // Chunk files are outside the R-only scan, so they have no index
             // entry. Read + construct a throwaway Document best-effort so its
@@ -1075,7 +1092,20 @@ fn reported_packages_to_warm(
                     crate::state::Document::new_with_language_id(&text, Some(1), &uri, Some("rmd"));
                 packages.extend(doc.loaded_packages.iter().cloned());
                 packages.extend(doc.data_packages.iter().cloned());
-                let metadata = crate::cross_file::extract_metadata(&doc.analysis_text());
+                let mut metadata = crate::cross_file::extract_metadata(&doc.analysis_text());
+                crate::cross_file::enrich_selective_import_resolutions(
+                    &mut metadata,
+                    &uri,
+                    workspace_root,
+                );
+                selective_roots.extend(metadata.selective_import_requests(&uri).filter_map(
+                    |request| match request.source {
+                        crate::selective_import::ImportSource::LocalModule(module) => {
+                            Some(module.uri)
+                        }
+                        crate::selective_import::ImportSource::Package(_) => None,
+                    },
+                ));
                 packages.extend(
                     metadata
                         .library_calls
@@ -1090,9 +1120,35 @@ fn reported_packages_to_warm(
                         | crate::box_use::BoxSpec::Unsupported(_) => None,
                     },
                 ));
+                packages.extend(
+                    metadata
+                        .import_calls
+                        .iter()
+                        .filter_map(crate::import_pkg::ImportCall::package_name)
+                        .map(str::to_string),
+                );
             }
         }
     }
+
+    // Report targets may import package-using local modules without naming those
+    // packages themselves. Traverse only typed selective-module edges: ordinary
+    // source() children keep their existing, separately documented warming rules.
+    for module_uri in state
+        .cross_file_graph
+        .selective_module_closure(selective_roots)
+    {
+        let Some(metadata) = state.get_enriched_metadata(&module_uri) else {
+            continue;
+        };
+        packages.extend(
+            metadata
+                .referenced_packages()
+                .filter(|package| !crate::package_library::is_load_all_sentinel(package))
+                .map(str::to_string),
+        );
+    }
+
     packages
 }
 
@@ -3742,6 +3798,59 @@ infixContinuationStyle = "indented"
         assert!(
             warm.contains("syntheticBoxPackage"),
             "static box package imports must contribute to the CLI warm set: {warm:?}"
+        );
+    }
+
+    #[test]
+    fn targeted_warming_traverses_indexed_selective_modules() {
+        let temp = TempDir::new().unwrap();
+        let importer = temp.path().join("main.R");
+        fs::write(&importer, "import::here('module.R', value)\n").unwrap();
+        fs::write(
+            temp.path().join("module.R"),
+            "import::here(syntheticImportPackage, value)\n",
+        )
+        .unwrap();
+
+        let canonical_root = std::fs::canonicalize(temp.path()).unwrap();
+        let workspace_url = Url::from_file_path(&canonical_root).unwrap();
+        let state =
+            build_indexed_state(&canonical_root, &workspace_url, true, None, &canonical_root)
+                .unwrap();
+        let targets = vec![std::fs::canonicalize(importer).unwrap()];
+        let warm = reported_packages_to_warm(&state, &targets);
+        assert!(
+            warm.contains("syntheticImportPackage"),
+            "a package referenced only inside an indexed local module must warm: {warm:?}"
+        );
+    }
+
+    #[test]
+    fn targeted_warming_traverses_selective_modules_from_chunk_file() {
+        let temp = TempDir::new().unwrap();
+        let report = temp.path().join("report.Rmd");
+        fs::write(
+            &report,
+            "# Report\n\n```{r}\nimport::here(value, .from = \"module.R\")\n```\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("module.R"),
+            "import::here(syntheticChunkImportPackage, value)\n",
+        )
+        .unwrap();
+
+        let canonical_root = std::fs::canonicalize(temp.path()).unwrap();
+        let workspace_url = Url::from_file_path(&canonical_root).unwrap();
+        let state =
+            build_indexed_state(&canonical_root, &workspace_url, true, None, &canonical_root)
+                .unwrap();
+        let targets = vec![std::fs::canonicalize(report).unwrap()];
+        let warm = reported_packages_to_warm(&state, &targets);
+        assert!(
+            warm.contains("syntheticChunkImportPackage"),
+            "a package referenced only inside a local module imported by an Rmd chunk must warm: \
+             {warm:?}"
         );
     }
 

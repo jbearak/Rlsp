@@ -44,7 +44,9 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::Url;
 
 use super::{BoxAttach, BoxExports, BoxImport};
-use crate::selective_import::{ExportSet, ImportEnv, ImportSource, MemberProvenance};
+use crate::selective_import::{
+    ExportSet, ImportEnv, ImportSource, LocalModuleDialect, LocalModuleIdentity, MemberProvenance,
+};
 
 /// Maximum re-export recursion depth. Re-export chains deeper than this fail
 /// closed (an [`ExportSet::unresolved`] contribution), matching the
@@ -64,6 +66,13 @@ pub trait ModuleExportEnv {
 
     /// An installed package's export set (from the package library).
     fn package_exports(&self, package: &str) -> ExportSet;
+
+    /// `{import}` script-module private top-level environment. Kept separate
+    /// from `box_exports`/`legacy_exports` so box marker policy never leaks
+    /// across dialects.
+    fn import_module_exports(&self, _uri: &Url) -> ExportSet {
+        ExportSet::unresolved()
+    }
 
     /// The definition site of one exported `member` of `source`, if known.
     /// Defaults to `None`.
@@ -89,6 +98,7 @@ pub struct ArtifactModuleExportEnv<'a> {
     package_library: Option<&'a crate::package_library::PackageLibrary>,
     top_level_interfaces: RefCell<HashMap<Url, Arc<TopLevelInterface>>>,
     package_export_sets: RefCell<HashMap<String, ExportSet>>,
+    import_module_stack: RefCell<HashSet<Url>>,
 }
 
 impl<'a> ArtifactModuleExportEnv<'a> {
@@ -103,6 +113,7 @@ impl<'a> ArtifactModuleExportEnv<'a> {
             package_library,
             top_level_interfaces: RefCell::new(HashMap::new()),
             package_export_sets: RefCell::new(HashMap::new()),
+            import_module_stack: RefCell::new(HashSet::new()),
         }
     }
 
@@ -187,9 +198,9 @@ impl<'a> ArtifactModuleExportEnv<'a> {
                     })
                 } else if let Some(exported) = exported {
                     let exports = match &source {
-                        ImportSource::Package(name) => self.package_exports(name),
-                        ImportSource::LocalModule(source_uri) => {
-                            resolve_module_export_set(source_uri, self)
+                        ImportSource::Package(name) => ModuleExportEnv::package_exports(self, name),
+                        ImportSource::LocalModule(source) => {
+                            resolve_module_export_set(&source.uri, self)
                         }
                     };
                     // Exact navigation provenance is available only for a
@@ -202,8 +213,8 @@ impl<'a> ArtifactModuleExportEnv<'a> {
                     } else {
                         match &source {
                             ImportSource::Package(_) => None,
-                            ImportSource::LocalModule(source_uri) => self.local_member_provenance(
-                                source_uri,
+                            ImportSource::LocalModule(source) => self.local_member_provenance(
+                                &source.uri,
                                 exported,
                                 visited,
                                 depth + 1,
@@ -214,6 +225,52 @@ impl<'a> ArtifactModuleExportEnv<'a> {
                     None
                 };
 
+                if let Some(provenance) = provenance {
+                    let order = (import.line, import.column);
+                    if best
+                        .as_ref()
+                        .is_none_or(|(best_order, _)| order >= *best_order)
+                    {
+                        best = Some((order, provenance));
+                    }
+                }
+            }
+
+            // `{import}` redirects top-level from()/into() calls into a script
+            // module's private environment (the module carries `.packageName`).
+            // Therefore every top-level supported call can provide member
+            // provenance here, regardless of its standalone destination label.
+            for import in metadata
+                .import_calls
+                .iter()
+                .filter(|import| !import.function_scoped)
+            {
+                let Some(request) = import.lower(uri) else {
+                    continue;
+                };
+                // This walk already owns the provenance recursion guard. Resolve
+                // only export membership and local-name selection here, then
+                // follow the selected source member with the same guard below.
+                let resolved = request.resolve(&ImportResolver::without_provenance(self));
+                let Some(binding) = resolved
+                    .bindings
+                    .iter()
+                    .find(|binding| !binding.is_namespace && binding.local == member)
+                else {
+                    continue;
+                };
+                let Some(exported) = binding.exported.as_deref() else {
+                    continue;
+                };
+                if resolved.exports.membership(exported) == Some(false) {
+                    continue;
+                }
+                let provenance = match &request.source {
+                    ImportSource::Package(_) => None,
+                    ImportSource::LocalModule(source) => {
+                        self.local_member_provenance(&source.uri, exported, visited, depth + 1)
+                    }
+                };
                 if let Some(provenance) = provenance {
                     let order = (import.line, import.column);
                     if best
@@ -282,11 +339,103 @@ impl ModuleExportEnv for ArtifactModuleExportEnv<'_> {
         exports
     }
 
+    fn import_module_exports(&self, uri: &Url) -> ExportSet {
+        if !self.import_module_stack.borrow_mut().insert(uri.clone()) {
+            return ExportSet::unresolved();
+        }
+        let result = self
+            .top_level_interface(uri)
+            .map_or_else(ExportSet::unresolved, |_| {
+                let Some(artifacts) = (self.get_artifacts)(uri) else {
+                    return ExportSet::unresolved();
+                };
+                let mut members = crate::import_pkg::resolve::own_live_exports(&artifacts).members;
+                for event in &artifacts.timeline {
+                    match event {
+                        crate::cross_file::scope::ScopeEvent::Def {
+                            symbol,
+                            function_scope: None,
+                            ..
+                        }
+                        | crate::cross_file::scope::ScopeEvent::Declaration {
+                            symbol,
+                            function_scope: None,
+                            ..
+                        } => {
+                            members.insert(symbol.name.to_string());
+                        }
+                        crate::cross_file::scope::ScopeEvent::Removal {
+                            symbols,
+                            function_scope: None,
+                            ..
+                        } => {
+                            for name in symbols {
+                                members.remove(name);
+                            }
+                        }
+                        crate::cross_file::scope::ScopeEvent::SelectiveImport {
+                            request,
+                            function_scope: None,
+                            ..
+                        } => {
+                            // When this file is loaded as an `{import}` script
+                            // module, upstream redirects named from()/into()
+                            // destinations into the module's private environment.
+                            // Export discovery needs only local names. Avoid
+                            // starting an unrelated provenance walk for every
+                            // binding; exact navigation resolves provenance on
+                            // demand through `local_member_provenance`.
+                            let resolved =
+                                request.resolve(&ImportResolver::without_provenance(self));
+                            for binding in resolved.bindings {
+                                if binding.is_namespace {
+                                    continue;
+                                }
+                                if binding.exported.as_deref().is_some_and(|exported| {
+                                    resolved.exports.membership(exported) == Some(false)
+                                }) {
+                                    continue;
+                                }
+                                members.insert(binding.local);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                members.remove(".packageName");
+                members.remove("__last_modified__");
+                ExportSet {
+                    members,
+                    completeness: crate::selective_import::ExportCompleteness::Partial,
+                    known_absent_prefixes: Default::default(),
+                }
+            });
+        self.import_module_stack.borrow_mut().remove(uri);
+        result
+    }
+
     fn member_provenance(&self, source: &ImportSource, member: &str) -> Option<MemberProvenance> {
-        let ImportSource::LocalModule(uri) = source else {
+        let ImportSource::LocalModule(module) = source else {
             return None;
         };
-        self.local_member_provenance(uri, member, &mut HashSet::new(), 0)
+        self.local_member_provenance(&module.uri, member, &mut HashSet::new(), 0)
+    }
+}
+
+impl ImportEnv for ArtifactModuleExportEnv<'_> {
+    fn package_exports(&self, package: &str) -> ExportSet {
+        ModuleExportEnv::package_exports(self, package)
+    }
+
+    fn module_exports(&self, module: &LocalModuleIdentity) -> Option<ExportSet> {
+        Some(match module.dialect {
+            LocalModuleDialect::Box => resolve_module_export_set(&module.uri, self),
+            LocalModuleDialect::ImportPackage => self.import_module_exports(&module.uri),
+        })
+    }
+
+    fn member_provenance(&self, source: &ImportSource, member: &str) -> Option<MemberProvenance> {
+        ModuleExportEnv::member_provenance(self, source, member)
     }
 }
 
@@ -349,7 +498,9 @@ fn resolve_reexport_source(
 ) -> ExportSet {
     let source_exports = match reexport.resolved_source() {
         Some(ImportSource::Package(name)) => env.package_exports(&name),
-        Some(ImportSource::LocalModule(uri)) => resolve_module_inner(&uri, env, visited, depth),
+        Some(ImportSource::LocalModule(module)) => {
+            resolve_module_inner(&module.uri, env, visited, depth)
+        }
         None => ExportSet::unresolved(),
     };
 
@@ -380,12 +531,26 @@ fn resolve_reexport_source(
 /// [`resolve_module_export_set`] (re-exports expanded).
 pub struct ImportResolver<'a> {
     env: &'a dyn ModuleExportEnv,
+    resolve_provenance: bool,
 }
 
 impl<'a> ImportResolver<'a> {
     /// Wrap a [`ModuleExportEnv`].
     pub fn new(env: &'a dyn ModuleExportEnv) -> Self {
-        Self { env }
+        Self {
+            env,
+            resolve_provenance: true,
+        }
+    }
+
+    /// Resolve export membership and binding names without eagerly following
+    /// member provenance. Used by recursive export/provenance walks that either
+    /// do not consume definition sites or must thread their own cycle guard.
+    fn without_provenance(env: &'a dyn ModuleExportEnv) -> Self {
+        Self {
+            env,
+            resolve_provenance: false,
+        }
     }
 }
 
@@ -394,12 +559,17 @@ impl ImportEnv for ImportResolver<'_> {
         self.env.package_exports(package)
     }
 
-    fn module_exports(&self, uri: &Url) -> Option<ExportSet> {
-        Some(resolve_module_export_set(uri, self.env))
+    fn module_exports(&self, module: &LocalModuleIdentity) -> Option<ExportSet> {
+        match module.dialect {
+            LocalModuleDialect::Box => Some(resolve_module_export_set(&module.uri, self.env)),
+            LocalModuleDialect::ImportPackage => Some(self.env.import_module_exports(&module.uri)),
+        }
     }
 
     fn member_provenance(&self, source: &ImportSource, member: &str) -> Option<MemberProvenance> {
-        self.env.member_provenance(source, member)
+        self.resolve_provenance
+            .then(|| self.env.member_provenance(source, member))
+            .flatten()
     }
 }
 
@@ -413,6 +583,10 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    fn box_module(uri: Url) -> ImportSource {
+        ImportSource::LocalModule(LocalModuleIdentity::new(uri, LocalModuleDialect::Box))
+    }
 
     /// In-memory env: maps module URIs to their `BoxExports` (or a legacy set),
     /// and package names to export sets.
@@ -577,9 +751,12 @@ mod tests {
         let resolver = ImportResolver::new(&env);
 
         let request = SelectiveImportRequest {
-            source: ImportSource::LocalModule(url("file:///m.r")),
+            source: box_module(url("file:///m.r")),
             namespace: None,
             attach: vec![AttachBinding::Wildcard],
+            destination: crate::selective_import::ImportDestination::CurrentEnvironment,
+            excluded_exports: Default::default(),
+            wildcard_skips_explicit_exports: false,
             function_scoped: false,
             provenance: ImportProvenance {
                 uri: url("file:///importer.r"),
@@ -620,9 +797,9 @@ mod tests {
         assert!(exports.exports("public"));
         assert!(!exports.exports(".private"));
 
-        let provenance = env
-            .member_provenance(&ImportSource::LocalModule(uri.clone()), "public")
-            .expect("public provenance");
+        let provenance =
+            ModuleExportEnv::member_provenance(&env, &box_module(uri.clone()), "public")
+                .expect("public provenance");
         assert_eq!(provenance.uri, uri);
         assert_eq!(provenance.line, 0);
         assert_eq!(provenance.column, 0);
@@ -671,14 +848,60 @@ mod tests {
 
         for (module_path, member) in [(&renamed_path, "renamed"), (&wildcard_path, "original")] {
             let module_uri = Url::from_file_path(module_path).expect("module uri");
-            let provenance = env
-                .member_provenance(&ImportSource::LocalModule(module_uri), member)
-                .expect("re-export provenance");
+            let provenance =
+                ModuleExportEnv::member_provenance(&env, &box_module(module_uri), member)
+                    .expect("re-export provenance");
             assert_eq!(provenance.uri, base_uri);
             assert_eq!(provenance.line, 1);
             assert_eq!(provenance.column, 0);
             assert_eq!(provenance.end_column, 8);
         }
+    }
+
+    #[test]
+    fn import_package_provenance_cycle_reuses_the_active_guard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a_path = dir.path().join("a.R");
+        let b_path = dir.path().join("b.R");
+        let a_code = "import::here(value, .from = \"b.R\")\n";
+        let b_code = "import::here(value, .from = \"a.R\")\nvalue <- function() 1\n";
+        std::fs::write(&a_path, a_code).expect("write a");
+        std::fs::write(&b_path, b_code).expect("write b");
+
+        let mut artifacts = HashMap::new();
+        let mut metadata = HashMap::new();
+        for (path, code) in [(&a_path, a_code), (&b_path, b_code)] {
+            let uri = Url::from_file_path(path).expect("file uri");
+            let document = crate::state::Document::new_with_uri(code, None, &uri);
+            let mut meta = crate::cross_file::extract_metadata(code);
+            crate::cross_file::enrich_selective_import_resolutions(&mut meta, &uri, None);
+            let meta = Arc::new(meta);
+            let artifact = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+                &uri,
+                document.tree.as_ref().expect("tree"),
+                code,
+                Some(&meta),
+            ));
+            metadata.insert(uri.clone(), meta);
+            artifacts.insert(uri, artifact);
+        }
+
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let env = ArtifactModuleExportEnv::new(&get_artifacts, &get_metadata, None);
+        let a_uri = Url::from_file_path(&a_path).expect("a uri");
+        let b_uri = Url::from_file_path(&b_path).expect("b uri");
+        let source = ImportSource::LocalModule(LocalModuleIdentity::new(
+            a_uri,
+            LocalModuleDialect::ImportPackage,
+        ));
+
+        let provenance = ModuleExportEnv::member_provenance(&env, &source, "value")
+            .expect("the cycle must terminate at b's own definition");
+        assert_eq!(provenance.uri, b_uri);
+        assert_eq!(provenance.line, 1);
+        assert_eq!(provenance.column, 0);
+        assert_eq!(provenance.end_column, 5);
     }
 
     #[test]
@@ -688,9 +911,12 @@ mod tests {
             .insert("file:///m.r".into(), explicit(&["a", "b"]));
         let resolver = ImportResolver::new(&env);
         let request = SelectiveImportRequest {
-            source: ImportSource::LocalModule(url("file:///m.r")),
+            source: box_module(url("file:///m.r")),
             namespace: Some(NamespaceBinding { alias: "m".into() }),
             attach: vec![],
+            destination: crate::selective_import::ImportDestination::CurrentEnvironment,
+            excluded_exports: Default::default(),
+            wildcard_skips_explicit_exports: false,
             function_scoped: false,
             provenance: ImportProvenance {
                 uri: url("file:///importer.r"),

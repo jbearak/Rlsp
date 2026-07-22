@@ -9,7 +9,7 @@ When you invoke Find References (Shift+F12 / right-click → Find All References
 2. Searches the current file, all other open documents, and every workspace-indexed file for identifier nodes with that same name.
 3. Returns every match — both definition sites (assignments, function parameters) and usage sites.
 
-Find References is ordinarily a **name-based** search: it matches on the identifier text, with no dependency-graph or scope filtering. Static selective members imported through `box::use()` are the exception: Raven follows their resolved definition identity so unrelated same-named members are excluded. See [Scope and pooling](#scope-and-pooling) and [box selective-member identity](#box-selective-member-identity).
+Find References is ordinarily a **name-based** search: it matches on the identifier text, with no dependency-graph or scope filtering. Static members imported through `box::use()` or supported `import::` calls are the exception: Raven follows their local definition or installed-package export identity so unrelated same-named members are excluded. See [Scope and pooling](#scope-and-pooling) and [selective-import member identity](#selective-import-member-identity).
 
 ## Cross-File Scoping
 
@@ -38,9 +38,11 @@ Unlike completions and diagnostics, Find References does **not** consult the `so
 
 If you need a result scoped to one ordinary symbol's definition, use [Go-to-Definition](go-to-definition.md), which *is* scope- and dependency-aware.
 
-### box selective-member identity
+### Selective-import member identity
 
-For a resolved member imported through static [`box::use()`](cross-file.md#box-module-imports-boxuse), Raven starts from the original local-module definition and keeps only occurrences whose go-to-definition resolves to that exact identity. The result can include namespace access through `$`, `@`, or literal `[["name"]]`, named/wildcard attachments, renamed local bindings, re-export chains, and the underlying definition in open or workspace-indexed files. An unrelated top-level binding or `other$member` with the same spelling is excluded. This identity filtering applies whether Find References starts from a qualified use, an attached/renamed use, or the module definition itself; ordinary non-box structural references retain the broad pooling described above.
+For a resolved local-module member imported through static [`box::use()`](cross-file.md#box-module-imports-boxuse) or a supported [`import::` call](cross-file.md#import-package-selective-imports), Raven starts from the original definition and keeps only occurrences that resolve to that exact identity. The result can include namespace access through `$`, `@`, or literal `[["name"]]` where the syntax supports it, named/wildcard attachments, renamed local bindings, re-export chains, and the underlying definition in open or workspace-indexed files.
+
+Selected installed-package members have no navigable source definition, so Raven instead preserves the exact `(package, exported name)` identity. Renamed declaration tokens and uses remain linked to the original export, while unrelated local bindings or imports from another package with the same spelling are excluded. Ordinary non-selective structural references retain the broad pooling described above.
 
 > Find References works inside R code chunks of R Markdown / Quarto (`.Rmd` / `.Rmarkdown` / `.qmd`) documents — all R chunk bodies are pooled as one R program, so references span chunks. Invoking it on prose, YAML, or a non-R chunk returns no results.
 

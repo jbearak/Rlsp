@@ -63,6 +63,12 @@ pub const BOX_MODULE_NOT_FOUND: &str = "box-module-not-found";
 pub const BOX_MODULE_CASE_MISMATCH: &str = "box-module-case-mismatch";
 /// A selected `box::use()` attachment that is absent from a complete export set.
 pub const BOX_EXPORT_NOT_FOUND: &str = "box-export-not-found";
+/// A literal `{import}` script module that resolves to no exact `.R`/`.r` file.
+pub const IMPORT_MODULE_NOT_FOUND: &str = "import-module-not-found";
+/// A literal `{import}` script module found only under a different filename case.
+pub const IMPORT_MODULE_CASE_MISMATCH: &str = "import-module-case-mismatch";
+/// A selected `{import}` member absent from a complete package export snapshot.
+pub const IMPORT_EXPORT_NOT_FOUND: &str = "import-export-not-found";
 /// A `# raven: expect[...]` (or, under the global sweep, any suppression)
 /// that suppressed nothing. Hint severity. F2.
 pub const UNUSED_SUPPRESSION: &str = "unused-suppression";
@@ -96,6 +102,9 @@ pub const ANALYZER_CODES: &[&str] = &[
     BOX_MODULE_NOT_FOUND,
     BOX_MODULE_CASE_MISMATCH,
     BOX_EXPORT_NOT_FOUND,
+    IMPORT_MODULE_NOT_FOUND,
+    IMPORT_MODULE_CASE_MISMATCH,
+    IMPORT_EXPORT_NOT_FOUND,
     UNUSED_SUPPRESSION,
 ];
 
@@ -115,6 +124,7 @@ pub const SUPPRESSIBLE_ANALYZER_CODES: &[&str] = &[
     PACKAGE_OUTSIDE_ACTIVE_LIBRARY,
     NAMESPACE_MEMBER_NOT_FOUND,
     BOX_EXPORT_NOT_FOUND,
+    IMPORT_EXPORT_NOT_FOUND,
 ];
 
 /// Canonical lint codes, kebab-case (the suppression spelling of the

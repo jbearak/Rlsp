@@ -13,6 +13,7 @@ Go-to-definition (Cmd-click, Ctrl-click on Windows/Linux, or F12) navigates to w
 | File path inside `source()` or a path directive | The referenced file, opened at line 0 |
 | Static relative module spec inside `box::use(./module)` | The resolved file module or package-style `__init__.r` / `__init__.R` |
 | Exported member of a box namespace alias, or an attached/renamed box binding | The original local-module definition, including through named, renamed, and wildcard re-exports; installed-package members remain non-navigable |
+| Literal `.R`/`.r` source or selected/renamed local member in a static `import::` call | The exact script file or original top-level definition |
 | Identifier in `.stan`, `.jags`, or `.bugs` files | The most recent definition at or before the cursor (or the first definition if the cursor precedes all of them) — see [JAGS and Stan](#jags-and-stan) for the per-language details |
 
 ## Position-Aware Resolution

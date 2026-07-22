@@ -11,6 +11,7 @@ Raven offers context-aware completions for R symbols, package exports, function 
 | **Package exports** | Functions and variables from loaded packages, with `{pkg}` attribution |
 | **Namespace-qualified exports** | A package's exported symbols after `pkg::` (e.g. `dplyr::`) |
 | **box imports** | Static namespace aliases and attached/renamed exports; known exports after `alias$`, `alias@`, or literal `alias[["…"]]` access |
+| **import package bindings** | Static selected, renamed, and known `.all` bindings from packages or literal script modules; named destinations contribute fallback names only |
 | **Function parameters** | Parameter names when inside a function call |
 | **File paths** | `.R`/`.r` files and directories inside `source()` strings and path directives |
 | **$ members** | Known members after `$` (from assignments and constructors) |

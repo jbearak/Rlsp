@@ -762,7 +762,7 @@ impl DiagnosticsSnapshot {
                 lookup: &data_lookup,
                 base_packages: self.package_library.base_packages(),
             });
-        let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+        let import_env = crate::selective_import::ArtifactSelectiveImportEnv::new(
             &get_artifacts,
             &get_metadata,
             (self.cross_file_config.packages_enabled && self.package_library_ready)
@@ -925,6 +925,16 @@ pub(crate) fn diagnostics_from_snapshot(
 
     // Static `box::use()` module/export diagnostics.
     collect_box_import_diagnostics_from_snapshot(
+        snapshot,
+        uri,
+        &mut diagnostics,
+        if track_unused {
+            Some(&mut suppressed_pairs)
+        } else {
+            None
+        },
+    );
+    collect_import_pkg_diagnostics_from_snapshot(
         snapshot,
         uri,
         &mut diagnostics,
@@ -3909,7 +3919,7 @@ pub(crate) fn get_cross_file_scope(
             lookup: &data_lookup,
             base_packages: state.package_library.base_packages(),
         });
-    let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+    let import_env = crate::selective_import::ArtifactSelectiveImportEnv::new(
         &get_artifacts,
         &get_metadata,
         (state.cross_file_config.packages_enabled && state.package_library_ready)
@@ -3987,7 +3997,7 @@ pub(crate) fn get_cross_file_scope_with_cache(
             lookup: &data_lookup,
             base_packages: state.package_library.base_packages(),
         });
-    let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+    let import_env = crate::selective_import::ArtifactSelectiveImportEnv::new(
         &get_artifacts,
         &get_metadata,
         (state.cross_file_config.packages_enabled && state.package_library_ready)
@@ -6219,7 +6229,7 @@ fn collect_box_import_diagnostics_from_snapshot(
 ) {
     let get_artifacts = |target_uri: &Url| snapshot.artifacts_map.get(target_uri).cloned();
     let get_metadata = |target_uri: &Url| snapshot.metadata_map.get(target_uri).cloned();
-    let env = crate::box_use::ArtifactModuleExportEnv::new(
+    let env = crate::selective_import::ArtifactSelectiveImportEnv::new(
         &get_artifacts,
         &get_metadata,
         (snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready)
@@ -6238,7 +6248,12 @@ fn collect_box_import_diagnostics_from_snapshot(
             }
             crate::box_use::BoxSpec::LocalModule { .. } => match &import.local_resolution {
                 Some(crate::box_use::LocalModuleResolution::Resolved(uri)) => {
-                    crate::selective_import::ImportSource::LocalModule(uri.clone())
+                    crate::selective_import::ImportSource::LocalModule(
+                        crate::selective_import::LocalModuleIdentity::new(
+                            uri.clone(),
+                            crate::selective_import::LocalModuleDialect::Box,
+                        ),
+                    )
                 }
                 Some(crate::box_use::LocalModuleResolution::CaseMismatch { expected, found }) => {
                     let severity = snapshot.cross_file_config.case_mismatch_severity.resolve(
@@ -6324,6 +6339,136 @@ fn collect_box_import_diagnostics_from_snapshot(
                 message: format!("'{exported}' is not exported by this box import source"),
                 code: Some(NumberOrString::String(
                     crate::diagnostic_code::BOX_EXPORT_NOT_FOUND.to_string(),
+                )),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+fn collect_import_pkg_diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    diagnostics: &mut Vec<Diagnostic>,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
+) {
+    let get_artifacts = |target_uri: &Url| snapshot.artifacts_map.get(target_uri).cloned();
+    let get_metadata = |target_uri: &Url| snapshot.metadata_map.get(target_uri).cloned();
+    let env = crate::selective_import::ArtifactSelectiveImportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        (snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready)
+            .then_some(snapshot.package_library.as_ref()),
+    );
+    let resolver = crate::box_use::resolve::ImportResolver::new(&env);
+
+    for import in &snapshot.directive_meta.import_calls {
+        let range = Range::new(
+            Position::new(import.line, import.column),
+            Position::new(import.line, import.end_column.max(import.column)),
+        );
+        let source_range = Range::new(
+            Position::new(import.source_line, import.source_column),
+            Position::new(import.source_line, import.source_end_column),
+        );
+        match &import.local_resolution {
+            Some(crate::import_pkg::LocalScriptResolution::CaseMismatch {
+                expected,
+                found,
+                case_sensitive_fs,
+            }) => {
+                let regime = if *case_sensitive_fs {
+                    crate::cross_file::path_resolve::CaseMismatchRegime::CaseSensitiveFs
+                } else {
+                    crate::cross_file::path_resolve::CaseMismatchRegime::CaseInsensitiveFs
+                };
+                if let Some(severity) = snapshot
+                    .cross_file_config
+                    .case_mismatch_severity
+                    .resolve(regime)
+                {
+                    diagnostics.push(Diagnostic {
+                        range: source_range,
+                        severity: Some(severity),
+                        message: format!(
+                            "import script path case mismatch: expected '{}', found '{}'",
+                            expected.display(),
+                            found.display()
+                        ),
+                        code: Some(NumberOrString::String(
+                            crate::diagnostic_code::IMPORT_MODULE_CASE_MISMATCH.to_string(),
+                        )),
+                        ..Default::default()
+                    });
+                }
+                continue;
+            }
+            Some(crate::import_pkg::LocalScriptResolution::Missing) => {
+                if let Some(severity) = snapshot.cross_file_config.missing_file_severity {
+                    diagnostics.push(Diagnostic {
+                        range: source_range,
+                        severity: Some(severity),
+                        message: "Cannot resolve literal import script module".to_string(),
+                        code: Some(NumberOrString::String(
+                            crate::diagnostic_code::IMPORT_MODULE_NOT_FOUND.to_string(),
+                        )),
+                        ..Default::default()
+                    });
+                }
+                continue;
+            }
+            Some(crate::import_pkg::LocalScriptResolution::Resolved(_)) | None => {}
+        }
+        let Some(request) = import.lower(uri) else {
+            continue;
+        };
+        let resolved = request.resolve(&resolver);
+        let Some(severity) = snapshot
+            .cross_file_config
+            .packages_namespace_member_severity
+        else {
+            continue;
+        };
+        let mut diagnosed = HashSet::new();
+        let attachment_ranges = crate::import_pkg::detect::attachment_token_ranges(
+            &snapshot.tree,
+            &snapshot.text,
+            import,
+        );
+        for attach in &request.attach {
+            let Some(exported) = attach.exported_name() else {
+                continue;
+            };
+            if request.excluded_exports.contains(exported)
+                || resolved.exports.membership(exported) != Some(false)
+                || !diagnosed.insert(exported.to_string())
+            {
+                continue;
+            }
+            let member_range = attachment_ranges
+                .iter()
+                .find(|token| token.exported == exported)
+                .map_or(range, |token| token.range);
+            let diagnostic_line = member_range.start.line;
+            if crate::cross_file::directive::is_line_ignored_for_code(
+                &snapshot.directive_meta,
+                diagnostic_line,
+                Some(crate::diagnostic_code::IMPORT_EXPORT_NOT_FOUND),
+            ) {
+                if let Some(out) = suppressed_out.as_deref_mut() {
+                    out.push((
+                        diagnostic_line,
+                        crate::diagnostic_code::IMPORT_EXPORT_NOT_FOUND.to_string(),
+                    ));
+                }
+                continue;
+            }
+            diagnostics.push(Diagnostic {
+                range: member_range,
+                severity: Some(severity),
+                message: format!("'{exported}' is not exported by this import source"),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::IMPORT_EXPORT_NOT_FOUND.to_string(),
                 )),
                 ..Default::default()
             });
@@ -6458,10 +6603,36 @@ fn collect_missing_package_diagnostics_from_snapshot_for_uri(
         });
     }
 
-    for import in &snapshot.directive_meta.box_imports {
-        let crate::box_use::BoxSpec::Package(package) = &import.spec else {
-            continue;
-        };
+    let selective_packages = snapshot
+        .directive_meta
+        .box_imports
+        .iter()
+        .filter_map(|import| match &import.spec {
+            crate::box_use::BoxSpec::Package(package) => Some((
+                package.as_str(),
+                import.line,
+                import.column,
+                import.end_column,
+            )),
+            _ => None,
+        })
+        .chain(
+            snapshot
+                .directive_meta
+                .import_calls
+                .iter()
+                .filter_map(|import| {
+                    import.package_name().map(|package| {
+                        (
+                            package,
+                            import.source_line,
+                            import.source_column,
+                            import.source_end_column,
+                        )
+                    })
+                }),
+        );
+    for (package, line, column, end_column) in selective_packages {
         if snapshot.package_library.package_exists(package) {
             continue;
         }
@@ -6480,21 +6651,21 @@ fn collect_missing_package_diagnostics_from_snapshot_for_uri(
         };
         if crate::cross_file::directive::is_line_ignored_for_code(
             &snapshot.directive_meta,
-            import.line,
+            line,
             Some(code),
         ) {
             if let Some(out) = suppressed_out.as_deref_mut() {
-                out.push((import.line, code.to_string()));
+                out.push((line, code.to_string()));
             }
             continue;
         }
-        if outside_active && !reported_outside_active.insert(package.as_str()) {
+        if outside_active && !reported_outside_active.insert(package) {
             continue;
         }
         diagnostics.push(Diagnostic {
             range: Range::new(
-                Position::new(import.line, import.column),
-                Position::new(import.line, import.end_column.max(import.column)),
+                Position::new(line, column),
+                Position::new(line, end_column.max(column)),
             ),
             severity: Some(severity),
             message: missing_package_message(package, outside_active),
@@ -6950,7 +7121,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             lookup: &data_lookup,
             base_packages: snapshot.package_library.base_packages(),
         });
-    let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+    let import_env = crate::selective_import::ArtifactSelectiveImportEnv::new(
         &get_artifacts,
         &get_metadata,
         (snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready)
@@ -8053,7 +8224,7 @@ fn collect_undefined_variables_from_snapshot(
             lookup: &data_lookup,
             base_packages: snapshot.package_library.base_packages(),
         });
-    let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+    let import_env = crate::selective_import::ArtifactSelectiveImportEnv::new(
         &get_artifacts,
         &get_metadata,
         (snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready)
@@ -8718,6 +8889,11 @@ fn is_static_box_declaration_identifier(node: Node, text: &str) -> bool {
             .is_some_and(|value| value.id() == node.id())
 }
 
+fn is_static_import_declaration_identifier(node: Node, text: &str) -> bool {
+    debug_assert_eq!(node.kind(), "identifier");
+    crate::import_pkg::detect::is_static_declaration_token(node, text)
+}
+
 /// Returns true if the given identifier node is a *structural non-reference*:
 /// an identifier that exists in the AST but never refers to a value at runtime,
 /// regardless of which diagnostic pipeline is consuming it.
@@ -8740,6 +8916,7 @@ fn is_structural_non_reference(node: Node, text: &str) -> bool {
     is_assignment_target(node)
         || is_structural_label(node)
         || is_static_box_declaration_identifier(node, text)
+        || is_static_import_declaration_identifier(node, text)
 }
 
 /// Returns true when `node` is a default-parameter-expression identifier that
@@ -19760,14 +19937,35 @@ fn push_scoped_symbol_completion(
         return;
     }
 
-    // External package-export pseudo-URIs (`package:dplyr`, `package:base`,
-    // ...) are added via the separate per-package loop later; skip them
-    // here to avoid duplicate entries. Package-internal symbols injected by
-    // `append_package_contribution` use the synthetic URI
-    // `scope::PACKAGE_INTERNAL_URI` — these are the user's OWN package's
-    // symbols (from sibling `R/*.R` files or `importFrom` NAMESPACE
-    // targets) and are NOT added anywhere else, so they must pass through
-    // this filter.
+    // A selective package binding carries its exact exported/source member in
+    // the pseudo-URI fragment. Emit that resolved local name directly: adding the
+    // whole package later would leak unselected exports, and using the local alias
+    // as the help topic would break renamed imports.
+    if let (Some(package), Some(exported)) = (
+        crate::cross_file::scope::package_name_from_uri(&symbol.source_uri),
+        crate::cross_file::scope::package_export_from_uri(&symbol.source_uri),
+    ) {
+        let name_string = name.to_string();
+        seen_names.insert(name_string.clone());
+        items.push(CompletionItem {
+            label: name_string.clone(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some(format!("{{{package}}}")),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, name_string)),
+            data: Some(serde_json::json!({
+                "topic": exported.as_ref(),
+                "package": package,
+            })),
+            ..Default::default()
+        });
+        return;
+    }
+
+    // Ordinary external package-export pseudo-URIs (`package:dplyr`,
+    // `package:base`, ...) are added via the separate per-package loop later;
+    // skip them here to avoid duplicate entries. Package-internal symbols
+    // injected by `append_package_contribution` use the synthetic URI
+    // `scope::PACKAGE_INTERNAL_URI` and must pass through this filter.
     let is_package_internal = crate::cross_file::scope::is_package_internal_uri(&symbol.source_uri);
     let source_uri_str = symbol.source_uri.as_str();
     if source_uri_str.starts_with("package:") && !is_package_internal {
@@ -20010,8 +20208,25 @@ pub fn completion(
         );
     }
 
-    // Add package exports only if packages feature is enabled
+    // Add package exports only if packages feature is enabled.
     if state.cross_file_config.packages_enabled {
+        // Selective package bindings are already narrowed to their resolved local
+        // names. Add them before whole-package exports so a lexical/current or
+        // named `{import}` binding keeps its scope precedence without widening to
+        // every export of the source package.
+        for (name, symbol) in scope.symbols.iter().filter(|(_, symbol)| {
+            crate::cross_file::scope::package_export_from_uri(&symbol.source_uri).is_some()
+        }) {
+            push_scoped_symbol_completion(
+                state,
+                uri,
+                name.as_ref(),
+                symbol,
+                &mut items,
+                &mut seen_names,
+            );
+        }
+
         // Combine base packages, inherited, and loaded packages using a set for O(1) dedup
         // Requirement 6.3: Base packages SHALL be available at all positions
         let mut pkg_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -21652,9 +21867,11 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             return Some(markdown_hover(value, node_range));
         }
 
-        // Check if this is a package export (source_uri starts with "package:")
-        // Package exports have URIs like "package:dplyr" or "package:base"
-        let package_name = symbol.source_uri.as_str().strip_prefix("package:");
+        // Check if this is an external package export. Selective package
+        // bindings retain the exported/source member in the URI fragment so a
+        // renamed local can query the original help topic.
+        let package_name = crate::cross_file::scope::package_name_from_uri(&symbol.source_uri);
+        let package_topic = crate::cross_file::scope::package_export_from_uri(&symbol.source_uri);
 
         // Try to extract the definition statement; otherwise fall back to
         // signature/package-help info for the symbol.
@@ -21672,19 +21889,20 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     package_name
                 );
                 if let Some(pkg) = package_name {
+                    let topic = package_topic.as_deref().unwrap_or(name);
                     // Default-attached exports are all seeded under the synthetic
                     // `package:base` URI; recover the real owner (e.g. stats::ave)
                     // before fetching help / building the help-panel link. Genuine
                     // base topics (sum, ...) resolve back to "base" unchanged.
                     // See issue #592.
                     let owner: String = if pkg == "base" {
-                        state.package_library.resolve_default_attached_owner(name)
+                        state.package_library.resolve_default_attached_owner(topic)
                     } else {
                         pkg.to_string()
                     };
                     let owner_ref = owner.as_str();
                     let help_text =
-                        get_help_cached(&state.help_cache, name, Some(owner_ref), r_path.clone())
+                        get_help_cached(&state.help_cache, topic, Some(owner_ref), r_path.clone())
                             .await;
                     log::trace!(
                         "hover: get_help returned {:?}",
@@ -21692,7 +21910,7 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     );
                     if let Some(help_text) = help_text {
                         value.push_str(&format!("```\n{}\n```", help_text));
-                        value.insert_str(0, &build_help_panel_link(name, owner_ref));
+                        value.insert_str(0, &build_help_panel_link(topic, owner_ref));
                     } else if let Some(sig) = &symbol.signature {
                         value.push_str(&format!("```r\n{}\n```\n", sig));
                         value.push_str(&format!("\nfrom {{{}}}", owner_ref));
@@ -21921,7 +22139,8 @@ fn detect_active_parameter(call_node: Node, cursor_point: Point) -> Option<u32> 
 /// Some(SignatureInformation) if successful, None if help unavailable
 async fn try_build_package_signature(
     help_cache: &crate::help::HelpCache,
-    function_name: &str,
+    display_name: &str,
+    topic_name: &str,
     package_name: &str,
     r_path: std::path::PathBuf,
 ) -> Option<SignatureInformation> {
@@ -21931,7 +22150,7 @@ async fn try_build_package_signature(
     // top of the inner subprocess timeout.
     let help_task = tokio::task::spawn_blocking({
         let cache = help_cache.clone();
-        let func = function_name.to_string();
+        let func = topic_name.to_string();
         let pkg = package_name.to_string();
         let rp = r_path.clone();
         move || cache.get_or_fetch(&func, Some(&pkg), &rp)
@@ -21951,7 +22170,7 @@ async fn try_build_package_signature(
     // Get parameter documentation. Same timeout protection as above.
     let args_task = tokio::task::spawn_blocking({
         let cache = help_cache.clone();
-        let func = function_name.to_string();
+        let func = topic_name.to_string();
         let pkg = package_name.to_string();
         move || cache.get_arguments(&func, Some(&pkg), &r_path)
     });
@@ -21980,7 +22199,7 @@ async fn try_build_package_signature(
             .collect();
 
         // Build the signature label
-        let label = format_signature_label(function_name, &params);
+        let label = format_signature_label(display_name, &params);
 
         // Build documentation
         let documentation = description.map(|desc| {
@@ -22000,7 +22219,7 @@ async fn try_build_package_signature(
 
     // Fallback: function name with package attribution
     Some(SignatureInformation {
-        label: format!("{}(...)", function_name),
+        label: format!("{}(...)", display_name),
         documentation: Some(Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
             value: format!("from `{}`", package_name),
@@ -22128,7 +22347,8 @@ enum SignatureResolution {
     /// Package function — needs async help fetch.
     Package {
         help_cache: crate::help::HelpCache,
-        func_name: String,
+        display_name: String,
+        topic_name: String,
         package_name: String,
         /// Pre-built fallback used when async package lookup returns `None`.
         fallback: SignatureInformation,
@@ -22227,10 +22447,13 @@ pub fn prepare_signature_help(
 
     // Determine resolution strategy
     let resolution = if let Some(symbol) = scope.symbols.get(func_name) {
-        if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
+        if let Some(pkg) = crate::cross_file::scope::package_name_from_uri(&symbol.source_uri) {
+            let topic = crate::cross_file::scope::package_export_from_uri(&symbol.source_uri)
+                .map_or_else(|| func_name.to_string(), |topic| topic.into_owned());
             SignatureResolution::Package {
                 help_cache: state.help_cache.clone(),
-                func_name: func_name.to_string(),
+                display_name: func_name.to_string(),
+                topic_name: topic,
                 package_name: pkg.to_string(),
                 fallback: build_fallback_signature(func_name, &scope, uri, state),
                 r_path: r_path.clone(),
@@ -22258,7 +22481,8 @@ pub fn prepare_signature_help(
             } else {
                 SignatureResolution::Package {
                     help_cache: state.help_cache.clone(),
-                    func_name: func_name.to_string(),
+                    display_name: func_name.to_string(),
+                    topic_name: func_name.to_string(),
                     package_name: pkg_name,
                     fallback: build_fallback_signature(func_name, &scope, uri, state),
                     r_path,
@@ -22288,13 +22512,20 @@ pub async fn resolve_signature_help(ctx: SignatureHelpContext) -> Option<Signatu
     let signature_info = match ctx.resolution {
         SignatureResolution::Package {
             help_cache,
-            func_name,
+            display_name,
+            topic_name,
             package_name,
             fallback,
             r_path,
         } => {
-            let sig =
-                try_build_package_signature(&help_cache, &func_name, &package_name, r_path).await;
+            let sig = try_build_package_signature(
+                &help_cache,
+                &display_name,
+                &topic_name,
+                &package_name,
+                r_path,
+            )
+            .await;
             sig.unwrap_or(fallback)
         }
         SignatureResolution::Ready(sig) => sig,
@@ -22319,7 +22550,9 @@ fn build_fallback_signature(
         let sig = symbol.signature.as_deref().unwrap_or(&fallback);
         let label = sig.to_string();
 
-        let doc = if let Some(pkg) = symbol.source_uri.as_str().strip_prefix("package:") {
+        let doc = if let Some(pkg) =
+            crate::cross_file::scope::package_name_from_uri(&symbol.source_uri)
+        {
             Some(Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::Markdown,
                 value: format!("from `{}`", pkg),
@@ -22449,6 +22682,26 @@ fn box_module_spec_definition(
     })
 }
 
+fn import_module_spec_definition(
+    metadata: &crate::cross_file::CrossFileMetadata,
+    position: Position,
+) -> Option<Location> {
+    let import = metadata.import_calls.iter().find(|import| {
+        position.line == import.source_line
+            && position.character >= import.source_column
+            && position.character < import.source_end_column
+    })?;
+    let crate::import_pkg::LocalScriptResolution::Resolved(target_uri) =
+        import.local_resolution.as_ref()?
+    else {
+        return None;
+    };
+    Some(Location {
+        uri: target_uri.clone(),
+        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+    })
+}
+
 pub fn goto_definition(
     state: &WorldState,
     uri: &Url,
@@ -22522,12 +22775,16 @@ pub fn goto_definition_with_cancel(
     let node = tree.root_node().descendant_for_point_range(point, point)?;
     if matches!(node.kind(), "identifier" | "string")
         && let Some(location) = selective_attachment_declaration_definition(state, uri, node, &text)
+            .or_else(|| {
+                import_attachment_declaration_definition(state, uri, tree, node, position, &text)
+            })
     {
         return Some(GotoDefinitionResponse::Scalar(location));
     }
 
     if let Some(metadata) = content_provider.get_metadata(uri)
         && let Some(location) = box_module_spec_definition(&metadata, tree, &text, position)
+            .or_else(|| import_module_spec_definition(&metadata, position))
     {
         return Some(GotoDefinitionResponse::Scalar(location));
     }
@@ -22711,10 +22968,7 @@ pub fn goto_definition_with_cancel(
             log::trace!(
                 "Symbol '{}' is from package '{}', no navigable source available",
                 name,
-                symbol
-                    .source_uri
-                    .as_str()
-                    .strip_prefix("package:")
+                crate::cross_file::scope::package_name_from_uri(&symbol.source_uri)
                     .unwrap_or("unknown")
             );
             return None;
@@ -23217,10 +23471,16 @@ fn selective_namespace_reference_target(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectiveMemberIdentity {
+    LocalDefinition(Location),
+    PackageMember { package: String, exported: String },
+}
+
 #[derive(Debug)]
 struct SelectiveMemberReferenceTarget {
-    definition: Location,
-    /// Every source spelling that may resolve to `definition`: the exported
+    identity: SelectiveMemberIdentity,
+    /// Every source spelling that may resolve to this identity: the exported
     /// member name plus attached/renamed local aliases from all importers.
     candidate_names: HashSet<String>,
 }
@@ -23289,7 +23549,7 @@ fn selective_attachment_declaration_definition(
 
     let get_artifacts = |target_uri: &Url| content_provider.get_artifacts(target_uri);
     let get_metadata = |target_uri: &Url| content_provider.get_metadata(target_uri);
-    let env = crate::box_use::ArtifactModuleExportEnv::new(
+    let env = crate::selective_import::ArtifactSelectiveImportEnv::new(
         &get_artifacts,
         &get_metadata,
         Some(&state.package_library),
@@ -23304,35 +23564,161 @@ fn selective_attachment_declaration_definition(
         .map(|provenance| member_provenance_location(&provenance))
 }
 
+fn import_attachment_declaration_definition(
+    state: &WorldState,
+    uri: &Url,
+    tree: &tree_sitter::Tree,
+    _node: Node,
+    position: Position,
+    text: &str,
+) -> Option<Location> {
+    let content_provider = state.content_provider();
+    let metadata = content_provider.get_metadata(uri)?;
+    let (import, token) = metadata.import_calls.iter().find_map(|import| {
+        crate::import_pkg::detect::attachment_token_ranges(tree, text, import)
+            .into_iter()
+            .find(|token| {
+                (position >= token.range.start && position < token.range.end)
+                    || token
+                        .local_range
+                        .is_some_and(|range| position >= range.start && position < range.end)
+            })
+            .map(|token| (import, token))
+    })?;
+    let local = token.local;
+    let request = import.lower(uri)?;
+    let get_artifacts = |target_uri: &Url| content_provider.get_artifacts(target_uri);
+    let get_metadata = |target_uri: &Url| content_provider.get_metadata(target_uri);
+    let env = crate::selective_import::ArtifactSelectiveImportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        Some(&state.package_library),
+    );
+    request
+        .resolve(&crate::box_use::resolve::ImportResolver::new(&env))
+        .bindings
+        .into_iter()
+        .find(|binding| !binding.is_namespace && binding.local == local)
+        .and_then(|binding| binding.provenance)
+        .map(|provenance| member_provenance_location(&provenance))
+}
+
+/// Resolve an `{import}` package attachment declaration or a lexical selective
+/// package binding to its stable `(package, exported)` identity.
+fn selective_package_member_identity_at_position(
+    state: &WorldState,
+    uri: &Url,
+    tree: &tree_sitter::Tree,
+    node: Node,
+    position: Position,
+    text: &str,
+) -> Option<SelectiveMemberIdentity> {
+    let content_provider = state.content_provider();
+    if let Some(metadata) = content_provider.get_metadata(uri) {
+        for import in &metadata.import_calls {
+            let Some(package) = import.package_name() else {
+                continue;
+            };
+            if let Some(token) =
+                crate::import_pkg::detect::attachment_token_ranges(tree, text, import)
+                    .into_iter()
+                    .find(|token| {
+                        (position >= token.range.start && position < token.range.end)
+                            || token.local_range.is_some_and(|range| {
+                                position >= range.start && position < range.end
+                            })
+                    })
+            {
+                return Some(SelectiveMemberIdentity::PackageMember {
+                    package: package.to_string(),
+                    exported: token.exported,
+                });
+            }
+        }
+    }
+
+    if node.kind() != "identifier"
+        || is_assignment_target(node)
+        || is_destructuring_assignment_target(node, text)
+        || is_structural_label(node)
+    {
+        return None;
+    }
+    let raw = node_text(node, text);
+    let lookup_key = unquote_backtick_name(raw).unwrap_or(raw);
+    let scope = get_cross_file_scope(
+        state,
+        uri,
+        position.line,
+        position.character,
+        &DiagCancelToken::never(),
+        Some(state.package_state.scope_contribution()),
+    );
+    let symbol = scope
+        .symbols
+        .get(raw)
+        .or_else(|| scope.symbols.get(lookup_key))?;
+    let package = crate::cross_file::scope::package_name_from_uri(&symbol.source_uri)?;
+    let exported = crate::cross_file::scope::package_export_from_uri(&symbol.source_uri)?;
+    Some(SelectiveMemberIdentity::PackageMember {
+        package: package.to_string(),
+        exported: exported.into_owned(),
+    })
+}
+
 /// Classify a go-to-definition target as a selective-import member identity.
 ///
 /// This deliberately scans canonical import metadata instead of inferring
 /// identity from the member's spelling. It therefore unifies namespace access,
 /// named/wildcard attach, renamed attach, and re-export chains while excluding
-/// unrelated workspace members with the same name. Package members have no
-/// file provenance and remain on Raven's existing name-based path.
+/// unrelated workspace members with the same name. Package members use their
+/// stable `(package, exported name)` identity because they have no file
+/// provenance.
 fn selective_member_reference_target(
     state: &WorldState,
     uri: &Url,
+    tree: &tree_sitter::Tree,
+    node: Node,
     position: Position,
-    cursor_location: Location,
-    cursor_definition: Option<Location>,
+    text: &str,
 ) -> Option<SelectiveMemberReferenceTarget> {
-    // A definition token can resolve to an unrelated same-name workspace symbol
-    // through ordinary scope lookup. Its own exact range is authoritative here;
-    // canonical import provenance below still has to confirm that it is actually
-    // exported through a selective import.
-    let definition = cursor_definition
-        .or_else(|| goto_definition_location(state, uri, position))
-        .unwrap_or(cursor_location);
-    if definition.uri.as_str().starts_with("package:") {
-        return None;
-    }
+    // Package members have no navigable source definition. Their package/export
+    // identity is carried by selective scope bindings and exact `{import}`
+    // declaration-token metadata instead.
+    let package_identity =
+        selective_package_member_identity_at_position(state, uri, tree, node, position, text);
+    let cursor_location = Location {
+        uri: uri.clone(),
+        range: Range {
+            start: ts_point_to_lsp_position(text, node.start_position()),
+            end: ts_point_to_lsp_position(text, node.end_position()),
+        },
+    };
+    let cursor_definition = if node.kind() == "identifier"
+        && (is_assignment_target(node) || is_destructuring_assignment_target(node, text))
+    {
+        Some(cursor_location.clone())
+    } else if node.kind() == "identifier" {
+        selective_attachment_declaration_definition(state, uri, node, text)
+    } else {
+        None
+    };
+    let identity = package_identity.unwrap_or_else(|| {
+        // A definition token can resolve to an unrelated same-name workspace
+        // symbol through ordinary scope lookup. Its own exact range is
+        // authoritative here; canonical import provenance below still has to
+        // confirm that it is actually exported through a selective import.
+        SelectiveMemberIdentity::LocalDefinition(
+            cursor_definition
+                .or_else(|| goto_definition_location(state, uri, position))
+                .unwrap_or(cursor_location),
+        )
+    });
 
     let content_provider = state.content_provider();
     let get_artifacts = |target_uri: &Url| content_provider.get_artifacts(target_uri);
     let get_metadata = |target_uri: &Url| content_provider.get_metadata(target_uri);
-    let env = crate::box_use::ArtifactModuleExportEnv::new(
+    let env = crate::selective_import::ArtifactSelectiveImportEnv::new(
         &get_artifacts,
         &get_metadata,
         Some(&state.package_library),
@@ -23344,23 +23730,35 @@ fn selective_member_reference_target(
         let Some(metadata) = content_provider.get_metadata(&importer_uri) else {
             continue;
         };
-        for import in &metadata.box_imports {
-            let Some(request) = lower_static_box_import(&importer_uri, import) else {
-                continue;
-            };
+        for request in metadata.selective_import_requests(&importer_uri) {
             let resolved = request.resolve(&resolver);
 
-            if request.namespace.is_some() {
-                for member in &resolved.exports.members {
-                    let provenance = crate::selective_import::ImportEnv::member_provenance(
-                        &resolver,
+            match &identity {
+                SelectiveMemberIdentity::LocalDefinition(definition) => {
+                    if request.namespace.is_some() {
+                        for member in &resolved.exports.members {
+                            let provenance = crate::selective_import::ImportEnv::member_provenance(
+                                &resolver,
+                                &request.source,
+                                member,
+                            );
+                            if provenance.as_ref().is_some_and(|provenance| {
+                                member_provenance_location(provenance) == *definition
+                            }) {
+                                candidate_names.insert(member.clone());
+                            }
+                        }
+                    }
+                }
+                SelectiveMemberIdentity::PackageMember { package, exported } => {
+                    if matches!(
                         &request.source,
-                        member,
-                    );
-                    if provenance.as_ref().is_some_and(|provenance| {
-                        member_provenance_location(provenance) == definition
-                    }) {
-                        candidate_names.insert(member.clone());
+                        crate::selective_import::ImportSource::Package(source_package)
+                            if source_package == package
+                    ) && request.namespace.is_some()
+                        && resolved.exports.members.contains(exported)
+                    {
+                        candidate_names.insert(exported.clone());
                     }
                 }
             }
@@ -23369,29 +23767,24 @@ fn selective_member_reference_target(
                 if binding.is_namespace {
                     continue;
                 }
-                if binding
-                    .provenance
-                    .as_ref()
-                    .is_some_and(|provenance| member_provenance_location(provenance) == definition)
-                {
+                let binding_matches = match &identity {
+                    SelectiveMemberIdentity::LocalDefinition(definition) => {
+                        binding.provenance.as_ref().is_some_and(|provenance| {
+                            member_provenance_location(provenance) == *definition
+                        })
+                    }
+                    SelectiveMemberIdentity::PackageMember { package, exported } => {
+                        matches!(
+                            &request.source,
+                            crate::selective_import::ImportSource::Package(source_package)
+                                if source_package == package
+                        ) && binding.exported.as_deref() == Some(exported.as_str())
+                    }
+                };
+                if binding_matches {
                     candidate_names.insert(binding.local.clone());
-                    for attach in &request.attach {
-                        match attach {
-                            crate::selective_import::AttachBinding::Named(exported)
-                                if exported == &binding.local =>
-                            {
-                                candidate_names.insert(exported.clone());
-                            }
-                            crate::selective_import::AttachBinding::Renamed { local, exported }
-                                if local == &binding.local =>
-                            {
-                                candidate_names.insert(exported.clone());
-                            }
-                            crate::selective_import::AttachBinding::Wildcard => {
-                                candidate_names.insert(binding.local.clone());
-                            }
-                            _ => {}
-                        }
+                    if let Some(exported) = &binding.exported {
+                        candidate_names.insert(exported.clone());
                     }
                 }
             }
@@ -23399,7 +23792,7 @@ fn selective_member_reference_target(
     }
 
     (!candidate_names.is_empty()).then_some(SelectiveMemberReferenceTarget {
-        definition,
+        identity,
         candidate_names,
     })
 }
@@ -23566,22 +23959,6 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     // workspace-wide name pool to definition identity. This is intentionally
     // selective-import-only: ordinary `$`/`@` structural references retain their
     // established name-based behavior.
-    let cursor_location = Location {
-        uri: uri.clone(),
-        range: Range {
-            start: ts_point_to_lsp_position(&text, node.start_position()),
-            end: ts_point_to_lsp_position(&text, node.end_position()),
-        },
-    };
-    let cursor_definition = if node.kind() == "identifier"
-        && (is_assignment_target(node) || is_destructuring_assignment_target(node, &text))
-    {
-        Some(cursor_location.clone())
-    } else if node.kind() == "identifier" {
-        selective_attachment_declaration_definition(state, uri, node, &text)
-    } else {
-        None
-    };
     if node.kind() == "identifier"
         && let Some(target) =
             selective_namespace_reference_target(state, uri, position, node, name, &text)
@@ -23589,8 +23966,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
         collect_selective_namespace_references(state, uri, &target, &mut locations);
         return Some(locations);
     }
-    if let Some(target) =
-        selective_member_reference_target(state, uri, position, cursor_location, cursor_definition)
+    if let Some(target) = selective_member_reference_target(state, uri, tree, node, position, &text)
     {
         collect_selective_member_references(state, uri, &target, &mut locations);
         return Some(locations);
@@ -23763,6 +24139,7 @@ fn collect_selective_member_references(
             let text = document.analysis_text();
             collect_selective_member_references_in_subtree(
                 state,
+                tree,
                 tree.root_node(),
                 &text,
                 &file_uri,
@@ -23782,6 +24159,7 @@ fn collect_selective_member_references(
         let text = state.analysis_text_for_uri(&file_uri, &raw);
         collect_selective_member_references_in_subtree(
             state,
+            tree,
             tree.root_node(),
             &text,
             &file_uri,
@@ -23793,6 +24171,7 @@ fn collect_selective_member_references(
 
 fn collect_selective_member_references_in_subtree(
     state: &WorldState,
+    tree: &tree_sitter::Tree,
     node: Node,
     text: &str,
     uri: &Url,
@@ -23833,20 +24212,33 @@ fn collect_selective_member_references_in_subtree(
                 end: ts_point_to_lsp_position(text, node.end_position()),
             },
         };
-        let declaration_definition = matches!(node.kind(), "identifier" | "string")
-            .then(|| selective_attachment_declaration_definition(state, uri, node, text))
-            .flatten();
-        if location == target.definition
-            || declaration_definition.as_ref() == Some(&target.definition)
-            || goto_definition_location(state, uri, position).as_ref() == Some(&target.definition)
-        {
+        let matches_identity = match &target.identity {
+            SelectiveMemberIdentity::LocalDefinition(definition) => {
+                let declaration_definition = matches!(node.kind(), "identifier" | "string")
+                    .then(|| selective_attachment_declaration_definition(state, uri, node, text))
+                    .flatten();
+                location == *definition
+                    || declaration_definition.as_ref() == Some(definition)
+                    || goto_definition_location(state, uri, position).as_ref() == Some(definition)
+            }
+            SelectiveMemberIdentity::PackageMember { .. } => {
+                selective_package_member_identity_at_position(
+                    state, uri, tree, node, position, text,
+                )
+                .as_ref()
+                    == Some(&target.identity)
+            }
+        };
+        if matches_identity {
             locations.push(location);
         }
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_selective_member_references_in_subtree(state, child, text, uri, target, locations);
+        collect_selective_member_references_in_subtree(
+            state, tree, child, text, uri, target, locations,
+        );
     }
 }
 
@@ -24301,6 +24693,100 @@ mod tests {
                     crate::diagnostic_code::BOX_EXPORT_NOT_FOUND.to_string(),
                 ))
         }));
+    }
+
+    #[tokio::test]
+    async fn import_missing_export_suppression_uses_member_line() {
+        use crate::package_library::PackageInfo;
+
+        async fn diagnostics(code: &str) -> Vec<Diagnostic> {
+            let uri = Url::parse("file:///workspace/main.R").unwrap();
+            let mut state = WorldState::new();
+            state.workspace_scan_complete = true;
+            state.package_library_ready = true;
+            let mut package =
+                PackageInfo::new("dplyr".to_string(), HashSet::from(["present".to_string()]));
+            package.exports_completeness = crate::package_library::MemberCompleteness::Complete;
+            state.package_library.insert_package(package).await;
+            state.open_document(uri.clone(), code, Some(1));
+            let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("snapshot");
+            diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+                .expect("diagnostics")
+        }
+
+        let member_directive = diagnostics(concat!(
+            "import::here(\n",
+            "  dplyr,\n",
+            "  # raven: ignore-next[import-export-not-found]\n",
+            "  missing\n",
+            ")\n",
+        ))
+        .await;
+        assert!(member_directive.iter().all(|diagnostic| {
+            diagnostic.code.as_ref()
+                != Some(&NumberOrString::String(
+                    crate::diagnostic_code::IMPORT_EXPORT_NOT_FOUND.to_string(),
+                ))
+        }));
+
+        let call_directive = diagnostics(concat!(
+            "# raven: ignore-next[import-export-not-found]\n",
+            "import::here(\n",
+            "  dplyr,\n",
+            "  missing\n",
+            ")\n",
+        ))
+        .await;
+        let missing = call_directive
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code.as_ref()
+                    == Some(&NumberOrString::String(
+                        crate::diagnostic_code::IMPORT_EXPORT_NOT_FOUND.to_string(),
+                    ))
+            })
+            .expect("a call-line directive must not suppress a later member");
+        assert_eq!(missing.range.start.line, 3);
+    }
+
+    #[tokio::test]
+    async fn selective_package_references_follow_package_export_identity() {
+        use crate::package_library::PackageInfo;
+
+        let uri = Url::parse("file:///workspace/main.R").unwrap();
+        let code = concat!(
+            "import::here(syntheticPkg, local_alias = source_member)\n",
+            "local_alias()\n",
+            "source_member <- function() 1\n",
+            "local_alias <- function() 2\n",
+            "source_member()\n",
+            "local_alias()\n",
+        );
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.package_library_ready = true;
+        state
+            .package_library
+            .insert_package(PackageInfo::new(
+                "syntheticPkg".to_string(),
+                HashSet::from(["source_member".to_string()]),
+            ))
+            .await;
+        state.open_document(uri.clone(), code, Some(1));
+
+        let references = references(&state, &uri, Position::new(1, 2)).expect("references");
+        let mut ranges = references
+            .iter()
+            .map(|location| {
+                (
+                    location.range.start.line,
+                    location.range.start.character,
+                    location.range.end.character,
+                )
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+        assert_eq!(ranges, vec![(0, 27, 38), (0, 41, 54), (1, 0, 11)]);
     }
 
     #[test]
@@ -28157,6 +28643,95 @@ x <- "#;
     // ========================================================================
     // Package export completion data field and resolve tests
     // ========================================================================
+
+    #[tokio::test]
+    async fn selective_package_alias_completion_and_signature_keep_exported_topic() {
+        use crate::package_library::PackageInfo;
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        state
+            .package_library
+            .insert_package(PackageInfo::new(
+                "syntheticPkg".to_string(),
+                HashSet::from(["source_member".to_string(), "unselected_member".to_string()]),
+            ))
+            .await;
+
+        let completion_uri = Url::parse("file:///completion.R").unwrap();
+        let completion_code = "import::here(syntheticPkg, local_alias = source_member)\nlocal_\n";
+        state.open_document(completion_uri.clone(), completion_code, Some(1));
+        let Some(CompletionResponse::Array(items)) =
+            super::completion(&state, &completion_uri, Position::new(1, 6), None)
+        else {
+            panic!("expected completion array");
+        };
+        let alias = items
+            .iter()
+            .find(|item| item.label == "local_alias")
+            .expect("renamed selective package binding must complete");
+        assert_eq!(
+            alias
+                .data
+                .as_ref()
+                .and_then(|data| data.get("package"))
+                .and_then(|value| value.as_str()),
+            Some("syntheticPkg")
+        );
+        assert_eq!(
+            alias
+                .data
+                .as_ref()
+                .and_then(|data| data.get("topic"))
+                .and_then(|value| value.as_str()),
+            Some("source_member")
+        );
+        assert!(items.iter().all(|item| item.label != "source_member"));
+        assert!(items.iter().all(|item| item.label != "unselected_member"));
+
+        let signature_uri = Url::parse("file:///signature.R").unwrap();
+        let signature_code =
+            "import::here(syntheticPkg, local_alias = source_member)\nlocal_alias(x)\n";
+        state.open_document(signature_uri.clone(), signature_code, Some(1));
+        state.help_cache.insert(
+            "source_member",
+            Some("syntheticPkg"),
+            Some("SOURCE TOPIC HELP".to_string()),
+        );
+        state.help_cache.insert(
+            "local_alias",
+            Some("syntheticPkg"),
+            Some("WRONG ALIAS HELP".to_string()),
+        );
+        let hover = hover(&state, &signature_uri, Position::new(1, 2))
+            .await
+            .expect("selective alias hover");
+        let hover_text = match hover.contents {
+            HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover, got {other:?}"),
+        };
+        assert!(hover_text.contains("SOURCE TOPIC HELP"));
+        assert!(!hover_text.contains("WRONG ALIAS HELP"));
+
+        let context = prepare_signature_help(&state, &signature_uri, Position::new(1, 12))
+            .expect("signature context");
+        match context.resolution {
+            SignatureResolution::Package {
+                display_name,
+                topic_name,
+                package_name,
+                ..
+            } => {
+                assert_eq!(display_name, "local_alias");
+                assert_eq!(topic_name, "source_member");
+                assert_eq!(package_name, "syntheticPkg");
+            }
+            SignatureResolution::Ready(_) => panic!("expected package signature resolution"),
+        }
+    }
 
     /// Test that package export completion items include data field for resolve.
     #[test]

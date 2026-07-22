@@ -570,7 +570,7 @@ fn namespace_import_candidate_batch(
         |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
             content_provider.get_metadata(target_uri)
         };
-    let env = crate::box_use::ArtifactModuleExportEnv::new(
+    let env = crate::selective_import::ArtifactSelectiveImportEnv::new(
         &get_artifacts,
         &get_metadata,
         (state.cross_file_config.packages_enabled && state.package_library_ready)
@@ -582,7 +582,7 @@ fn namespace_import_candidate_batch(
             Url::parse(&format!("package:{name}"))
                 .unwrap_or_else(|_| Url::parse("package:unknown").unwrap())
         }
-        crate::selective_import::ImportSource::LocalModule(uri) => uri.clone(),
+        crate::selective_import::ImportSource::LocalModule(module) => module.uri.clone(),
     };
 
     let names: Vec<&str> = match rhs_name {
@@ -2189,7 +2189,7 @@ mod tests {
         let url = Url::parse(uri).expect("uri");
         let doc = Document::new_with_uri(text, None, &url);
         let mut metadata = crate::cross_file::extract_metadata(text);
-        crate::cross_file::enrich_box_import_resolutions(&mut metadata, &url);
+        crate::cross_file::enrich_selective_import_resolutions(&mut metadata, &url, None);
         let metadata = Arc::new(metadata);
         let artifacts = Arc::new(if let Some(tree) = doc.tree.as_ref() {
             crate::cross_file::scope::compute_artifacts_with_metadata(
@@ -2682,6 +2682,41 @@ other$public
             }),
             "ordinary object members with the same name must not leak"
         );
+    }
+
+    #[test]
+    fn multiline_import_rename_tokens_navigate_to_local_module_definition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let module_path = dir.path().join("mod.R");
+        let importer_path = dir.path().join("main.R");
+        let module_code = "public <- function() NULL\n";
+        let importer_code = concat!(
+            "import::here(\n",
+            "  alias =\n",
+            "    public,\n",
+            "  .from = 'mod.R'\n",
+            ")\n",
+            "alias()\n",
+        );
+        fs::write(&module_path, module_code).expect("write module");
+        fs::write(&importer_path, importer_code).expect("write importer");
+
+        let mut state = fresh_state();
+        let module_url = Url::from_file_path(&module_path).expect("module url");
+        let importer_url = Url::from_file_path(&importer_path).expect("importer url");
+        add_indexed_doc(&mut state, module_url.as_str(), module_code);
+        add_indexed_doc(&mut state, importer_url.as_str(), importer_code);
+
+        for position in [
+            Position::new(1, 3),
+            Position::new(2, 6),
+            Position::new(5, 2),
+        ] {
+            let definition = loc(goto_definition(&state, &importer_url, position));
+            assert_eq!(definition.uri, module_url);
+            assert_eq!(definition.range.start, Position::new(0, 0));
+            assert_eq!(definition.range.end, Position::new(0, 6));
+        }
     }
 
     #[test]

@@ -15,11 +15,9 @@
 //! bindings, a privacy boundary, and provenance for editor navigation — without
 //! knowing *how* the request was spelled in source code.
 //!
-//! The first producer of these values is the `box::use()` detector in
-//! [`crate::box_use`]. It is intended to also back a future, second surface
-//! syntax (issue #663) without changing any of the semantics here: a new
-//! detector only needs to lower its parse into [`SelectiveImportRequest`]
-//! values.
+//! Producers are the `box::use()` detector in [`crate::box_use`] and the static
+//! `{import}` detector in [`crate::import_pkg`]. Their syntax and local-module
+//! policies remain separate; both lower into [`SelectiveImportRequest`] values.
 //!
 //! # Request vs. resolved contribution
 //!
@@ -72,6 +70,11 @@ use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::Url;
 
+/// Canonical artifact/package adapter used by every selective-import dialect.
+/// The compatibility implementation remains physically beside box's recursive
+/// re-export resolver, but callers use this syntax-neutral name.
+pub type ArtifactSelectiveImportEnv<'a> = crate::box_use::ArtifactModuleExportEnv<'a>;
+
 /// Identity of the thing a selective import pulls members from.
 ///
 /// This is the durable, resolution-complete identity: a package is named, and a
@@ -86,7 +89,32 @@ pub enum ImportSource {
     Package(String),
     /// A local module, identified by its resolved file URI. This is the URI of
     /// the module *file* (`foo.r` or `foo/__init__.r`), never a directory.
-    LocalModule(Url),
+    LocalModule(LocalModuleIdentity),
+}
+
+/// Surface dialect whose local-module rules produced a resolved file identity.
+///
+/// The URI alone is not enough: `{box}` and `{import}` deliberately expose
+/// different module interfaces for the same script. Keeping the dialect on the
+/// durable identity prevents a cache or resolver from accidentally applying
+/// box export-marker privacy to an import script (or vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum LocalModuleDialect {
+    Box,
+    ImportPackage,
+}
+
+/// Resolution-complete identity of a local selective-import module.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LocalModuleIdentity {
+    pub uri: Url,
+    pub dialect: LocalModuleDialect,
+}
+
+impl LocalModuleIdentity {
+    pub fn new(uri: Url, dialect: LocalModuleDialect) -> Self {
+        Self { uri, dialect }
+    }
 }
 
 impl ImportSource {
@@ -97,9 +125,10 @@ impl ImportSource {
                 0u8.hash(state);
                 name.hash(state);
             }
-            ImportSource::LocalModule(uri) => {
+            ImportSource::LocalModule(module) => {
                 1u8.hash(state);
-                uri.as_str().hash(state);
+                module.dialect.hash(state);
+                module.uri.as_str().hash(state);
             }
         }
     }
@@ -107,7 +136,7 @@ impl ImportSource {
     /// The resolved local-module file URI, if this source is a local module.
     pub fn local_module_uri(&self) -> Option<&Url> {
         match self {
-            ImportSource::LocalModule(uri) => Some(uri),
+            ImportSource::LocalModule(module) => Some(&module.uri),
             ImportSource::Package(_) => None,
         }
     }
@@ -303,6 +332,20 @@ pub struct NamespaceBinding {
     pub alias: String,
 }
 
+/// Environment layer that receives attached bindings.
+///
+/// Namespace aliases are independent and always belong to the current lexical
+/// environment. `{box}` therefore always uses `CurrentEnvironment`; `{import}`
+/// uses either the current environment (`here`) or a named search-path entry
+/// (`from` / `into`). Named search-path entries are fallback layers and are
+/// never namespace objects.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ImportDestination {
+    #[default]
+    CurrentEnvironment,
+    NamedSearchPath(String),
+}
+
 /// One attached-member binding: a name brought directly into the importer's
 /// scope (no `alias$` qualification needed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +474,25 @@ pub struct SelectiveImportRequest {
     pub namespace: Option<NamespaceBinding>,
     /// Attached-member bindings.
     pub attach: Vec<AttachBinding>,
+    /// Destination for attached members. Namespace bindings, when present, are
+    /// lexical and do not use this search-path channel.
+    #[serde(default)]
+    pub destination: ImportDestination,
+    /// Source/export identities excluded from both explicit selections and
+    /// wildcard expansion. Filtering by exported identity is important for a
+    /// renamed request (`local = exported`): excluding `exported` removes the
+    /// alias too.
+    #[serde(default)]
+    pub excluded_exports: BTreeSet<String>,
+    /// Whether `{import}`'s sequential attach policy is active: wildcard expansion
+    /// omits source identities already selected explicitly, while a later
+    /// *different* source identity targeting the same local name overwrites the
+    /// earlier binding. Thus `alias = exported, .all = TRUE` does not also attach
+    /// bare `exported`, but `filter = select, .all = TRUE` ends with bare
+    /// `filter` bound to `filter`. `{box}` leaves this disabled: its wildcard may
+    /// bind both names and duplicate locals keep the first binding.
+    #[serde(default)]
+    pub wildcard_skips_explicit_exports: bool,
     /// Whether the import is lexically inside a function body. A
     /// function-scoped import binds only within that function; it never enters
     /// the file's top-level (cross-file-visible) scope. Producers must set this
@@ -460,6 +522,12 @@ impl SelectiveImportRequest {
             None => 0u8.hash(state),
         }
         self.function_scoped.hash(state);
+        self.destination.hash(state);
+        state.write_usize(self.excluded_exports.len());
+        for excluded in &self.excluded_exports {
+            excluded.hash(state);
+        }
+        self.wildcard_skips_explicit_exports.hash(state);
         state.write_usize(self.attach.len());
         for a in &self.attach {
             a.hash_into(state);
@@ -548,7 +616,7 @@ pub trait ImportEnv {
     fn package_exports(&self, package: &str) -> ExportSet;
     /// The export set of a resolved local-module file, fully expanded through
     /// any re-exports. `None` when the module could not be read.
-    fn module_exports(&self, uri: &Url) -> Option<ExportSet>;
+    fn module_exports(&self, module: &LocalModuleIdentity) -> Option<ExportSet>;
     /// The definition site of an exported member of a source, if known.
     /// Defaults to `None`; implementations override for navigation support.
     fn member_provenance(&self, _source: &ImportSource, _member: &str) -> Option<MemberProvenance> {
@@ -568,8 +636,8 @@ pub trait ImportEnv {
 pub fn resolve_request(request: &SelectiveImportRequest, env: &dyn ImportEnv) -> ResolvedImport {
     let exports = match &request.source {
         ImportSource::Package(name) => env.package_exports(name),
-        ImportSource::LocalModule(uri) => env
-            .module_exports(uri)
+        ImportSource::LocalModule(module) => env
+            .module_exports(module)
             .unwrap_or_else(ExportSet::unresolved),
     };
 
@@ -586,24 +654,64 @@ pub fn resolve_request(request: &SelectiveImportRequest, env: &dyn ImportEnv) ->
         });
     }
 
+    // `{import}` processes explicit selections before `.all`. If an exported
+    // identity was explicitly selected (including under an alias), wildcard
+    // expansion must not additionally attach its bare name. This also makes
+    // the shared resolver deterministic for a redundant box attach list while
+    // leaving box's resulting scope unchanged.
+    let explicit_exports: BTreeSet<&str> = request
+        .attach
+        .iter()
+        .filter_map(AttachBinding::exported_name)
+        .collect();
+    let mut seen_locals = BTreeSet::new();
+    let mut push_member = |binding: ResolvedBinding| {
+        if seen_locals.insert(binding.local.clone()) {
+            bindings.push(binding);
+        } else if request.wildcard_skips_explicit_exports
+            && let Some(existing) = bindings
+                .iter_mut()
+                .find(|existing| !existing.is_namespace && existing.local == binding.local)
+        {
+            // `{import}` evaluates assignments sequentially. Export-identity
+            // de-duplication still suppresses `.all` for an export already selected
+            // explicitly, but a later *different* export targeting the same local
+            // name overwrites the earlier binding. `{box}` keeps its historical
+            // first-local-wins behavior because it leaves the policy flag disabled.
+            *existing = binding;
+        }
+    };
+
     for a in &request.attach {
         match a {
-            AttachBinding::Named(name) => bindings.push(ResolvedBinding {
-                local: name.clone(),
-                exported: Some(name.clone()),
-                is_namespace: false,
-                provenance: env.member_provenance(&request.source, name),
-            }),
-            AttachBinding::Renamed { local, exported } => bindings.push(ResolvedBinding {
-                local: local.clone(),
-                exported: Some(exported.clone()),
-                is_namespace: false,
-                provenance: env.member_provenance(&request.source, exported),
-            }),
+            AttachBinding::Named(name) if !request.excluded_exports.contains(name) => {
+                push_member(ResolvedBinding {
+                    local: name.clone(),
+                    exported: Some(name.clone()),
+                    is_namespace: false,
+                    provenance: env.member_provenance(&request.source, name),
+                });
+            }
+            AttachBinding::Renamed { local, exported }
+                if !request.excluded_exports.contains(exported) =>
+            {
+                push_member(ResolvedBinding {
+                    local: local.clone(),
+                    exported: Some(exported.clone()),
+                    is_namespace: false,
+                    provenance: env.member_provenance(&request.source, exported),
+                });
+            }
             AttachBinding::Wildcard => {
                 // Expand against the resolved export set. Never dropped.
                 for member in &exports.members {
-                    bindings.push(ResolvedBinding {
+                    if request.excluded_exports.contains(member)
+                        || (request.wildcard_skips_explicit_exports
+                            && explicit_exports.contains(member.as_str()))
+                    {
+                        continue;
+                    }
+                    push_member(ResolvedBinding {
                         local: member.clone(),
                         exported: Some(member.clone()),
                         is_namespace: false,
@@ -611,6 +719,7 @@ pub fn resolve_request(request: &SelectiveImportRequest, env: &dyn ImportEnv) ->
                     });
                 }
             }
+            AttachBinding::Named(_) | AttachBinding::Renamed { .. } => {}
         }
     }
 
@@ -673,6 +782,9 @@ mod tests {
             source: ImportSource::Package("dplyr".into()),
             namespace: namespace.map(|a| NamespaceBinding { alias: a.into() }),
             attach,
+            destination: ImportDestination::CurrentEnvironment,
+            excluded_exports: BTreeSet::new(),
+            wildcard_skips_explicit_exports: false,
             function_scoped: false,
             provenance: provenance(),
         }
@@ -688,7 +800,7 @@ mod tests {
         fn package_exports(&self, _package: &str) -> ExportSet {
             self.pkg.clone()
         }
-        fn module_exports(&self, _uri: &Url) -> Option<ExportSet> {
+        fn module_exports(&self, _module: &LocalModuleIdentity) -> Option<ExportSet> {
             self.module.clone()
         }
     }
@@ -851,9 +963,15 @@ mod tests {
             module: None, // module unreadable
         };
         let req = SelectiveImportRequest {
-            source: ImportSource::LocalModule(uri("file:///proj/mod.r")),
+            source: ImportSource::LocalModule(LocalModuleIdentity::new(
+                uri("file:///proj/mod.r"),
+                LocalModuleDialect::Box,
+            )),
             namespace: Some(NamespaceBinding { alias: "m".into() }),
             attach: vec![AttachBinding::Wildcard],
+            destination: ImportDestination::CurrentEnvironment,
+            excluded_exports: BTreeSet::new(),
+            wildcard_skips_explicit_exports: false,
             function_scoped: false,
             provenance: provenance(),
         };
@@ -895,13 +1013,125 @@ mod tests {
             interface_hash(std::slice::from_ref(&base), Some(&exports)),
             h0
         );
+
+        let mut excluded = base.clone();
+        excluded.excluded_exports.insert("filter".to_string());
+        assert_ne!(interface_hash(std::slice::from_ref(&excluded), None), h0);
+
+        let mut destination = base.clone();
+        destination.destination = ImportDestination::NamedSearchPath("tools".to_string());
+        assert_ne!(interface_hash(std::slice::from_ref(&destination), None), h0);
+    }
+
+    #[test]
+    fn exclusions_filter_export_identity_and_wildcard_deduplicates_aliases() {
+        let env = TestEnv {
+            pkg: ExportSet::complete(["filter", "lag", "select"]),
+            module: None,
+        };
+        let mut req = request(
+            None,
+            vec![
+                AttachBinding::Renamed {
+                    local: "keep".to_string(),
+                    exported: "filter".to_string(),
+                },
+                AttachBinding::Wildcard,
+            ],
+        );
+        req.wildcard_skips_explicit_exports = true;
+        let resolved = req.resolve(&env);
+        let locals: BTreeSet<_> = resolved
+            .bindings
+            .iter()
+            .map(|binding| &binding.local)
+            .collect();
+        assert!(locals.contains(&"keep".to_string()));
+        assert!(!locals.contains(&"filter".to_string()));
+
+        req.excluded_exports.insert("filter".to_string());
+        req.excluded_exports.insert("lag".to_string());
+        let resolved = req.resolve(&env);
+        let locals: BTreeSet<_> = resolved
+            .bindings
+            .iter()
+            .map(|binding| &binding.local)
+            .collect();
+        assert!(!locals.contains(&"keep".to_string()));
+        assert!(!locals.contains(&"lag".to_string()));
+        assert!(locals.contains(&"select".to_string()));
+    }
+
+    #[test]
+    fn wildcard_deduplication_is_opt_in_for_import_package_only() {
+        let env = TestEnv {
+            pkg: ExportSet::complete(["filter"]),
+            module: None,
+        };
+        let req = request(
+            None,
+            vec![
+                AttachBinding::Renamed {
+                    local: "keep".to_string(),
+                    exported: "filter".to_string(),
+                },
+                AttachBinding::Wildcard,
+            ],
+        );
+        let locals: BTreeSet<_> = req
+            .resolve(&env)
+            .bindings
+            .into_iter()
+            .map(|binding| binding.local)
+            .collect();
+        assert_eq!(
+            locals,
+            ["filter", "keep"].into_iter().map(String::from).collect()
+        );
+    }
+
+    #[test]
+    fn import_package_later_distinct_export_overwrites_same_local_name() {
+        let env = TestEnv {
+            pkg: ExportSet::complete(["filter", "select"]),
+            module: None,
+        };
+        let mut req = request(
+            None,
+            vec![
+                AttachBinding::Renamed {
+                    local: "filter".to_string(),
+                    exported: "select".to_string(),
+                },
+                AttachBinding::Wildcard,
+            ],
+        );
+        req.wildcard_skips_explicit_exports = true;
+
+        let resolved = req.resolve(&env);
+        let binding = resolved
+            .bindings
+            .iter()
+            .find(|binding| binding.local == "filter")
+            .expect("filter binding");
+        assert_eq!(binding.exported.as_deref(), Some("filter"));
+        assert!(
+            resolved
+                .bindings
+                .iter()
+                .all(|binding| binding.exported.as_deref() != Some("select")),
+            "the explicit select identity is suppressed from wildcard expansion"
+        );
     }
 
     #[test]
     fn import_source_round_trips_through_serde() {
         for src in [
             ImportSource::Package("dplyr".into()),
-            ImportSource::LocalModule(uri("file:///proj/mod/foo.r")),
+            ImportSource::LocalModule(LocalModuleIdentity::new(
+                uri("file:///proj/mod/foo.r"),
+                LocalModuleDialect::Box,
+            )),
         ] {
             let json = serde_json::to_string(&src).unwrap();
             let back: ImportSource = serde_json::from_str(&json).unwrap();

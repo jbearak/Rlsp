@@ -31,7 +31,7 @@ Raven's sibling project [Sight](https://github.com/jbearak/sight) implements a l
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
 - **File path intellisense** — Completions and cmd-click inside `source()` paths
 - **[Smart indentation](docs/indentation.md)** — Context-aware auto-indent with configurable argument and chain styles
-- **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains and static `targets::tar_source()` batches, and models static `box::use()` imports with strict module privacy
+- **[Cross-file awareness](docs/cross-file.md)** — Follows `source()` chains and static `targets::tar_source()` batches, and models static `{box}` and `{import}` selective imports with module privacy
 - **[Directives](docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **[Syntax highlighting](docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
 
