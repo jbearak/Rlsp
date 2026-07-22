@@ -9,7 +9,7 @@ When you invoke Find References (Shift+F12 / right-click → Find All References
 2. Searches the current file, all other open documents, and every workspace-indexed file for identifier nodes with that same name.
 3. Returns every match — both definition sites (assignments, function parameters) and usage sites.
 
-Find References is a **name-based** search: it matches on the identifier text, with no dependency-graph or scope filtering. It is intentionally broad — see [Scope and pooling](#scope-and-pooling).
+Find References is ordinarily a **name-based** search: it matches on the identifier text, with no dependency-graph or scope filtering. Static selective members imported through `box::use()` are the exception: Raven follows their resolved definition identity so unrelated same-named members are excluded. See [Scope and pooling](#scope-and-pooling) and [box selective-member identity](#box-selective-member-identity).
 
 ## Cross-File Scoping
 
@@ -36,7 +36,11 @@ Unlike completions and diagnostics, Find References does **not** consult the `so
 - Same-named symbols in files that are *not* connected by any `source()` path are pooled together rather than treated as distinct symbols.
 - Because the search keys on the member *name* and not the accessor operator, the `` x$`name` `` and `x@name` forms, the `x[["name"]]` literal-string subscript form, and a `name =` constructor argument all pool together — cmd-clicking any one returns the others. The `[[` form participates only for a single, positional, literal string subscript (the same rule [Go-to-Definition](go-to-definition.md) uses); `x[[i]]`, `x[[1]]`, `x["name"]`, and computed/named/multi-argument subscripts are not matched, and a plain string literal that is not a `[[` subscript is never treated as a reference.
 
-If you need a result scoped to one symbol's definition, use [Go-to-Definition](go-to-definition.md), which *is* scope- and dependency-aware.
+If you need a result scoped to one ordinary symbol's definition, use [Go-to-Definition](go-to-definition.md), which *is* scope- and dependency-aware.
+
+### box selective-member identity
+
+For a resolved member imported through static [`box::use()`](cross-file.md#box-module-imports-boxuse), Raven starts from the original local-module definition and keeps only occurrences whose go-to-definition resolves to that exact identity. The result can include namespace access through `$`, `@`, or literal `[["name"]]`, named/wildcard attachments, renamed local bindings, re-export chains, and the underlying definition in open or workspace-indexed files. An unrelated top-level binding or `other$member` with the same spelling is excluded. This identity filtering applies whether Find References starts from a qualified use, an attached/renamed use, or the module definition itself; ordinary non-box structural references retain the broad pooling described above.
 
 > Find References works inside R code chunks of R Markdown / Quarto (`.Rmd` / `.Rmarkdown` / `.qmd`) documents — all R chunk bodies are pooled as one R program, so references span chunks. Invoking it on prose, YAML, or a non-R chunk returns no results.
 

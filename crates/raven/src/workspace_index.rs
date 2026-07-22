@@ -679,6 +679,28 @@ impl WorkspaceIndex {
             .unwrap_or_default()
     }
 
+    /// Snapshot only the URIs of finalized artifact entries satisfying `pred`.
+    /// The predicate runs against borrowed artifact records under the index read
+    /// lock, avoiding clones of trees, ropes, and unrelated artifact payloads.
+    pub(crate) fn artifact_uris_matching<F>(&self, pred: F) -> Vec<Url>
+    where
+        F: Fn(&Url, &ArtifactEntry) -> bool,
+    {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .artifacts
+                    .iter()
+                    .filter_map(|(uri, slot)| match slot {
+                        ArtifactSlot::Complete(entry) if pred(uri, entry) => Some(uri.clone()),
+                        ArtifactSlot::Complete(_) | ArtifactSlot::Pending { .. } => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Whether any finalized artifact entry satisfies `pred`.
     pub(crate) fn any_artifact<F>(&self, pred: F) -> bool
     where

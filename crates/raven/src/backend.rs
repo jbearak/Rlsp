@@ -9833,6 +9833,25 @@ fn source_targets_to_index_for_live_diagnostics(
         }
     }
 
+    // Selective local modules need canonical artifacts just like ordinary
+    // source targets, even though their graph edges never lend scope. Resolve
+    // with box's exact-case, file-relative semantics and index only successful
+    // targets; missing candidates are watched separately below.
+    for import in &meta.box_imports {
+        let Some(crate::selective_import::ImportSource::LocalModule(source_uri)) =
+            import.resolved_source()
+        else {
+            continue;
+        };
+        if !state.is_project_excluded_uri(&source_uri)
+            && !state.is_document_open_or_alias(&source_uri)
+            && !state.workspace_index.is_complete(&source_uri)
+            && !files_to_index.contains(&source_uri)
+        {
+            files_to_index.push(source_uri);
+        }
+    }
+
     files_to_index
 }
 
@@ -10081,7 +10100,7 @@ fn capture_open_edit_fallback(
 fn derive_open_edit_fallback(
     captured: CapturedOpenEditFallback,
 ) -> (crate::cross_file::CrossFileMetadata, PreparedOpenCommitPlan) {
-    let local_metadata = captured.precomputed_metadata.unwrap_or_else(|| {
+    let mut local_metadata = captured.precomputed_metadata.unwrap_or_else(|| {
         let mut metadata = crate::cross_file::extract_metadata(&captured.analysis_text);
         crate::cross_file::resolve_system_file_sources(
             &mut metadata,
@@ -10099,6 +10118,9 @@ fn derive_open_edit_fallback(
         }
         metadata
     });
+    if let Some(primary_uri) = captured.graph_roots.first() {
+        crate::cross_file::enrich_box_import_resolutions(&mut local_metadata, primary_uri);
+    }
     let graph = captured
         .graph_roots
         .iter()
@@ -10504,6 +10526,7 @@ async fn commit_detached_live_package_open_edit(
         };
         let expansion_uri = uri.clone();
         metadata = tokio::task::spawn_blocking(move || {
+            crate::cross_file::enrich_box_import_resolutions(&mut metadata, &expansion_uri);
             let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
                 &mut metadata,
                 &expansion_uri,
@@ -11190,6 +11213,7 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
             crate::cross_file::analysis_text_for_kind(captured.chunk_kind, &content).into_owned();
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(&analysis, None));
         let mut metadata = crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
+        crate::cross_file::enrich_box_import_resolutions(&mut metadata, &root.uri);
         crate::cross_file::resolve_system_file_sources(
             &mut metadata,
             captured.system_file_workspace_name.as_deref(),
@@ -11737,6 +11761,7 @@ fn derive_open_install_analysis(
     };
     let analysis_text = captured.document.analysis_text();
     let mut metadata = crate::cross_file::extract_metadata(&analysis_text);
+    crate::cross_file::enrich_box_import_resolutions(&mut metadata, &captured.uri);
     if !local_only {
         crate::cross_file::enrich_metadata_with_inherited_wd(
             &mut metadata,
@@ -12171,6 +12196,7 @@ fn derive_open_metadata_reenrichment(
     };
 
     let mut metadata = crate::cross_file::extract_metadata(&captured.analysis_text);
+    crate::cross_file::enrich_box_import_resolutions(&mut metadata, &captured.uri);
     crate::cross_file::enrich_metadata_with_inherited_wd(
         &mut metadata,
         &captured.uri,
@@ -13227,6 +13253,7 @@ async fn resync_file_from_disk(
     let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None));
     let mut cross_file_meta =
         crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
+    crate::cross_file::enrich_box_import_resolutions(&mut cross_file_meta, uri);
 
     let snapshot =
         crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
@@ -13324,7 +13351,7 @@ async fn resync_file_from_disk(
             .cross_file_graph
             .get_dependents(uri)
             .iter()
-            .any(|edge| !edge.is_backward_directive && !edge.non_lending);
+            .any(|edge| !edge.is_backward_directive && edge.lends_scope());
         let mut additional_graph = Vec::new();
         if !has_incoming_forward {
             let target_name = path.file_name();
@@ -15533,6 +15560,101 @@ struct CollectedWatchedResync {
     deletions: Vec<WatchedResyncItem>,
 }
 
+/// Snapshot importers whose ordered `{box}` candidate set intersects this
+/// watched notification. Exact and case-only candidate spellings both count.
+///
+/// This runs under the backend's read lock before watched commit collection. It
+/// scans the workspace artifact tier once per notification and clones only the
+/// matching URIs, rather than cloning every full index entry under the global
+/// write lock once per event.
+struct BoxCandidateImporterRefresh {
+    uri: Url,
+    metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    open_generation: Option<crate::open_document_store::AnalysisGeneration>,
+}
+
+/// Snapshot importers whose persisted local-module outcome may have changed.
+///
+/// The returned metadata is deliberately not enriched here: callers invoke
+/// [`enrich_box_candidate_importers`] after dropping the `WorldState` guard so
+/// exact-case filesystem probing never runs while the state is locked.
+fn box_candidate_importers_for_changes(
+    state: &WorldState,
+    changes: &[FileEvent],
+) -> Vec<BoxCandidateImporterRefresh> {
+    let changed_paths: Vec<std::path::PathBuf> = changes
+        .iter()
+        .filter(|change| {
+            matches!(
+                change.typ,
+                FileChangeType::CREATED | FileChangeType::CHANGED | FileChangeType::DELETED
+            )
+        })
+        .filter_map(|change| change.uri.to_file_path().ok())
+        .collect();
+    if changed_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let matches = |importer_uri: &Url, metadata: &crate::cross_file::CrossFileMetadata| {
+        metadata.box_imports.iter().any(|import| {
+            changed_paths.iter().any(|changed_path| {
+                crate::box_use::path::candidate_set_matches_path(
+                    importer_uri,
+                    &import.spec,
+                    changed_path,
+                )
+            })
+        })
+    };
+
+    let mut uris: Vec<Url> = state
+        .documents
+        .keys()
+        .filter_map(|uri| {
+            state
+                .documents
+                .get_record(uri)
+                .filter(|record| matches(uri, record.metadata()))
+                .map(|_| uri.clone())
+        })
+        .collect();
+    uris.extend(
+        state
+            .workspace_index
+            .artifact_uris_matching(|uri, entry| matches(uri, entry.metadata.as_ref())),
+    );
+    uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    uris.dedup();
+    uris.into_iter()
+        .filter_map(|uri| {
+            let metadata = state.get_enriched_metadata(&uri)?;
+            let open_generation = state
+                .documents
+                .get_record(&uri)
+                .map(|record| record.generation());
+            Some(BoxCandidateImporterRefresh {
+                uri,
+                metadata,
+                open_generation,
+            })
+        })
+        .collect()
+}
+
+/// Refresh persisted local-module identities without holding `WorldState`.
+fn enrich_box_candidate_importers(
+    mut importers: Vec<BoxCandidateImporterRefresh>,
+) -> Vec<BoxCandidateImporterRefresh> {
+    for importer in &mut importers {
+        crate::cross_file::enrich_box_import_resolutions(
+            Arc::make_mut(&mut importer.metadata),
+            &importer.uri,
+        );
+    }
+    importers
+}
+
 /// Reserve one watched generation per closed URI and capture the pre-update
 /// diagnostic fanout. When any event in one normalized notification belongs
 /// to an open source-batch parent, the backend calls this once for the whole
@@ -15540,11 +15662,84 @@ struct CollectedWatchedResync {
 /// the parent refresh. Notification-wide ownership prevents that parent from
 /// publishing after its batch member lands but before an ordinary dependency
 /// event from the same notification commits.
-fn collect_watched_resync(state: &mut WorldState, changes: &[FileEvent]) -> CollectedWatchedResync {
+fn collect_watched_resync(
+    state: &mut WorldState,
+    changes: &[FileEvent],
+    candidate_importers: Vec<BoxCandidateImporterRefresh>,
+) -> CollectedWatchedResync {
     let mut updates = Vec::new();
+    let mut queued_updates = std::collections::HashSet::new();
     let mut affected = Vec::new();
     let mut affected_set = std::collections::HashSet::new();
     let mut deletions = Vec::new();
+    let changed_uris: std::collections::HashSet<Url> =
+        changes.iter().map(|change| change.uri.clone()).collect();
+
+    // A missing module has no edge to discover through the reverse index, and
+    // creation of a higher-priority candidate must retarget an existing edge.
+    // Recompute each unchanged importer's artifacts as well as its graph edge:
+    // open records can be refreshed synchronously from their immutable document,
+    // while closed importers re-enter the existing guarded watched batch.
+    let workspace_root = state.workspace_folders.first().cloned();
+    for importer in candidate_importers {
+        let importer_uri = importer.uri;
+        let metadata = importer.metadata;
+        if let Some(generation) = importer.open_generation {
+            if state
+                .replace_open_document_metadata_if_current(
+                    &importer_uri,
+                    generation,
+                    metadata.clone(),
+                )
+                .is_err()
+            {
+                // The editor changed or closed this document after the detached
+                // refresh snapshot. Its newer lifecycle owns graph/artifact work.
+                continue;
+            }
+        } else {
+            // A document opened after the detached snapshot must not receive
+            // closed-file metadata. Its open lifecycle owns the current text.
+            if state.documents.contains_key(&importer_uri) {
+                continue;
+            }
+            if !changed_uris.contains(&importer_uri)
+                && !state.is_project_excluded_uri(&importer_uri)
+            {
+                let generation = bump_watched_file_resync_generation(state, &importer_uri);
+                state.workspace_index.schedule_update(importer_uri.clone());
+                queued_updates.insert(importer_uri.clone());
+                updates.push(WatchedResyncItem {
+                    uri: importer_uri.clone(),
+                    generation,
+                });
+            }
+        }
+
+        extend_with_watched_pre_update_dependents(
+            &mut affected,
+            &mut affected_set,
+            state,
+            &importer_uri,
+        );
+        let graph_roots = state.authoritative_revalidation_roots_for_uri(&importer_uri);
+        update_cross_file_graph_for_roots(
+            state,
+            &graph_roots,
+            metadata.as_ref(),
+            workspace_root.as_ref(),
+        );
+        if affected_set.insert(importer_uri.clone()) {
+            affected.push(importer_uri.clone());
+        }
+        extend_with_watched_pre_update_dependents(
+            &mut affected,
+            &mut affected_set,
+            state,
+            &importer_uri,
+        );
+    }
+    state.recompute_open_neighborhood_pins();
 
     for change in changes {
         let uri = &change.uri;
@@ -15570,8 +15765,12 @@ fn collect_watched_resync(state: &mut WorldState, changes: &[FileEvent]) -> Coll
                     log::trace!("Queued excluded file removal in watched closed batch: {uri}");
                     continue;
                 }
+                if queued_updates.contains(uri) {
+                    continue;
+                }
                 let generation = bump_watched_file_resync_generation(state, uri);
                 state.workspace_index.schedule_update(uri.clone());
+                queued_updates.insert(uri.clone());
                 updates.push(WatchedResyncItem {
                     uri: uri.clone(),
                     generation,
@@ -15582,7 +15781,6 @@ fn collect_watched_resync(state: &mut WorldState, changes: &[FileEvent]) -> Coll
                     state,
                     uri,
                 );
-                log::trace!("Invalidated caches for changed file: {uri}");
             }
             FileChangeType::DELETED => {
                 let generation = bump_watched_file_resync_generation(state, uri);
@@ -15590,7 +15788,12 @@ fn collect_watched_resync(state: &mut WorldState, changes: &[FileEvent]) -> Coll
                     uri: uri.clone(),
                     generation,
                 });
-                log::trace!("Removed deleted file from cross-file state: {uri}");
+                extend_with_watched_pre_update_dependents(
+                    &mut affected,
+                    &mut affected_set,
+                    state,
+                    uri,
+                );
             }
             _ => {}
         }
@@ -18121,25 +18324,26 @@ impl LanguageServer for Backend {
         // therefore run off-lock. Prepare the exact post-change document now;
         // the detached helper recomputes graph and package projections from one
         // basis and commits them together.
-        let (detached_live_package_edit, detached_excluded_source_batch) = {
+        let (detached_live_package_edit, detached_excluded_analysis) = {
             let state = self.state.read().await;
             let prepared = state.prepare_document_changes(&uri, changes.clone(), version);
-            let source_batch_affected = prepared.as_ref().is_some_and(|prepared| {
+            let detached_analysis_affected = prepared.as_ref().is_some_and(|prepared| {
                 let metadata =
                     crate::cross_file::extract_metadata(&prepared.document().analysis_text());
                 metadata.has_source_batch_topology()
-                    || state
-                        .get_enriched_metadata(&uri)
-                        .is_some_and(|previous| previous.has_source_batch_topology())
+                    || !metadata.box_imports.is_empty()
+                    || state.get_enriched_metadata(&uri).is_some_and(|previous| {
+                        previous.has_source_batch_topology() || !previous.box_imports.is_empty()
+                    })
             });
             let excluded = state.is_project_excluded_uri(&uri);
-            let detached = (source_batch_affected
+            let detached = (detached_analysis_affected
                 || (!state.is_project_excluded_uri(&uri)
                     && (rprofile_sourced_root_for_open_document(&state, &uri).is_some()
                         || preamble_sourced_root_for_open_document(&state, &uri).is_some())))
             .then_some(prepared)
             .flatten();
-            (detached, source_batch_affected && excluded)
+            (detached, detached_analysis_affected && excluded)
         };
         let mut detached_live_effects = if let Some(prepared) = detached_live_package_edit {
             let Some(effects) = commit_detached_live_package_open_edit(
@@ -18158,10 +18362,10 @@ impl LanguageServer for Backend {
             None
         };
 
-        if detached_excluded_source_batch {
+        if detached_excluded_analysis {
             let effects = detached_live_effects
                 .take()
-                .expect("excluded source-batch edit used the detached commit path");
+                .expect("excluded filesystem-derived edit used the detached commit path");
             let (
                 files_to_index,
                 workspace_root,
@@ -18584,6 +18788,8 @@ impl LanguageServer for Backend {
                         Some(&probe.scope_contribution),
                         // Probe reads only packages, not `scope.symbols`;
                         // no `data()` alias expansion needed (issue #429).
+                        None,
+                        // Probe path: selective-import provider not wired here.
                         None,
                         probe.package_query_uris.get(&revalidation_uri),
                     );
@@ -19057,13 +19263,19 @@ impl LanguageServer for Backend {
             });
         }
 
+        let box_candidate_importers = {
+            let state = self.state.read().await;
+            box_candidate_importers_for_changes(&state, &params.changes)
+        };
+        let box_candidate_importers = enrich_box_candidate_importers(box_candidate_importers);
+
         if !open_tar_source_parents.is_empty() {
             let source_sysdata_event = project_root
                 .as_ref()
                 .is_some_and(|root| has_sysdata_fallback_watcher_event(root, &params.changes));
             let source_batch = {
                 let mut state = self.state.write().await;
-                collect_watched_resync(&mut state, &params.changes)
+                collect_watched_resync(&mut state, &params.changes, box_candidate_importers)
             };
             let receipt = if let Some(receipt) = notification_receipt.take() {
                 receipt
@@ -19131,7 +19343,7 @@ impl LanguageServer for Backend {
             deletions: deleted_uris,
         } = {
             let mut state = self.state.write().await;
-            collect_watched_resync(&mut state, &params.changes)
+            collect_watched_resync(&mut state, &params.changes, box_candidate_importers)
         };
 
         if let Some(receipt) = notification_receipt.take() {
@@ -21185,6 +21397,8 @@ impl Backend {
             &|| false,
             Some(&probe.scope_contribution),
             None,
+            // Probe path: selective-import provider not wired here.
+            None,
             probe.package_query_uris.get(uri),
         );
         let mut packages = direct_packages;
@@ -21508,6 +21722,10 @@ impl Backend {
             )
         };
 
+        // Persist local box-module identities off-lock before artifacts and graph
+        // projections consume them.
+        crate::cross_file::enrich_box_import_resolutions(&mut cross_file_meta, file_uri);
+
         // Resolve system.file() source entries into concrete paths so
         // transitive on-demand walks don't stop at this hop.
         crate::cross_file::resolve_system_file_sources(
@@ -21739,6 +21957,17 @@ impl Backend {
             };
 
             let Some(meta) = meta else { continue };
+
+            // Selective module edges are non-lending, but their targets still
+            // need canonical metadata/artifacts. They are always file-relative
+            // and deliberately ignore the ordinary source PathContext.
+            for import in &meta.box_imports {
+                if let Some(crate::selective_import::ImportSource::LocalModule(source_uri)) =
+                    import.resolved_source()
+                {
+                    queue.push_back((source_uri, depth.saturating_add(1)));
+                }
+            }
 
             let Some(forward_ctx) = crate::cross_file::path_resolve::PathContext::from_metadata(
                 &uri,
@@ -22016,6 +22245,10 @@ impl Backend {
                 analysis_basis,
             )
         };
+
+        // Persist local box-module identities off-lock before artifacts and graph
+        // projections consume them.
+        crate::cross_file::enrich_box_import_resolutions(&mut cross_file_meta, file_uri);
 
         // Resolve system.file() source entries into concrete paths so
         // transitive on-demand walks don't stop at this hop.
@@ -23101,6 +23334,11 @@ fn collect_open_document_packages(
             for p in valid_namespace_ref_packages(&meta) {
                 doc_pkgs.insert(p.to_string());
             }
+            for p in meta.referenced_packages() {
+                if is_valid_package_name(p) && !crate::package_library::is_load_all_sentinel(p) {
+                    doc_pkgs.insert(p.to_string());
+                }
+            }
         }
         let line = doc.text().lines().count().saturating_sub(1) as u32;
         docs.push((uri.clone(), line));
@@ -23108,12 +23346,12 @@ fn collect_open_document_packages(
     (doc_pkgs, docs)
 }
 
-/// Open documents whose namespace references (`pkg::member`) name any package in
-/// `warmed`. After a background prefetch warms a package, these documents may
-/// gain/lose `namespace-member-not-found` / `package-not-installed` diagnostics
-/// even though they don't `source()` the edited file, so they must be marked
-/// for force-republish (issue #503). Reads each doc's enriched metadata — the
-/// shared source of truth for namespace references.
+/// Open documents whose namespace references (`pkg::member`) or static package
+/// `box::use()` imports name any package in `warmed`. After a background prefetch
+/// warms a package, these documents may gain/lose package/member diagnostics,
+/// wildcard bindings, and completions even though they don't `source()` the
+/// edited file, so they must be marked for force-republish (issues #503/#662).
+/// Reads each doc's enriched metadata — the shared source of truth.
 fn open_docs_referencing_packages(
     state: &WorldState,
     warmed: &std::collections::HashSet<String>,
@@ -23121,10 +23359,16 @@ fn open_docs_referencing_packages(
     let mut out = Vec::new();
     for uri in state.documents.keys() {
         if let Some(meta) = state.get_enriched_metadata(uri)
-            && meta
+            && (meta
                 .namespace_references
                 .iter()
-                .any(|r| warmed.contains(&r.package))
+                .any(|reference| warmed.contains(&reference.package))
+                || meta.box_imports.iter().any(|import| {
+                    matches!(
+                        &import.spec,
+                        crate::box_use::BoxSpec::Package(package) if warmed.contains(package)
+                    )
+                }))
         {
             out.push(uri.clone());
         }
@@ -23213,6 +23457,8 @@ async fn prefetch_packages_for_open_documents_into(
             Some(&probe.scope_contribution),
             // Probe reads only packages, not `scope.symbols`; no `data()`
             // alias expansion needed (issue #429).
+            None,
+            // Probe path: selective-import provider not wired here.
             None,
             probe.package_query_uris.get(uri),
         );
@@ -24159,6 +24405,8 @@ async fn run_libpath_consumer(
                             Some(&probe.scope_contribution),
                             // Probe reads only packages, not `scope.symbols`;
                             // no `data()` alias expansion needed (issue #429).
+                            None,
+                            // Probe path: selective-import provider not wired here.
                             None,
                             probe.package_query_uris.get(uri),
                         );
@@ -32111,8 +32359,9 @@ mod refresh_packages_tests {
         let a = Url::parse("file:///ws/a.R").unwrap();
         let b = Url::parse("file:///ws/b.R").unwrap();
         let c = Url::parse("file:///ws/c.R").unwrap();
+        let d = Url::parse("file:///ws/d.R").unwrap();
         // a.R warms `dplyr` via library(); b.R references it via `dplyr::`;
-        // c.R references an unrelated package.
+        // c.R references an unrelated package; d.R imports it through box.
         state
             .documents
             .insert(a.clone(), Document::new("library(dplyr)\n", Some(1)));
@@ -32122,6 +32371,9 @@ mod refresh_packages_tests {
         state
             .documents
             .insert(c.clone(), Document::new("tidyr::pivot(x)\n", Some(1)));
+        state
+            .documents
+            .insert(d.clone(), Document::new("box::use(dplyr[...])\n", Some(1)));
 
         let warmed: std::collections::HashSet<String> =
             std::iter::once("dplyr".to_string()).collect();
@@ -32131,8 +32383,15 @@ mod refresh_packages_tests {
             !found.contains(&c),
             "c.R references only tidyr::; got {found:?}"
         );
-        // a.R has no namespace reference (only a library() call).
-        assert!(!found.contains(&a), "a.R has no pkg:: ref; got {found:?}");
+        assert!(
+            found.contains(&d),
+            "d.R imports dplyr through box; got {found:?}"
+        );
+        // a.R has neither a namespace reference nor a static box import.
+        assert!(
+            !found.contains(&a),
+            "a.R has no relevant ref; got {found:?}"
+        );
     }
 
     /// Deterministic (R-free) coverage of the issue #429 sysdata fallback gate
@@ -36565,6 +36824,297 @@ mod project_config_initialize_tests {
                 .any(|diagnostic| diagnostic.message.contains("helper_value is not defined")),
             "excluded buffer's own source() target should resolve; diagnostics: {:?}",
             diagnostic_signature(&state, &excluded_uri)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_project_excluded_file_resolves_own_box_module() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("mod.r"),
+            "box::export(public)\npublic <- function() 1\nprivate <- 2\n",
+        )
+        .unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let module_uri = Url::from_file_path(tmp.path().join("mod.r")).unwrap();
+        let excluded_uri = Url::from_file_path(tmp.path().join("generated").join("use.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        backend.state.write().await.workspace_scan_complete = true;
+
+        open_doc(
+            backend,
+            &excluded_uri,
+            "r",
+            1,
+            "box::use(../mod, ../mod[attached = public])\nmod$public()\nattached()\n",
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&excluded_uri)
+                .iter()
+                .any(|edge| {
+                    edge.to == module_uri && edge.non_lending && edge.is_selective_module()
+                }),
+            "excluded buffer should keep a non-lending selective module edge"
+        );
+        let diagnostics = snapshot_diagnostics(&state, &excluded_uri);
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("mod is not defined")
+                    || diagnostic.message.contains("attached is not defined")
+                    || diagnostic.message.contains("is not exported")
+            }),
+            "excluded open buffer should resolve its own box imports; diagnostics: {:?}",
+            diagnostic_signature(&state, &excluded_uri)
+        );
+    }
+
+    #[test]
+    fn watched_box_candidate_changes_add_and_retarget_import_edges() {
+        let tmp = TempDir::new().unwrap();
+        let importer_path = tmp.path().join("main.R");
+        let fallback_path = tmp.path().join("mod").join("__init__.r");
+        let preferred_path = tmp.path().join("mod.r");
+        let importer_code = "box::use(./mod)\n";
+        fs::write(&importer_path, importer_code).unwrap();
+
+        let importer_uri = Url::from_file_path(&importer_path).unwrap();
+        let fallback_uri = Url::from_file_path(&fallback_path).unwrap();
+        let preferred_uri = Url::from_file_path(&preferred_path).unwrap();
+        let selective_target = |state: &WorldState| {
+            state
+                .documents
+                .get_record(&importer_uri)
+                .and_then(|record| {
+                    record
+                        .artifacts()
+                        .timeline
+                        .iter()
+                        .find_map(|event| match event {
+                            crate::cross_file::scope::ScopeEvent::SelectiveImport {
+                                request,
+                                ..
+                            } => request.source.local_module_uri().cloned(),
+                            _ => None,
+                        })
+                })
+        };
+        let mut state = WorldState::new();
+        state
+            .workspace_folders
+            .push(Url::from_file_path(tmp.path()).unwrap());
+        state.open_document(importer_uri.clone(), importer_code, Some(1));
+        let metadata = crate::cross_file::extract_metadata(importer_code);
+        state
+            .cross_file_graph
+            .update_file(&importer_uri, &metadata, None, |_| None);
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&importer_uri)
+                .is_empty()
+        );
+
+        fs::create_dir(tmp.path().join("mod")).unwrap();
+        fs::write(&fallback_path, "fallback <- 1\n").unwrap();
+        let fallback_change = [FileEvent {
+            uri: fallback_uri.clone(),
+            typ: FileChangeType::CREATED,
+        }];
+        let candidate_importers = box_candidate_importers_for_changes(&state, &fallback_change);
+        let candidate_importers = enrich_box_candidate_importers(candidate_importers);
+        let collected = collect_watched_resync(&mut state, &fallback_change, candidate_importers);
+        assert!(collected.affected.contains(&importer_uri));
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&importer_uri)
+                .iter()
+                .any(|edge| edge.to == fallback_uri && edge.is_selective_module())
+        );
+        assert_eq!(
+            selective_target(&state),
+            Some(fallback_uri.clone()),
+            "candidate creation must rebuild the open importer's scope artifacts"
+        );
+
+        fs::write(&preferred_path, "preferred <- 1\n").unwrap();
+        let preferred_change = [FileEvent {
+            uri: preferred_uri.clone(),
+            typ: FileChangeType::CREATED,
+        }];
+        let candidate_importers = box_candidate_importers_for_changes(&state, &preferred_change);
+        assert!(
+            candidate_importers
+                .iter()
+                .any(|candidate| candidate.uri == importer_uri),
+            "preferred candidate creation must rediscover the unchanged importer"
+        );
+        let candidate_importers = enrich_box_candidate_importers(candidate_importers);
+        collect_watched_resync(&mut state, &preferred_change, candidate_importers);
+        let preferred_dependencies = state.cross_file_graph.get_dependencies(&importer_uri);
+        assert!(
+            preferred_dependencies
+                .iter()
+                .any(|edge| edge.to == preferred_uri && edge.is_selective_module()),
+            "preferred candidate must retarget the edge: {preferred_dependencies:?}"
+        );
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependencies(&importer_uri)
+                .iter()
+                .any(|edge| edge.to == fallback_uri)
+        );
+        assert_eq!(
+            selective_target(&state),
+            Some(preferred_uri.clone()),
+            "priority changes must retarget the open importer's scope artifacts"
+        );
+
+        fs::remove_file(&preferred_path).unwrap();
+        let preferred_deletion = [FileEvent {
+            uri: preferred_uri,
+            typ: FileChangeType::DELETED,
+        }];
+        let candidate_importers = box_candidate_importers_for_changes(&state, &preferred_deletion);
+        let candidate_importers = enrich_box_candidate_importers(candidate_importers);
+        collect_watched_resync(&mut state, &preferred_deletion, candidate_importers);
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&importer_uri)
+                .iter()
+                .any(|edge| edge.to == fallback_uri && edge.is_selective_module())
+        );
+        assert_eq!(
+            selective_target(&state),
+            Some(fallback_uri),
+            "candidate deletion must rebuild artifacts for the fallback target"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_box_candidate_change_rebuilds_unchanged_closed_importer() {
+        let tmp = TempDir::new().unwrap();
+        let anchor_code = "anchor <- 1\n";
+        let importer_code = "box::use(./mod[public])\npublic()\n";
+        let anchor_path = tmp.path().join("anchor.R");
+        let importer_path = tmp.path().join("main.R");
+        let module_path = tmp.path().join("mod.r");
+        fs::write(&anchor_path, anchor_code).unwrap();
+        fs::write(&importer_path, importer_code).unwrap();
+
+        let (svc, _anchor_uri) =
+            open_in_quiescent_workspace(&tmp, "anchor.R", "r", anchor_code).await;
+        let backend = svc.inner();
+        let importer_uri = Url::from_file_path(&importer_path).unwrap();
+        let module_uri = Url::from_file_path(&module_path).unwrap();
+        assert!(backend.index_file_on_demand(&importer_uri).await.is_some());
+        {
+            let state = backend.state.read().await;
+            assert!(!state.documents.contains_key(&importer_uri));
+            let artifacts = state
+                .workspace_index
+                .get_artifacts(&importer_uri)
+                .expect("closed importer artifacts");
+            assert!(artifacts.timeline.iter().all(|event| !matches!(
+                event,
+                crate::cross_file::scope::ScopeEvent::SelectiveImport { .. }
+            )));
+        }
+
+        fs::write(
+            &module_path,
+            "box::export(public)\npublic <- function() 1\n",
+        )
+        .unwrap();
+        let changes = [FileEvent {
+            uri: module_uri.clone(),
+            typ: FileChangeType::CREATED,
+        }];
+        let candidate_importers = {
+            let state = backend.state.read().await;
+            box_candidate_importers_for_changes(&state, &changes)
+        };
+        assert!(
+            candidate_importers
+                .iter()
+                .any(|candidate| candidate.uri == importer_uri)
+        );
+        let candidate_importers = enrich_box_candidate_importers(candidate_importers);
+        let collected = {
+            let mut state = backend.state.write().await;
+            collect_watched_resync(&mut state, &changes, candidate_importers)
+        };
+        assert!(
+            collected
+                .updates
+                .iter()
+                .any(|item| item.uri == importer_uri),
+            "the unchanged closed importer must join the guarded watched batch"
+        );
+
+        run_watched_resync_batch(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            WatchedResyncBatch {
+                updates: collected.updates,
+                affected: collected.affected,
+                deletions: collected.deletions,
+                reserved_tickets: Vec::new(),
+                transfer_handles: Vec::new(),
+                completion: WatchedResyncCompletion::Detached,
+                mode: WatchedResyncBatchMode::Immediate,
+                attempts_remaining: 2,
+                final_handoff_test_capture: None,
+            },
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        let artifacts = state
+            .workspace_index
+            .get_artifacts(&importer_uri)
+            .expect("rebuilt closed importer artifacts");
+        assert!(artifacts.timeline.iter().any(|event| matches!(
+            event,
+            crate::cross_file::scope::ScopeEvent::SelectiveImport { request, .. }
+                if request.source.local_module_uri() == Some(&module_uri)
+        )));
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&importer_uri)
+                .iter()
+                .any(|edge| edge.to == module_uri && edge.is_selective_module())
         );
     }
 
@@ -47012,7 +47562,7 @@ mod project_config_initialize_tests {
     }
 
     #[tokio::test]
-    async fn resync_restores_open_parent_when_only_incoming_edge_is_non_lending() {
+    async fn resync_restores_open_parent_when_other_incoming_edges_do_not_lend_scope() {
         let tmp = TempDir::new().unwrap();
         let parent = "source(\"helper.R\")\nparent_value <- 1\n";
         fs::write(tmp.path().join("parent.R"), parent).unwrap();
@@ -47022,6 +47572,7 @@ mod project_config_initialize_tests {
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
         let excluded_uri = Url::from_file_path(tmp.path().join("excluded.R")).unwrap();
+        let selective_uri = Url::from_file_path(tmp.path().join("selective.R")).unwrap();
 
         {
             let mut state = backend.state.write().await;
@@ -47050,17 +47601,35 @@ mod project_config_initialize_tests {
                 .cross_file_graph
                 .make_forward_edges_non_lending(&excluded_uri);
 
+            let mut selective_meta = crate::cross_file::extract_metadata("box::use(./helper)\n");
+            crate::cross_file::enrich_box_import_resolutions(&mut selective_meta, &selective_uri);
+            state.cross_file_graph.update_file(
+                &selective_uri,
+                &selective_meta,
+                workspace_root.as_ref(),
+                |_| None,
+            );
+
             let incoming = state.cross_file_graph.get_dependents(&helper_uri);
             assert_eq!(
                 incoming.len(),
-                1,
-                "precondition: only the excluded incoming edge remains"
+                2,
+                "precondition: only non-lending ordinary and selective edges remain"
             );
             assert!(
                 incoming
                     .iter()
                     .any(|edge| edge.from == excluded_uri && edge.non_lending),
-                "precondition: retained incoming edge is non-lending"
+                "precondition: retained ordinary incoming edge is non-lending"
+            );
+            assert!(
+                incoming.iter().any(|edge| {
+                    edge.from == selective_uri
+                        && edge.is_selective_module()
+                        && !edge.non_lending
+                        && !edge.lends_scope()
+                }),
+                "precondition: a selective edge is graph-visible but does not lend scope"
             );
         }
 
@@ -47092,6 +47661,12 @@ mod project_config_initialize_tests {
                 .iter()
                 .any(|edge| edge.from == excluded_uri && edge.non_lending),
             "the excluded consumer's retained edge remains non-lending"
+        );
+        assert!(
+            incoming
+                .iter()
+                .any(|edge| edge.from == selective_uri && edge.is_selective_module()),
+            "the selective consumer's revalidation edge remains present"
         );
     }
 

@@ -447,6 +447,116 @@ Raven watches `.libPaths()` directories and invalidates caches when packages are
 
 See [Configuration](configuration.md) for watcher settings (`packages.watchLibraryPaths`, `packages.watchDebounceMs`).
 
+## box module imports (`box::use`)
+
+Raven understands the [box](https://klmr.me/box/) module system's `box::use()`
+imports and `box::export()` / `#' @export` interface declarations. box is
+modelled as its own kind of cross-file relationship — a **selective import** —
+which is deliberately distinct from both a package `library()` load and an
+ordinary `source()` edge:
+
+- Unlike `library(pkg)`, a box import never dumps a package's whole export set
+  in as bare names. It binds a **namespace object** (used as `alias$member`)
+  and/or an explicitly listed subset of members.
+- Unlike `source("file.R")`, a box module import does **not** merge the target
+  file's top-level definitions into the importer, does not propagate
+  `# raven: nse` / `# raven: func`, and never takes part in the backward
+  parent-prefix walk. Only the target's **exported** names cross the boundary,
+  and only under the names the import requests.
+
+### Supported import forms
+
+```r
+box::use(
+  dplyr,                 # bind the `dplyr` namespace  -> dplyr$filter(...)
+  dr = dplyr,            # ... under an explicit alias -> dr$filter(...)
+  dplyr[filter, select], # attach `filter`, `select` directly (no namespace)
+  dplyr[f = filter],     # attach dplyr's `filter` under the local name `f`
+  dplyr[...],            # attach every export
+  ./helpers,             # local module: helpers.r / helpers/__init__.r
+  ../lib/util[foo],      # attach `foo` from ../lib/util
+)
+```
+
+- A **bare name** is an installed package; a **local module** *must* begin with
+  `./` or `../`. Both top-level and function-scoped `box::use()` calls are
+  recognised, as is the `box:::use()` spelling.
+- The **default namespace alias** is the final path/package component
+  (`../lib/util` binds `util`); `alias = spec` overrides it.
+- An **attach-only** spec (`pkg[a, b]`, `pkg[...]`) binds no namespace object
+  unless you also write an explicit `alias = pkg[...]`.
+
+### Local module path resolution
+
+Local module paths resolve **relative to the importing file's own directory**
+and intentionally ignore `# raven: cd`, the implicit testthat/testit working
+directory, and the forward workspace-root fallback — none of those apply to
+box. The extension is omitted in the spec; candidates are tried in this order,
+first existing wins:
+
+1. `<path>.r`
+2. `<path>.R`
+3. `<path>/__init__.r`
+4. `<path>/__init__.R`
+
+so a `.r`/`.R` **file module** wins over an `__init__` **package module**, and
+a lowercase extension wins over uppercase, matching box. Resolution is
+**case-sensitive**: a path that exists only under a different case is reported
+as a case mismatch rather than silently corrected.
+
+### Exported interface
+
+A module's exports are determined by, in order of authority:
+
+- `box::export(a, b, c)` — the union of unquoted names across all such calls.
+  `box::export()` with no arguments is an explicit **empty** interface.
+- `#' @export` roxygen tags on top-level definitions, and on top-level
+  `box::use()` imports (which **re-export** the imported names).
+
+If **either** explicit mechanism is present the interface is authoritative, so
+member absence (`module$missingName`) is decidable. If **neither** is present,
+the module falls back to the legacy default — every top-level binding whose name
+does not begin with a dot — which is treated as *non-authoritative* (a missing
+member is not concluded, because a statically-invisible dynamic binding might
+supply it). Names that are private, or merely transitively imported without an
+explicit re-export, never cross the boundary.
+
+### Language intelligence and revalidation
+
+Static box imports participate in the same canonical artifact, scope, package,
+and diagnostic lifecycles as the rest of Raven:
+
+- Imported namespace aliases and attached/renamed members are position-aware,
+  function-scoped when the call is inside a function, and available to
+  diagnostics, completion, hover, signatures, and go-to-definition.
+- Namespace-member completion and navigation understand `$`, `@`, and a single
+  positional literal-string `[[...]]` subscript. Local-module members navigate
+  to their original definitions through named, renamed, and wildcard
+  re-exports. Installed-package members use Raven's package export metadata but
+  do not fabricate source-file navigation.
+- Find-references for a resolved selective member follows definition identity
+  across namespace access, attached names, renames, and indexed importers,
+  rather than pooling unrelated same-named members. Ordinary non-box references
+  keep Raven's broad name-based behavior.
+- Local module imports add a selective dependency edge. Export/import interface
+  edits revalidate dependents, but the edge never lends ordinary `source()`
+  scope and never propagates `# raven: nse` / `# raven: func` declarations.
+- Missing local modules, case-only mismatches, missing installed packages, and
+  names absent from a complete export set produce diagnostics. Partial or
+  unknown export metadata never proves absence.
+
+The same model is used for open files, closed workspace-indexed files, excluded
+open documents, the language server, and `raven check`. The `/` in a box spec
+remains exempt from the `infix_spaces` lint, while ordinary `/` expressions keep
+their existing parsing and lint behavior.
+
+Raven does not execute module code or hooks, evaluate dynamic `box.path`
+configuration, search user-global/remote module locations, or guess computed
+imports. Unsupported forms fail conservatively — they neither bind names nor
+emit misleading diagnostics. See
+[Limitations](limitations.md#box-module-system-boxuse) for the exact static
+boundary.
+
 ## NSE directive propagation
 
 `# raven: nse` declarations (see [Non-Standard Evaluation](non-standard-evaluation.md) and [directives](directives.md#nse-declarations)) are cross-file facts, like defined symbols and `library()` loads: a declaration governs undefined-variable suppression for its named callee in every file connected to it through the resolved `source()` graph, in both directions and transitively. Declare a helper's NSE contract once — next to its `library()` call, its definition, or in a sourced setup file — and the corresponding false positives are suppressed at call sites in the connected files.

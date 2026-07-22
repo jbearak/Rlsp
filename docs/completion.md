@@ -10,6 +10,7 @@ Raven offers context-aware completions for R symbols, package exports, function 
 | **Cross-file symbols** | Symbols from sourced files, available after the `source()` call / `# raven: source` directive |
 | **Package exports** | Functions and variables from loaded packages, with `{pkg}` attribution |
 | **Namespace-qualified exports** | A package's exported symbols after `pkg::` (e.g. `dplyr::`) |
+| **box imports** | Static namespace aliases and attached/renamed exports; known exports after `alias$`, `alias@`, or literal `alias[["…"]]` access |
 | **Function parameters** | Parameter names when inside a function call |
 | **File paths** | `.R`/`.r` files and directories inside `source()` strings and path directives |
 | **$ members** | Known members after `$` (from assignments and constructors) |
@@ -52,6 +53,19 @@ Each item is attributed `{package}` and resolves to that topic's help, exactly l
 Unlike the position-aware completions above, `pkg::` does **not** require a prior `library(pkg)` call: any installed package resolves on demand by reading its `NAMESPACE` (the same way `pkg::name` works in R without attaching the package). Writing `pkg::` (or `pkg:::`) also **warms `pkg`'s metadata** into the package cache in the background — exactly as a `library(pkg)` call would — so the two refinements below become available without an explicit attach. Crucially, this warming never attaches `pkg` to bare-name scope: it only populates metadata. Two refinements arrive once a package has been loaded (in the background, or by an earlier `library()`/`pkg::` use in the session): exported **datasets** (which live in `data/`, not the `NAMESPACE`), and the complete export set for the ~6% of packages that export via `exportPattern()` — those offer their explicitly-exported names immediately.
 
 Inside a `pkg::` expression no other completions are offered (keywords, local symbols, and other packages are irrelevant there). Internal access via `pkg:::` (non-exported symbols) warms the package's metadata but is **not** completed and is never member-validated. Like the other package completions, this requires `raven.packages.enabled`. A `pkg::member` that a *complete* export set does not contain is flagged by the [`namespace-member-not-found`](diagnostics.md#namespace-member-references-pkgmember) diagnostic.
+
+### box Namespace and Attached Completions
+
+A static [`box::use()` import](cross-file.md#box-module-imports-boxuse) contributes only the bindings it requests. A namespace import offers known exported members after `$` or `@`; a literal `[["member"]]` access resolves the same member for hover/navigation. Selective and renamed attachments appear as bare-name completions under their local names, and wildcard attachment expands the known export set.
+
+```r
+box::use(./model, ./format[render, fmt = format_value])
+model$   # Offers only known exports of ./model
+rend     # Can offer render
+fmt      # Can offer the renamed attachment
+```
+
+Private or merely transitive module names are never offered. Complete export metadata can prove a member absent; partial/unknown metadata contributes known positives without guessing the rest. Installed-package box imports use Raven's normal installed/frozen/downloaded package metadata, but do not attach the whole package as bare-name scope.
 
 ## Function Parameter Completions
 

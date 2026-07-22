@@ -183,6 +183,140 @@ pub fn extract_from_ast(params_node: Node, text: &str) -> Vec<ParameterInfo> {
     params
 }
 
+/// Parse the parameter list retained in a static cross-file signature string.
+///
+/// Handles nested parentheses and quoted commas/defaults. This is shared by
+/// signature help and selective-import parameter resolution so renamed imported
+/// functions do not need to rediscover their original assignment name in the AST.
+pub(crate) fn parse_signature_parameters(signature: &str) -> Vec<ParameterInfo> {
+    let Some(start) = signature.find('(').map(|position| position + 1) else {
+        return Vec::new();
+    };
+    let Some(end) = signature.rfind(')') else {
+        return Vec::new();
+    };
+    if start >= end {
+        return Vec::new();
+    }
+
+    let mut params = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in signature[start..end].chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(active) => {
+                current.push(ch);
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == active {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' | '`' => {
+                    quote = Some(ch);
+                    current.push(ch);
+                }
+                '(' => {
+                    paren_depth += 1;
+                    current.push(ch);
+                }
+                ')' => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                '[' => {
+                    bracket_depth += 1;
+                    current.push(ch);
+                }
+                ']' => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                '{' => {
+                    brace_depth += 1;
+                    current.push(ch);
+                }
+                '}' => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                ',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                    if !current.trim().is_empty() {
+                        params.push(parse_signature_parameter(&current));
+                    }
+                    current.clear();
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+    if !current.trim().is_empty() {
+        params.push(parse_signature_parameter(&current));
+    }
+    params
+}
+
+pub(crate) fn parse_signature_parameter(param: &str) -> ParameterInfo {
+    let trimmed = param.trim();
+    if trimmed == "..." || trimmed.starts_with("...") {
+        return ParameterInfo {
+            name: "...".to_string(),
+            default_value: None,
+            is_dots: true,
+        };
+    }
+
+    let mut quote = None;
+    let mut escaped = false;
+    let mut eq_position = None;
+    for (index, ch) in trimmed.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(active) => {
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == active {
+                    quote = None;
+                }
+            }
+            None if matches!(ch, '\'' | '"' | '`') => quote = Some(ch),
+            None if ch == '=' => {
+                eq_position = Some(index);
+                break;
+            }
+            None => {}
+        }
+    }
+
+    if let Some(eq_position) = eq_position {
+        let default = trimmed[eq_position + 1..].trim();
+        ParameterInfo {
+            name: trimmed[..eq_position].trim().to_string(),
+            default_value: (!default.is_empty()).then(|| default.to_string()),
+            is_dots: false,
+        }
+    } else {
+        ParameterInfo {
+            name: trimmed.to_string(),
+            default_value: None,
+            is_dots: false,
+        }
+    }
+}
+
 /// Get the text content of a tree-sitter node.
 fn node_text<'a>(node: Node<'a>, text: &'a str) -> &'a str {
     let start = node.start_byte();
@@ -281,14 +415,25 @@ pub fn resolve(
     let resolved_package = if let Some(ns) = namespace {
         Some(ns.to_string())
     } else {
-        // Resolve the true owner package (issue #407) so formals come from the
-        // package that actually defines the function (e.g. `dplyr` for a
-        // `mutate` made visible through `library(tidyverse)`), not the
-        // aggregate that merely made it visible.
-        let pkg_list: Vec<String> = all_packages.to_vec();
-        state
-            .package_library
-            .find_package_owner_for_symbol(function_name, &pkg_list)
+        let lookup_key =
+            crate::handlers::unquote_backtick_name(function_name).unwrap_or(function_name);
+        let selective_package = scope
+            .symbols
+            .get(function_name)
+            .or_else(|| scope.symbols.get(lookup_key))
+            .and_then(|symbol| symbol.source_uri.as_str().strip_prefix("package:"))
+            .filter(|package| !package.is_empty())
+            .map(str::to_string);
+        selective_package.or_else(|| {
+            // Resolve the true owner package (issue #407) so formals come from
+            // the package that actually defines the function (e.g. `dplyr` for
+            // a `mutate` made visible through `library(tidyverse)`), not the
+            // aggregate that merely made it visible.
+            let pkg_list: Vec<String> = all_packages.to_vec();
+            state
+                .package_library
+                .find_package_owner_for_symbol(function_name, &pkg_list)
+        })
     };
 
     if let Some(ref pkg_name) = resolved_package {
@@ -523,9 +668,24 @@ fn resolve_from_cross_file(
         return None;
     }
 
-    // Skip package-sourced symbols (those have "package:" URIs)
+    // Skip package-sourced symbols (those have "package:" URIs). The package
+    // phase resolves those using the selective binding's exact source package.
     if symbol.source_uri.as_str().starts_with("package:") {
         return None;
+    }
+
+    // Selective local-module imports retain the defining symbol's signature.
+    // Prefer it over an AST name lookup because a renamed attachment's local
+    // name intentionally differs from the source assignment name.
+    if let Some(signature) = &symbol.signature {
+        return Some(FunctionSignature {
+            name: function_name.to_string(),
+            parameters: parse_signature_parameters(signature),
+            source: SignatureSource::CrossFile {
+                uri: symbol.source_uri.clone(),
+                line: symbol.defined_line,
+            },
+        });
     }
 
     // Try to get the source file's AST and extract parameters
@@ -794,6 +954,13 @@ fn get_scope(
             lookup: &data_lookup,
             base_packages: state.package_library.base_packages(),
         });
+    let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        (state.cross_file_config.packages_enabled && state.package_library_ready)
+            .then_some(state.package_library.as_ref()),
+    );
+    let selective_import_provider = scope::SelectiveImportProvider { env: &import_env };
 
     let package_contribution = state.package_state.scope_contribution();
     let package_query_uri = package_contribution
@@ -816,6 +983,7 @@ fn get_scope(
         &|| false, // non-diagnostic path, no cancellation,
         Some(package_contribution),
         data_provider.as_ref(),
+        Some(&selective_import_provider),
         package_query_uri.as_ref(),
     )
 }
@@ -1172,6 +1340,110 @@ f(beta = 2)
         )
         .expect("later call resolves to a user signature");
         assert_eq!(names(late), vec!["beta"]);
+    }
+
+    #[test]
+    fn renamed_local_module_function_uses_retained_signature() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let module_path = tmp.path().join("mod.r");
+        let importer_path = tmp.path().join("main.R");
+        let module_code = "box::export(original)\noriginal <- function(x = m[1, 2], y = c(1, 2), label = \"a,b\", `a,b` = 1, ...) x\n";
+        let importer_code = "box::use(./mod[renamed = original])\nrenamed(\n";
+        std::fs::write(&module_path, module_code).unwrap();
+        std::fs::write(&importer_path, importer_code).unwrap();
+
+        let module_uri = Url::from_file_path(&module_path).unwrap();
+        let importer_uri = Url::from_file_path(&importer_path).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.open_document(module_uri.clone(), module_code, Some(1));
+        state.open_document(importer_uri.clone(), importer_code, Some(1));
+
+        let signature = resolve_user_only(
+            &state,
+            "renamed",
+            &importer_uri,
+            tower_lsp::lsp_types::Position::new(1, 8),
+        )
+        .expect("renamed module function must retain its source signature");
+        assert!(matches!(
+            signature.source,
+            SignatureSource::CrossFile { ref uri, line: 1 } if uri == &module_uri
+        ));
+        let labels = signature
+            .parameters
+            .iter()
+            .map(ParameterInfo::label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "x = m[1, 2]",
+                "y = c(1, 2)",
+                "label = \"a,b\"",
+                "`a,b` = 1",
+                "...",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_package_function_uses_exact_selective_source() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        state.package_library = Arc::new(PackageLibrary::new_empty());
+        state
+            .package_library
+            .insert_package(PackageInfo::new(
+                "pkgA".to_string(),
+                HashSet::from(["shared".to_string()]),
+            ))
+            .await;
+
+        let uri = Url::parse("file:///workspace/main.R").unwrap();
+        let code = "box::use(pkgA[shared])\nshared(\n";
+        state.open_document(uri.clone(), code, Some(1));
+        let cache = SignatureCache::new(10);
+        for (package, parameter) in [("pkgA", "from_a"), ("pkgB", "from_b")] {
+            cache.insert_package(
+                format!("{package}::shared"),
+                FunctionSignature {
+                    name: "shared".to_string(),
+                    parameters: vec![ParameterInfo {
+                        name: parameter.to_string(),
+                        default_value: None,
+                        is_dots: false,
+                    }],
+                    source: SignatureSource::RSubprocess {
+                        package: Some(package.to_string()),
+                    },
+                },
+            );
+        }
+
+        let signature = resolve(
+            &state,
+            &cache,
+            "shared",
+            None,
+            false,
+            &uri,
+            tower_lsp::lsp_types::Position::new(1, 7),
+        )
+        .expect("selectively attached package function must resolve cached formals");
+        assert_eq!(signature.parameters[0].name, "from_a");
+        assert!(matches!(
+            signature.source,
+            SignatureSource::RSubprocess {
+                package: Some(ref package)
+            } if package == "pkgA"
+        ));
     }
 
     #[cfg(unix)]

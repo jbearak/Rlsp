@@ -21,6 +21,9 @@ use super::source_detect::{
 };
 use super::static_path::LazyStaticBindings;
 use super::types::{ForwardSource, byte_offset_to_utf16_column};
+use crate::box_use::ModuleExportEnv;
+use crate::box_use::resolve::ImportResolver;
+use crate::selective_import::{ImportSource, SelectiveImportRequest};
 
 // ============================================================================
 // Line Index for Fast Lookups
@@ -775,6 +778,39 @@ pub enum ScopeEvent {
         runtime_function_scope: RuntimeFunctionScope,
         function_scope: Option<FunctionScopeInterval>,
     },
+    /// A syntax-agnostic *selective import* (issue #662): a `box::use()` (or a
+    /// future second surface syntax) that pulls a namespace alias and/or an
+    /// explicitly enumerated set of members from one source — an installed
+    /// package or a resolved local module file — into this file's scope behind
+    /// a privacy boundary.
+    ///
+    /// This is deliberately **not** [`ScopeEvent::PackageLoad`] (which attaches
+    /// a package's whole export set as bare names) and **not**
+    /// [`ScopeEvent::Source`] (which merges a target's top-level definitions and
+    /// participates in lending/parent-prefix/NSE propagation). Only the source's
+    /// *exported* members cross the boundary, and only under the names the import
+    /// requests. See [`crate::selective_import`].
+    ///
+    /// The [`request`](SelectiveImportRequest) is the resolved, lowered form
+    /// (source identity already resolved by `box_use::path`). Binding
+    /// resolution happens at query time against a
+    /// [`SelectiveImportProvider`] so wildcard attaches expand against the live
+    /// export set and per-member provenance points at the true definition site.
+    /// Static bindings (namespace alias, named/renamed attaches) bind even with
+    /// no provider.
+    ///
+    /// `line/column` is the import's call site (the effect position — the
+    /// binding is visible from that position onward, like a `Def`). The
+    /// `function_scope` is annotated from the canonical function-scope tree so a
+    /// function-scoped import binds only inside its function while a top-level
+    /// one is cross-file visible like other top-level `Def` effects.
+    SelectiveImport {
+        line: u32,
+        column: u32,
+        request: SelectiveImportRequest,
+        runtime_function_scope: RuntimeFunctionScope,
+        function_scope: Option<FunctionScopeInterval>,
+    },
 }
 
 /// A detected `devtools::load_all()` / `pkgload::load_all()` call site
@@ -928,6 +964,13 @@ pub struct ScopeAtPosition {
     /// Origins are stored as `Arc<Url>` so cross-file propagation between
     /// scopes is a refcount bump rather than a Url-internals string clone.
     pub package_origins: HashMap<String, HashSet<Arc<Url>>>,
+    /// Namespace aliases bound by selective imports (issue #662), keyed by the
+    /// local alias name. Retains each alias's source and resolved export set so a
+    /// `alias$member` qualified-resolution pass (issue #662) can validate
+    /// members without re-resolving. Distinct from `symbols` (which holds the
+    /// alias as an ordinary bound name) and never expressed as a fake package
+    /// load. See [`NamespaceImportAlias`].
+    pub namespace_import_aliases: HashMap<Arc<str>, NamespaceImportAlias>,
 }
 
 fn record_visible_position(
@@ -1375,7 +1418,12 @@ where
         let is_standalone = get_metadata(&f).is_some_and(|m| m.standalone);
         if !is_standalone {
             for edge in graph.get_dependents(&f) {
-                if edge.non_lending {
+                // A selective `box::use()` module importer is not a lending
+                // parent of `f`, so it must not be pulled into `f`'s scope
+                // contribution set (issue #662). Forward module edges are left
+                // in the forward walk above so an imported module's interface
+                // still busts the importer's memo — a safe over-approximation.
+                if !edge.lends_scope() {
                     continue;
                 }
                 if contrib.insert(edge.from.clone()) {
@@ -1768,6 +1816,9 @@ pub(super) fn event_effect_position(event: &ScopeEvent) -> (u32, u32) {
         ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         ScopeEvent::DataLoad { line, column, .. } => (*line, *column),
         ScopeEvent::Declaration { line, column, .. } => (*line, *column),
+        // A selective import's bindings are visible from the call site onward,
+        // like a `Def`/`Declaration` (the `<=` visibility check applies).
+        ScopeEvent::SelectiveImport { line, column, .. } => (*line, *column),
     }
 }
 
@@ -1939,6 +1990,7 @@ fn single_file_attachment_projection(
         None,
         None,
         None,
+        None,
     ) else {
         return (HashSet::new(), HashSet::new());
     };
@@ -2098,6 +2150,13 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts, line_index: &L
                 ..
             }
             | ScopeEvent::Declaration {
+                line,
+                column,
+                runtime_function_scope,
+                function_scope,
+                ..
+            }
+            | ScopeEvent::SelectiveImport {
                 line,
                 column,
                 runtime_function_scope,
@@ -2663,6 +2722,30 @@ pub fn compute_artifacts_with_metadata(
     // (one sentinel PackageLoad per call site); see `push_dev_load_all_events`.
     push_dev_load_all_events(&mut artifacts);
 
+    // Emit selective-import events for `box::use()` imports (issue #662). Each
+    // import lowers to a syntax-agnostic `SelectiveImportRequest`: package specs
+    // lower directly, local specs resolve their module URI here, and unsupported
+    // or unresolved local specs are skipped so they never silently bind. Binding
+    // resolution is deferred to query time against a `SelectiveImportProvider`
+    // (issue #662). `RuntimeFunctionScope::Lexical` lets the canonical function-scope tree
+    // decide whether the import is function-scoped (binds only inside its
+    // function) or top-level (cross-file visible), exactly like a `Def`.
+    if let Some(metadata) = metadata {
+        for import in &metadata.box_imports {
+            let Some(source) = import.resolved_source() else {
+                continue;
+            };
+            let request = import.lower(uri, source);
+            artifacts.timeline.push(ScopeEvent::SelectiveImport {
+                line: import.line,
+                column: import.column,
+                request,
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
+                function_scope: None,
+            });
+        }
+    }
+
     finalize_scope_timeline(&mut artifacts, &line_index);
 
     // Add declared symbols (`# raven: var` / `# raven: func` directives and
@@ -2707,6 +2790,18 @@ pub fn compute_artifacts_with_metadata(
         .map(|m| m.targets_pipeline_packages.as_slice())
         .unwrap_or(&[]);
     let declarations = extract_top_level_declarations(&artifacts.timeline);
+    // Selective imports (`box::use()`) and this file's own box export set feed
+    // the interface hash so import/export/re-export changes revalidate connected
+    // files (issue #662).
+    let selective_imports: Vec<&SelectiveImportRequest> = artifacts
+        .timeline
+        .iter()
+        .filter_map(|event| match event {
+            ScopeEvent::SelectiveImport { request, .. } => Some(request),
+            _ => None,
+        })
+        .collect();
+    let box_exports = metadata.and_then(|m| m.box_exports.as_ref());
     artifacts.interface_hash = compute_interface_hash(
         &top_level,
         &loaded_packages,
@@ -2720,6 +2815,9 @@ pub fn compute_artifacts_with_metadata(
         &source_interfaces,
         metadata.is_some_and(|m| m.standalone),
         metadata.and_then(|m| m.shiny_application.as_ref()),
+        &selective_imports,
+        &artifacts.timeline,
+        box_exports,
     );
 
     artifacts
@@ -2950,6 +3048,13 @@ pub fn scope_at_position(
                 // Production diagnostics / completion flow through
                 // `scope_at_position_with_graph[_cached]` / `ScopeStream`, which
                 // DO expand.
+            }
+            ScopeEvent::SelectiveImport { .. } => {
+                // No selective-import injection here (issue #662): these
+                // single-file helpers take no `SelectiveImportProvider`, so they
+                // cannot resolve a source's export set. Production diagnostics /
+                // completion flow through `scope_at_position_with_graph[_cached]`
+                // / `ScopeStream`, which DO inject the bindings.
             }
         }
     }
@@ -3251,6 +3356,11 @@ where
                 // Production diagnostics / completion flow through
                 // `scope_at_position_with_graph[_cached]` / `ScopeStream`, which
                 // DO expand.
+            }
+            ScopeEvent::SelectiveImport { .. } => {
+                // No selective-import injection here (issue #662): these
+                // single-file helpers take no `SelectiveImportProvider`.
+                // Production paths inject through the graph-aware resolvers.
             }
         }
     }
@@ -5825,6 +5935,12 @@ fn compute_interface_hash(
     sources: &[FinalizedSourceInterface],
     standalone: bool,
     shiny_application: Option<&super::types::ShinyApplicationMetadata>,
+    // Issue #662: the file's `box::use()` imports (lowered requests) and its own
+    // `box` export set. Both change what this file makes visible to — and what
+    // it re-exports to — connected files, so a change must revalidate dependents.
+    selective_imports: &[&SelectiveImportRequest],
+    scope_timeline: &[ScopeEvent],
+    box_exports: Option<&crate::box_use::BoxExports>,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
 
@@ -6008,7 +6124,179 @@ fn compute_interface_hash(
         interface.contributes_to_timeline.hash(&mut hasher);
     }
 
+    // Issue #662: selective imports (`box::use()`). Each request's
+    // interface-relevant identity — source, namespace alias, attach set, and the
+    // `function_scoped` flag — feeds the hash via `hash_into`, which deliberately
+    // excludes provenance (line/column), so mere line movement does not
+    // invalidate. Preserve extraction order: imports obey source-order shadowing,
+    // so swapping two otherwise-identical alias/attachment declarations can
+    // change the effective interface even though neither request changed.
+    hasher.write_usize(selective_imports.len());
+    for request in selective_imports {
+        request.hash_into(&mut hasher);
+    }
+
+    // Preserve each top-level import's order relative to every other top-level
+    // scope effect without hashing raw import coordinates. Blank-line movement
+    // therefore remains stable, while moving an import across a definition,
+    // removal, source, package/data load, declaration, or another import changes
+    // the interface because it can change the winning binding. Package imports
+    // have no file dependency edge, so this hash is their invalidation signal.
+    hash_top_level_scope_effect_order(scope_timeline, &mut hasher);
+
+    // Issue #662: this file's own `box` export set. A change to the exported
+    // member set, the export mode (Explicit vs LegacyDefault — which flips
+    // absence authority), or the wildcard re-export targets changes what
+    // importers of this module see, so it must revalidate them. `members` is a
+    // `BTreeSet`, so its iteration order is already deterministic; re-exports are
+    // hashed by their interface-relevant structure (excluding line/column).
+    match box_exports {
+        Some(exports) => {
+            1u8.hash(&mut hasher);
+            for member in &exports.members {
+                member.hash(&mut hasher);
+            }
+            match exports.mode {
+                crate::box_use::ExportMode::Explicit => 0u8.hash(&mut hasher),
+                crate::box_use::ExportMode::LegacyDefault => 1u8.hash(&mut hasher),
+            }
+            hasher.write_usize(exports.reexports.len());
+            for reexport in &exports.reexports {
+                hash_box_import_interface(reexport, &mut hasher);
+            }
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+
     hasher.finish()
+}
+
+fn hash_top_level_scope_effect_order<H: std::hash::Hasher>(timeline: &[ScopeEvent], state: &mut H) {
+    for event in timeline {
+        match event {
+            ScopeEvent::Def {
+                symbol,
+                function_scope: None,
+                ..
+            } => {
+                0u8.hash(state);
+                symbol.hash(state);
+            }
+            ScopeEvent::Source {
+                source,
+                function_scope: None,
+                ..
+            } => {
+                1u8.hash(state);
+                source.path.hash(state);
+                source.resolved_uri.hash(state);
+            }
+            ScopeEvent::SourceBatch { kind, members, .. } => {
+                2u8.hash(state);
+                kind.hash(state);
+                for member in members {
+                    member.path.hash(state);
+                    member.resolved_uri.hash(state);
+                }
+            }
+            ScopeEvent::Removal {
+                symbols,
+                function_scope: None,
+                ..
+            } => {
+                3u8.hash(state);
+                symbols.hash(state);
+            }
+            ScopeEvent::PackageLoad {
+                package,
+                function_scope: None,
+                ..
+            } => {
+                4u8.hash(state);
+                package.hash(state);
+            }
+            ScopeEvent::DataLoad {
+                stems,
+                package,
+                function_scope: None,
+                ..
+            } => {
+                5u8.hash(state);
+                stems.hash(state);
+                package.hash(state);
+            }
+            ScopeEvent::Declaration {
+                symbol,
+                function_scope: None,
+                ..
+            } => {
+                6u8.hash(state);
+                symbol.hash(state);
+            }
+            ScopeEvent::SelectiveImport {
+                request,
+                function_scope: None,
+                ..
+            } => {
+                7u8.hash(state);
+                request.hash_into(state);
+            }
+            ScopeEvent::FunctionScope { .. }
+            | ScopeEvent::Def { .. }
+            | ScopeEvent::Source { .. }
+            | ScopeEvent::Removal { .. }
+            | ScopeEvent::PackageLoad { .. }
+            | ScopeEvent::DataLoad { .. }
+            | ScopeEvent::Declaration { .. }
+            | ScopeEvent::SelectiveImport { .. } => {}
+        }
+    }
+}
+
+/// Fold a re-exported [`BoxImport`](crate::box_use::BoxImport)'s
+/// interface-relevant structure into `state`: its spec, explicit alias, attach
+/// list, and `function_scoped` flag. Provenance (line/column) is excluded so a
+/// re-export moving by a line does not invalidate importers.
+fn hash_box_import_interface<H: std::hash::Hasher>(
+    import: &crate::box_use::BoxImport,
+    state: &mut H,
+) {
+    use crate::box_use::{BoxAttach, BoxSpec};
+    match &import.spec {
+        BoxSpec::Package(name) => {
+            0u8.hash(state);
+            name.hash(state);
+        }
+        BoxSpec::LocalModule {
+            up_levels,
+            components,
+        } => {
+            1u8.hash(state);
+            up_levels.hash(state);
+            components.hash(state);
+        }
+        BoxSpec::Unsupported(raw) => {
+            2u8.hash(state);
+            raw.hash(state);
+        }
+    }
+    import.explicit_alias.hash(state);
+    import.function_scoped.hash(state);
+    state.write_usize(import.attach.len());
+    for attach in &import.attach {
+        match attach {
+            BoxAttach::Named(name) => {
+                0u8.hash(state);
+                name.hash(state);
+            }
+            BoxAttach::Renamed { local, exported } => {
+                1u8.hash(state);
+                local.hash(state);
+                exported.hash(state);
+            }
+            BoxAttach::Wildcard => 2u8.hash(state),
+        }
+    }
 }
 
 /// Provider for expanding [`ScopeEvent::DataLoad`] events at scope query time
@@ -6027,6 +6315,261 @@ pub struct DataAliasProvider<'a> {
     pub lookup: &'a dyn Fn(&str, &str) -> Vec<String>,
     /// Default-attached base package names, searched for bare `data(stem)`.
     pub base_packages: &'a HashSet<String>,
+}
+
+/// Query-time seam for resolving [`ScopeEvent::SelectiveImport`] events (issue
+/// #662), mirroring [`DataAliasProvider`]. It wraps a
+/// [`ModuleExportEnv`], which production wires
+/// to the package library (installed / frozen / bundled exports) for package
+/// sources and to the cross-file artifacts / metadata for local-module sources.
+///
+/// `None` (tests and paths where imports are irrelevant) disables export-set
+/// resolution: only the *static* bindings of an import — its namespace alias and
+/// named/renamed attaches — bind; wildcard attaches expand to nothing and no
+/// member absence is provable. Passing a provider additionally resolves wildcard
+/// attaches against the live export set, proves member absence (a `Complete`
+/// set), and attributes per-member provenance to the true definition site.
+pub struct SelectiveImportProvider<'a> {
+    /// The module/package export environment resolution reads from.
+    pub env: &'a dyn ModuleExportEnv,
+}
+
+/// The retained identity of a selective import's *namespace alias* binding, so
+/// the `alias$member` qualified-resolution pass (issue #662) can recover the
+/// alias's source and export set. Kept in [`ScopeAtPosition::namespace_import_aliases`]
+/// rather than faked as a package load, because a namespace alias binds only the
+/// whole source object and never leaks its members as bare names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceImportAlias {
+    /// The source the alias refers to (a package name or a local-module URI).
+    pub source: ImportSource,
+    /// The source's resolved export set (with completeness), for member
+    /// validation of `alias$member` accesses.
+    pub exports: crate::selective_import::ExportSet,
+    /// Where the import that introduced the alias was written.
+    pub provenance: crate::selective_import::ImportProvenance,
+}
+
+/// Drop retained namespace identities whose alias binding was subsequently
+/// shadowed, removed, or replaced by an attached member with the same local name.
+///
+/// `namespace_import_aliases` is auxiliary qualified-member state; `symbols` is
+/// authoritative for ordinary R source-order semantics. Filtering at the final
+/// projection chokepoint keeps recursive and streaming resolution aligned across
+/// every kind of later binding (`Def`, `source()`, `data()`, tar batches, and
+/// `rm()`) without duplicating invalidation logic in each event arm.
+fn retain_current_namespace_import_aliases(scope: &mut ScopeAtPosition) {
+    let symbols = &scope.symbols;
+    scope.namespace_import_aliases.retain(|name, alias| {
+        symbols.get(name).is_some_and(|symbol| {
+            symbol.source_uri == alias.provenance.uri
+                && symbol.defined_line == alias.provenance.line
+                && symbol.defined_column == alias.provenance.column
+        })
+    });
+}
+
+/// A fail-closed [`ImportEnv`](crate::selective_import::ImportEnv) used when no
+/// [`SelectiveImportProvider`] is threaded in: every source resolves to
+/// [`ExportSet::unresolved`](crate::selective_import::ExportSet::unresolved), so
+/// static (namespace / named / renamed) bindings still bind while wildcards
+/// expand to nothing and no absence is provable.
+struct UnresolvedImportEnv;
+
+impl crate::selective_import::ImportEnv for UnresolvedImportEnv {
+    fn package_exports(&self, _package: &str) -> crate::selective_import::ExportSet {
+        crate::selective_import::ExportSet::unresolved()
+    }
+    fn module_exports(&self, _uri: &Url) -> Option<crate::selective_import::ExportSet> {
+        None
+    }
+}
+
+/// Identity of the [`SelectiveImportProvider`] in effect, for [`ForwardChildKey`]
+/// (mirrors [`data_alias_provider_fp`]): the address of the provider, or `0` for
+/// `None`. A change in provider must not serve a stale forward-child memo entry.
+fn selective_import_provider_fp(provider: Option<&SelectiveImportProvider<'_>>) -> usize {
+    provider.map_or(0, |p| p as *const SelectiveImportProvider as usize)
+}
+
+/// Fold the [`DataAliasProvider`] and [`SelectiveImportProvider`] identities into
+/// the single `provider_fp` slot of [`ForwardChildKey`]. Both providers affect a
+/// forward-sourced child's resolved scope, so either one changing must invalidate
+/// the memo entry. The mix keeps distinct `(data, selective)` pairs distinct.
+fn combine_provider_fps(data_alias_fp: usize, selective_import_fp: usize) -> usize {
+    data_alias_fp.rotate_left(1) ^ selective_import_fp.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Resolve and inject a [`ScopeEvent::SelectiveImport`] into `scope` at the query
+/// position, shared by the recursive resolver and the streaming path so both
+/// agree on what a selective import makes visible (issue #662, requirement #4).
+///
+/// Visibility is gated exactly like a `Def`/`Declaration`: the import's bindings
+/// are visible from its call site onward and, when function-scoped, only inside
+/// that function. When visible, the request is resolved against `provider`
+/// (or a fail-closed [`UnresolvedImportEnv`] when `None`) and only *concrete*
+/// bindings are injected:
+///
+/// * the namespace alias (if any) binds a [`ScopedSymbol`] at the import site and
+///   its source/export identity is retained in
+///   [`ScopeAtPosition::namespace_import_aliases`] — its members are **not**
+///   leaked as bare names;
+/// * attached/renamed/wildcard members bind under their local name, attributed to
+///   the true member definition site when known and to a `package:<name>` pseudo
+///   URI otherwise; a member that a `Complete` export set proves absent does not
+///   bind, while `Partial`/`Unknown` named attaches bind conservatively.
+///
+/// Later timeline events overwrite these bindings (source order / shadowing) and
+/// a preceding `rm()` tombstone is cleared, matching `Def` semantics.
+#[allow(clippy::too_many_arguments)]
+fn apply_selective_import(
+    scope: &mut ScopeAtPosition,
+    importing_uri: &Url,
+    imp_line: u32,
+    imp_col: u32,
+    request: &SelectiveImportRequest,
+    function_scope: Option<FunctionScopeInterval>,
+    active_conditional_shiny_scopes: &HashSet<FunctionScopeInterval>,
+    active_effective_scopes: &HashSet<FunctionScopeInterval>,
+    query_line: u32,
+    query_column: u32,
+    query_inside_function: bool,
+    provider: Option<&SelectiveImportProvider<'_>>,
+) {
+    let effective_scope = innermost_effective_scope(
+        active_conditional_shiny_scopes,
+        imp_line,
+        imp_col,
+        function_scope,
+    );
+    if !is_symbol_visible(
+        imp_line,
+        imp_col,
+        effective_scope,
+        active_effective_scopes,
+        query_line,
+        query_column,
+        query_inside_function,
+    ) {
+        return;
+    }
+
+    let (symbols, aliases) =
+        resolve_selective_import_bindings(request, importing_uri, imp_line, imp_col, provider);
+    for (name, symbol) in symbols {
+        scope.removed_names.remove(&name);
+        scope.parent_prefix_symbol_names.remove(&name);
+        scope.symbols.insert(name, symbol);
+    }
+    for (name, alias) in aliases {
+        scope.namespace_import_aliases.insert(name, alias);
+    }
+}
+
+/// Resolve a [`SelectiveImportRequest`] to the concrete symbol bindings and
+/// namespace-alias identities it introduces, without any visibility gating or
+/// scope mutation. Shared by [`apply_selective_import`] (recursive resolver,
+/// which mutates a [`ScopeAtPosition`]) and the [`ScopeStream`] path (which
+/// mutates a [`ScopeFrame`]), so both agree on what a selective import makes
+/// visible. See [`apply_selective_import`] for the binding rules.
+type SelectiveSymbolBindings = Vec<(Arc<str>, ScopedSymbol)>;
+type SelectiveNamespaceBindings = Vec<(Arc<str>, NamespaceImportAlias)>;
+
+fn resolve_selective_import_bindings(
+    request: &SelectiveImportRequest,
+    importing_uri: &Url,
+    imp_line: u32,
+    imp_col: u32,
+    provider: Option<&SelectiveImportProvider<'_>>,
+) -> (SelectiveSymbolBindings, SelectiveNamespaceBindings) {
+    let resolved = match provider {
+        Some(p) => request.resolve(&ImportResolver::new(p.env)),
+        None => request.resolve(&UnresolvedImportEnv),
+    };
+
+    // Pseudo URI for a member with no known definition site (a package member,
+    // or a local member whose provenance the env did not supply).
+    let fallback_uri = || match &request.source {
+        ImportSource::Package(name) => Url::parse(&format!("package:{}", name))
+            .unwrap_or_else(|_| Url::parse("package:unknown").unwrap()),
+        ImportSource::LocalModule(uri) => uri.clone(),
+    };
+
+    let mut symbols = Vec::new();
+    let mut aliases = Vec::new();
+    for binding in &resolved.bindings {
+        if binding.is_namespace {
+            // The namespace alias binds the whole source object at the import
+            // site; its members are NOT bound as bare names.
+            let name: Arc<str> = Arc::from(binding.local.as_str());
+            let symbol = ScopedSymbol {
+                name: name.clone(),
+                kind: SymbolKind::Variable,
+                source_uri: importing_uri.clone(),
+                defined_line: imp_line,
+                defined_column: imp_col,
+                defined_end_column: request.provenance.end_column.max(imp_col),
+                signature: None,
+                is_declared: false,
+            };
+            symbols.push((name.clone(), symbol));
+            // Retain the alias identity for the later qualified-resolve pass.
+            aliases.push((
+                name,
+                NamespaceImportAlias {
+                    source: request.source.clone(),
+                    exports: resolved.exports.clone(),
+                    provenance: request.provenance.clone(),
+                },
+            ));
+            continue;
+        }
+
+        // An attached (named / renamed / wildcard-expanded) member. A member the
+        // source's Complete export set proves absent must not bind; Partial /
+        // Unknown named attaches bind conservatively.
+        if let Some(exported) = binding.exported.as_deref()
+            && resolved.exports.membership(exported) == Some(false)
+        {
+            continue;
+        }
+
+        let (def_uri, def_line, def_col, def_end_col, kind, signature) = match &binding.provenance {
+            Some(p) => (
+                p.uri.clone(),
+                p.line,
+                p.column,
+                p.end_column.max(p.column),
+                if p.is_function {
+                    SymbolKind::Function
+                } else {
+                    SymbolKind::Variable
+                },
+                p.signature.clone(),
+            ),
+            None => (
+                fallback_uri(),
+                0,
+                0,
+                crate::utf16::utf16_len(binding.local.as_str()),
+                SymbolKind::Variable,
+                None,
+            ),
+        };
+        let name: Arc<str> = Arc::from(binding.local.as_str());
+        let symbol = ScopedSymbol {
+            name: name.clone(),
+            kind,
+            source_uri: def_uri,
+            defined_line: def_line,
+            defined_column: def_col,
+            defined_end_column: def_end_col,
+            signature,
+            is_declared: false,
+        };
+        symbols.push((name, symbol));
+    }
+    (symbols, aliases)
 }
 
 /// Expand one `data(...)` call's file-stem aliases to the dataset object
@@ -6163,6 +6706,10 @@ where
         is_cancelled,
         package_contribution,
         data_alias_provider,
+        // Convenience wrapper: no selective-import provider (tests / non-import
+        // paths). Production supplies one via the `*_with_package_query_uri`
+        // variants.
+        None,
         None,
     )
 }
@@ -6188,6 +6735,7 @@ pub fn scope_at_position_with_graph_with_package_query_uri<F, G>(
     is_cancelled: &dyn Fn() -> bool,
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
     data_alias_provider: Option<&DataAliasProvider<'_>>,
+    selective_import_provider: Option<&SelectiveImportProvider<'_>>,
     package_query_uri: Option<&Url>,
 ) -> ScopeAtPosition
 where
@@ -6231,6 +6779,7 @@ where
         package_contribution,
         package_query_uri,
         data_alias_provider,
+        selective_import_provider,
         false,
         None,
         &forward_child_memo,
@@ -6325,6 +6874,9 @@ where
         prefix_cache,
         package_contribution,
         data_alias_provider,
+        // Convenience (non-package-query-uri) wrapper: no selective-import
+        // provider; production uses the `*_with_package_query_uri` variant.
+        None,
         None,
     )
 }
@@ -6348,6 +6900,7 @@ pub fn scope_at_position_with_graph_cached_with_package_query_uri<F, G>(
     prefix_cache: &mut ParentPrefixCache,
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
     data_alias_provider: Option<&DataAliasProvider<'_>>,
+    selective_import_provider: Option<&SelectiveImportProvider<'_>>,
     package_query_uri: Option<&Url>,
 ) -> ScopeAtPosition
 where
@@ -6370,6 +6923,7 @@ where
         prefix_cache,
         package_contribution,
         data_alias_provider,
+        selective_import_provider,
         None,
         package_query_uri,
     )
@@ -6419,6 +6973,9 @@ where
         prefix_cache,
         package_contribution,
         data_alias_provider,
+        // Convenience (non-package-query-uri) wrapper: no selective-import
+        // provider; production uses the `*_and_package_query_uri` variant.
+        None,
         standalone_ctx,
         None,
     )
@@ -6446,6 +7003,9 @@ pub fn scope_at_position_with_graph_cached_with_standalone_cache_and_package_que
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
     // `data()` file-stem alias provider (issue #429); see [`DataAliasProvider`].
     data_alias_provider: Option<&DataAliasProvider<'_>>,
+    // `box::use` selective-import provider (issue #662); see
+    // [`SelectiveImportProvider`].
+    selective_import_provider: Option<&SelectiveImportProvider<'_>>,
     // Issue #483 (WI2b): persistent standalone-scope cache context, or `None` to
     // disable caching. Seeds the per-query forward-child memo so the EOF hook in
     // `scope_at_position_with_graph_recursive` can consult/populate the cache.
@@ -6551,6 +7111,7 @@ where
         package_contribution,
         package_query_uri,
         data_alias_provider,
+        selective_import_provider,
         false,
         None,
         &forward_child_memo,
@@ -6734,7 +7295,10 @@ where
     let mut parent_edge_indices: HashMap<ParentInvocationKey, usize> = HashMap::new();
     let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
     for edge in graph.get_dependents(uri) {
-        if edge.non_lending || (require_backward_directive && !edge.is_backward_directive) {
+        // A selective `box::use()` module edge never lends parent prefix/scope
+        // (issue #662); `lends_scope()` folds that in with the `non_lending`
+        // exclusion so both stay in lockstep.
+        if !edge.lends_scope() || (require_backward_directive && !edge.is_backward_directive) {
             continue;
         }
 
@@ -6902,6 +7466,10 @@ where
             // scope for the issue's single-file acceptance criteria; the
             // literal-stem `Def` fallback still flows through the prefix.
             None,
+            // Parent-prefix walk likewise carries no selective-import provider
+            // (cached provider-independently); a parent's own top-level imports
+            // are not lent backward through the prefix.
+            None,
             false,
             edge.source_batch_kind
                 .filter(|kind| kind.is_pre_entry())
@@ -6956,6 +7524,8 @@ where
                 hoist_globals,
                 backward_dep_mode,
                 is_cancelled,
+                None,
+                // Backward parent walk: selective imports never lend upward.
                 None,
             );
             for name in contribution.removed_names {
@@ -7236,6 +7806,7 @@ fn resolve_tar_batch_contribution<F, G>(
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
     data_alias_provider: Option<&DataAliasProvider<'_>>,
+    selective_import_provider: Option<&SelectiveImportProvider<'_>>,
 ) -> ChildSourceContribution
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -7274,7 +7845,8 @@ where
                 .get_dependencies(parent_uri)
                 .iter()
                 .find(|edge| {
-                    edge.call_site_line == Some(source.line)
+                    edge.is_ordinary_source()
+                        && edge.call_site_line == Some(source.line)
                         && edge.call_site_column == Some(source.column)
                         && edge.tar_source_ordinal == ordinal
                         && edge.source_batch_kind == source_batch_kind
@@ -7319,6 +7891,11 @@ where
         } else {
             data_alias_provider
         };
+        let child_selective_provider = if child_is_standalone {
+            None
+        } else {
+            selective_import_provider
+        };
         let mut member_visited = ancestor_visited.clone();
         // A fresh memo has no standalone-cache context. Passing
         // `isolate_forward_source_visits = false` below also keeps every
@@ -7349,6 +7926,7 @@ where
             None,
             None,
             child_provider,
+            child_selective_provider,
             true,
             None,
             &member_forward_memo,
@@ -7524,6 +8102,13 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // receive it — that prefix is cached provider-independently, so it always
     // passes `None`. `None` disables expansion (literal-stem `Def` fallback).
     data_alias_provider: Option<&DataAliasProvider<'_>>,
+    // Provider resolving `box::use` selective-import events (issue #662),
+    // threaded exactly like `data_alias_provider`: forward-source children
+    // receive it (a sourced file's own top-level imports lend bindings), the
+    // backward parent-prefix walk passes `None`. `None` still binds an import's
+    // static namespace alias and named/renamed attaches; only wildcard
+    // expansion, member-absence proof, and true member provenance need it.
+    selective_import_provider: Option<&SelectiveImportProvider<'_>>,
     // A direct tar-batch member may execute more than once with distinct
     // inherited/chdir contexts. For that one execution, ordinary relative
     // source paths must prefer this recursively supplied context over the
@@ -8078,7 +8663,8 @@ where
                             .get_dependencies(uri)
                             .iter()
                             .find(|edge| {
-                                edge.call_site_line == Some(*src_line)
+                                edge.is_ordinary_source()
+                                    && edge.call_site_line == Some(*src_line)
                                     && edge.call_site_column == Some(*src_col)
                             })
                             .map(|edge| edge.to.clone())
@@ -8184,6 +8770,14 @@ where
                         } else {
                             data_alias_provider
                         };
+                        // Selective-import provider mirrors `child_provider`: a
+                        // standalone child severs it (its imports resolve in
+                        // isolation), otherwise it inherits the caller's.
+                        let child_selective_provider = if child_is_standalone {
+                            None
+                        } else {
+                            selective_import_provider
+                        };
                         let empty_packages_for_child = HashSet::new();
                         let owned_packages: HashSet<String>;
                         let packages_for_child: &HashSet<String> =
@@ -8284,7 +8878,10 @@ where
                             // (the common case in the dense graphs this targets)
                             // pays nothing for it.
                             let path_fp = path_context_fingerprint(child_ctx.as_ref());
-                            let provider_fp = data_alias_provider_fp(child_provider);
+                            let provider_fp = combine_provider_fps(
+                                data_alias_provider_fp(child_provider),
+                                selective_import_provider_fp(child_selective_provider),
+                            );
                             resolve_forward_child_memoized(
                                 forward_child_memo,
                                 graph,
@@ -8329,6 +8926,7 @@ where
                                         None,
                                         None,
                                         child_provider,
+                                        child_selective_provider,
                                         child_prefer_supplied_path_context,
                                         None,
                                         forward_child_memo,
@@ -8360,6 +8958,7 @@ where
                                 None,
                                 None,
                                 child_provider,
+                                child_selective_provider,
                                 child_prefer_supplied_path_context,
                                 None,
                                 forward_child_memo,
@@ -8522,6 +9121,7 @@ where
                     backward_dep_mode,
                     is_cancelled,
                     data_alias_provider,
+                    selective_import_provider,
                 );
                 for name in contribution.removed_names {
                     scope.symbols.remove(&name);
@@ -8743,6 +9343,28 @@ where
                     }
                 }
             }
+            ScopeEvent::SelectiveImport {
+                line: imp_line,
+                column: imp_col,
+                request,
+                function_scope,
+                ..
+            } => {
+                apply_selective_import(
+                    &mut scope,
+                    uri,
+                    *imp_line,
+                    *imp_col,
+                    request,
+                    *function_scope,
+                    &active_conditional_shiny_scopes,
+                    &active_effective_scopes,
+                    line,
+                    column,
+                    query_inside_function,
+                    selective_import_provider,
+                );
+            }
         }
     }
 
@@ -8790,6 +9412,8 @@ where
         append_package_contribution(&mut scope, contribution_uri, contrib);
         append_rprofile_prelude(&mut scope, contribution_uri, contrib);
     }
+
+    retain_current_namespace_import_aliases(&mut scope);
 
     // Issue #483 (WI2b): populate the persistent standalone cache. Only the
     // clean tail return reaches here — the cancellation early-returns above
@@ -9458,6 +10082,13 @@ struct ScopeFrame {
     /// an outer function frame) — matching the recursive resolver, which
     /// applies `Removal` events in timeline order over a flat `scope.symbols`.
     removed_names: HashSet<Arc<str>>,
+    /// Namespace aliases bound by selective-import (`box::use`, issue #662)
+    /// events that applied within this frame. Merged into
+    /// [`ScopeAtPosition::namespace_import_aliases`] by [`ScopeStream::snapshot`]
+    /// alongside `symbols`, so a top-level alias is globally visible while a
+    /// function-scoped alias is visible only when the query is inside that
+    /// function frame — matching the recursive resolver's handling.
+    namespace_import_aliases: HashMap<Arc<str>, NamespaceImportAlias>,
 }
 
 /// Cached contribution of one forward `Source` event: the symbols, packages,
@@ -9667,6 +10298,14 @@ where
     /// so the two paths agree on what a `data()` call makes visible.
     data_alias_provider: Option<&'a DataAliasProvider<'a>>,
 
+    /// `box::use` selective-import provider (issue #662). When `Some`, the
+    /// `SelectiveImport` arms of `apply_event_to_strict` / `apply_event_to_late`
+    /// resolve wildcard/absence/provenance against it; when `None`, only the
+    /// import's static bindings apply. Threaded into forward-source children
+    /// exactly like `data_alias_provider`, so the streaming and recursive paths
+    /// agree on what a selective import makes visible.
+    selective_import_provider: Option<&'a SelectiveImportProvider<'a>>,
+
     /// Per-stream memo of forward-sourced child EOF scopes (issue #472). Shared
     /// across all `resolve_source_contribution` calls and threaded into each
     /// child's recursive resolution, so a child reached by multiple `source()`
@@ -9765,6 +10404,8 @@ where
             prefix_cache,
             package_contribution,
             data_alias_provider,
+            // Convenience constructor: no selective-import provider.
+            None,
             None,
             None,
         )
@@ -9806,6 +10447,8 @@ where
             prefix_cache,
             package_contribution,
             data_alias_provider,
+            // Convenience constructor: no selective-import provider.
+            None,
             standalone_ctx,
             None,
         )
@@ -9828,6 +10471,7 @@ where
         prefix_cache: &'a std::cell::RefCell<ParentPrefixCache>,
         package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
         data_alias_provider: Option<&'a DataAliasProvider<'a>>,
+        selective_import_provider: Option<&'a SelectiveImportProvider<'a>>,
         // Issue #483 (WI2b): persistent standalone-scope cache context, or `None`
         // to disable caching. Seeds the actual-depth forward-child memo (forward
         // children) and, WHEN prefix-memo sharing is enabled, the shared prefix
@@ -10004,6 +10648,7 @@ where
             package_query_uri,
             contribution_symbol_names,
             data_alias_provider,
+            selective_import_provider,
             forward_child_memo,
             prefix_forward_child_memo,
         })
@@ -10107,6 +10752,9 @@ where
             package_query_uri: None,
             contribution_symbol_names: HashSet::new(),
             data_alias_provider,
+            // Attachment projection is a backward-parent-style path; selective
+            // imports never lend across attach() projections.
+            selective_import_provider: None,
             forward_child_memo: std::cell::RefCell::new(ForwardChildMemo::default()),
             prefix_forward_child_memo: None,
         })
@@ -10553,6 +11201,43 @@ where
                     }
                 }
             }
+            ScopeEvent::SelectiveImport {
+                line,
+                column,
+                request,
+                function_scope,
+                ..
+            } => {
+                let function_scope = self.conditional_event_scope(line, column, function_scope);
+                if !self.conditional_scope_applies(function_scope) {
+                    return;
+                }
+                // Resolve the import against the streamed provider and inject its
+                // concrete bindings, mirroring the recursive resolver's
+                // `apply_selective_import`. `advance_to` only reaches this event
+                // when its effect position is <= the cursor, so position gating is
+                // already satisfied; `pick_frame_mut` handles function-scope
+                // gating. The namespace alias binds the whole source object and is
+                // retained separately; its members are never leaked as bare names.
+                let provider = self.selective_import_provider;
+                let importing_uri = self.queried_uri.clone();
+                let (symbols, aliases) = resolve_selective_import_bindings(
+                    &request,
+                    &importing_uri,
+                    line,
+                    column,
+                    provider,
+                );
+                if let Some(frame) = self.pick_frame_mut(function_scope) {
+                    for (name, symbol) in symbols {
+                        frame.removed_names.remove(&name);
+                        frame.symbols.insert(name, symbol);
+                    }
+                    for (name, alias) in aliases {
+                        frame.namespace_import_aliases.insert(name, alias);
+                    }
+                }
+            }
         }
     }
 
@@ -10645,6 +11330,8 @@ where
             targets_only_loaded_packages: prefix.targets_only_loaded_packages.clone(),
             targets_only_attached_packages: prefix.targets_only_attached_packages.clone(),
             package_origins,
+            // Tar batches never carry selective-import namespace aliases.
+            namespace_import_aliases: HashMap::new(),
         }
     }
 
@@ -10674,6 +11361,7 @@ where
             self.backward_dep_mode,
             self.is_cancelled,
             self.data_alias_provider,
+            self.selective_import_provider,
         );
         if self.resolution_depth + 1 >= self.max_depth && contribution.depth_exceeded.is_empty() {
             contribution
@@ -10848,6 +11536,10 @@ where
             targets_only_loaded_packages: prefix.targets_only_loaded_packages.clone(),
             targets_only_attached_packages: prefix.targets_only_attached_packages.clone(),
             package_origins: prefix.package_origins.clone(),
+            // Populated from the global and active function frames below,
+            // mirroring the symbol layering (global first, then outer-to-inner
+            // function frames).
+            namespace_import_aliases: HashMap::new(),
         };
 
         // Layer global frame on top. The global frame contains base exports
@@ -10862,6 +11554,11 @@ where
         let global = self.choose_global_frame();
         for (name, symbol) in &global.symbols {
             scope.symbols.insert(name.clone(), symbol.clone());
+        }
+        for (name, alias) in &global.namespace_import_aliases {
+            scope
+                .namespace_import_aliases
+                .insert(name.clone(), alias.clone());
         }
         for pkg in &global.packages {
             scope.targets_only_loaded_packages.remove(pkg);
@@ -10883,6 +11580,11 @@ where
         for (_iv, frame) in &self.function_stack {
             for (name, symbol) in &frame.symbols {
                 scope.symbols.insert(name.clone(), symbol.clone());
+            }
+            for (name, alias) in &frame.namespace_import_aliases {
+                scope
+                    .namespace_import_aliases
+                    .insert(name.clone(), alias.clone());
             }
             for pkg in &frame.packages {
                 scope.targets_only_loaded_packages.remove(pkg);
@@ -10998,6 +11700,7 @@ where
             append_rprofile_prelude(&mut scope, contribution_uri, contrib);
         }
 
+        retain_current_namespace_import_aliases(&mut scope);
         scope
     }
 
@@ -11365,6 +12068,38 @@ where
                     }
                 }
             }
+            ScopeEvent::SelectiveImport {
+                line,
+                column,
+                request,
+                function_scope,
+                ..
+            } => {
+                // Global (top-level) selective imports only — the late frame is
+                // the hoisted global scope, so a function-scoped import is skipped
+                // here and applied in its own strict frame. Mirrors the recursive
+                // resolver's `apply_selective_import`.
+                if self
+                    .conditional_event_scope(*line, *column, *function_scope)
+                    .is_some()
+                {
+                    return;
+                }
+                let (symbols, aliases) = resolve_selective_import_bindings(
+                    request,
+                    self.queried_uri,
+                    *line,
+                    *column,
+                    self.selective_import_provider,
+                );
+                for (name, symbol) in symbols {
+                    frame.removed_names.remove(&name);
+                    frame.symbols.insert(name, symbol);
+                }
+                for (name, alias) in aliases {
+                    frame.namespace_import_aliases.insert(name, alias);
+                }
+            }
         }
     }
 
@@ -11396,7 +12131,9 @@ where
             .get_dependencies(self.queried_uri)
             .iter()
             .find(|edge| {
-                edge.call_site_line == Some(src_line) && edge.call_site_column == Some(src_col)
+                edge.is_ordinary_source()
+                    && edge.call_site_line == Some(src_line)
+                    && edge.call_site_column == Some(src_col)
             })
             .map(|edge| edge.to.clone())
             .or_else(|| {
@@ -11436,6 +12173,11 @@ where
             None
         } else {
             self.data_alias_provider
+        };
+        let child_selective_provider = if child_is_standalone {
+            None
+        } else {
+            self.selective_import_provider
         };
 
         // Build child PathContext, respecting source.chdir. A standalone callee
@@ -11503,7 +12245,10 @@ where
         // Memoize the child's EOF scope (issue #472), skipping cyclic children.
         // `path_fp` is computed before the closure moves `child_ctx`.
         let path_fp = path_context_fingerprint(child_ctx.as_ref());
-        let provider_fp = data_alias_provider_fp(child_provider);
+        let provider_fp = combine_provider_fps(
+            data_alias_provider_fp(child_provider),
+            selective_import_provider_fp(child_selective_provider),
+        );
         let child_scope = resolve_forward_child_memoized(
             &self.forward_child_memo,
             self.graph,
@@ -11540,6 +12285,7 @@ where
                     None,
                     None,
                     child_provider,
+                    child_selective_provider,
                     false,
                     None,
                     &self.forward_child_memo,
@@ -12899,6 +13645,48 @@ mod tests {
         let artifacts2 = compute_artifacts(&test_uri(), &tree2, code2);
 
         assert_ne!(artifacts1.interface_hash, artifacts2.interface_hash);
+    }
+
+    #[test]
+    fn interface_hash_tracks_box_import_and_export_boundaries_not_line_motion() {
+        fn artifacts(code: &str) -> ScopeArtifacts {
+            let tree = parse_r(code);
+            let metadata = crate::cross_file::extract_metadata_with_tree(code, Some(&tree));
+            compute_artifacts_with_metadata(&test_uri(), &tree, code, Some(&metadata))
+        }
+
+        let named = artifacts("box::use(dplyr[filter])\n");
+        let renamed = artifacts("box::use(dplyr[local_filter = filter])\n");
+        let moved = artifacts("\nbox::use(dplyr[filter])\n");
+        assert_ne!(
+            named.interface_hash, renamed.interface_hash,
+            "changing imported bindings must invalidate dependents"
+        );
+        assert_eq!(
+            named.interface_hash, moved.interface_hash,
+            "moving an otherwise identical import must not churn the interface"
+        );
+
+        let a_then_b = artifacts("box::use(x = packageA)\nbox::use(x = packageB)\n");
+        let b_then_a = artifacts("box::use(x = packageB)\nbox::use(x = packageA)\n");
+        assert_ne!(
+            a_then_b.interface_hash, b_then_a.interface_hash,
+            "reordering shadowing imports must invalidate the effective interface"
+        );
+
+        let import_then_def = artifacts("box::use(packageA[x])\nx <- 1\n");
+        let def_then_import = artifacts("x <- 1\nbox::use(packageA[x])\n");
+        assert_ne!(
+            import_then_def.interface_hash, def_then_import.interface_hash,
+            "moving an import across a competing definition must invalidate dependents"
+        );
+
+        let export_a = artifacts("box::export(a)\na <- 1\nb <- 2\n");
+        let export_b = artifacts("box::export(b)\na <- 1\nb <- 2\n");
+        assert_ne!(
+            export_a.interface_hash, export_b.interface_hash,
+            "changing the module export boundary must invalidate importers"
+        );
     }
 
     #[test]
@@ -15680,6 +16468,7 @@ outside_var <- 2"#;
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
             ScopeEvent::DataLoad { line, column, .. } => (*line, *column),
             ScopeEvent::Declaration { line, column, .. } => (*line, *column),
+            ScopeEvent::SelectiveImport { line, column, .. } => (*line, *column),
         });
 
         // Child code: just a simple definition
@@ -16111,6 +16900,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
             ScopeEvent::DataLoad { line, column, .. } => (*line, *column),
             ScopeEvent::Declaration { line, column, .. } => (*line, *column),
+            ScopeEvent::SelectiveImport { line, column, .. } => (*line, *column),
         });
 
         // Child code
@@ -17572,6 +18362,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
                 ScopeEvent::PackageLoad { .. } => "PackageLoad",
                 ScopeEvent::DataLoad { .. } => "DataLoad",
                 ScopeEvent::Declaration { .. } => "Declaration",
+                ScopeEvent::SelectiveImport { .. } => "SelectiveImport",
             })
             .collect();
 
@@ -17592,6 +18383,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
                 ScopeEvent::PackageLoad { line, .. } => *line,
                 ScopeEvent::DataLoad { line, .. } => *line,
                 ScopeEvent::Declaration { line, .. } => *line,
+                ScopeEvent::SelectiveImport { line, .. } => *line,
             })
             .collect();
 
@@ -18209,6 +19001,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
                 ScopeEvent::PackageLoad { line, .. } => ("PackageLoad", *line),
                 ScopeEvent::DataLoad { line, .. } => ("DataLoad", *line),
                 ScopeEvent::Declaration { line, .. } => ("Declaration", *line),
+                ScopeEvent::SelectiveImport { line, .. } => ("SelectiveImport", *line),
             })
             .collect();
 
@@ -32380,6 +33173,7 @@ mod package_contribution_tests {
             &|| false,
             Some(&contrib),
             None,
+            None,
             Some(&canonical_uri),
         );
         assert!(
@@ -37474,5 +38268,231 @@ mod package_contribution_tests {
             shiny_streamed.loaded_packages,
             shiny_recursive.loaded_packages
         );
+    }
+
+    struct SelectiveTestEnv {
+        exports: crate::selective_import::ExportSet,
+        provenance: Option<crate::selective_import::MemberProvenance>,
+    }
+
+    impl crate::box_use::ModuleExportEnv for SelectiveTestEnv {
+        fn box_exports(&self, _uri: &Url) -> Option<crate::box_use::BoxExports> {
+            None
+        }
+
+        fn legacy_exports(&self, _uri: &Url) -> crate::selective_import::ExportSet {
+            crate::selective_import::ExportSet::unresolved()
+        }
+
+        fn package_exports(&self, _package: &str) -> crate::selective_import::ExportSet {
+            self.exports.clone()
+        }
+
+        fn member_provenance(
+            &self,
+            _source: &crate::selective_import::ImportSource,
+            _member: &str,
+        ) -> Option<crate::selective_import::MemberProvenance> {
+            self.provenance.clone()
+        }
+    }
+
+    fn selective_scope_pair(
+        code: &str,
+        line: u32,
+        column: u32,
+        exports: crate::selective_import::ExportSet,
+    ) -> (ScopeAtPosition, ScopeAtPosition) {
+        let uri = Url::parse("file:///selective/main.R").unwrap();
+        let metadata = Arc::new(crate::cross_file::extract_metadata(code));
+        let artifacts = Arc::new(compute_artifacts_with_metadata(
+            &uri,
+            &parse_r(code),
+            code,
+            Some(&metadata),
+        ));
+        let get_artifacts = |candidate: &Url| (candidate == &uri).then(|| artifacts.clone());
+        let get_metadata = |candidate: &Url| (candidate == &uri).then(|| metadata.clone());
+        let graph = super::super::dependency::DependencyGraph::new();
+        let base_exports = HashSet::new();
+        let env = SelectiveTestEnv {
+            exports,
+            provenance: None,
+        };
+        let provider = SelectiveImportProvider { env: &env };
+        let recursive = scope_at_position_with_graph_with_package_query_uri(
+            &uri,
+            line,
+            column,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+            Some(&provider),
+            None,
+        );
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new_with_standalone_cache_and_package_query_uri(
+            &uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            None,
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+            Some(&provider),
+            None,
+            None,
+        )
+        .expect("selective-import stream");
+        stream.advance_to(line, column);
+        (recursive, stream.snapshot())
+    }
+
+    #[test]
+    fn selective_import_bindings_privacy_and_streaming_parity() {
+        let code = "box::use(ns = pkg[a, renamed = b, ...])\nprobe";
+        let exports = crate::selective_import::ExportSet::complete(["a", "b"]);
+        let (recursive, streamed) = selective_scope_pair(code, 1, u32::MAX, exports);
+
+        for name in ["ns", "a", "b", "renamed"] {
+            assert!(
+                recursive.symbols.contains_key(name),
+                "missing binding {name}"
+            );
+        }
+        assert_eq!(
+            recursive
+                .namespace_import_aliases
+                .keys()
+                .map(|name| name.to_string())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["ns".to_string()])
+        );
+        assert_eq!(streamed.symbols, recursive.symbols);
+        assert_eq!(
+            streamed.namespace_import_aliases,
+            recursive.namespace_import_aliases
+        );
+    }
+
+    #[test]
+    fn selective_import_complete_absence_fails_closed_but_unknown_binds() {
+        let code = "box::use(pkg[missing])\nmissing";
+        let (complete, complete_stream) = selective_scope_pair(
+            code,
+            1,
+            u32::MAX,
+            crate::selective_import::ExportSet::complete(["present"]),
+        );
+        assert!(!complete.symbols.contains_key("missing"));
+        assert_eq!(complete_stream.symbols, complete.symbols);
+
+        let (unknown, unknown_stream) = selective_scope_pair(
+            code,
+            1,
+            u32::MAX,
+            crate::selective_import::ExportSet::unresolved(),
+        );
+        assert!(unknown.symbols.contains_key("missing"));
+        assert_eq!(unknown_stream.symbols, unknown.symbols);
+    }
+
+    #[test]
+    fn selective_import_preserves_attached_function_kind_and_signature() {
+        let source_uri = Url::parse("file:///selective/module.r").unwrap();
+        let importing_uri = Url::parse("file:///selective/main.r").unwrap();
+        let env = SelectiveTestEnv {
+            exports: crate::selective_import::ExportSet::complete(["original"]),
+            provenance: Some(crate::selective_import::MemberProvenance {
+                uri: source_uri.clone(),
+                line: 4,
+                column: 0,
+                end_column: 8,
+                is_function: true,
+                signature: Some("original(x, y = 1)".to_string()),
+            }),
+        };
+        let provider = SelectiveImportProvider { env: &env };
+        let request = crate::selective_import::SelectiveImportRequest {
+            source: crate::selective_import::ImportSource::LocalModule(source_uri.clone()),
+            namespace: None,
+            attach: vec![crate::selective_import::AttachBinding::Renamed {
+                local: "renamed".to_string(),
+                exported: "original".to_string(),
+            }],
+            function_scoped: false,
+            provenance: crate::selective_import::ImportProvenance {
+                uri: importing_uri.clone(),
+                line: 0,
+                column: 0,
+                end_column: 20,
+            },
+        };
+
+        let (symbols, _) =
+            resolve_selective_import_bindings(&request, &importing_uri, 0, 0, Some(&provider));
+        let symbol = &symbols[0].1;
+        assert_eq!(symbol.kind, SymbolKind::Function);
+        assert_eq!(symbol.source_uri, source_uri);
+        assert_eq!(symbol.signature.as_deref(), Some("original(x, y = 1)"));
+    }
+
+    #[test]
+    fn selective_import_function_scope_shadowing_and_removal_clear_alias_identity() {
+        let function_code = concat!(
+            "f <- function() {\n",
+            "  box::use(ns = pkg[a])\n",
+            "  ns$a\n",
+            "}\n",
+            "ns",
+        );
+        let exports = crate::selective_import::ExportSet::complete(["a"]);
+        let (inside, inside_stream) =
+            selective_scope_pair(function_code, 2, u32::MAX, exports.clone());
+        assert!(inside.symbols.contains_key("ns"));
+        assert!(inside.symbols.contains_key("a"));
+        assert!(inside.namespace_import_aliases.contains_key("ns"));
+        assert_eq!(inside_stream.symbols, inside.symbols);
+        assert_eq!(
+            inside_stream.namespace_import_aliases,
+            inside.namespace_import_aliases
+        );
+
+        let (outside, outside_stream) =
+            selective_scope_pair(function_code, 4, u32::MAX, exports.clone());
+        assert!(!outside.symbols.contains_key("ns"));
+        assert!(!outside.symbols.contains_key("a"));
+        assert!(outside.namespace_import_aliases.is_empty());
+        assert_eq!(outside_stream.symbols, outside.symbols);
+
+        for code in [
+            "box::use(ns = pkg)\nns <- 1\nns$a",
+            "box::use(ns = pkg)\nrm(ns)\nns$a",
+        ] {
+            let (recursive, streamed) = selective_scope_pair(code, 2, u32::MAX, exports.clone());
+            assert!(
+                recursive.namespace_import_aliases.is_empty(),
+                "a shadowed or removed alias must lose namespace identity: {code}"
+            );
+            assert_eq!(
+                streamed.namespace_import_aliases,
+                recursive.namespace_import_aliases
+            );
+        }
     }
 }

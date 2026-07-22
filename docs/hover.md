@@ -12,6 +12,7 @@ Hovering over an identifier shows what the symbol is, where it's defined, and �
 | Named-argument label resolving to a user-defined function's formal (`param` in `f(param = …)`) | A code block with the formal (and its default), *parameter of* `f`, and the formal's `@param` doc when documented |
 | Function-parameter name at a definition site (`x` in `f <- function(x)`) | The parameter's `@param` roxygen — when the enclosing *named* function is documented |
 | `obj$name` / `obj@slot` member with a *local* member definition | A code block with that member's definition statement and a file-location line (parity with go-to-definition) |
+| Exported member of a static `box::use()` namespace alias (`mod$name`, `mod@name`, `mod[["name"]]`) | The original local-module definition statement and location, including through renamed/wildcard re-exports; package-backed members retain package attribution without fabricated source navigation |
 | Symbol declared via `# raven: var` / `# raven: func` | `name (declared function\|variable)` + the directive and line where it's declared |
 | Package export in scope (via `library()` / `require()` / `loadNamespace()` / directives) | Bold `pkg::name` help-panel link + R help text |
 | Built-in or otherwise unresolved symbol | R help text, if R has a topic for it |
@@ -34,6 +35,10 @@ Hover tries sources in this order and stops at the first match. This matches the
 5. **R help fallback.** For anything left over — base/recommended built-ins, or symbols whose origin Raven can't infer — hover asks R for a help topic and returns it verbatim in a code block.
 
 Each step takes the first hit and stops; steps 3–5 never run once a match is found.
+
+### box module members
+
+Static [`box::use()` imports](cross-file.md#box-module-imports-boxuse) are resolved before ordinary structural-member scanning. Hover on an exported local-module member follows exact definition provenance through named, renamed, and wildcard re-exports, including when the defining module is closed but workspace-indexed. Private members and members proven absent from a complete export set produce no hover. Partial/unknown export metadata remains conservative. Installed-package imports use Raven's package metadata and help attribution, but Raven does not invent a source-file location for installed code.
 
 ## File Location Lines
 

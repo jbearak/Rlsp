@@ -503,6 +503,79 @@ The open-doc-authoritative provider and the closed two-tier authority live at
 `crates/raven/src/content_provider.rs` and
 `crates/raven/src/workspace_index.rs`, respectively.
 
+### box::use module imports (#662)
+
+box (`box::use()`) is modelled as a **selective import** — a third kind of
+cross-file relationship, distinct from both a `library()` package load
+(`ScopeEvent::PackageLoad`) and an ordinary lending `source()` edge. Two crate
+modules own it, split by concern:
+
+- `crates/raven/src/selective_import.rs` — the **syntax-agnostic** data model.
+  `SelectiveImportRequest` carries an `ImportSource` (a package name, or a
+  resolved local-module `Url`), optional `NamespaceBinding`, `AttachBinding`s,
+  and import provenance. Resolution combines it with an `ExportSet` carrying an
+  `ExportCompleteness` marker and per-member provenance. It is deliberately
+  independent of any surface syntax so it can back a future second syntax
+  (#663) unchanged. Its interface hash folds semantic import/export boundaries,
+  not source-line provenance, so moving an unchanged import does not churn
+  dependents.
+- `crates/raven/src/box_use/` — everything **box-specific**:
+  - `detect.rs` parses `box::use()` / `box:::use()` calls. Specs are parsed from
+    the raw argument text, not only the argument sub-tree, because R precedence
+    makes `./mod[a, b]` parse as `. / (mod[a, b])` (`[` binds tighter than `/`).
+  - `exports.rs` parses `box::export()` unions and `#' @export` tags, including
+    re-exported imports and symbolic wildcard re-exports. Marker-less modules
+    derive their partial legacy fallback from the canonical live top-level
+    scope rather than from a separate definition scanner.
+  - `path.rs` resolves a local `BoxSpec::LocalModule` without reusing
+    `path_resolve.rs`: box paths are file-relative, ignore `# raven: cd` /
+    testthat WD / workspace-root fallback, are case-sensitive, and try
+    `path.r`, `path.R`, `path/__init__.r`, `path/__init__.R`. The resolved URI
+    stays raw/non-canonicalised, matching Raven's URI identity convention.
+  - `resolve.rs` combines explicit or legacy module exports with package
+    snapshots, resolves recursive named/renamed/wildcard re-exports with cycle
+    and depth guards, and preserves exact original-definition provenance.
+
+`CrossFileMetadata` stores `box_imports: Vec<BoxImport>` and
+`box_exports: Option<BoxExports>` (both `#[serde(default)]`). Local imports also
+persist their detached `LocalModuleResolution` (`Resolved`, `CaseMismatch`, or
+`Missing`). Syntax extraction leaves that field unset; open/edit, workspace
+scan, watched resync, on-demand indexing, excluded-file, and CLI preparation
+seams enrich it only after dropping any `WorldState` guard. Graph construction,
+scope/artifact resolution, diagnostics, navigation, references, and hover
+consume the persisted outcome and must never probe the filesystem themselves.
+Watched candidate events re-enrich unchanged importers off-lock and guard an
+open-record replacement by its never-reused analysis generation, so a stale
+watch refresh cannot overwrite newer editor text.
+
+`ScopeEvent::SelectiveImport` places resolved imports in the ordinary ordered
+scope timeline; the same `SelectiveImportProvider` seam is used by recursive and
+streaming resolution, diagnostics, interactive requests, and parameter
+resolution. Namespace aliases retain source identity separately from their
+visible symbol so shadowing and removal cannot leave stale member resolution.
+
+Local module imports produce `DependencyEdgeKind::SelectiveModule`. These edges
+are present in full and trimmed graphs and participate in interface-driven
+revalidation, but `lends_scope()` is false and ordinary-source-only traversal
+excludes them from parent-prefix lending and cross-file `# raven: nse` /
+`# raven: func` propagation. This typed distinction must not be replaced with
+`non_lending`, whose separate exclusion semantics preserve `S_trimmed ⊆ S_full`.
+
+Package imports reuse `PackageLibrary::namespace_exports_snapshot_sync`; the
+query is synchronous and never spawns R or mutates the cache. Completeness is
+preserved, so only a `Complete` set proves a selected member absent. Static box
+package references enter the existing package-warming lifecycle. Local module
+exports and provenance come from canonical `ScopeArtifacts` and metadata, not a
+parallel index.
+
+Qualified member resolution for `$`, `@`, and literal `[[...]]` recognizes box
+namespace aliases before ordinary structural-member lookup. Local definitions
+navigate through re-export chains; package members deliberately have no file
+location. Selective-member references are identity-filtered by repeatedly using
+go-to-definition, while ordinary structural references retain their historical
+name-based pooling behavior. Closed/indexed definition hover extracts statements
+from `WorkspaceIndex` before falling back to the cross-file file cache.
+
 ### Path resolution invariant (forward vs backward)
 
 There is a deliberate distinction in how relative paths are resolved:

@@ -422,6 +422,73 @@ where
     inherited_wd
 }
 
+/// What kind of dependency an edge represents.
+///
+/// This distinguishes ordinary lending `source()`/directive edges from
+/// **selective module** edges introduced by a local `box::use()` import (issue
+/// #662). The two are structurally alike — both make the target a dependency
+/// for cycle detection, neighborhood extraction, membership, watch, and
+/// dependent revalidation — but a selective-module edge has a fundamentally
+/// different *lending* policy: it must **not** lend the target's top-level
+/// symbols, packages, or parent-prefix into the importer, and it must **not**
+/// propagate cross-file `# raven: nse` / `# raven: func` declarations. Only the
+/// target's *exported* members cross the boundary, and only under the names the
+/// import requests — injected separately as a
+/// [`ScopeEvent::SelectiveImport`](crate::cross_file::scope::ScopeEvent::SelectiveImport).
+///
+/// This is a **typed edge kind**, deliberately *not* the [`non_lending`] marker
+/// (which is reserved for project-excluded open buffers and is filtered out of
+/// trimmed backward indexes entirely). A selective-module edge stays in both
+/// the full and trimmed forward/backward indexes so graph structure sees it;
+/// lending consumers instead skip it via [`DependencyEdge::is_ordinary_source`]
+/// / [`DependencyEdge::lends_scope`].
+///
+/// [`non_lending`]: DependencyEdge::non_lending
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DependencyEdgeKind {
+    /// An ordinary lending edge: `source()` / `sys.source()` / a
+    /// forward-or-backward `# raven:` source directive. Lends scope subject to
+    /// the usual locality and `non_lending` rules.
+    #[default]
+    OrdinarySource,
+    /// A selective local-module import edge from a `box::use(./mod...)`. Present
+    /// for graph structure and revalidation but never lends ordinary scope.
+    SelectiveModule,
+}
+
+/// Which edge kinds a transitive graph walk may cross.
+///
+/// The shared revalidation-consistent traversal primitive
+/// ([`DependencyGraph::revalidation_consistent_set`]) is parameterized by this
+/// so its two consumers keep the **identical traversal shape** while differing
+/// only in explicit, auditable edge selection:
+///
+/// * Dependency revalidation
+///   (`super::revalidation::compute_affected_dependents_after_edit`) and the
+///   libpath "which docs are affected" filter use [`Self::All`] — a selective
+///   `box::use()` module edge must still reschedule the importer when the
+///   imported module's interface changes.
+/// * Cross-file NSE/func collection (`crate::handlers::collect_cross_file_nse`)
+///   uses [`Self::OrdinarySourceOnly`] — a module edge lends no scope, so
+///   NSE/func declarations must never propagate across it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeTraversalFilter {
+    /// Cross every edge regardless of kind.
+    All,
+    /// Cross only ordinary source edges (skip selective-module import edges).
+    OrdinarySourceOnly,
+}
+
+impl EdgeTraversalFilter {
+    /// Whether a walk under this filter may cross `edge`.
+    fn accepts(self, edge: &DependencyEdge) -> bool {
+        match self {
+            EdgeTraversalFilter::All => true,
+            EdgeTraversalFilter::OrdinarySourceOnly => edge.is_ordinary_source(),
+        }
+    }
+}
+
 /// A dependency edge from parent (caller) to child (callee)
 #[derive(Debug, Clone)]
 pub struct DependencyEdge {
@@ -429,6 +496,12 @@ pub struct DependencyEdge {
     pub from: Url,
     /// Child file (callee)
     pub to: Url,
+    /// What kind of dependency this edge represents. Ordinary lending source
+    /// edges vs. non-lending selective `box::use()` module edges. Part of edge
+    /// identity (dedup / interface / revision) so a module edge and an ordinary
+    /// source edge to the same target at the same call site stay distinct and
+    /// so introducing/removing a module import revalidates dependents.
+    pub kind: DependencyEdgeKind,
     /// 0-based line number in parent where call occurs
     pub call_site_line: Option<u32>,
     /// 0-based UTF-16 column in parent where call occurs
@@ -526,6 +599,10 @@ struct SourceInheritanceIdentity {
     chdir: bool,
     is_sys_source: bool,
     is_function_scoped: bool,
+    /// Ordinary-source vs. selective-module. A module edge lends nothing, so it
+    /// is a distinct inheritance semantics and must not dedup or compare equal
+    /// to an ordinary source edge to the same target.
+    kind: DependencyEdgeKind,
 }
 
 /// Semantic identity of one source invocation.
@@ -591,6 +668,34 @@ impl Hash for DependencyEdge {
 }
 
 impl DependencyEdge {
+    /// Whether this is a selective `box::use()` local-module edge.
+    ///
+    /// A selective-module edge participates in graph structure (cycles,
+    /// neighborhood, membership, watch, revalidation) exactly like an ordinary
+    /// source edge, but must be skipped by every *lending* consumer: it never
+    /// lends the target's ordinary top-level symbols, packages, or parent-prefix
+    /// into the importer, and never propagates cross-file NSE/func. Selected
+    /// exports are injected separately via `ScopeEvent::SelectiveImport`.
+    pub fn is_selective_module(&self) -> bool {
+        matches!(self.kind, DependencyEdgeKind::SelectiveModule)
+    }
+
+    /// Whether this is an ordinary lending source edge (the negation of
+    /// [`Self::is_selective_module`]). Ordinary edges are the only edges that
+    /// may lend scope; module edges never do.
+    pub fn is_ordinary_source(&self) -> bool {
+        matches!(self.kind, DependencyEdgeKind::OrdinarySource)
+    }
+
+    /// Whether this edge may lend ordinary scope (symbols/packages/parent
+    /// prefix) across the relationship. True only for an ordinary source edge
+    /// that is not `non_lending`. This is the single predicate every lending
+    /// consumer should gate on so the two exclusion reasons (excluded-buffer
+    /// `non_lending` and selective-module) cannot drift apart.
+    pub fn lends_scope(&self) -> bool {
+        self.is_ordinary_source() && !self.non_lending
+    }
+
     /// Whether the child may inherit only declarations, not ordinary bindings,
     /// from this parent edge.
     pub(crate) fn uses_declared_only_parent_inheritance(&self) -> bool {
@@ -622,6 +727,7 @@ impl DependencyEdge {
                 chdir: self.chdir,
                 is_sys_source: self.is_sys_source,
                 is_function_scoped: self.is_function_scoped,
+                kind: self.kind,
             },
             is_backward_directive: self.is_backward_directive,
         }
@@ -1004,6 +1110,7 @@ impl DependencyGraph {
                             is_directive: true,
                             is_backward_directive: false,
                             non_lending: false,
+                            kind: DependencyEdgeKind::OrdinarySource,
                         };
                         directive_from_to.insert(edge.directive_conflict_identity());
                         directive_edges.push(edge);
@@ -1079,6 +1186,7 @@ impl DependencyGraph {
                     is_directive: true,
                     is_backward_directive: true,
                     non_lending: false,
+                    kind: DependencyEdgeKind::OrdinarySource,
                 };
                 let pair = edge.directive_conflict_identity();
                 directive_from_to.insert(pair);
@@ -1110,6 +1218,7 @@ impl DependencyGraph {
                     is_directive: false,
                     is_backward_directive: false,
                     non_lending: false,
+                    kind: DependencyEdgeKind::OrdinarySource,
                 };
                 let pair = edge.directive_conflict_identity();
 
@@ -1161,9 +1270,56 @@ impl DependencyGraph {
             }
         }
 
-        // Deduplicate and add all edges
+        // Process selective `box::use()` local-module imports (issue #662).
+        // Each import to a resolvable local module contributes a typed
+        // `SelectiveModule` edge from the importer to the module file. These
+        // edges are graph-structural (cycles, neighborhood, membership, watch,
+        // revalidation) but never lend ordinary scope — see
+        // `DependencyEdgeKind`. Package imports (`box::use(dplyr)`) and
+        // unsupported specs contribute NO file edge; missing/case-mismatch
+        // module diagnostics are computed separately from metadata.
+        let mut module_edges: Vec<DependencyEdge> = Vec::new();
+        for import in &meta.box_imports {
+            // Only local-module specs resolve to a file edge.
+            if !matches!(import.spec, crate::box_use::BoxSpec::LocalModule { .. }) {
+                continue;
+            }
+            let Some(crate::selective_import::ImportSource::LocalModule(source_uri)) =
+                import.resolved_source()
+            else {
+                continue;
+            };
+            module_edges.push(DependencyEdge {
+                from: uri.clone(),
+                to: source_uri,
+                call_site_line: Some(import.line),
+                call_site_column: Some(import.column),
+                tar_source_ordinal: None,
+                source_batch_kind: None,
+                // Locality/chdir/sys are irrelevant for a non-lending module
+                // edge; use neutral values. `is_function_scoped` is carried so a
+                // top-level↔function-scoped flip changes edge identity and
+                // revalidates dependents.
+                locality: SourceLocality::Global,
+                chdir: false,
+                is_sys_source: false,
+                is_function_scoped: import.function_scoped,
+                is_directive: false,
+                is_backward_directive: false,
+                non_lending: false,
+                kind: DependencyEdgeKind::SelectiveModule,
+            });
+        }
+
+        // Deduplicate and add all edges. Module edges dedup independently of
+        // ordinary source edges because `kind` is part of the dedup key, so a
+        // file that both `source()`s and `box::use`s the same target keeps both.
         let mut seen_keys = HashSet::new();
-        for edge in directive_edges.into_iter().chain(ast_edges) {
+        for edge in directive_edges
+            .into_iter()
+            .chain(ast_edges)
+            .chain(module_edges)
+        {
             if seen_keys.insert(edge.graph_dedup_key()) {
                 self.add_edge(edge);
             }
@@ -1401,16 +1557,30 @@ impl DependencyGraph {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn has_unvisited_dependents(&self, uri: &Url, visited: &HashMap<Url, usize>) -> bool {
-        self.backward
-            .get(uri)
-            .is_some_and(|edges| edges.iter().any(|edge| !visited.contains_key(&edge.from)))
+    fn has_unvisited_dependents(
+        &self,
+        uri: &Url,
+        visited: &HashMap<Url, usize>,
+        filter: EdgeTraversalFilter,
+    ) -> bool {
+        self.backward.get(uri).is_some_and(|edges| {
+            edges
+                .iter()
+                .any(|edge| filter.accepts(edge) && !visited.contains_key(&edge.from))
+        })
     }
 
-    fn has_unvisited_dependencies(&self, uri: &Url, visited: &HashMap<Url, usize>) -> bool {
-        self.forward
-            .get(uri)
-            .is_some_and(|edges| edges.iter().any(|edge| !visited.contains_key(&edge.to)))
+    fn has_unvisited_dependencies(
+        &self,
+        uri: &Url,
+        visited: &HashMap<Url, usize>,
+        filter: EdgeTraversalFilter,
+    ) -> bool {
+        self.forward.get(uri).is_some_and(|edges| {
+            edges
+                .iter()
+                .any(|edge| filter.accepts(edge) && !visited.contains_key(&edge.to))
+        })
     }
 
     fn has_unvisited_neighbors(&self, uri: &Url, visited: &HashSet<Url>) -> bool {
@@ -1433,9 +1603,33 @@ impl DependencyGraph {
         max_depth: usize,
         max_visited: usize,
     ) -> Vec<Url> {
+        self.transitive_dependents_filtered(uri, max_depth, max_visited, EdgeTraversalFilter::All)
+    }
+
+    /// Backward-walk variant that only crosses edges accepted by `filter`.
+    ///
+    /// The public [`Self::get_transitive_dependents`] uses
+    /// [`EdgeTraversalFilter::All`]; the shared revalidation-consistent primitive
+    /// uses this directly so NSE/func collection can restrict itself to ordinary
+    /// source edges without duplicating the traversal.
+    fn transitive_dependents_filtered(
+        &self,
+        uri: &Url,
+        max_depth: usize,
+        max_visited: usize,
+        filter: EdgeTraversalFilter,
+    ) -> Vec<Url> {
         let mut result = Vec::new();
         let mut visited: HashMap<Url, usize> = HashMap::new();
-        self.collect_dependents(uri, max_depth, 0, &mut visited, &mut result, max_visited);
+        self.collect_dependents(
+            uri,
+            max_depth,
+            0,
+            &mut visited,
+            &mut result,
+            max_visited,
+            filter,
+        );
         result
     }
 
@@ -1444,6 +1638,7 @@ impl DependencyGraph {
     /// a revisit at a strictly shallower depth must continue recursing so
     /// ancestors reachable within the budget through the shorter path are
     /// not silently dropped.
+    #[allow(clippy::too_many_arguments)]
     fn collect_dependents(
         &self,
         uri: &Url,
@@ -1452,6 +1647,7 @@ impl DependencyGraph {
         visited: &mut HashMap<Url, usize>,
         result: &mut Vec<Url>,
         max_visited: usize,
+        filter: EdgeTraversalFilter,
     ) {
         if current_depth > max_depth {
             self.record_depth_truncation();
@@ -1473,13 +1669,16 @@ impl DependencyGraph {
             result.push(uri.clone());
         }
         if current_depth == max_depth {
-            if self.has_unvisited_dependents(uri, visited) {
+            if self.has_unvisited_dependents(uri, visited, filter) {
                 self.record_depth_truncation();
             }
             return;
         }
 
         for edge in self.get_dependents(uri) {
+            if !filter.accepts(edge) {
+                continue;
+            }
             if visited.len() >= max_visited && !visited.contains_key(&edge.from) {
                 self.record_visited_budget_truncation();
                 break;
@@ -1491,6 +1690,7 @@ impl DependencyGraph {
                 visited,
                 result,
                 max_visited,
+                filter,
             );
         }
     }
@@ -1511,7 +1711,15 @@ impl DependencyGraph {
     ) -> Vec<Url> {
         let mut result = Vec::new();
         let mut visited: HashMap<Url, usize> = HashMap::new();
-        self.collect_dependencies(uri, max_depth, 0, &mut visited, &mut result, max_visited);
+        self.collect_dependencies(
+            uri,
+            max_depth,
+            0,
+            &mut visited,
+            &mut result,
+            max_visited,
+            EdgeTraversalFilter::All,
+        );
         result
     }
 
@@ -1531,6 +1739,29 @@ impl DependencyGraph {
     where
         I: IntoIterator<Item = &'a Url>,
     {
+        self.transitive_dependencies_multi_root_filtered(
+            roots,
+            max_depth,
+            max_visited,
+            EdgeTraversalFilter::All,
+        )
+    }
+
+    /// Multi-root forward walk that only crosses edges accepted by `filter`.
+    ///
+    /// Backs both [`Self::get_transitive_dependencies_multi_root`]
+    /// ([`EdgeTraversalFilter::All`]) and the revalidation-consistent primitive's
+    /// ordinary-source-only variant.
+    fn transitive_dependencies_multi_root_filtered<'a, I>(
+        &self,
+        roots: I,
+        max_depth: usize,
+        max_visited: usize,
+        filter: EdgeTraversalFilter,
+    ) -> Vec<Url>
+    where
+        I: IntoIterator<Item = &'a Url>,
+    {
         let mut result = Vec::new();
         let mut visited: HashMap<Url, usize> = HashMap::new();
         for root in roots {
@@ -1538,7 +1769,15 @@ impl DependencyGraph {
                 self.record_visited_budget_truncation();
                 break;
             }
-            self.collect_dependencies(root, max_depth, 0, &mut visited, &mut result, max_visited);
+            self.collect_dependencies(
+                root,
+                max_depth,
+                0,
+                &mut visited,
+                &mut result,
+                max_visited,
+                filter,
+            );
         }
         result
     }
@@ -1596,14 +1835,59 @@ impl DependencyGraph {
         max_depth: usize,
         max_visited: usize,
     ) -> impl Iterator<Item = Url> {
-        let ancestors = self.get_transitive_dependents(root, max_depth, max_visited);
+        self.revalidation_consistent_set_filtered(
+            root,
+            max_depth,
+            max_visited,
+            EdgeTraversalFilter::All,
+        )
+    }
+
+    /// The revalidation-consistent set restricted to **ordinary source edges**.
+    ///
+    /// Identical traversal shape to [`Self::revalidation_consistent_set`] — the
+    /// same two graph primitives chained the same way — but selective-module
+    /// import edges are never crossed. This is what
+    /// `crate::handlers::collect_cross_file_nse` uses: revalidation (via the
+    /// unfiltered method) must still reschedule a module importer when the
+    /// imported module changes, but NSE/func declarations must never propagate
+    /// across a module edge because it lends no scope. Sharing the filtered core
+    /// keeps the edge-selection difference explicit and prevents the two walks
+    /// from drifting in traversal shape.
+    pub fn revalidation_consistent_set_over_ordinary_source(
+        &self,
+        root: &Url,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> impl Iterator<Item = Url> {
+        self.revalidation_consistent_set_filtered(
+            root,
+            max_depth,
+            max_visited,
+            EdgeTraversalFilter::OrdinarySourceOnly,
+        )
+    }
+
+    /// Shared core for the revalidation-consistent set, parameterized by which
+    /// edge kinds the two directed walks may cross. Keeping both public entry
+    /// points delegating here guarantees they share the identical traversal
+    /// shape and can only differ in explicit edge selection.
+    fn revalidation_consistent_set_filtered(
+        &self,
+        root: &Url,
+        max_depth: usize,
+        max_visited: usize,
+        filter: EdgeTraversalFilter,
+    ) -> impl Iterator<Item = Url> {
+        let ancestors = self.transitive_dependents_filtered(root, max_depth, max_visited, filter);
         // `root` first matches the historical `once(root).chain(ancestors)`
         // convention so the shared `max_visited` budget prioritizes the queried
         // file's own subtree.
-        let descendants = self.get_transitive_dependencies_multi_root(
+        let descendants = self.transitive_dependencies_multi_root_filtered(
             std::iter::once(root).chain(ancestors.iter()),
             max_depth,
             max_visited,
+            filter,
         );
         // The chained iterator owns both Vecs, so it carries no borrow of `&self`.
         // Callers fold it through their own post-processing (revalidation: a
@@ -1618,6 +1902,7 @@ impl DependencyGraph {
     /// shorter path are not silently dropped — diamond-shaped dep graphs
     /// (a common helper sourced via multiple paths of differing length)
     /// would otherwise lose subtrees beyond `max_depth - prev_depth`.
+    #[allow(clippy::too_many_arguments)]
     fn collect_dependencies(
         &self,
         uri: &Url,
@@ -1626,6 +1911,7 @@ impl DependencyGraph {
         visited: &mut HashMap<Url, usize>,
         result: &mut Vec<Url>,
         max_visited: usize,
+        filter: EdgeTraversalFilter,
     ) {
         if current_depth > max_depth {
             self.record_depth_truncation();
@@ -1647,13 +1933,16 @@ impl DependencyGraph {
             result.push(uri.clone());
         }
         if current_depth == max_depth {
-            if self.has_unvisited_dependencies(uri, visited) {
+            if self.has_unvisited_dependencies(uri, visited, filter) {
                 self.record_depth_truncation();
             }
             return;
         }
 
         for edge in self.get_dependencies(uri) {
+            if !filter.accepts(edge) {
+                continue;
+            }
             if visited.len() >= max_visited && !visited.contains_key(&edge.to) {
                 self.record_visited_budget_truncation();
                 break;
@@ -1665,6 +1954,7 @@ impl DependencyGraph {
                 visited,
                 result,
                 max_visited,
+                filter,
             );
         }
     }
@@ -2409,6 +2699,46 @@ mod tests {
             sources: vec![make_source(path, line)],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn box_local_module_edges_revalidate_without_lending_or_nse_traversal() {
+        let (temp, root) = create_temp_workspace(&["main.R", "mod.r"]);
+        let importer = temp_url(&temp, "main.R");
+        let module = temp_url(&temp, "mod.r");
+        let mut metadata = crate::cross_file::extract_metadata("box::use(./mod)\n");
+        crate::cross_file::enrich_box_import_resolutions(&mut metadata, &importer);
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&importer, &metadata, Some(&root), |_| None);
+
+        let dependencies = graph.get_dependencies(&importer);
+        assert_eq!(dependencies.len(), 1);
+        let edge = dependencies[0];
+        assert_eq!(edge.to, module);
+        assert!(edge.is_selective_module());
+        assert!(!edge.lends_scope());
+        assert!(
+            graph
+                .get_dependents(&module)
+                .iter()
+                .any(|candidate| candidate.from == importer),
+            "the module must retain a backward edge for dependent revalidation"
+        );
+
+        let full: HashSet<_> = graph
+            .revalidation_consistent_set(&module, 16, 128)
+            .collect();
+        assert!(
+            full.contains(&importer),
+            "editing the module must reschedule its importer"
+        );
+        let ordinary_only: HashSet<_> = graph
+            .revalidation_consistent_set_over_ordinary_source(&module, 16, 128)
+            .collect();
+        assert!(
+            !ordinary_only.contains(&importer),
+            "selective edges must not propagate ordinary source scope or NSE/func declarations"
+        );
     }
 
     /// Regression (WI2b cache soundness, confirmed by Codex): a `source()` /
@@ -5207,6 +5537,7 @@ z <- 3
             is_directive: false,
             is_backward_directive: false,
             non_lending: false,
+            kind: DependencyEdgeKind::OrdinarySource,
         };
 
         let mut other_call_site = base.clone();
@@ -5269,6 +5600,24 @@ z <- 3
             different_locality.source_invocation_identity(),
             "inheritance semantics must remain part of invocation identity"
         );
+
+        // A selective-module edge is a distinct edge identity from an ordinary
+        // source edge to the same target at the same call site: kind flows into
+        // dedup, interface, and revision identity (issue #662).
+        let mut module = base.clone();
+        module.kind = DependencyEdgeKind::SelectiveModule;
+        assert_ne!(
+            base.graph_dedup_key(),
+            module.graph_dedup_key(),
+            "module edge kind must remain part of graph deduplication"
+        );
+        assert_ne!(
+            base.dependency_interface_identity(),
+            module.dependency_interface_identity(),
+            "module edge kind must be dependency-interface-visible for revalidation"
+        );
+        assert!(base.lends_scope() && base.is_ordinary_source());
+        assert!(module.is_selective_module() && !module.lends_scope());
 
         let mut tar_child = base.clone();
         tar_child.tar_source_ordinal = Some(0);

@@ -762,6 +762,13 @@ impl DiagnosticsSnapshot {
                 lookup: &data_lookup,
                 base_packages: self.package_library.base_packages(),
             });
+        let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+            &get_artifacts,
+            &get_metadata,
+            (self.cross_file_config.packages_enabled && self.package_library_ready)
+                .then_some(self.package_library.as_ref()),
+        );
+        let selective_import_provider = scope::SelectiveImportProvider { env: &import_env };
 
         let mut cache = self.parent_prefix_cache.borrow_mut();
         scope::scope_at_position_with_graph_cached_with_standalone_cache_and_package_query_uri(
@@ -780,6 +787,7 @@ impl DiagnosticsSnapshot {
             &mut cache,
             Some(&self.scope_contribution),
             data_provider.as_ref(),
+            Some(&selective_import_provider),
             self.standalone_ctx.clone(),
             self.package_query_uri.as_ref(),
         )
@@ -914,6 +922,18 @@ pub(crate) fn diagnostics_from_snapshot(
 
     // Missing file diagnostics (sync check from snapshot metadata)
     collect_missing_file_diagnostics_from_snapshot(snapshot, uri, &mut diagnostics);
+
+    // Static `box::use()` module/export diagnostics.
+    collect_box_import_diagnostics_from_snapshot(
+        snapshot,
+        uri,
+        &mut diagnostics,
+        if track_unused {
+            Some(&mut suppressed_pairs)
+        } else {
+            None
+        },
+    );
 
     // Missing package diagnostics
     collect_missing_package_diagnostics_from_snapshot_for_uri(
@@ -3889,6 +3909,13 @@ pub(crate) fn get_cross_file_scope(
             lookup: &data_lookup,
             base_packages: state.package_library.base_packages(),
         });
+    let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        (state.cross_file_config.packages_enabled && state.package_library_ready)
+            .then_some(state.package_library.as_ref()),
+    );
+    let selective_import_provider = scope::SelectiveImportProvider { env: &import_env };
 
     let package_query_uri = package_contribution
         .and_then(|contrib| contrib.workspace_root.as_ref())
@@ -3909,6 +3936,7 @@ pub(crate) fn get_cross_file_scope(
         &is_cancelled,
         package_contribution,
         data_provider.as_ref(),
+        Some(&selective_import_provider),
         package_query_uri.as_ref(),
     )
 }
@@ -3959,6 +3987,13 @@ pub(crate) fn get_cross_file_scope_with_cache(
             lookup: &data_lookup,
             base_packages: state.package_library.base_packages(),
         });
+    let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        (state.cross_file_config.packages_enabled && state.package_library_ready)
+            .then_some(state.package_library.as_ref()),
+    );
+    let selective_import_provider = scope::SelectiveImportProvider { env: &import_env };
 
     let package_query_uri = package_contribution
         .and_then(|contrib| contrib.workspace_root.as_ref())
@@ -3980,6 +4015,7 @@ pub(crate) fn get_cross_file_scope_with_cache(
         prefix_cache,
         package_contribution,
         data_provider.as_ref(),
+        Some(&selective_import_provider),
         package_query_uri.as_ref(),
     )
 }
@@ -6073,6 +6109,8 @@ fn collect_max_depth_diagnostics_from_snapshot(
         // No `data()` alias expansion (issue #429): this pass only reads
         // `scope_result.depth_exceeded`, never `scope.symbols`.
         None,
+        // No selective-import resolution needed here (depth-only pass).
+        None,
         snapshot.package_query_uri.as_ref(),
     );
 
@@ -6161,6 +6199,131 @@ fn collect_missing_file_diagnostics_from_snapshot(
                 message: format!("Cannot resolve parent path: '{}'", sourced_by.path),
                 code: Some(NumberOrString::String(
                     crate::diagnostic_code::UNRESOLVED_SOURCE_PATH.to_string(),
+                )),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+/// Diagnose statically recognizable `{box}` imports without evaluating R.
+/// Missing/case-mismatched local modules use the existing path severity policies;
+/// selected-member absence is emitted only from a complete effective export set.
+/// Unsupported/dynamic specs, wildcard attaches, and partial/unknown absence all
+/// fail conservatively and remain silent.
+fn collect_box_import_diagnostics_from_snapshot(
+    snapshot: &DiagnosticsSnapshot,
+    uri: &Url,
+    diagnostics: &mut Vec<Diagnostic>,
+    mut suppressed_out: Option<&mut Vec<(u32, String)>>,
+) {
+    let get_artifacts = |target_uri: &Url| snapshot.artifacts_map.get(target_uri).cloned();
+    let get_metadata = |target_uri: &Url| snapshot.metadata_map.get(target_uri).cloned();
+    let env = crate::box_use::ArtifactModuleExportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        (snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready)
+            .then_some(snapshot.package_library.as_ref()),
+    );
+    let resolver = crate::box_use::resolve::ImportResolver::new(&env);
+
+    for import in &snapshot.directive_meta.box_imports {
+        let range = Range::new(
+            Position::new(import.line, import.column),
+            Position::new(import.line, import.end_column.max(import.column)),
+        );
+        let source = match &import.spec {
+            crate::box_use::BoxSpec::Package(package) => {
+                crate::selective_import::ImportSource::Package(package.clone())
+            }
+            crate::box_use::BoxSpec::LocalModule { .. } => match &import.local_resolution {
+                Some(crate::box_use::LocalModuleResolution::Resolved(uri)) => {
+                    crate::selective_import::ImportSource::LocalModule(uri.clone())
+                }
+                Some(crate::box_use::LocalModuleResolution::CaseMismatch { expected, found }) => {
+                    let severity = snapshot.cross_file_config.case_mismatch_severity.resolve(
+                        crate::cross_file::path_resolve::CaseMismatchRegime::CaseSensitiveFs,
+                    );
+                    if let Some(severity) = severity {
+                        diagnostics.push(Diagnostic {
+                            range,
+                            severity: Some(severity),
+                            message: format!(
+                                "box module path case mismatch: expected '{}', found '{}'",
+                                expected.display(),
+                                found.display()
+                            ),
+                            code: Some(NumberOrString::String(
+                                crate::diagnostic_code::BOX_MODULE_CASE_MISMATCH.to_string(),
+                            )),
+                            ..Default::default()
+                        });
+                    }
+                    continue;
+                }
+                Some(crate::box_use::LocalModuleResolution::Missing) => {
+                    if let Some(severity) = snapshot.cross_file_config.missing_file_severity {
+                        diagnostics.push(Diagnostic {
+                            range,
+                            severity: Some(severity),
+                            message: "Cannot resolve local box module".to_string(),
+                            code: Some(NumberOrString::String(
+                                crate::diagnostic_code::BOX_MODULE_NOT_FOUND.to_string(),
+                            )),
+                            ..Default::default()
+                        });
+                    }
+                    continue;
+                }
+                None => continue,
+            },
+            crate::box_use::BoxSpec::Unsupported(_) => continue,
+        };
+
+        let request = import.lower(uri, source);
+        let resolved = request.resolve(&resolver);
+        let Some(severity) = snapshot
+            .cross_file_config
+            .packages_namespace_member_severity
+        else {
+            continue;
+        };
+        let attachment_ranges =
+            crate::box_use::detect::attachment_token_ranges(&snapshot.tree, &snapshot.text, import);
+        let mut diagnosed = HashSet::new();
+        for attach in &request.attach {
+            let Some(exported) = attach.exported_name() else {
+                continue;
+            };
+            if resolved.exports.membership(exported) != Some(false)
+                || !diagnosed.insert(exported.to_string())
+            {
+                continue;
+            }
+            let member_range = attachment_ranges
+                .iter()
+                .find(|token| token.exported == exported)
+                .map_or(range, |token| token.range);
+            let diagnostic_line = member_range.start.line;
+            if crate::cross_file::directive::is_line_ignored_for_code(
+                &snapshot.directive_meta,
+                diagnostic_line,
+                Some(crate::diagnostic_code::BOX_EXPORT_NOT_FOUND),
+            ) {
+                if let Some(out) = suppressed_out.as_deref_mut() {
+                    out.push((
+                        diagnostic_line,
+                        crate::diagnostic_code::BOX_EXPORT_NOT_FOUND.to_string(),
+                    ));
+                }
+                continue;
+            }
+            diagnostics.push(Diagnostic {
+                range: member_range,
+                severity: Some(severity),
+                message: format!("'{exported}' is not exported by this box import source"),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::BOX_EXPORT_NOT_FOUND.to_string(),
                 )),
                 ..Default::default()
             });
@@ -6290,6 +6453,51 @@ fn collect_missing_package_diagnostics_from_snapshot_for_uri(
             },
             severity: Some(severity),
             message: missing_package_message(&declaration.package, outside_active),
+            code: Some(NumberOrString::String(code.to_string())),
+            ..Default::default()
+        });
+    }
+
+    for import in &snapshot.directive_meta.box_imports {
+        let crate::box_use::BoxSpec::Package(package) = &import.spec else {
+            continue;
+        };
+        if snapshot.package_library.package_exists(package) {
+            continue;
+        }
+        let outside_active = package_available_outside_active_renv(snapshot, package);
+        if !outside_active
+            && !snapshot
+                .cross_file_config
+                .packages_report_generic_uninstalled
+        {
+            continue;
+        }
+        let code = if outside_active {
+            crate::diagnostic_code::PACKAGE_OUTSIDE_ACTIVE_LIBRARY
+        } else {
+            crate::diagnostic_code::PACKAGE_NOT_INSTALLED
+        };
+        if crate::cross_file::directive::is_line_ignored_for_code(
+            &snapshot.directive_meta,
+            import.line,
+            Some(code),
+        ) {
+            if let Some(out) = suppressed_out.as_deref_mut() {
+                out.push((import.line, code.to_string()));
+            }
+            continue;
+        }
+        if outside_active && !reported_outside_active.insert(package.as_str()) {
+            continue;
+        }
+        diagnostics.push(Diagnostic {
+            range: Range::new(
+                Position::new(import.line, import.column),
+                Position::new(import.line, import.end_column.max(import.column)),
+            ),
+            severity: Some(severity),
+            message: missing_package_message(package, outside_active),
             code: Some(NumberOrString::String(code.to_string())),
             ..Default::default()
         });
@@ -6742,6 +6950,13 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             lookup: &data_lookup,
             base_packages: snapshot.package_library.base_packages(),
         });
+    let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        (snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready)
+            .then_some(snapshot.package_library.as_ref()),
+    );
+    let selective_import_provider = scope::SelectiveImportProvider { env: &import_env };
 
     let mut stream_opt = scope::ScopeStream::new_with_standalone_cache_and_package_query_uri(
         uri,
@@ -6757,6 +6972,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         &snapshot.parent_prefix_cache,
         Some(&snapshot.scope_contribution),
         data_provider.as_ref(),
+        Some(&selective_import_provider),
         snapshot.standalone_ctx.clone(),
         snapshot.package_query_uri.as_ref(),
     );
@@ -7389,14 +7605,21 @@ fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFil
     let max_visited = snapshot.cross_file_config.max_transitive_dependents_visited;
 
     // The revalidation-consistent set `S(uri) = ancestors ∪ descendants(ancestors
-    // ∪ {uri})`, shared with `compute_affected_dependents_after_edit`. Shiny adds
-    // a post-traversal visibility filter without changing the traversal: entry
-    // declarations do not lend backward, and a later helper lends only to
-    // function bodies in earlier helpers. Revalidation intentionally retains the
-    // unfiltered superset, so every declaration this collector accepts still has
-    // a guaranteed inverse republish path.
+    // ∪ {uri})`, restricted to ORDINARY SOURCE edges. It shares the identical
+    // traversal shape with `compute_affected_dependents_after_edit` (which uses
+    // the unfiltered `revalidation_consistent_set`, so a selective-module import
+    // still reschedules its importer when the module changes) but must never
+    // cross a `box::use()` selective-module edge here: a module edge lends no
+    // scope, so cross-file NSE/func declarations must not propagate across it.
+    // Restricting the walk itself (not just the resulting member set) is required
+    // — a file reachable only through a module edge must not become a member.
+    // Shiny adds a post-traversal visibility filter without changing the
+    // traversal: entry declarations do not lend backward, and a later helper
+    // lends only to function bodies in earlier helpers. Revalidation
+    // intentionally retains the unfiltered superset, so every declaration this
+    // collector accepts still has a guaranteed inverse republish path.
     let mut members: Vec<Url> = graph
-        .revalidation_consistent_set(uri, max_depth, max_visited)
+        .revalidation_consistent_set_over_ordinary_source(uri, max_depth, max_visited)
         .filter(|u| u != uri)
         .collect();
     members.sort();
@@ -7830,6 +8053,13 @@ fn collect_undefined_variables_from_snapshot(
             lookup: &data_lookup,
             base_packages: snapshot.package_library.base_packages(),
         });
+    let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        (snapshot.cross_file_config.packages_enabled && snapshot.package_library_ready)
+            .then_some(snapshot.package_library.as_ref()),
+    );
+    let selective_import_provider = scope::SelectiveImportProvider { env: &import_env };
 
     let mut stream_opt = scope::ScopeStream::new_with_standalone_cache_and_package_query_uri(
         uri,
@@ -7845,6 +8075,7 @@ fn collect_undefined_variables_from_snapshot(
         &snapshot.parent_prefix_cache,
         Some(&snapshot.scope_contribution),
         data_provider.as_ref(),
+        Some(&selective_import_provider),
         snapshot.standalone_ctx.clone(),
         snapshot.package_query_uri.as_ref(),
     );
@@ -8428,6 +8659,65 @@ fn is_named_argument_label(node: Node) -> bool {
     })
 }
 
+/// Find the outer `box::use()` / top-level `box::export()` argument containing
+/// `node`. Attach lists contain nested `argument` nodes, so callers must keep
+/// walking until an argument belongs to the declaration call itself.
+fn enclosing_box_declaration_argument<'a>(
+    node: Node<'a>,
+    text: &str,
+) -> Option<(Node<'a>, Node<'a>)> {
+    let mut current = node;
+    loop {
+        let parent = current.parent()?;
+        if parent.kind() == "argument"
+            && let Some(arguments) = parent
+                .parent()
+                .filter(|ancestor| ancestor.kind() == "arguments")
+            && let Some(call) = arguments
+                .parent()
+                .filter(|ancestor| ancestor.kind() == "call")
+            && (crate::box_use::detect::is_box_use_call(call, text)
+                || crate::box_use::exports::is_box_export_call(call, text))
+        {
+            return Some((parent, call));
+        }
+        current = parent;
+    }
+}
+
+/// Whether `node` is static declaration syntax inside `box::use()` or a
+/// top-level `box::export()` call, rather than an evaluated R reference.
+///
+/// This is intentionally member-precise rather than a whole-call suppression:
+/// unsupported/dynamic pieces such as `box::use(pkg[computed()])` keep their
+/// ordinary references. For a supported use spec, only the parsed package/path
+/// components and named/renamed attachment tokens are structural. For export,
+/// only a direct positional identifier argument of a top-level declaration is
+/// structural; nested expressions and function-scoped calls remain ordinary R.
+fn is_static_box_declaration_identifier(node: Node, text: &str) -> bool {
+    debug_assert_eq!(node.kind(), "identifier");
+
+    let Some((argument, call)) = enclosing_box_declaration_argument(node, text) else {
+        return false;
+    };
+
+    if crate::box_use::detect::is_box_use_call(call, text) {
+        let Some(value) = argument.child_by_field_name("value") else {
+            return false;
+        };
+        return crate::box_use::detect::is_static_declaration_token(value, node, text);
+    }
+
+    crate::box_use::exports::is_box_export_call(call, text)
+        && call
+            .parent()
+            .is_some_and(|parent| parent.kind() == "program")
+        && argument.child_by_field_name("name").is_none()
+        && argument
+            .child_by_field_name("value")
+            .is_some_and(|value| value.id() == node.id())
+}
+
 /// Returns true if the given identifier node is a *structural non-reference*:
 /// an identifier that exists in the AST but never refers to a value at runtime,
 /// regardless of which diagnostic pipeline is consuming it.
@@ -8445,9 +8735,11 @@ fn is_named_argument_label(node: Node) -> bool {
 /// `hover` is a non-diagnostics consumer, but it suppresses on
 /// `is_structural_label` ONLY, not this full predicate: assignment targets are
 /// definition sites it must still surface.
-fn is_structural_non_reference(node: Node) -> bool {
+fn is_structural_non_reference(node: Node, text: &str) -> bool {
     debug_assert_eq!(node.kind(), "identifier");
-    is_assignment_target(node) || is_structural_label(node)
+    is_assignment_target(node)
+        || is_structural_label(node)
+        || is_static_box_declaration_identifier(node, text)
 }
 
 /// Returns true when `node` is a default-parameter-expression identifier that
@@ -8775,7 +9067,7 @@ fn body_has_formal_reference_before(
     }
     if node.kind() == "identifier"
         && node_text(node, text) == formal_name
-        && !is_structural_non_reference(node)
+        && !is_structural_non_reference(node, text)
     {
         return true;
     }
@@ -8869,7 +9161,7 @@ fn collect_identifier_usages_utf16<'a>(
     };
 
     if node.kind() == "identifier" {
-        if is_structural_non_reference(node) {
+        if is_structural_non_reference(node, text) {
             return;
         }
 
@@ -17368,7 +17660,7 @@ fn collect_usages_with_analysis<'a>(
         if context.in_formula || context.suppressed {
             return;
         }
-        if is_structural_non_reference(node) {
+        if is_structural_non_reference(node, text) {
             return;
         }
         // zeallot `%<-%` / rlang `%<~%` binding targets — text-dependent, so
@@ -20448,29 +20740,38 @@ pub fn extract_definition_statement(
     symbol: &ScopedSymbol,
     state: &WorldState,
 ) -> Option<DefinitionInfo> {
-    // Get content provider for the symbol's source file.
-    // Use analysis_text() so that byte offsets from doc.tree (which was parsed
-    // from the masked text for Rmd/Quarto) agree with the string we slice.
-    // For plain R documents analysis_text() == text(), so this is neutral there.
-    let content = if let Some(doc) = state.documents.get(&symbol.source_uri) {
-        doc.analysis_text()
-    } else {
-        state.cross_file_file_cache.get(&symbol.source_uri)?
-    };
+    // Open documents are authoritative, and their tree is paired with the same
+    // masked analysis text it was parsed from.
+    if let Some(doc) = state.documents.get(&symbol.source_uri) {
+        return extract_statement_from_tree(doc.tree.as_ref()?, symbol, &doc.analysis_text());
+    }
 
-    // Get tree for parsing
-    let tree = if let Some(doc) = state.documents.get(&symbol.source_uri) {
-        doc.tree.as_ref()?
-    } else {
-        // Parse content if not in documents
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok()?;
-        let parsed = parser.parse(&content, None)?;
-        // We can't store this tree, so we need to work with it immediately
-        return extract_statement_from_tree(&parsed, symbol, &content);
-    };
+    // Closed workspace files already carry a canonical tree and artifacts. Use
+    // that indexed representation directly instead of requiring a duplicate file
+    // cache entry; this is what lets hover render definitions from closed modules.
+    if let Some(entry) = state.workspace_index.get(&symbol.source_uri) {
+        let raw = entry.contents.to_string();
+        let content = state.analysis_text_for_uri(&symbol.source_uri, &raw);
+        if let Some(tree) = &entry.tree {
+            return extract_statement_from_tree(tree, symbol, &content);
+        }
+        return parse_and_extract_definition_statement(symbol, &content);
+    }
 
-    extract_statement_from_tree(tree, symbol, &content)
+    // Excluded/non-indexed dependency files may still be present in the canonical
+    // cross-file file cache. Parse their cached analysis content on demand.
+    let content = state.cross_file_file_cache.get(&symbol.source_uri)?;
+    parse_and_extract_definition_statement(symbol, &content)
+}
+
+fn parse_and_extract_definition_statement(
+    symbol: &ScopedSymbol,
+    content: &str,
+) -> Option<DefinitionInfo> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(content, None)?;
+    extract_statement_from_tree(&tree, symbol, content)
 }
 
 fn next_utf8_char_boundary(line: &str, byte_offset: usize) -> usize {
@@ -20538,12 +20839,9 @@ fn extract_statement_from_tree(
 /// content/tree-acquisition and statement-extraction machinery. The synthetic
 /// `name` is unused by that path (which keys off `source_uri` + position).
 ///
-/// This shares [`extract_definition_statement`]'s document-store coverage with
-/// the main cross-file-scope hover path. If go-to-definition can locate a
-/// member whose defining file is indexed-only (not in `documents` or the file
-/// cache), hover may resolve the location but find no statement to render and
-/// fall through to suppression — the same boundary that path already has, not a
-/// member-specific gap.
+/// This shares [`extract_definition_statement`]'s open-document, workspace-index,
+/// and cross-file-cache coverage with the main cross-file-scope hover path, so a
+/// definition found in a closed/indexed module can render without opening it.
 fn member_definition_info(
     state: &WorldState,
     location: &tower_lsp::lsp_types::Location,
@@ -21221,15 +21519,30 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         // suppression (no live session to inspect).
         if let Some((lhs_node, op)) = crate::extract_op::extract_operator_rhs(node)
             && let Some(path) = crate::qualified_resolve::build_qualified_path(lhs_node, &text)
-            && let Some(location) = crate::qualified_resolve::resolve_qualified_member(
-                state, uri, position, &path, name, op,
-            )
-            && let Some(def_info) = member_definition_info(state, &location)
         {
-            return Some(markdown_hover(
-                local_definition_hover(state, &def_info, uri),
-                node_range,
-            ));
+            if let Some(package) = crate::qualified_resolve::selective_namespace_package(
+                state, uri, position, &path, name,
+            ) {
+                let mut value = build_help_panel_link(name, &package);
+                if let Some(help_text) =
+                    get_help_cached(&state.help_cache, name, Some(&package), r_path.clone()).await
+                {
+                    value.push_str(&format!("```\n{}\n```", help_text));
+                } else {
+                    value.push_str(&format!("```r\n{}\n```\n", name));
+                    value.push_str(&format!("\nfrom {{{}}}", package));
+                }
+                return Some(markdown_hover(value, node_range));
+            }
+            if let Some(location) = crate::qualified_resolve::resolve_qualified_member(
+                state, uri, position, &path, name, op,
+            ) && let Some(def_info) = member_definition_info(state, &location)
+            {
+                return Some(markdown_hover(
+                    local_definition_hover(state, &def_info, uri),
+                    node_range,
+                ));
+            }
         }
     }
 
@@ -21708,84 +22021,7 @@ async fn try_build_package_signature(
 /// # Returns
 /// Vector of ParameterInfo extracted from the signature
 fn parse_signature_params(signature: &str) -> Vec<crate::parameter_resolver::ParameterInfo> {
-    // Find the opening parenthesis
-    let start = match signature.find('(') {
-        Some(pos) => pos + 1,
-        None => return vec![],
-    };
-
-    // Find the closing parenthesis
-    let end = match signature.rfind(')') {
-        Some(pos) => pos,
-        None => return vec![],
-    };
-
-    if start >= end {
-        return vec![];
-    }
-
-    // Extract the parameter list
-    let params_str = &signature[start..end];
-
-    if params_str.trim().is_empty() {
-        return vec![];
-    }
-
-    // Split by commas, but be careful about nested parentheses and quotes
-    let mut params = Vec::new();
-    let mut current_param = String::new();
-    let mut paren_depth: usize = 0;
-    let mut in_quotes = false;
-    let mut quote_char = ' ';
-    let mut skip_next = false;
-
-    for ch in params_str.chars() {
-        if skip_next {
-            current_param.push(ch);
-            skip_next = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_quotes => {
-                current_param.push(ch);
-                skip_next = true;
-            }
-            '"' | '\'' if !in_quotes => {
-                in_quotes = true;
-                quote_char = ch;
-                current_param.push(ch);
-            }
-            c if in_quotes && c == quote_char => {
-                in_quotes = false;
-                current_param.push(ch);
-            }
-            '(' if !in_quotes => {
-                paren_depth += 1;
-                current_param.push(ch);
-            }
-            ')' if !in_quotes => {
-                paren_depth = paren_depth.saturating_sub(1);
-                current_param.push(ch);
-            }
-            ',' if !in_quotes && paren_depth == 0 => {
-                // End of parameter
-                if !current_param.trim().is_empty() {
-                    params.push(parse_single_param(&current_param));
-                }
-                current_param.clear();
-            }
-            _ => {
-                current_param.push(ch);
-            }
-        }
-    }
-
-    // Don't forget the last parameter
-    if !current_param.trim().is_empty() {
-        params.push(parse_single_param(&current_param));
-    }
-
-    params
+    crate::parameter_resolver::parse_signature_parameters(signature)
 }
 
 /// Parse a single parameter string into ParameterInfo.
@@ -21797,74 +22033,11 @@ fn parse_signature_params(signature: &str) -> Vec<crate::parameter_resolver::Par
 ///
 /// # Returns
 /// ParameterInfo for the parameter
+#[cfg(test)]
 fn parse_single_param(param_str: &str) -> crate::parameter_resolver::ParameterInfo {
-    let trimmed = param_str.trim();
-
-    // Check if this is the dots parameter
-    if trimmed == "..." || trimmed.starts_with("...") {
-        return crate::parameter_resolver::ParameterInfo {
-            name: "...".to_string(),
-            default_value: None,
-            is_dots: true,
-        };
-    }
-
-    // Find '=' that is not inside quotes
-    let eq_pos = {
-        let mut in_quotes = false;
-        let mut quote_char = ' ';
-        let mut skip_next = false;
-        let mut pos = None;
-        for (i, ch) in trimmed.char_indices() {
-            if skip_next {
-                skip_next = false;
-                continue;
-            }
-            match ch {
-                '\\' if in_quotes => {
-                    skip_next = true;
-                }
-                '"' | '\'' if !in_quotes => {
-                    in_quotes = true;
-                    quote_char = ch;
-                }
-                c if in_quotes && c == quote_char => {
-                    in_quotes = false;
-                }
-                '=' if !in_quotes => {
-                    pos = Some(i);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        pos
-    };
-
-    // Check if there's a default value (contains '=' outside quotes)
-    if let Some(eq_pos) = eq_pos {
-        let name = trimmed[..eq_pos].trim().to_string();
-        let default = trimmed[eq_pos + 1..].trim();
-        let default_value = if default.is_empty() {
-            None
-        } else {
-            Some(default.to_string())
-        };
-
-        crate::parameter_resolver::ParameterInfo {
-            name,
-            default_value,
-            is_dots: false,
-        }
-    } else {
-        // No default value
-        crate::parameter_resolver::ParameterInfo {
-            name: trimmed.to_string(),
-            default_value: None,
-            is_dots: false,
-        }
-    }
+    crate::parameter_resolver::parse_signature_parameter(param_str)
 }
+
 /// Attempt to build rich signature help for a user-defined function.
 ///
 /// Extracts parameters from AST, gets roxygen documentation,
@@ -22251,6 +22424,31 @@ fn active_shiny_application(
 /// let result = goto_definition(&state, &uri, pos);
 /// // `result` will be `Some(...)` when a navigable definition exists, otherwise `None`.
 /// ```
+/// Resolve a cursor on a static local `box::use()` module spec to the concrete
+/// file module or package-style `__init__` file. The detector's UTF-16 span is
+/// authoritative for hit-testing; package and unsupported/dynamic specs remain
+/// non-file-navigable.
+fn box_module_spec_definition(
+    metadata: &crate::cross_file::CrossFileMetadata,
+    tree: &tree_sitter::Tree,
+    text: &str,
+    position: Position,
+) -> Option<Location> {
+    let import = metadata.box_imports.iter().find(|import| {
+        crate::box_use::detect::module_spec_range(tree, text, import)
+            .is_some_and(|range| position >= range.start && position < range.end)
+    })?;
+    let crate::box_use::LocalModuleResolution::Resolved(target_uri) =
+        import.local_resolution.as_ref()?
+    else {
+        return None;
+    };
+    Some(Location {
+        uri: target_uri.clone(),
+        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+    })
+}
+
 pub fn goto_definition(
     state: &WorldState,
     uri: &Url,
@@ -22320,6 +22518,20 @@ pub fn goto_definition_with_cancel(
         }
     }
 
+    let point = lsp_position_to_ts_point(&text, position);
+    let node = tree.root_node().descendant_for_point_range(point, point)?;
+    if matches!(node.kind(), "identifier" | "string")
+        && let Some(location) = selective_attachment_declaration_definition(state, uri, node, &text)
+    {
+        return Some(GotoDefinitionResponse::Scalar(location));
+    }
+
+    if let Some(metadata) = content_provider.get_metadata(uri)
+        && let Some(location) = box_module_spec_definition(&metadata, tree, &text, position)
+    {
+        return Some(GotoDefinitionResponse::Scalar(location));
+    }
+
     if doc.file_type == FileType::Stan {
         if cancel.is_cancelled() {
             return None;
@@ -22371,9 +22583,7 @@ pub fn goto_definition_with_cancel(
         }));
     }
 
-    // Continue with normal identifier-based go-to-definition
-    let point = lsp_position_to_ts_point(&text, position);
-    let node = tree.root_node().descendant_for_point_range(point, point)?;
+    // Continue with normal identifier-based go-to-definition.
 
     // Terminal `x[["name"]]` string-subscript member (#461): `[[` is the
     // `$`-equivalent extractor, so a cursor on the literal-string subscript
@@ -22914,6 +23124,299 @@ fn shiny_reference_matches_target(
         .is_some_and(|symbol| same_symbol_definition(symbol, target))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectiveNamespaceReferenceTarget {
+    alias: String,
+    source: crate::selective_import::ImportSource,
+    provenance: crate::selective_import::ImportProvenance,
+}
+
+fn namespace_reference_target_from_import(
+    request: crate::selective_import::SelectiveImportRequest,
+) -> Option<SelectiveNamespaceReferenceTarget> {
+    let alias = request.namespace?.alias;
+    Some(SelectiveNamespaceReferenceTarget {
+        alias,
+        source: request.source,
+        provenance: request.provenance,
+    })
+}
+
+/// Resolve an identifier that is the namespace declaration token of one static
+/// `box::use()` argument. Explicit aliases use the argument's `name` field;
+/// default aliases use only the final module/package component before `[...]`,
+/// never an earlier same-named path component or an attached-member token.
+fn selective_namespace_declaration_target(
+    state: &WorldState,
+    uri: &Url,
+    node: Node,
+    text: &str,
+) -> Option<SelectiveNamespaceReferenceTarget> {
+    let (argument, call) = enclosing_box_declaration_argument(node, text)?;
+    if !crate::box_use::detect::is_box_use_call(call, text) {
+        return None;
+    }
+    let value = argument.child_by_field_name("value")?;
+    let value_start = ts_point_to_lsp_position(text, value.start_position());
+    let content_provider = state.content_provider();
+    let metadata = content_provider.get_metadata(uri)?;
+    let import = metadata
+        .box_imports
+        .iter()
+        .find(|import| import.line == value_start.line && import.column == value_start.character)?;
+    let request = lower_static_box_import(uri, import)?;
+    let alias = request.namespace.as_ref()?.alias.as_str();
+
+    let is_declaration = if let Some(explicit) = argument.child_by_field_name("name") {
+        explicit.id() == node.id()
+    } else {
+        let raw = &text[value.byte_range()];
+        let module = raw.split_once('[').map_or(raw, |(module, _)| module);
+        let module = module.trim_end();
+        node_text(node, text) == alias
+            && node.end_byte() == value.start_byte().saturating_add(module.len())
+    };
+    is_declaration
+        .then(|| namespace_reference_target_from_import(request))
+        .flatten()
+}
+
+fn selective_namespace_reference_target(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    node: Node,
+    name: &str,
+    text: &str,
+) -> Option<SelectiveNamespaceReferenceTarget> {
+    if let Some(target) = selective_namespace_declaration_target(state, uri, node, text) {
+        return Some(target);
+    }
+    if is_assignment_target(node)
+        || is_destructuring_assignment_target(node, text)
+        || is_structural_label(node)
+        || is_static_box_declaration_identifier(node, text)
+    {
+        return None;
+    }
+
+    let scope = get_cross_file_scope(
+        state,
+        uri,
+        position.line,
+        position.character,
+        &DiagCancelToken::never(),
+        Some(state.package_state.scope_contribution()),
+    );
+    let canonical = unquote_backtick_name(name).unwrap_or(name);
+    let identity = scope.namespace_import_aliases.get(canonical)?;
+    Some(SelectiveNamespaceReferenceTarget {
+        alias: canonical.to_string(),
+        source: identity.source.clone(),
+        provenance: identity.provenance.clone(),
+    })
+}
+
+#[derive(Debug)]
+struct SelectiveMemberReferenceTarget {
+    definition: Location,
+    /// Every source spelling that may resolve to `definition`: the exported
+    /// member name plus attached/renamed local aliases from all importers.
+    candidate_names: HashSet<String>,
+}
+
+fn goto_definition_location(state: &WorldState, uri: &Url, position: Position) -> Option<Location> {
+    match goto_definition(state, uri, position)? {
+        GotoDefinitionResponse::Scalar(location) => Some(location),
+        GotoDefinitionResponse::Array(locations) => locations.into_iter().next(),
+        GotoDefinitionResponse::Link(_) => None,
+    }
+}
+
+fn reference_search_uris(state: &WorldState, current: &Url) -> Vec<Url> {
+    let mut seen = HashSet::new();
+    let mut uris = Vec::new();
+    for uri in std::iter::once(current.clone())
+        .chain(state.documents.uris())
+        .chain(state.workspace_index.iter().into_iter().map(|(uri, _)| uri))
+    {
+        if seen.insert(uri.clone()) {
+            uris.push(uri);
+        }
+    }
+    uris
+}
+
+fn lower_static_box_import(
+    importer_uri: &Url,
+    import: &crate::box_use::BoxImport,
+) -> Option<crate::selective_import::SelectiveImportRequest> {
+    let source = import.resolved_source()?;
+    Some(import.lower(importer_uri, source))
+}
+
+/// Resolve a named or renamed attachment declaration token to the exported
+/// member's original definition. Both sides of `local = exported` participate:
+/// the local side declares the imported binding, while the exported side names
+/// the source member. Wildcards have no member-specific token.
+fn selective_attachment_declaration_definition(
+    state: &WorldState,
+    uri: &Url,
+    node: Node,
+    text: &str,
+) -> Option<Location> {
+    let (argument, call) = enclosing_box_declaration_argument(node, text)?;
+    if !crate::box_use::detect::is_box_use_call(call, text) {
+        return None;
+    }
+    let value = argument.child_by_field_name("value")?;
+    let raw = &text[value.byte_range()];
+    let attach_start = raw.find('[')?;
+    if node.start_byte() <= value.start_byte().saturating_add(attach_start) {
+        return None;
+    }
+
+    let value_start = ts_point_to_lsp_position(text, value.start_position());
+    let content_provider = state.content_provider();
+    let metadata = content_provider.get_metadata(uri)?;
+    let import = metadata
+        .box_imports
+        .iter()
+        .find(|import| import.line == value_start.line && import.column == value_start.character)?;
+    let request = lower_static_box_import(uri, import)?;
+    let identity = crate::box_use::detect::attachment_token_identity(value, node, text)?;
+    let local = identity.local;
+
+    let get_artifacts = |target_uri: &Url| content_provider.get_artifacts(target_uri);
+    let get_metadata = |target_uri: &Url| content_provider.get_metadata(target_uri);
+    let env = crate::box_use::ArtifactModuleExportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        Some(&state.package_library),
+    );
+    let resolver = crate::box_use::resolve::ImportResolver::new(&env);
+    request
+        .resolve(&resolver)
+        .bindings
+        .into_iter()
+        .find(|binding| !binding.is_namespace && binding.local == local)
+        .and_then(|binding| binding.provenance)
+        .map(|provenance| member_provenance_location(&provenance))
+}
+
+/// Classify a go-to-definition target as a selective-import member identity.
+///
+/// This deliberately scans canonical import metadata instead of inferring
+/// identity from the member's spelling. It therefore unifies namespace access,
+/// named/wildcard attach, renamed attach, and re-export chains while excluding
+/// unrelated workspace members with the same name. Package members have no
+/// file provenance and remain on Raven's existing name-based path.
+fn selective_member_reference_target(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    cursor_location: Location,
+    cursor_definition: Option<Location>,
+) -> Option<SelectiveMemberReferenceTarget> {
+    // A definition token can resolve to an unrelated same-name workspace symbol
+    // through ordinary scope lookup. Its own exact range is authoritative here;
+    // canonical import provenance below still has to confirm that it is actually
+    // exported through a selective import.
+    let definition = cursor_definition
+        .or_else(|| goto_definition_location(state, uri, position))
+        .unwrap_or(cursor_location);
+    if definition.uri.as_str().starts_with("package:") {
+        return None;
+    }
+
+    let content_provider = state.content_provider();
+    let get_artifacts = |target_uri: &Url| content_provider.get_artifacts(target_uri);
+    let get_metadata = |target_uri: &Url| content_provider.get_metadata(target_uri);
+    let env = crate::box_use::ArtifactModuleExportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        Some(&state.package_library),
+    );
+    let resolver = crate::box_use::resolve::ImportResolver::new(&env);
+    let mut candidate_names = HashSet::new();
+
+    for importer_uri in reference_search_uris(state, uri) {
+        let Some(metadata) = content_provider.get_metadata(&importer_uri) else {
+            continue;
+        };
+        for import in &metadata.box_imports {
+            let Some(request) = lower_static_box_import(&importer_uri, import) else {
+                continue;
+            };
+            let resolved = request.resolve(&resolver);
+
+            if request.namespace.is_some() {
+                for member in &resolved.exports.members {
+                    let provenance = crate::selective_import::ImportEnv::member_provenance(
+                        &resolver,
+                        &request.source,
+                        member,
+                    );
+                    if provenance.as_ref().is_some_and(|provenance| {
+                        member_provenance_location(provenance) == definition
+                    }) {
+                        candidate_names.insert(member.clone());
+                    }
+                }
+            }
+
+            for binding in &resolved.bindings {
+                if binding.is_namespace {
+                    continue;
+                }
+                if binding
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|provenance| member_provenance_location(provenance) == definition)
+                {
+                    candidate_names.insert(binding.local.clone());
+                    for attach in &request.attach {
+                        match attach {
+                            crate::selective_import::AttachBinding::Named(exported)
+                                if exported == &binding.local =>
+                            {
+                                candidate_names.insert(exported.clone());
+                            }
+                            crate::selective_import::AttachBinding::Renamed { local, exported }
+                                if local == &binding.local =>
+                            {
+                                candidate_names.insert(exported.clone());
+                            }
+                            crate::selective_import::AttachBinding::Wildcard => {
+                                candidate_names.insert(binding.local.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (!candidate_names.is_empty()).then_some(SelectiveMemberReferenceTarget {
+        definition,
+        candidate_names,
+    })
+}
+
+fn member_provenance_location(provenance: &crate::selective_import::MemberProvenance) -> Location {
+    Location {
+        uri: provenance.uri.clone(),
+        range: Range::new(
+            Position::new(provenance.line, provenance.column),
+            Position::new(
+                provenance.line,
+                provenance.end_column.max(provenance.column),
+            ),
+        ),
+    }
+}
+
 pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<Vec<Location>> {
     // Use ContentProvider for unified access
     let content_provider = state.content_provider();
@@ -23058,6 +23561,41 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     });
     let mut locations = Vec::new();
 
+    // Selective imports carry true per-member definition provenance. Once the
+    // cursor resolves to one of those members, switch from the legacy
+    // workspace-wide name pool to definition identity. This is intentionally
+    // selective-import-only: ordinary `$`/`@` structural references retain their
+    // established name-based behavior.
+    let cursor_location = Location {
+        uri: uri.clone(),
+        range: Range {
+            start: ts_point_to_lsp_position(&text, node.start_position()),
+            end: ts_point_to_lsp_position(&text, node.end_position()),
+        },
+    };
+    let cursor_definition = if node.kind() == "identifier"
+        && (is_assignment_target(node) || is_destructuring_assignment_target(node, &text))
+    {
+        Some(cursor_location.clone())
+    } else if node.kind() == "identifier" {
+        selective_attachment_declaration_definition(state, uri, node, &text)
+    } else {
+        None
+    };
+    if node.kind() == "identifier"
+        && let Some(target) =
+            selective_namespace_reference_target(state, uri, position, node, name, &text)
+    {
+        collect_selective_namespace_references(state, uri, &target, &mut locations);
+        return Some(locations);
+    }
+    if let Some(target) =
+        selective_member_reference_target(state, uri, position, cursor_location, cursor_definition)
+    {
+        collect_selective_member_references(state, uri, &target, &mut locations);
+        return Some(locations);
+    }
+
     // Search current document
     find_references_in_tree(tree.root_node(), name, &text, uri, &mut locations);
 
@@ -23127,6 +23665,189 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     }
 
     Some(locations)
+}
+
+fn collect_selective_namespace_references(
+    state: &WorldState,
+    current_uri: &Url,
+    target: &SelectiveNamespaceReferenceTarget,
+    locations: &mut Vec<Location>,
+) {
+    for file_uri in reference_search_uris(state, current_uri) {
+        if let Some(document) = state.get_document(&file_uri)
+            && let Some(tree) = &document.tree
+        {
+            let text = document.analysis_text();
+            collect_selective_namespace_references_in_subtree(
+                state,
+                tree.root_node(),
+                &text,
+                &file_uri,
+                target,
+                locations,
+            );
+            continue;
+        }
+
+        let Some(entry) = state.workspace_index.get(&file_uri) else {
+            continue;
+        };
+        let Some(tree) = &entry.tree else {
+            continue;
+        };
+        let raw = entry.contents.to_string();
+        let text = state.analysis_text_for_uri(&file_uri, &raw);
+        collect_selective_namespace_references_in_subtree(
+            state,
+            tree.root_node(),
+            &text,
+            &file_uri,
+            target,
+            locations,
+        );
+    }
+}
+
+fn collect_selective_namespace_references_in_subtree(
+    state: &WorldState,
+    node: Node,
+    text: &str,
+    uri: &Url,
+    target: &SelectiveNamespaceReferenceTarget,
+    locations: &mut Vec<Location>,
+) {
+    if node.kind() == "identifier"
+        && crate::r_names::canonical_use_name(node_text(node, text))
+            == crate::r_names::canonical_use_name(&target.alias)
+    {
+        let position = ts_point_to_lsp_position(text, node.start_position());
+        if selective_namespace_reference_target(
+            state,
+            uri,
+            position,
+            node,
+            node_text(node, text),
+            text,
+        )
+        .as_ref()
+            == Some(target)
+        {
+            locations.push(Location {
+                uri: uri.clone(),
+                range: Range {
+                    start: position,
+                    end: ts_point_to_lsp_position(text, node.end_position()),
+                },
+            });
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_selective_namespace_references_in_subtree(
+            state, child, text, uri, target, locations,
+        );
+    }
+}
+
+fn collect_selective_member_references(
+    state: &WorldState,
+    current_uri: &Url,
+    target: &SelectiveMemberReferenceTarget,
+    locations: &mut Vec<Location>,
+) {
+    for file_uri in reference_search_uris(state, current_uri) {
+        if let Some(document) = state.get_document(&file_uri)
+            && let Some(tree) = &document.tree
+        {
+            let text = document.analysis_text();
+            collect_selective_member_references_in_subtree(
+                state,
+                tree.root_node(),
+                &text,
+                &file_uri,
+                target,
+                locations,
+            );
+            continue;
+        }
+
+        let Some(entry) = state.workspace_index.get(&file_uri) else {
+            continue;
+        };
+        let Some(tree) = &entry.tree else {
+            continue;
+        };
+        let raw = entry.contents.to_string();
+        let text = state.analysis_text_for_uri(&file_uri, &raw);
+        collect_selective_member_references_in_subtree(
+            state,
+            tree.root_node(),
+            &text,
+            &file_uri,
+            target,
+            locations,
+        );
+    }
+}
+
+fn collect_selective_member_references_in_subtree(
+    state: &WorldState,
+    node: Node,
+    text: &str,
+    uri: &Url,
+    target: &SelectiveMemberReferenceTarget,
+    locations: &mut Vec<Location>,
+) {
+    let candidate = if node.kind() == "identifier" {
+        let raw = node_text(node, text);
+        let canonical = unquote_backtick_name(raw).unwrap_or(raw);
+        target
+            .candidate_names
+            .iter()
+            .any(|name| unquote_backtick_name(name).unwrap_or(name) == canonical)
+            .then(|| {
+                let mut position = ts_point_to_lsp_position(text, node.start_position());
+                if unquote_backtick_name(raw).is_some() {
+                    position.character = position.character.saturating_add(1);
+                }
+                position
+            })
+    } else if node.kind() == "string" {
+        crate::qualified_resolve::string_subscript_value(node, text).and_then(|value| {
+            target.candidate_names.contains(value).then(|| {
+                let mut position = ts_point_to_lsp_position(text, node.start_position());
+                position.character = position.character.saturating_add(1);
+                position
+            })
+        })
+    } else {
+        None
+    };
+
+    if let Some(position) = candidate {
+        let location = Location {
+            uri: uri.clone(),
+            range: Range {
+                start: ts_point_to_lsp_position(text, node.start_position()),
+                end: ts_point_to_lsp_position(text, node.end_position()),
+            },
+        };
+        let declaration_definition = matches!(node.kind(), "identifier" | "string")
+            .then(|| selective_attachment_declaration_definition(state, uri, node, text))
+            .flatten();
+        if location == target.definition
+            || declaration_definition.as_ref() == Some(&target.definition)
+            || goto_definition_location(state, uri, position).as_ref() == Some(&target.definition)
+        {
+            locations.push(location);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_selective_member_references_in_subtree(state, child, text, uri, target, locations);
+    }
 }
 
 fn find_references_in_tree(
@@ -23475,6 +24196,157 @@ fn hover_blocking(state: &WorldState, uri: &Url, position: Position) -> Option<H
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn box_fixture_diagnostics(
+        module_filename: Option<&str>,
+        module_code: &str,
+        importer_code: &str,
+    ) -> Vec<Diagnostic> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let importer_path = temp.path().join("main.R");
+        std::fs::write(&importer_path, importer_code).expect("write importer");
+        if let Some(filename) = module_filename {
+            std::fs::write(temp.path().join(filename), module_code).expect("write module");
+        }
+
+        let importer_uri = Url::from_file_path(&importer_path).expect("importer uri");
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.open_document(importer_uri.clone(), importer_code, Some(1));
+        let mut importer_meta = crate::cross_file::extract_metadata(importer_code);
+        crate::cross_file::enrich_box_import_resolutions(&mut importer_meta, &importer_uri);
+        state
+            .cross_file_graph
+            .update_file(&importer_uri, &importer_meta, None, |_| None);
+
+        if let Some(filename) = module_filename {
+            let module_uri = Url::from_file_path(temp.path().join(filename)).expect("module uri");
+            state.open_document(module_uri.clone(), module_code, Some(1));
+            let module_meta = crate::cross_file::extract_metadata(module_code);
+            state
+                .cross_file_graph
+                .update_file(&module_uri, &module_meta, None, |_| None);
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &importer_uri).expect("snapshot");
+        diagnostics_from_snapshot(&snapshot, &importer_uri, &DiagCancelToken::never())
+            .expect("diagnostics")
+    }
+
+    #[test]
+    fn box_diagnostics_require_authoritative_absence() {
+        let explicit = box_fixture_diagnostics(
+            Some("mod.r"),
+            "box::export(public)\npublic <- 1\nprivate <- 2\n",
+            "box::use(./mod[private])\n",
+        );
+        let absent = explicit
+            .iter()
+            .find(|diag| {
+                diag.code.as_ref().is_some_and(|code| {
+                    code == &NumberOrString::String(
+                        crate::diagnostic_code::BOX_EXPORT_NOT_FOUND.to_string(),
+                    )
+                })
+            })
+            .expect("complete explicit export set proves absence");
+        assert_eq!(absent.range.start, Position::new(0, 15));
+        assert_eq!(absent.range.end, Position::new(0, 22));
+
+        let multiline = box_fixture_diagnostics(
+            Some("mod.r"),
+            "box::export(public)\npublic <- 1\n",
+            "box::use(\n  ./mod[\n    first_missing,\n    renamed = second_missing,\n    first_missing\n  ]\n)\n",
+        );
+        let mut missing = multiline
+            .iter()
+            .filter(|diag| {
+                diag.code.as_ref()
+                    == Some(&NumberOrString::String(
+                        crate::diagnostic_code::BOX_EXPORT_NOT_FOUND.to_string(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+        missing.sort_by_key(|diag| diag.range.start.line);
+        assert_eq!(missing.len(), 2, "repeated missing members deduplicate");
+        assert_eq!(
+            missing[0].range,
+            Range::new(Position::new(2, 4), Position::new(2, 17))
+        );
+        assert_eq!(
+            missing[1].range,
+            Range::new(Position::new(3, 14), Position::new(3, 28))
+        );
+
+        let legacy =
+            box_fixture_diagnostics(Some("mod.r"), "public <- 1\n", "box::use(./mod[private])\n");
+        assert!(
+            legacy.iter().all(|diag| {
+                diag.code.as_ref()
+                    != Some(&NumberOrString::String(
+                        crate::diagnostic_code::BOX_EXPORT_NOT_FOUND.to_string(),
+                    ))
+            }),
+            "partial legacy exports must not prove a selected non-dot member absent: {legacy:?}"
+        );
+
+        let legacy_private = box_fixture_diagnostics(
+            Some("mod.r"),
+            ".private <- 1\npublic <- 2\n",
+            "box::use(./mod[.private])\n",
+        );
+        assert!(legacy_private.iter().any(|diag| {
+            diag.code.as_ref()
+                == Some(&NumberOrString::String(
+                    crate::diagnostic_code::BOX_EXPORT_NOT_FOUND.to_string(),
+                ))
+        }));
+    }
+
+    #[test]
+    fn box_diagnostics_report_missing_and_case_mismatched_modules() {
+        let missing = box_fixture_diagnostics(None, "", "box::use(./missing)\n");
+        assert!(missing.iter().any(|diag| {
+            diag.code.as_ref()
+                == Some(&NumberOrString::String(
+                    crate::diagnostic_code::BOX_MODULE_NOT_FOUND.to_string(),
+                ))
+        }));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let differently_cased = temp.path().join("Mod.r");
+        std::fs::write(&differently_cased, "x <- 1\n").expect("write module");
+        // Case-insensitive filesystems make `mod.r` an exact filesystem lookup;
+        // the portability diagnostic is observable only when both spellings are
+        // distinguishable.
+        if !temp.path().join("mod.r").exists() {
+            let importer_path = temp.path().join("main.R");
+            let importer_code = "box::use(./mod)\n";
+            std::fs::write(&importer_path, importer_code).expect("write importer");
+            let importer_uri = Url::from_file_path(&importer_path).expect("importer uri");
+            let module_uri = Url::from_file_path(&differently_cased).expect("module uri");
+            let mut state = WorldState::new();
+            state.workspace_scan_complete = true;
+            state.open_document(importer_uri.clone(), importer_code, Some(1));
+            state.open_document(module_uri, "x <- 1\n", Some(1));
+            let snapshot = DiagnosticsSnapshot::build(&state, &importer_uri).expect("snapshot");
+            let diagnostics =
+                diagnostics_from_snapshot(&snapshot, &importer_uri, &DiagCancelToken::never())
+                    .expect("diagnostics");
+            assert!(diagnostics.iter().any(|diag| {
+                diag.code.as_ref()
+                    == Some(&NumberOrString::String(
+                        crate::diagnostic_code::BOX_MODULE_CASE_MISMATCH.to_string(),
+                    ))
+            }));
+            assert!(diagnostics.iter().all(|diag| {
+                diag.code.as_ref()
+                    != Some(&NumberOrString::String(
+                        crate::diagnostic_code::BOX_MODULE_NOT_FOUND.to_string(),
+                    ))
+            }));
+        }
+    }
 
     #[test]
     fn contextual_divergence_disables_standalone_cache_even_without_extras() {
@@ -61001,7 +61873,7 @@ source(\"helpers.R\")
 
         let tree = parse_r_code(code);
         let node = nth_identifier_named(&tree, code, name, occurrence);
-        let actual = is_structural_non_reference(node);
+        let actual = is_structural_non_reference(node, code);
         let parent_kind = node.parent().map(|p| p.kind().to_string());
         assert_eq!(
             actual, expected,
@@ -61049,6 +61921,28 @@ source(\"helpers.R\")
     fn test_is_structural_non_reference_positional_argument_is_reference() {
         // `n` in `f(n)` is a positional argument value — a real reference.
         check_predicate("f(n)\n", "n", 0, false);
+    }
+
+    #[test]
+    fn test_is_structural_non_reference_static_box_declarations() {
+        let use_code = "box::use(./mod[attached = public, computed()])\n";
+        check_predicate(use_code, "mod", 0, true);
+        check_predicate(use_code, "attached", 0, true);
+        check_predicate(use_code, "public", 0, true);
+        check_predicate(use_code, "computed", 0, false);
+
+        let repeated = "box::use(pkg[x, computed(x)])\n";
+        check_predicate(repeated, "x", 0, true);
+        check_predicate(repeated, "x", 1, false);
+
+        check_predicate("box::export(public)\n", "public", 0, true);
+        check_predicate("box::export(computed())\n", "computed", 0, false);
+        check_predicate(
+            "f <- function() box::export(not_module_export)\n",
+            "not_module_export",
+            0,
+            false,
+        );
     }
 
     #[test]
