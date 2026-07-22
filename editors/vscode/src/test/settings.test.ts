@@ -88,6 +88,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.indexWorkspace', jsonPath: ['crossFile', 'indexWorkspace'], type: 'boolean' },
     { vsCodeKey: 'crossFile.maxRevalidationsPerTrigger', jsonPath: ['crossFile', 'maxRevalidationsPerTrigger'], type: 'number' },
     { vsCodeKey: 'crossFile.revalidationDebounceMs', jsonPath: ['crossFile', 'revalidationDebounceMs'], type: 'number' },
+    { vsCodeKey: 'crossFile.editedFileDebounceMs', jsonPath: ['crossFile', 'editedFileDebounceMs'], type: 'number' },
     // Cross-file severity settings
     { vsCodeKey: 'crossFile.missingFileSeverity', jsonPath: ['crossFile', 'missingFileSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
     { vsCodeKey: 'crossFile.caseMismatchSeverity', jsonPath: ['crossFile', 'caseMismatchSeverity'], type: 'enum', enumValues: ['auto', 'error', 'warning', 'information', 'info', 'hint', 'off'] as const },
@@ -991,6 +992,7 @@ suite('Settings Transmission Unit Tests', () => {
         const configuredSettings = new Map<string, unknown>([
             ['crossFile.maxRevalidationsPerTrigger', 25],
             ['crossFile.revalidationDebounceMs', 500],
+            ['crossFile.editedFileDebounceMs', 150],
         ]);
 
         const mockConfig = createMockConfig(configuredSettings);
@@ -998,6 +1000,7 @@ suite('Settings Transmission Unit Tests', () => {
 
         assert.strictEqual(options.crossFile?.maxRevalidationsPerTrigger, 25);
         assert.strictEqual(options.crossFile?.revalidationDebounceMs, 500);
+        assert.strictEqual(options.crossFile?.editedFileDebounceMs, 150);
     });
 
     /**

@@ -47,13 +47,6 @@ const LSP_INIT_ONLY_SETTINGS = {
     description:
       "Hoist global definitions inside function bodies so callers see late-binding semantics across files.",
   },
-  "raven.crossFile.editedFileDebounceMs": {
-    type: "number",
-    default: 50,
-    minimum: 0,
-    description:
-      "Debounce delay (ms) for re-running diagnostics on the actively-edited file.",
-  },
 };
 
 // First path segment (after `raven.`) → feature doc. The narrative pages

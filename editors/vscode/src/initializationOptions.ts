@@ -63,6 +63,7 @@ export interface RavenInitializationOptions {
         indexWorkspace?: boolean;
         maxRevalidationsPerTrigger?: number;
         revalidationDebounceMs?: number;
+        editedFileDebounceMs?: number;
         missingFileSeverity?: SeverityLevel;
         caseMismatchSeverity?: SeverityLevel | "auto";
         circularDependencySeverity?: SeverityLevel;
@@ -201,6 +202,7 @@ export function getInitializationOptions(
     const indexWorkspace = getExplicitSetting<boolean>(config, 'crossFile.indexWorkspace');
     const maxRevalidationsPerTrigger = getExplicitSetting<number>(config, 'crossFile.maxRevalidationsPerTrigger');
     const revalidationDebounceMs = getExplicitSetting<number>(config, 'crossFile.revalidationDebounceMs');
+    const editedFileDebounceMs = getExplicitSetting<number>(config, 'crossFile.editedFileDebounceMs');
     const missingFileSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.missingFileSeverity');
     const caseMismatchSeverity = getExplicitSetting<SeverityLevel | "auto">(config, 'crossFile.caseMismatchSeverity');
     const circularDependencySeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.circularDependencySeverity');
@@ -253,6 +255,7 @@ export function getInitializationOptions(
         indexWorkspace !== undefined ||
         maxRevalidationsPerTrigger !== undefined ||
         revalidationDebounceMs !== undefined ||
+        editedFileDebounceMs !== undefined ||
         missingFileSeverity !== undefined ||
         caseMismatchSeverity !== undefined ||
         circularDependencySeverity !== undefined ||
@@ -289,6 +292,9 @@ export function getInitializationOptions(
         }
         if (revalidationDebounceMs !== undefined) {
             options.crossFile.revalidationDebounceMs = revalidationDebounceMs;
+        }
+        if (editedFileDebounceMs !== undefined) {
+            options.crossFile.editedFileDebounceMs = editedFileDebounceMs;
         }
         if (missingFileSeverity !== undefined) {
             options.crossFile.missingFileSeverity = missingFileSeverity;
