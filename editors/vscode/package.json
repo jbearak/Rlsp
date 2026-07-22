@@ -1151,6 +1151,12 @@
           "minimum": 0,
           "description": "Debounce delay in milliseconds before triggering cross-file revalidation after a file change. Higher values reduce CPU usage during rapid editing but delay diagnostic updates."
         },
+        "raven.crossFile.editedFileDebounceMs": {
+          "type": "number",
+          "default": 50,
+          "minimum": 0,
+          "description": "Debounce delay in milliseconds before re-running diagnostics on the actively-edited file. Lower values give faster feedback; higher values (e.g. 200) wait until you pause typing before showing new squiggles."
+        },
         "raven.crossFile.missingFileSeverity": {
           "type": "string",
           "enum": [
