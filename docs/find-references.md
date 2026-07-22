@@ -40,7 +40,7 @@ If you need a result scoped to one ordinary symbol's definition, use [Go-to-Defi
 
 ### Selective-import member identity
 
-For a resolved local-module member imported through static [`box::use()`](cross-file.md#box-module-imports-boxuse) or a supported [`import::` call](cross-file.md#import-package-selective-imports), Raven starts from the original definition and keeps only occurrences that resolve to that exact identity. The result can include namespace access through `$`, `@`, or literal `[["name"]]` where the syntax supports it, named/wildcard attachments, renamed local bindings, re-export chains, and the underlying definition in open or workspace-indexed files.
+For a resolved local-module member imported through static [`box::use()`](modules.md#box-modules-boxuse) or a supported [`import::` call](modules.md#import-package-importfrom), Raven starts from the original definition and keeps only occurrences that resolve to that exact identity. The result can include namespace access through `$`, `@`, or literal `[["name"]]` where the syntax supports it, named/wildcard attachments, renamed local bindings, re-export chains, and the underlying definition in open or workspace-indexed files.
 
 Selected installed-package members have no navigable source definition, so Raven instead preserves the exact `(package, exported name)` identity. Renamed declaration tokens and uses remain linked to the original export, while unrelated local bindings or imports from another package with the same spelling are excluded. Ordinary non-selective structural references retain the broad pooling described above.
 

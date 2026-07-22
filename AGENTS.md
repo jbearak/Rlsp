@@ -15,6 +15,7 @@ All three block merge. Fix the underlying issue rather than suppressing it; when
 User-facing:
 - `README.md`
 - `docs/cross-file.md`
+- `docs/modules.md`
 - `docs/r-package-dev.md`
 - `docs/rprofile.md`
 - `docs/package-database.md`

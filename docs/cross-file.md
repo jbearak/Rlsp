@@ -488,39 +488,18 @@ code fail closed.
 
 #### Static `tar_map()` names
 
-For `tar_map()`, Raven records only the generated declarations that exist at
-runtime; the unsuffixed target objects supplied through `...` are not separate
-pipeline targets. Generated declarations are predicted only for a bounded
-literal table grammar:
-
-- `values` is a literal `list()`, `data.frame()`, or `tibble()` call (including
-  the corresponding direct namespace-qualified constructor);
-- every column is explicitly and uniquely named and contains scalar literals or
-  an unshadowed literal `c(...)` vector of strings, integers, booleans, or simple
-  decimal numbers whose R character spelling is unambiguous; constructor controls
-  such as `data.frame(check.names = ...)` and `tibble(.name_repair = ...)` fail
-  closed;
-- scalar columns may recycle, while non-scalar column lengths must agree;
-- target-definition objects may be unnamed or named arguments in `...`; exact
-  formal matching is applied before deciding which arguments belong to dots;
-- `names` is omitted, one column identifier, `c(column, ...)`, or an unshadowed
-  `everything()` (the qualified `tidyselect::everything()` form is always
-  authoritative); and
-- `delimiter` is omitted or one non-empty ASCII string literal.
-
-A base target name that collides with a values-table column is rejected, matching
-`tar_map()`'s runtime validation. Raven mirrors tarchetypes' quote stripping,
-`make.unique(..., sep = delimiter)`, and the ASCII subset of `make.names()`. The
-whole expansion is transactional: if any selected suffix or generated target
-name is not reproducible, Raven contributes no generated declarations or nested
-report links. A reference to a generated name navigates to the base target-name
-token because the generated spelling does not occur in source.
-
-Dynamic tables/selections/delimiters, empty selections (the runtime hash
-fallback), non-ASCII generated spellings, incompatible lengths, arbitrary
-metaprogramming, and replication/dynamic-branching factories are not predicted.
-Unsupported `tar_map()` name generation contributes no base or generated target
-declaration.
+`tar_map()` generates one set of targets per row of a value table. Raven
+predicts those generated names when the table and selection are **literal and
+statically resolvable** — a literal `list()` / `data.frame()` / `tibble()` with
+named scalar or literal-vector columns, a static column selection, and a literal
+delimiter — reproducing tarchetypes' own name mangling. A reference to a
+generated name navigates to the base target token, since the generated spelling
+never appears in source. Expansion is all-or-nothing: if any generated name is
+not statically reproducible, Raven expands none of them, and the unsuffixed
+target objects passed through `...` are not themselves pipeline targets. Dynamic
+tables, selections, or delimiters — and the runtime-hash fallback for an empty
+selection — are left unexpanded. The exact grammar and its edge cases are in
+[Limitations — targets and tarchetypes](limitations.md#targets-and-tarchetypes).
 
 #### Connected R Markdown and Quarto documents
 
@@ -562,148 +541,13 @@ Raven watches `.libPaths()` directories and invalidates caches when packages are
 
 See [Configuration](configuration.md) for watcher settings (`packages.watchLibraryPaths`, `packages.watchDebounceMs`).
 
-## box module imports (`box::use`)
+## Module & import systems
 
-Raven understands the [box](https://klmr.me/box/) module system's `box::use()`
-imports and `box::export()` / `#' @export` interface declarations. box is
-modelled as its own kind of cross-file relationship — a **selective import** —
-which is deliberately distinct from both a package `library()` load and an
-ordinary `source()` edge:
-
-- Unlike `library(pkg)`, a box import never dumps a package's whole export set
-  in as bare names. It binds a **namespace object** (used as `alias$member`)
-  and/or an explicitly listed subset of members.
-- Unlike `source("file.R")`, a box module import does **not** merge the target
-  file's top-level definitions into the importer, does not propagate
-  `# raven: nse` / `# raven: func`, and never takes part in the backward
-  parent-prefix walk. Only the target's **exported** names cross the boundary,
-  and only under the names the import requests.
-
-### Supported import forms
-
-```r
-box::use(
-  dplyr,                 # bind the `dplyr` namespace  -> dplyr$filter(...)
-  dr = dplyr,            # ... under an explicit alias -> dr$filter(...)
-  dplyr[filter, select], # attach `filter`, `select` directly (no namespace)
-  dplyr[f = filter],     # attach dplyr's `filter` under the local name `f`
-  dplyr[...],            # attach every export
-  ./helpers,             # local module: helpers.r / helpers/__init__.r
-  ../lib/util[foo],      # attach `foo` from ../lib/util
-)
-```
-
-- A **bare name** is an installed package; a **local module** *must* begin with
-  `./` or `../`. Both top-level and function-scoped `box::use()` calls are
-  recognised, as is the `box:::use()` spelling.
-- The **default namespace alias** is the final path/package component
-  (`../lib/util` binds `util`); `alias = spec` overrides it.
-- An **attach-only** spec (`pkg[a, b]`, `pkg[...]`) binds no namespace object
-  unless you also write an explicit `alias = pkg[...]`.
-
-### Local module path resolution
-
-Local module paths resolve **relative to the importing file's own directory**
-and intentionally ignore `# raven: cd`, the implicit testthat/testit working
-directory, and the forward workspace-root fallback — none of those apply to
-box. The extension is omitted in the spec; candidates are tried in this order,
-first existing wins:
-
-1. `<path>.r`
-2. `<path>.R`
-3. `<path>/__init__.r`
-4. `<path>/__init__.R`
-
-so a `.r`/`.R` **file module** wins over an `__init__` **package module**, and
-a lowercase extension wins over uppercase, matching box. Resolution is
-**case-sensitive**: a path that exists only under a different case is reported
-as a case mismatch rather than silently corrected.
-
-### Exported interface
-
-A module's exports are determined by, in order of authority:
-
-- `box::export(a, b, c)` — the union of unquoted names across all such calls.
-  `box::export()` with no arguments is an explicit **empty** interface.
-- `#' @export` roxygen tags on top-level definitions, and on top-level
-  `box::use()` imports (which **re-export** the imported names).
-
-If **either** explicit mechanism is present the interface is authoritative, so
-member absence (`module$missingName`) is decidable. If **neither** is present,
-the module falls back to the legacy default — every top-level binding whose name
-does not begin with a dot — which is treated as *non-authoritative* (a missing
-member is not concluded, because a statically-invisible dynamic binding might
-supply it). Names that are private, or merely transitively imported without an
-explicit re-export, never cross the boundary.
-
-### Language intelligence and revalidation
-
-Static box imports participate in the same canonical artifact, scope, package,
-and diagnostic lifecycles as the rest of Raven:
-
-- Imported namespace aliases and attached/renamed members are position-aware,
-  function-scoped when the call is inside a function, and available to
-  diagnostics, completion, hover, signatures, and go-to-definition.
-- Namespace-member completion and navigation understand `$`, `@`, and a single
-  positional literal-string `[[...]]` subscript. Local-module members navigate
-  to their original definitions through named, renamed, and wildcard
-  re-exports. Installed-package members use Raven's package export metadata but
-  do not fabricate source-file navigation.
-- Find-references for a resolved selective member follows definition identity
-  across namespace access, attached names, renames, and indexed importers,
-  rather than pooling unrelated same-named members. Ordinary non-box references
-  keep Raven's broad name-based behavior.
-- Local module imports add a selective dependency edge. Export/import interface
-  edits revalidate dependents, but the edge never lends ordinary `source()`
-  scope and never propagates `# raven: nse` / `# raven: func` declarations.
-- Missing local modules, case-only mismatches, missing installed packages, and
-  names absent from a complete export set produce diagnostics. Partial or
-  unknown export metadata never proves absence.
-
-The same model is used for open files, closed workspace-indexed files, excluded
-open documents, the language server, and `raven check`. The `/` in a box spec
-remains exempt from the `infix_spaces` lint, while ordinary `/` expressions keep
-their existing parsing and lint behavior.
-
-Raven does not execute module code or hooks, evaluate dynamic `box.path`
-configuration, search user-global/remote module locations, or guess computed
-imports. Unsupported forms fail conservatively — they neither bind names nor
-emit misleading diagnostics. See
-[Limitations](limitations.md#box-module-system-boxuse) for the exact static
-boundary.
-
-## import package selective imports
-
-Raven recognizes static double-colon `import::from()`, `import::here()`, and
-`import::into()` calls. Package sources use Raven's package export snapshots.
-Literal `.R`/`.r` sources are private script modules resolved with Raven's
-forward path context; a literal `.directory` is supported. The extension is
-part of the source and no box-style candidate names are inferred.
-
-Explicit names and `local = exported` aliases are supported. `.all = TRUE` adds
-known exports, `.all = FALSE` disables that expansion, and a nonempty static
-`.except` implies `.all` unless explicitly disabled. Exclusions compare the
-exported/source name, so excluding an export also removes its explicit alias.
-An explicit alias plus `.all` does not additionally attach the bare export.
-Imports otherwise follow R's sequential assignment behavior: if a different
-later export from `.all` targets the same local name, that later binding wins.
-
-`here()` contributes to the current lexical environment from the call position;
-inside a function its effect stays in that function. `from()` uses the lower-
-priority `"imports"` destination by default, and literal named `.into`/`into()`
-destinations are supported. These are fallback bindings below lexical/current-
-environment bindings, not namespace objects, and never enable `$` access.
-
-A script module's candidate interface is its partial live private top-level
-environment, including dotted names and top-level `import::here()` bindings.
-Synthetic `.packageName` and `__last_modified__` names are excluded. Box export
-markers do not govern `{import}` modules. Local relationships use non-lending
-`SelectiveModule` edges, so edits revalidate importers without ordinary scope or
-NSE lending.
-
-Dynamic `.character_only`, computed sources/options/destinations, URL/pins
-modules, environment-valued destinations, detach simulation, and `import:::`
-calls are outside this first phase and remain inert.
+The `box` and `import` packages define selective-import systems that Raven
+models distinctly from `source()` and `library()` — binding only the names an
+import requests rather than merging a file's definitions or attaching a whole
+package. They are documented separately in
+[Module & import systems](modules.md).
 
 ## NSE directive propagation
 

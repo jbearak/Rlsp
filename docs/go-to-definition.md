@@ -87,7 +87,7 @@ See [Cross-File Awareness](cross-file.md#automatic-source-detection) and [Direct
 
 ### box module paths and exports
 
-Cmd-click on a static relative [`box::use()` module spec](cross-file.md#box-module-imports-boxuse) opens the exact resolved module. box path resolution is file-relative and case-sensitive, ignores Raven's `source()` working-directory/fallback rules, and checks `path.r`, `path.R`, `path/__init__.r`, then `path/__init__.R`.
+Cmd-click on a static relative [`box::use()` module spec](modules.md#box-modules-boxuse) opens the exact resolved module. box path resolution is file-relative and case-sensitive, ignores Raven's `source()` working-directory/fallback rules, and checks `path.r`, `path.R`, `path/__init__.r`, then `path/__init__.R`.
 
 For namespace aliases and attached/renamed bindings, navigation crosses only the exported interface. `$`, `@`, and a single positional literal-string `[[...]]` access resolve to the original local-module definition, following named, renamed, or wildcard re-export chains with cycle guards. Private names and merely transitive imports do not navigate. Installed-package box imports reuse package export metadata but remain non-navigable for the same reason as other installed package exports.
 
