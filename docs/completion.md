@@ -57,7 +57,7 @@ Inside a `pkg::` expression no other completions are offered (keywords, local sy
 
 ### box Namespace and Attached Completions
 
-A static [`box::use()` import](cross-file.md#box-module-imports-boxuse) contributes only the bindings it requests. A namespace import offers known exported members after `$` or `@`; a literal `[["member"]]` access resolves the same member for hover/navigation. Selective and renamed attachments appear as bare-name completions under their local names, and wildcard attachment expands the known export set.
+A static [`box::use()` import](modules.md#box-modules-boxuse) contributes only the bindings it requests. A namespace import offers known exported members after `$` or `@`; a literal `[["member"]]` access resolves the same member for hover/navigation. Selective and renamed attachments appear as bare-name completions under their local names, and wildcard attachment expands the known export set.
 
 ```r
 box::use(./model, ./format[render, fmt = format_value])

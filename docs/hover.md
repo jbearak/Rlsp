@@ -38,7 +38,7 @@ Each step takes the first hit and stops; steps 3–5 never run once a match is f
 
 ### box module members
 
-Static [`box::use()` imports](cross-file.md#box-module-imports-boxuse) are resolved before ordinary structural-member scanning. Hover on an exported local-module member follows exact definition provenance through named, renamed, and wildcard re-exports, including when the defining module is closed but workspace-indexed. Private members and members proven absent from a complete export set produce no hover. Partial/unknown export metadata remains conservative. Installed-package imports use Raven's package metadata and help attribution, but Raven does not invent a source-file location for installed code.
+Static [`box::use()` imports](modules.md#box-modules-boxuse) are resolved before ordinary structural-member scanning. Hover on an exported local-module member follows exact definition provenance through named, renamed, and wildcard re-exports, including when the defining module is closed but workspace-indexed. Private members and members proven absent from a complete export set produce no hover. Partial/unknown export metadata remains conservative. Installed-package imports use Raven's package metadata and help attribution, but Raven does not invent a source-file location for installed code.
 
 ## File Location Lines
 

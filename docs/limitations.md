@@ -13,7 +13,7 @@ Raven is under active development. The gaps below reflect features that exist in
 
 ## box module system (`box::use`)
 
-Raven models the statically analyzable subset of the [box](https://klmr.me/box/) module system across diagnostics, completion, hover, go-to-definition, find-references, dependency revalidation, the language server, and `raven check`. See [Cross-File & Package Awareness — box module imports](./cross-file.md#box-module-imports-boxuse).
+Raven models the statically analyzable subset of the [box](https://klmr.me/box/) module system across diagnostics, completion, hover, go-to-definition, find-references, dependency revalidation, the language server, and `raven check`. See [Module & import systems — box modules](./modules.md#box-modules-boxuse).
 
 **Only static `box::use()` is recognised.** The call must be a literal `box::use(...)` / `box:::use(...)`. Programmatic invocation — `do.call(box::use, ...)`, aliasing `box::use` to another name, or building the argument list at runtime — is not recognised.
 
