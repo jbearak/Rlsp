@@ -6352,7 +6352,7 @@ async fn replay_open_documents_after_workspace_index_apply(
     // Local-module resolution performs filesystem I/O. Keep it outside every
     // WorldState lock, then generation-check each derived record at commit.
     let expansion_root = workspace_root.clone();
-    prepared = tokio::task::spawn_blocking(move || {
+    prepared = match tokio::task::spawn_blocking(move || {
         for (uri, _, metadata) in &mut prepared {
             crate::cross_file::enrich_selective_import_resolutions(
                 metadata,
@@ -6363,7 +6363,13 @@ async fn replay_open_documents_after_workspace_index_apply(
         prepared
     })
     .await
-    .unwrap_or_default();
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            log::error!("Selective-import enrichment failed during open-document replay: {error}");
+            Vec::new()
+        }
+    };
 
     let mut state = state_arc.write().await;
     let mut source_batch_parents = Vec::new();

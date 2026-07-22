@@ -248,7 +248,10 @@ impl<'a> ArtifactModuleExportEnv<'a> {
                 let Some(request) = import.lower(uri) else {
                     continue;
                 };
-                let resolved = request.resolve(&ImportResolver::new(self));
+                // This walk already owns the provenance recursion guard. Resolve
+                // only export membership and local-name selection here, then
+                // follow the selected source member with the same guard below.
+                let resolved = request.resolve(&ImportResolver::without_provenance(self));
                 let Some(binding) = resolved
                     .bindings
                     .iter()
@@ -256,12 +259,18 @@ impl<'a> ArtifactModuleExportEnv<'a> {
                 else {
                     continue;
                 };
-                if let Some(exported) = binding.exported.as_deref()
-                    && resolved.exports.membership(exported) == Some(false)
-                {
+                let Some(exported) = binding.exported.as_deref() else {
+                    continue;
+                };
+                if resolved.exports.membership(exported) == Some(false) {
                     continue;
                 }
-                let provenance = binding.provenance.clone();
+                let provenance = match &request.source {
+                    ImportSource::Package(_) => None,
+                    ImportSource::LocalModule(source) => {
+                        self.local_member_provenance(&source.uri, exported, visited, depth + 1)
+                    }
+                };
                 if let Some(provenance) = provenance {
                     let order = (import.line, import.column);
                     if best
@@ -372,7 +381,12 @@ impl ModuleExportEnv for ArtifactModuleExportEnv<'_> {
                             // When this file is loaded as an `{import}` script
                             // module, upstream redirects named from()/into()
                             // destinations into the module's private environment.
-                            let resolved = request.resolve(&ImportResolver::new(self));
+                            // Export discovery needs only local names. Avoid
+                            // starting an unrelated provenance walk for every
+                            // binding; exact navigation resolves provenance on
+                            // demand through `local_member_provenance`.
+                            let resolved =
+                                request.resolve(&ImportResolver::without_provenance(self));
                             for binding in resolved.bindings {
                                 if binding.is_namespace {
                                     continue;
@@ -517,12 +531,26 @@ fn resolve_reexport_source(
 /// [`resolve_module_export_set`] (re-exports expanded).
 pub struct ImportResolver<'a> {
     env: &'a dyn ModuleExportEnv,
+    resolve_provenance: bool,
 }
 
 impl<'a> ImportResolver<'a> {
     /// Wrap a [`ModuleExportEnv`].
     pub fn new(env: &'a dyn ModuleExportEnv) -> Self {
-        Self { env }
+        Self {
+            env,
+            resolve_provenance: true,
+        }
+    }
+
+    /// Resolve export membership and binding names without eagerly following
+    /// member provenance. Used by recursive export/provenance walks that either
+    /// do not consume definition sites or must thread their own cycle guard.
+    fn without_provenance(env: &'a dyn ModuleExportEnv) -> Self {
+        Self {
+            env,
+            resolve_provenance: false,
+        }
     }
 }
 
@@ -539,7 +567,9 @@ impl ImportEnv for ImportResolver<'_> {
     }
 
     fn member_provenance(&self, source: &ImportSource, member: &str) -> Option<MemberProvenance> {
-        self.env.member_provenance(source, member)
+        self.resolve_provenance
+            .then(|| self.env.member_provenance(source, member))
+            .flatten()
     }
 }
 
@@ -826,6 +856,52 @@ mod tests {
             assert_eq!(provenance.column, 0);
             assert_eq!(provenance.end_column, 8);
         }
+    }
+
+    #[test]
+    fn import_package_provenance_cycle_reuses_the_active_guard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a_path = dir.path().join("a.R");
+        let b_path = dir.path().join("b.R");
+        let a_code = "import::here(value, .from = \"b.R\")\n";
+        let b_code = "import::here(value, .from = \"a.R\")\nvalue <- function() 1\n";
+        std::fs::write(&a_path, a_code).expect("write a");
+        std::fs::write(&b_path, b_code).expect("write b");
+
+        let mut artifacts = HashMap::new();
+        let mut metadata = HashMap::new();
+        for (path, code) in [(&a_path, a_code), (&b_path, b_code)] {
+            let uri = Url::from_file_path(path).expect("file uri");
+            let document = crate::state::Document::new_with_uri(code, None, &uri);
+            let mut meta = crate::cross_file::extract_metadata(code);
+            crate::cross_file::enrich_selective_import_resolutions(&mut meta, &uri, None);
+            let meta = Arc::new(meta);
+            let artifact = Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
+                &uri,
+                document.tree.as_ref().expect("tree"),
+                code,
+                Some(&meta),
+            ));
+            metadata.insert(uri.clone(), meta);
+            artifacts.insert(uri, artifact);
+        }
+
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let env = ArtifactModuleExportEnv::new(&get_artifacts, &get_metadata, None);
+        let a_uri = Url::from_file_path(&a_path).expect("a uri");
+        let b_uri = Url::from_file_path(&b_path).expect("b uri");
+        let source = ImportSource::LocalModule(LocalModuleIdentity::new(
+            a_uri,
+            LocalModuleDialect::ImportPackage,
+        ));
+
+        let provenance = ModuleExportEnv::member_provenance(&env, &source, "value")
+            .expect("the cycle must terminate at b's own definition");
+        assert_eq!(provenance.uri, b_uri);
+        assert_eq!(provenance.line, 1);
+        assert_eq!(provenance.column, 0);
+        assert_eq!(provenance.end_column, 5);
     }
 
     #[test]

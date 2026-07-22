@@ -1496,6 +1496,59 @@ f(beta = 2)
         assert!(cache.get_package("syntheticPkg::local_alias").is_none());
     }
 
+    #[tokio::test]
+    async fn renamed_box_package_function_uses_exported_cache_key_and_local_display_name() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        state.package_library = Arc::new(PackageLibrary::new_empty());
+        state
+            .package_library
+            .insert_package(PackageInfo::new(
+                "syntheticPkg".to_string(),
+                HashSet::from(["source_member".to_string()]),
+            ))
+            .await;
+
+        let uri = Url::parse("file:///workspace/main.R").unwrap();
+        let code = "box::use(syntheticPkg[local_alias = source_member])\nlocal_alias(\n";
+        state.open_document(uri.clone(), code, Some(1));
+        let cache = SignatureCache::new(10);
+        cache.insert_package(
+            "syntheticPkg::source_member".to_string(),
+            FunctionSignature {
+                name: "source_member".to_string(),
+                parameters: vec![ParameterInfo {
+                    name: "from_source".to_string(),
+                    default_value: None,
+                    is_dots: false,
+                }],
+                source: SignatureSource::RSubprocess {
+                    package: Some("syntheticPkg".to_string()),
+                },
+            },
+        );
+
+        let signature = resolve(
+            &state,
+            &cache,
+            "local_alias",
+            None,
+            false,
+            &uri,
+            tower_lsp::lsp_types::Position::new(1, 12),
+        )
+        .expect("renamed box function must resolve exported cached formals");
+        assert_eq!(signature.name, "local_alias");
+        assert_eq!(signature.parameters[0].name, "from_source");
+        assert!(cache.get_package("syntheticPkg::local_alias").is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn alias_open_test_file_uses_canonical_testthat_scope_for_package_signature() {

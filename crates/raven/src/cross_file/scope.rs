@@ -11677,6 +11677,13 @@ where
         if prefix.symbols.contains_key(name) {
             return true;
         }
+        // Package contribution last among lexical bindings — keeps the streaming
+        // visibility view aligned with the recursive resolver's depth-0
+        // `append_package_contribution`. The out-of-scope diagnostic collector
+        // and any other `is_visible`-only consumers need this fallthrough;
+        // otherwise a contribution-provided name would be misreported as "used
+        // before available" relative to a forward `source()` that happens to
+        // export the same name.
         if self.contribution_symbol_names.contains(name) {
             return true;
         }
@@ -11696,13 +11703,6 @@ where
         {
             return true;
         }
-        // Package contribution last — keeps the streaming visibility view
-        // aligned with the recursive resolver's depth-0
-        // `append_package_contribution`. The out-of-scope diagnostic
-        // collector and any other `is_visible`-only consumers need this
-        // fallthrough; otherwise a contribution-provided name would be
-        // misreported as "used before available" relative to a forward
-        // `source()` that happens to export the same name.
         false
     }
 

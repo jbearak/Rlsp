@@ -24139,6 +24139,7 @@ fn collect_selective_member_references(
             let text = document.analysis_text();
             collect_selective_member_references_in_subtree(
                 state,
+                tree,
                 tree.root_node(),
                 &text,
                 &file_uri,
@@ -24158,6 +24159,7 @@ fn collect_selective_member_references(
         let text = state.analysis_text_for_uri(&file_uri, &raw);
         collect_selective_member_references_in_subtree(
             state,
+            tree,
             tree.root_node(),
             &text,
             &file_uri,
@@ -24169,6 +24171,7 @@ fn collect_selective_member_references(
 
 fn collect_selective_member_references_in_subtree(
     state: &WorldState,
+    tree: &tree_sitter::Tree,
     node: Node,
     text: &str,
     uri: &Url,
@@ -24219,13 +24222,10 @@ fn collect_selective_member_references_in_subtree(
                     || goto_definition_location(state, uri, position).as_ref() == Some(definition)
             }
             SelectiveMemberIdentity::PackageMember { .. } => {
-                crate::parameter_resolver::get_text_and_tree(state, uri)
-                    .and_then(|(_, tree)| {
-                        selective_package_member_identity_at_position(
-                            state, uri, &tree, node, position, text,
-                        )
-                    })
-                    .as_ref()
+                selective_package_member_identity_at_position(
+                    state, uri, tree, node, position, text,
+                )
+                .as_ref()
                     == Some(&target.identity)
             }
         };
@@ -24236,7 +24236,9 @@ fn collect_selective_member_references_in_subtree(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_selective_member_references_in_subtree(state, child, text, uri, target, locations);
+        collect_selective_member_references_in_subtree(
+            state, tree, child, text, uri, target, locations,
+        );
     }
 }
 
