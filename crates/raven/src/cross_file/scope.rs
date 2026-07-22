@@ -2857,6 +2857,12 @@ pub fn compute_artifacts_with_metadata(
     let targets_pipeline_packages: &[super::types::TargetsPackageDeclaration] = metadata
         .map(|m| m.targets_pipeline_packages.as_slice())
         .unwrap_or(&[]);
+    let target_declarations: &[super::types::TargetDeclaration] = metadata
+        .map(|m| m.target_declarations.as_slice())
+        .unwrap_or(&[]);
+    let target_references: &[super::types::TargetReference] = metadata
+        .map(|m| m.target_references.as_slice())
+        .unwrap_or(&[]);
     let declarations = extract_top_level_declarations(&artifacts.timeline);
     // Selective imports (`box::use()`) and this file's own box export set feed
     // the interface hash so import/export/re-export changes revalidate connected
@@ -2874,6 +2880,8 @@ pub fn compute_artifacts_with_metadata(
         &top_level,
         &loaded_packages,
         targets_pipeline_packages,
+        target_declarations,
+        target_references,
         &declared_symbols,
         nse_decls,
         &removal_refs,
@@ -5994,6 +6002,8 @@ fn compute_interface_hash(
     interface: &HashMap<Arc<str>, ScopedSymbol>,
     package_loads: &[PackageLoadKey],
     targets_pipeline_packages: &[super::types::TargetsPackageDeclaration],
+    target_declarations: &[super::types::TargetDeclaration],
+    target_references: &[super::types::TargetReference],
     declared_symbols: &[super::types::DeclaredSymbol],
     nse_declarations: &[super::types::NseDeclaration],
     top_level_removals: &[TopLevelRemoval<'_>],
@@ -6065,6 +6075,34 @@ fn compute_interface_hash(
     sorted_targets_packages.sort_unstable();
     sorted_targets_packages.dedup();
     sorted_targets_packages.hash(&mut hasher);
+
+    // Target declarations form a separate cross-document namespace. Hash the
+    // declaration spelling and source range so renames and generated-name changes
+    // revalidate linked reports even when ordinary R scope is unchanged.
+    let mut sorted_target_declarations: Vec<_> = target_declarations.iter().collect();
+    sorted_target_declarations.sort_by_key(|declaration| {
+        (
+            &declaration.name,
+            declaration.line,
+            declaration.column,
+            declaration.end_column,
+        )
+    });
+    sorted_target_declarations.hash(&mut hasher);
+
+    // Explicit target reads are consumed by connected pipeline/report documents.
+    // Hash source ranges as well as names so moving or renaming a read republishes
+    // the opposite endpoint even when ordinary R scope and graph edges are stable.
+    let mut sorted_target_references: Vec<_> = target_references.iter().collect();
+    sorted_target_references.sort_by_key(|reference| {
+        (
+            &reference.name,
+            reference.line,
+            reference.column,
+            reference.end_column,
+        )
+    });
+    sorted_target_references.hash(&mut hasher);
 
     // Include declared symbols in the hash (sorted for determinism)
     // This ensures cache invalidation when declarations change (Requirements 10.1-10.4)
@@ -13308,6 +13346,60 @@ mod tests {
         assert!(
             affected.contains(&parent),
             "a dependent that sources the edited file must be revalidated on a signature edit"
+        );
+    }
+
+    /// Static target declarations are consumed by connected report documents,
+    /// so a name-only change must invalidate dependents even though it contributes
+    /// no ordinary R binding.
+    #[test]
+    fn interface_hash_changes_when_target_declaration_changes() {
+        let code = "1\n";
+        let tree = parse_r(code);
+        let mut alpha = crate::cross_file::types::CrossFileMetadata::default();
+        alpha.target_declarations = vec![crate::cross_file::types::TargetDeclaration {
+            name: "alpha".to_string(),
+            line: 0,
+            column: 0,
+            end_column: 5,
+        }];
+        let mut beta = alpha.clone();
+        beta.target_declarations[0].name = "beta".to_string();
+
+        let alpha_hash =
+            compute_artifacts_with_metadata(&test_uri(), &tree, code, Some(&alpha)).interface_hash;
+        let beta_hash =
+            compute_artifacts_with_metadata(&test_uri(), &tree, code, Some(&beta)).interface_hash;
+        assert_ne!(
+            alpha_hash, beta_hash,
+            "a target-name-only edit must change interface_hash"
+        );
+    }
+
+    /// Static target reads affect diagnostics in the linked pipeline/report, so a
+    /// read-only edit must invalidate dependents even when declarations and edges
+    /// stay unchanged.
+    #[test]
+    fn interface_hash_changes_when_target_reference_changes() {
+        let code = "1\n";
+        let tree = parse_r(code);
+        let mut alpha = crate::cross_file::types::CrossFileMetadata::default();
+        alpha.target_references = vec![crate::cross_file::types::TargetReference {
+            name: "alpha".to_string(),
+            line: 0,
+            column: 0,
+            end_column: 5,
+        }];
+        let mut beta = alpha.clone();
+        beta.target_references[0].name = "beta".to_string();
+
+        let alpha_hash =
+            compute_artifacts_with_metadata(&test_uri(), &tree, code, Some(&alpha)).interface_hash;
+        let beta_hash =
+            compute_artifacts_with_metadata(&test_uri(), &tree, code, Some(&beta)).interface_hash;
+        assert_ne!(
+            alpha_hash, beta_hash,
+            "a target-reference-only edit must change interface_hash"
         );
     }
 

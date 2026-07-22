@@ -3206,6 +3206,7 @@ pub(crate) struct CapturedOpenMetadataAnalysis {
     basis: AnalysisBasis,
     pub(crate) uri: Url,
     pub(crate) expected: AnalysisGeneration,
+    pub(crate) chunk_kind: ChunkKind,
     pub(crate) analysis_text: String,
     pub(crate) old_metadata: Arc<crate::cross_file::CrossFileMetadata>,
     pub(crate) workspace_root: Option<Url>,
@@ -8108,7 +8109,10 @@ impl WorldState {
         // authoritative. No reader consults this cache for open documents.
         let document = Document::new_with_language_id(text, version, &uri, language_id);
         let analysis_text = document.analysis_text();
-        let metadata = Arc::new(crate::cross_file::extract_metadata(&analysis_text));
+        let metadata = Arc::new(crate::cross_file::extract_metadata_from_analysis_for_kind(
+            document.chunk_kind,
+            &analysis_text,
+        ));
         let lifecycle_epoch = self.diagnostics_gate.current_epoch(&uri);
         self.install_open_document(uri, document, metadata, lifecycle_epoch);
     }
@@ -8591,6 +8595,7 @@ impl WorldState {
             basis,
             uri: uri.clone(),
             expected,
+            chunk_kind: record.document().chunk_kind,
             analysis_text: record.document().analysis_text(),
             old_metadata: record.metadata().clone(),
             workspace_root: self.workspace_folders.first().cloned(),
@@ -9948,6 +9953,7 @@ impl WorldState {
                 let new = projection.new_metadata.as_ref();
                 old.sources != new.sources
                     || old.sourced_by != new.sourced_by
+                    || old.tarchetypes_document_links != new.tarchetypes_document_links
                     || old.working_directory != new.working_directory
                     || old.inherited_working_directory != new.inherited_working_directory
             });
@@ -10456,7 +10462,10 @@ impl WorldState {
                     .map(|record| record.metadata().clone())
                     .or_else(|| {
                         self.documents.get(&open_uri).map(|doc| {
-                            Arc::new(crate::cross_file::extract_metadata(&doc.analysis_text()))
+                            Arc::new(crate::cross_file::extract_metadata_from_analysis_for_kind(
+                                doc.chunk_kind,
+                                &doc.analysis_text(),
+                            ))
                         })
                     })
             })
@@ -11159,23 +11168,27 @@ impl WorldState {
                 continue;
             };
 
-            let tree = parser.parse(&content, None);
-            let metadata = Arc::new(crate::cross_file::extract_metadata(&content));
+            let chunk_kind = self.chunk_kind_for_closed_file(&uri);
+            let analysis = crate::cross_file::analysis_text_for_kind(chunk_kind, &content);
+            let tree = parser.parse(analysis.as_ref(), None);
+            let metadata = Arc::new(crate::cross_file::extract_metadata_from_analysis_for_kind(
+                chunk_kind, &analysis,
+            ));
             let artifacts = tree.as_ref().map_or_else(
                 || Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
                 |t| {
                     Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
                         &uri,
                         t,
-                        &content,
+                        &analysis,
                         Some(&metadata),
                     ))
                 },
             );
             let snapshot =
                 crate::cross_file::file_cache::FileSnapshot::with_content_hash(&fs_meta, &content);
-            let loaded_packages = extract_loaded_packages(&tree, &content);
-            let data_packages = extract_data_packages(&tree, &content);
+            let loaded_packages = extract_loaded_packages(&tree, &analysis);
+            let data_packages = extract_data_packages(&tree, &analysis);
 
             let entry = crate::workspace_index::IndexEntry {
                 contents: Rope::from_str(&content),
@@ -11866,8 +11879,10 @@ pub(crate) fn derive_workspace_dependency_graph(
         .map(|open| {
             let metadata = open.metadata.clone().unwrap_or_else(|| {
                 let raw = open.content.to_string();
-                let analysis = crate::cross_file::analysis_text_for_kind(open.chunk_kind, &raw);
-                Arc::new(crate::cross_file::extract_metadata(&analysis))
+                Arc::new(crate::cross_file::extract_metadata_for_kind(
+                    open.chunk_kind,
+                    &raw,
+                ))
             });
             (open.uri.clone(), metadata)
         })
@@ -12377,7 +12392,8 @@ fn processed_workspace_document(
     // in multibyte prose).
     let analysis_text = doc.analysis_text();
 
-    let cross_file_meta = crate::cross_file::extract_metadata(&analysis_text);
+    let cross_file_meta =
+        crate::cross_file::extract_metadata_from_analysis_for_kind(doc.chunk_kind, &analysis_text);
 
     let artifacts = std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
         crate::cross_file::scope::compute_artifacts_with_metadata(
@@ -13760,6 +13776,103 @@ mod tests {
                 .diagnostics_gate
                 .force_republish_count_for_test(&dependent),
             1
+        );
+    }
+
+    #[test]
+    fn report_link_replacement_revalidates_removed_and_added_documents() {
+        use crate::cross_file::types::{CrossFileMetadata, TarchetypesDocumentLink};
+
+        fn report_link(path: &str) -> CrossFileMetadata {
+            CrossFileMetadata {
+                tarchetypes_document_links: vec![TarchetypesDocumentLink {
+                    path: path.to_string(),
+                    line: 0,
+                    column: 31,
+                    end_column: 31 + path.len() as u32,
+                }],
+                ..Default::default()
+            }
+        }
+
+        let root = Url::parse("file:///workspace").unwrap();
+        let pipeline = Url::parse("file:///workspace/_targets.R").unwrap();
+        let old_report = Url::parse("file:///workspace/old.qmd").unwrap();
+        let new_report = Url::parse("file:///workspace/new.qmd").unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders.push(root.clone());
+        state.open_document(
+            pipeline.clone(),
+            "tarchetypes::tar_quarto(report, \"old.qmd\")\n",
+            Some(1),
+        );
+        state.open_document(old_report.clone(), "```{r}\n1\n```\n", Some(1));
+        state.open_document(new_report.clone(), "```{r}\n1\n```\n", Some(1));
+
+        let old_metadata = report_link("old.qmd");
+        let new_metadata = report_link("new.qmd");
+        state
+            .cross_file_graph
+            .update_file(&pipeline, &old_metadata, Some(&root), |_| None);
+        let effects = commit_test_edit(
+            &mut state,
+            &pipeline,
+            "tarchetypes::tar_quarto(report, \"new.qmd\")\n",
+            new_metadata.clone(),
+            PreparedOpenCommitPlan {
+                graph: vec![open_projection(
+                    pipeline.clone(),
+                    new_metadata.clone(),
+                    Some(old_metadata),
+                    new_metadata,
+                    false,
+                )],
+                ..PreparedOpenCommitPlan::default()
+            },
+        )
+        .unwrap();
+        let affected: HashSet<_> = effects
+            .revalidations
+            .into_iter()
+            .map(|ticket| ticket.uri)
+            .collect();
+
+        assert!(
+            affected.contains(&old_report),
+            "the removed report endpoint must be retained from the pre-update graph"
+        );
+        assert!(
+            affected.contains(&new_report),
+            "the added report endpoint must be discovered from the post-update graph"
+        );
+    }
+
+    #[test]
+    fn open_report_metadata_keeps_reads_but_not_pipeline_authority() {
+        let uri = Url::parse("file:///workspace/report.qmd").unwrap();
+        let text = r#"---
+title: report
+---
+
+```{r}
+targets::tar_target(fake, 1)
+targets::tar_read(fake)
+tarchetypes::tar_render(nested, "nested.Rmd")
+```
+"#;
+        let mut state = WorldState::new();
+        state.open_document_with_language_id(uri.clone(), text, Some(1), Some("quarto"));
+        let metadata = state.documents.get_record(&uri).unwrap().metadata();
+
+        assert!(metadata.target_declarations.is_empty());
+        assert!(metadata.tarchetypes_document_links.is_empty());
+        assert_eq!(
+            metadata
+                .target_references
+                .iter()
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fake"]
         );
     }
 

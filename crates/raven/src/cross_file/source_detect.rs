@@ -3189,10 +3189,15 @@ pub(crate) fn detect_library_and_tar_source_requests(
     Vec<TargetsPackageDeclaration>,
     Vec<TarSourceRequest>,
     Vec<ListFilesSourceRequest>,
+    super::targets::TargetsMetadata,
 ) {
     let root = tree.root_node();
     let mut bindings = super::static_path::LazyStaticBindings::new(root, content);
     let package_output = detect_library_walk_output(tree, content, &mut bindings);
+    let attaching_calls =
+        top_level_attaching_library_calls_with_bindings(tree, content, &mut bindings);
+    let targets_metadata =
+        super::targets::detect_targets_metadata(root, content, &mut bindings, &attaching_calls);
     let library_calls = package_output
         .library_calls
         .into_iter()
@@ -3207,6 +3212,7 @@ pub(crate) fn detect_library_and_tar_source_requests(
         targets_pipeline_packages,
         requests,
         list_files_requests,
+        targets_metadata,
     )
 }
 

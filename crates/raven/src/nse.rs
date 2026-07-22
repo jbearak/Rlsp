@@ -55,6 +55,11 @@ pub(crate) enum ArgPolicy {
     /// suppress them all. Reserved for forms where per-formal modeling is
     /// unnecessary (e.g. `aes(...)`, `exprs(...)`).
     WholeCall,
+    /// Suppress only named argument values, leaving positional argument values
+    /// checked. This models declaration DSLs such as `tar_plan(x = command,
+    /// factory(...))`: named dots are delayed commands, while unnamed dots are
+    /// target-definition objects whose nested calls retain their own policies.
+    NamedArguments,
     /// Per-formal NSE: suppress only the arguments bound to the named formals
     /// (and, when `captured_dots` is set, the arguments absorbed by `...` /
     /// trailing positionals). Every other argument is checked.
@@ -385,6 +390,7 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
             _ => return None,
         },
         "targets" => targets_policy(name)?,
+        "tarchetypes" => tarchetypes_policy(name)?,
         "gt" => gt_policy(name)?,
         "gtsummary" => gtsummary_policy(name)?,
         "recipes" => recipes_policy(name)?,
@@ -995,6 +1001,338 @@ fn targets_policy(name: &str) -> Option<ArgPolicy> {
     Some(policy)
 }
 
+/// NSE policies for the statically modelable, user-facing `tarchetypes`
+/// archetypes. Target factories capture target names and delayed commands just
+/// like `targets::tar_target()`. Selector formals capture only their
+/// data-mask/tidyselect expressions; literal paths and ordinary controls remain
+/// standard-evaluated. `tar_map()` and `tar_combine()` deliberately do not
+/// capture their target-definition `...`, so nested factories retain their own
+/// precise policies.
+fn tarchetypes_policy(name: &str) -> Option<ArgPolicy> {
+    const TARGET_FACTORY_FORMALS: &[&str] = &[
+        "name",
+        "command",
+        "pattern",
+        "tidy_eval",
+        "packages",
+        "library",
+        "repository",
+        "iteration",
+        "error",
+        "memory",
+        "garbage_collection",
+        "deployment",
+        "priority",
+        "resources",
+        "storage",
+        "retrieval",
+        "cue",
+        "description",
+    ];
+
+    let policy = match name {
+        // Common storage-format factories generated from `tar_format_api()`,
+        // plus the equivalent nanoparquet and superseded AWS variants.
+        "tar_url" | "tar_file" | "tar_file_fast" | "tar_rds" | "tar_qs" | "tar_keras"
+        | "tar_torch" | "tar_arrow_feather" | "tar_parquet" | "tar_fst" | "tar_fst_dt"
+        | "tar_fst_tbl" | "tar_nanoparquet" | "tar_aws_file" | "tar_aws_fst" | "tar_aws_fst_dt"
+        | "tar_aws_fst_tbl" | "tar_aws_keras" | "tar_aws_parquet" | "tar_aws_qs"
+        | "tar_aws_rds" | "tar_aws_torch" => ArgPolicy::per_formal(
+            TARGET_FACTORY_FORMALS,
+            &["name", "command", "pattern"],
+            false,
+        ),
+        "tar_file_read" => ArgPolicy::per_formal(
+            &[
+                "name",
+                "command",
+                "read",
+                "tidy_eval",
+                "packages",
+                "library",
+                "format",
+                "format_file",
+                "repository",
+                "error",
+                "memory",
+                "garbage_collection",
+                "deployment",
+                "priority",
+                "resources",
+                "storage",
+                "retrieval",
+                "cue",
+                "description",
+            ],
+            &["name", "command", "read"],
+            false,
+        ),
+        "tar_change" | "tar_force" => ArgPolicy::per_formal(
+            &[
+                "name",
+                "command",
+                if name == "tar_change" {
+                    "change"
+                } else {
+                    "force"
+                },
+                "tidy_eval",
+                "packages",
+                "library",
+                "format",
+                "repository",
+                "iteration",
+                "error",
+                "memory",
+                "garbage_collection",
+                "deployment",
+                "priority",
+                "resources",
+                "storage",
+                "retrieval",
+                "cue",
+                "description",
+            ],
+            &[
+                "name",
+                "command",
+                if name == "tar_change" {
+                    "change"
+                } else {
+                    "force"
+                },
+            ],
+            false,
+        ),
+        "tar_skip" => ArgPolicy::per_formal(
+            &[
+                "name",
+                "command",
+                "skip",
+                "pattern",
+                "tidy_eval",
+                "packages",
+                "library",
+                "format",
+                "repository",
+                "iteration",
+                "error",
+                "memory",
+                "garbage_collection",
+                "deployment",
+                "priority",
+                "resources",
+                "storage",
+                "retrieval",
+                "cue",
+                "description",
+            ],
+            &["name", "command", "skip", "pattern"],
+            false,
+        ),
+        "tar_group_by" => ArgPolicy::per_formal(
+            &[
+                "name",
+                "command",
+                "...",
+                "tidy_eval",
+                "packages",
+                "library",
+                "format",
+                "repository",
+                "error",
+                "memory",
+                "garbage_collection",
+                "deployment",
+                "priority",
+                "resources",
+                "storage",
+                "retrieval",
+                "cue",
+                "description",
+            ],
+            &["name", "command"],
+            true,
+        ),
+        "tar_group_select" => ArgPolicy::per_formal(
+            &[
+                "name",
+                "command",
+                "by",
+                "tidy_eval",
+                "packages",
+                "library",
+                "format",
+                "repository",
+                "error",
+                "memory",
+                "garbage_collection",
+                "deployment",
+                "priority",
+                "resources",
+                "storage",
+                "retrieval",
+                "cue",
+                "description",
+            ],
+            &["name", "command", "by"],
+            false,
+        ),
+        "tar_group_count" | "tar_group_size" => ArgPolicy::per_formal(
+            &[
+                "name",
+                "command",
+                if name == "tar_group_count" {
+                    "count"
+                } else {
+                    "size"
+                },
+                "tidy_eval",
+                "packages",
+                "library",
+                "format",
+                "repository",
+                "error",
+                "memory",
+                "garbage_collection",
+                "deployment",
+                "priority",
+                "resources",
+                "storage",
+                "retrieval",
+                "cue",
+                "description",
+            ],
+            &["name", "command"],
+            false,
+        ),
+        "tar_select_names" | "tar_select_targets" => {
+            ArgPolicy::per_formal(&["targets", "..."], &[], true)
+        }
+        "tar_map" => ArgPolicy::per_formal(
+            &[
+                "values",
+                "...",
+                "names",
+                "descriptions",
+                "unlist",
+                "delimiter",
+            ],
+            &["names", "descriptions"],
+            false,
+        ),
+        "tar_plan" => ArgPolicy::NamedArguments,
+        "tar_combine" => ArgPolicy::per_formal(
+            &[
+                "name",
+                "...",
+                "command",
+                "use_names",
+                "pattern",
+                "packages",
+                "library",
+                "format",
+                "repository",
+                "iteration",
+                "error",
+                "memory",
+                "garbage_collection",
+                "deployment",
+                "priority",
+                "resources",
+                "storage",
+                "retrieval",
+                "cue",
+                "description",
+            ],
+            &["name", "command", "pattern"],
+            false,
+        ),
+        "tar_render" => ArgPolicy::per_formal(
+            &[
+                "name",
+                "path",
+                "output_file",
+                "working_directory",
+                "tidy_eval",
+                "packages",
+                "library",
+                "error",
+                "memory",
+                "garbage_collection",
+                "deployment",
+                "priority",
+                "resources",
+                "retrieval",
+                "cue",
+                "description",
+                "quiet",
+                "...",
+            ],
+            &["name"],
+            true,
+        ),
+        "tar_knit" => ArgPolicy::per_formal(
+            &[
+                "name",
+                "path",
+                "output_file",
+                "working_directory",
+                "tidy_eval",
+                "packages",
+                "library",
+                "error",
+                "memory",
+                "garbage_collection",
+                "deployment",
+                "priority",
+                "resources",
+                "retrieval",
+                "cue",
+                "description",
+                "quiet",
+                "...",
+            ],
+            &["name"],
+            true,
+        ),
+        "tar_quarto" => ArgPolicy::per_formal(
+            &[
+                "name",
+                "path",
+                "output_file",
+                "working_directory",
+                "extra_files",
+                "execute",
+                "execute_params",
+                "cache",
+                "cache_refresh",
+                "debug",
+                "quiet",
+                "quarto_args",
+                "pandoc_args",
+                "profile",
+                "tidy_eval",
+                "packages",
+                "library",
+                "error",
+                "memory",
+                "garbage_collection",
+                "deployment",
+                "priority",
+                "resources",
+                "retrieval",
+                "cue",
+                "description",
+            ],
+            &["name", "execute_params"],
+            false,
+        ),
+        _ => return None,
+    };
+    Some(policy)
+}
+
 /// NSE policy for `gt` table-construction verbs. `gt` selects table columns with
 /// tidyselect (`columns =`, also `after`/`hide_columns`/`target_columns`/
 /// `spanners`/`groups`) and filters rows with a data mask (`rows =`), so those
@@ -1464,6 +1802,7 @@ pub(crate) fn suppressed_arguments(
     match policy {
         ArgPolicy::Standard => vec![false; arg_labels.len()],
         ArgPolicy::WholeCall => vec![true; arg_labels.len()],
+        ArgPolicy::NamedArguments => arg_labels.iter().map(Option::is_some).collect(),
         ArgPolicy::PerFormal {
             formals,
             captured,
@@ -1932,6 +2271,132 @@ mod tests {
         let p = package_policy("targets", "tar_target").unwrap();
         let mask = suppressed_arguments(&p, &labels(&[None, None]), false);
         assert_eq!(mask, vec![true, true]);
+    }
+
+    #[test]
+    fn tarchetypes_target_factories_capture_only_delayed_code() {
+        for name in ["tar_rds", "tar_nanoparquet", "tar_file_read", "tar_skip"] {
+            assert!(
+                package_policy("tarchetypes", name).is_some(),
+                "missing policy for tarchetypes::{name}"
+            );
+        }
+
+        let p = package_policy("tarchetypes", "tar_rds").unwrap();
+        assert_eq!(
+            suppressed_arguments(&p, &labels(&[None, None, None, Some("packages")]), false),
+            vec![true, true, true, false]
+        );
+
+        let p = package_policy("tarchetypes", "tar_file_read").unwrap();
+        assert_eq!(
+            suppressed_arguments(&p, &labels(&[None, None, None, Some("format_file")]), false),
+            vec![true, true, true, false]
+        );
+    }
+
+    #[test]
+    fn tarchetypes_map_and_combine_preserve_nested_factory_analysis() {
+        let p = package_policy("tarchetypes", "tar_plan").unwrap();
+        assert_eq!(
+            suppressed_arguments(
+                &p,
+                &labels(&[Some("declared"), None, Some("another")]),
+                false,
+            ),
+            vec![true, false, true]
+        );
+
+        let p = package_policy("tarchetypes", "tar_map").unwrap();
+        assert_eq!(
+            suppressed_arguments(
+                &p,
+                &labels(&[
+                    None,
+                    None,
+                    Some("names"),
+                    Some("descriptions"),
+                    Some("delimiter"),
+                ]),
+                false,
+            ),
+            vec![false, false, true, true, false]
+        );
+
+        let p = package_policy("tarchetypes", "tar_combine").unwrap();
+        assert_eq!(
+            suppressed_arguments(
+                &p,
+                &labels(&[
+                    None,
+                    None,
+                    Some("command"),
+                    Some("pattern"),
+                    Some("use_names")
+                ]),
+                false,
+            ),
+            vec![true, false, true, true, false]
+        );
+    }
+
+    #[test]
+    fn tarchetypes_report_paths_are_standard_evaluated() {
+        let p = package_policy("tarchetypes", "tar_render").unwrap();
+        assert_eq!(
+            suppressed_arguments(
+                &p,
+                &labels(&[None, None, Some("params"), Some("output_file")]),
+                false,
+            ),
+            vec![true, false, true, false]
+        );
+
+        let p = package_policy("tarchetypes", "tar_quarto").unwrap();
+        assert_eq!(
+            suppressed_arguments(
+                &p,
+                &labels(&[None, None, Some("execute_params"), Some("extra_files")]),
+                false,
+            ),
+            vec![true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn tarchetypes_group_helpers_distinguish_selectors_from_controls() {
+        let p = package_policy("tarchetypes", "tar_group_by").unwrap();
+        assert_eq!(
+            suppressed_arguments(
+                &p,
+                &labels(&[None, None, None, None, Some("packages")]),
+                false,
+            ),
+            vec![true, true, true, true, false]
+        );
+
+        let p = package_policy("tarchetypes", "tar_group_count").unwrap();
+        assert_eq!(
+            suppressed_arguments(&p, &labels(&[None, None, None]), false),
+            vec![true, true, false]
+        );
+    }
+
+    #[test]
+    fn tarchetypes_raw_and_dynamic_helpers_have_no_builtin_policy() {
+        for name in [
+            "tar_render_raw",
+            "tar_quarto_rep",
+            "tar_eval",
+            "tar_sub",
+            "walk_ast",
+        ] {
+            assert_eq!(
+                package_policy("tarchetypes", name),
+                None,
+                "tarchetypes::{name} should remain unsupported"
+            );
+        }
     }
 
     #[test]
@@ -2478,11 +2943,12 @@ mod tests {
     // do not re-derive masks; that is the job of the tests above.
 
     /// Coarse variant of a policy lookup: `None` (the table returned `None`,
-    /// i.e. arguments are evaluated normally) vs the two NSE shapes.
+    /// i.e. arguments are evaluated normally) versus the precise NSE shapes.
     #[derive(Debug, PartialEq, Eq)]
     enum Shape {
         None,
         WholeCall,
+        NamedArguments,
         PerFormal,
     }
 
@@ -2491,6 +2957,7 @@ mod tests {
             std::option::Option::None => Shape::None,
             Some(ArgPolicy::Standard) => Shape::None,
             Some(ArgPolicy::WholeCall) => Shape::WholeCall,
+            Some(ArgPolicy::NamedArguments) => Shape::NamedArguments,
             Some(ArgPolicy::PerFormal { .. }) => Shape::PerFormal,
         }
     }

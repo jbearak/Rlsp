@@ -40,6 +40,35 @@ are inert rather than partially guessed.
 
 **Static member access only.** Namespace-member completion, hover, navigation, and identity-aware references cover `$`, `@`, and a single positional literal-string `[[...]]` subscript. Computed subscripts and nested runtime values are not evaluated. Installed-package members are available for completion and diagnostics but do not navigate to package source files.
 
+## targets and tarchetypes
+
+Raven models target declarations and report relationships only when their
+source spelling is statically trustworthy. Direct namespace-qualified calls are
+recognized; bare calls require a top-level package attachment and no local
+shadow. Aliases, `do.call()`, partial argument names, malformed calls, calls
+inside functions/quoted code, and arbitrary metaprogramming are inert.
+
+The supported `tar_map()` subset requires a literal `list()` / `data.frame()` /
+`tibble()` table with named scalar or literal-vector columns, target-definition
+objects statically bound to `...`, a static unshadowed column-name selection,
+compatible lengths, no target-name/value-column collision, and a literal
+delimiter. Expansion is all-or-nothing: Raven does not retain partial targets or
+report links when one generated name is unsupported. Raven does not predict the
+runtime hash fallback, non-ASCII or locale-sensitive `make.names()` results,
+dynamic values/selections/delimiters, replication factories, or other dynamic
+branching. Raw/string-expression variants,
+`tar_eval()`, `tar_sub()`, AST walkers, and internal `_run` helpers are not
+modeled.
+
+Report identity requires a static target name and a literal supported document
+path: `.Rmd` / `.Rmarkdown` for `tar_render()` and `tar_knit()`, or a single
+`.qmd` / `.Rmd` / `.Rmarkdown` file for `tar_quarto()`. Computed paths, Quarto
+project directories, and rendering are outside the analysis. Helpers sourced
+only by the report do not lend target declarations back into the pipeline.
+`tar_load()` references are enumerated only from a direct name or literal
+unshadowed `c(name, ...)`; dynamic tidyselect expressions are not expanded. See
+[Cross-file awareness — tarchetypes target factories and report documents](./cross-file.md#tarchetypes-target-factories-and-report-documents).
+
 ## R Markdown / Quarto
 
 R chunk bodies in `.Rmd` / `.Rmarkdown` / `.qmd` documents are fully analyzed as first-class R code. The following gaps are accepted limitations of the current implementation:

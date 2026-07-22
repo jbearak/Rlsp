@@ -53,6 +53,15 @@ view and breadcrumbs reflect the document's Markdown heading structure —
 the same structure the preview renders — so you can navigate the document
 as you preview it. See [docs/document-outline.md](document-outline.md).
 
+When a targets pipeline names an `.Rmd` / `.Rmarkdown` file with a static
+`tarchetypes::tar_render()` or `tar_knit()` path, Raven connects the document to
+the pipeline for target-name diagnostics and navigation. `tar_read()` and
+statically enumerable `tar_load()` names inside R chunks resolve against the
+pipeline's static declarations without importing the pipeline's ordinary R
+scope. This is language-server analysis only: Knit Preview still runs the
+normal knit pipeline and Raven never executes tarchetypes during analysis. See
+[Cross-file awareness — tarchetypes target factories and report documents](cross-file.md#tarchetypes-target-factories-and-report-documents).
+
 See [docs/coexistence.md](coexistence.md) for the surfaces Raven
 defers to other extensions (most notably `quarto.quarto`). The R and
 R Markdown grammars are vendored from REditorSupport upstream and ship

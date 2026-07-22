@@ -1,10 +1,40 @@
-# Raven v0.18.0 — selective module imports
+# Raven v0.18.0
 
 Raven 0.18.0 adds static understanding of the [box](https://klmr.me/box/) R module system. Raven now recognises `box::use()` imports and `box::export()` / `#' @export` interface declarations, resolves local module paths, and models each import as a first-class *selective import* that is deliberately distinct from a package `library()` load and from an ordinary `source()` relationship.
 
 It also recognizes the static first phase of the [`import`](https://rticulate.github.io/import/) package: `import::from()`, `import::here()`, and `import::into()` with package or literal `.R`/`.r` script sources, selected and renamed names, `.all`, static `.except`, literal `.directory`, and default or literal named destinations. Current-environment imports are lexical and position-sensitive; named destinations are lower-priority fallback bindings, not namespace objects. Script modules expose a partial live private top-level environment (including dotted names and nested top-level `import::here()` bindings) without adopting box export-marker rules. Wildcards de-duplicate an already selected exported identity, while a different later wildcard export targeting the same local name follows R's sequential last-write-wins behavior. Completion, hover, signatures, go-to-definition, and identity-aware references use the same selected binding without exposing unrelated package exports or private script members.
 
 ## Highlights
+
+### `{tarchetypes}` pipelines and report documents
+
+Raven now extends its existing `{targets}` cross-file model to common
+`{tarchetypes}` archetypes without executing pipeline code. It applies precise
+per-formal NSE policies to high-use storage, grouping, selection, mapping,
+planning, and report factories, so target names, delayed commands, tidyselect
+expressions, literal paths, and ordinary evaluated controls are not conflated.
+User-defined same-named functions still win through the existing package,
+attachment, alias, and shadowing precedence.
+
+Static declarations now include supported target factories, named `tar_plan()`
+commands, and generated `tar_map()` names from a bounded literal-table grammar.
+The `tar_map()` model handles scalar recycling, named or unnamed target objects
+in dots, unshadowed static column selection, literal delimiters, quote removal,
+`make.unique()` collisions, and ASCII `make.names()` spellings. Target/value
+column collisions and dynamic/hash-derived names fail closed; expansion is
+transactional, and the unsuffixed objects supplied to `tar_map()` are not
+invented as pipeline targets.
+
+Literal `.Rmd` / `.Rmarkdown` paths in `tar_render()` and `tar_knit()`, and
+single-document `.qmd` / `.Rmd` / `.Rmarkdown` paths in `tar_quarto()`, become
+non-lending dependency edges. Cmd-click opens the document, missing documents
+are diagnosed and watched, and edits revalidate both the pipeline and connected
+reports. Inside connected R chunks, static `tar_read()` and `tar_load()` target
+references use the pipeline's target namespace for diagnostics and
+navigation—without leaking ordinary pipeline variables, packages, or NSE
+contracts into the document. Helpers sourced only while rendering a report do
+not lend target authority, and case/symlink aliases share canonical authority
+while navigation returns the matching live document URI.
 
 ### `box::use()` imports
 
@@ -38,10 +68,11 @@ The semantics above are captured in a shared *selective import* abstraction (dia
 
 Support is scoped to statically analyzable forms. The following are **deliberately not** supported and fail conservatively — they neither bind names nor emit misleading diagnostics:
 
-- Programmatic invocation (`do.call`, aliasing `box::use`, runtime-built argument lists) — only literal `box::use(...)` calls are recognised.
-- Non-local module search paths such as `foo/bar`, `options(box.path = ...)`, the `R_BOX_PATH` environment variable, and remote/global modules.
+- For `{tarchetypes}`: aliases/programmatic invocation, raw/string-expression and replication factories, arbitrary metaprogramming, dynamic or hash-derived `tar_map()` names, non-ASCII generated spellings, computed report paths, Quarto project directories, and dynamic `tar_load()` tidyselect expressions.
+- For `{box}`: programmatic invocation (`do.call`, aliasing `box::use`, runtime-built argument lists) — only literal `box::use(...)` calls are recognised.
+- Non-local box module search paths such as `foo/bar`, `options(box.path = ...)`, the `R_BOX_PATH` environment variable, and remote/global modules.
 
-Raven does not execute module code or hooks, evaluate arbitrary `options(box.path = ...)`, inspect remote/user-global modules, or guess computed imports. Marker-less modules and not-yet-complete package metadata expose known positive members but do not prove a missing member absent. See [Limitations — box module system](limitations.md#box-module-system-boxuse) for the exact static boundary.
+Raven does not execute target factories, render documents, execute module code or hooks, evaluate arbitrary `options(box.path = ...)`, inspect remote/user-global modules, or guess computed imports. Marker-less modules and not-yet-complete package metadata expose known positive members but do not prove a missing member absent. See [Limitations — targets and tarchetypes](limitations.md#targets-and-tarchetypes) and [Limitations — box module system](limitations.md#box-module-system-boxuse) for the exact static boundaries.
 
 ## Install
 
@@ -51,6 +82,8 @@ Raven does not execute module code or hooks, evaluate arbitrary `options(box.pat
 
 ## Learn more
 
+- [Cross-file analysis — tarchetypes target factories and report documents](https://github.com/jbearak/raven/blob/v0.18.0/docs/cross-file.md#tarchetypes-target-factories-and-report-documents)
+- [Limitations — targets and tarchetypes](https://github.com/jbearak/raven/blob/v0.18.0/docs/limitations.md#targets-and-tarchetypes)
 - [Cross-file analysis — box module imports](https://github.com/jbearak/raven/blob/v0.18.0/docs/cross-file.md#box-module-imports-boxuse)
 - [Limitations — box module system](https://github.com/jbearak/raven/blob/v0.18.0/docs/limitations.md#box-module-system-boxuse)
 
