@@ -533,6 +533,102 @@ struct CandidateBatch {
     contributor_distances: HashMap<Url, usize>,
 }
 
+/// Build the terminal-member candidate batch for a selective-import namespace
+/// alias. This is deliberately separate from ordinary object member discovery:
+/// only the alias's exported boundary is enumerable, and no assignment or
+/// transitive source scope from the module may leak through it.
+///
+/// Completion (`rhs_name == None`) emits every statically known export. A
+/// definition query emits a candidate only when that exported member has exact
+/// provenance; package members and unresolved re-export provenance therefore
+/// remain non-navigable. Nested paths decline as a handled empty batch rather
+/// than falling back to ordinary object scanning.
+fn namespace_import_candidate_batch(
+    state: &WorldState,
+    cursor_uri: &Url,
+    cursor: Position,
+    path: &QualifiedPath,
+    rhs_name: Option<&str>,
+    alias: &crate::cross_file::scope::NamespaceImportAlias,
+) -> CandidateBatch {
+    if !path.segments.is_empty() {
+        return CandidateBatch {
+            candidates: Vec::new(),
+            cursor_uri: cursor_uri.clone(),
+            cursor,
+            contributor_ranks: HashMap::new(),
+            contributor_distances: HashMap::new(),
+        };
+    }
+
+    let content_provider = state.content_provider();
+    let get_artifacts =
+        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::scope::ScopeArtifacts>> {
+            content_provider.get_artifacts(target_uri)
+        };
+    let get_metadata =
+        |target_uri: &Url| -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
+            content_provider.get_metadata(target_uri)
+        };
+    let env = crate::box_use::ArtifactModuleExportEnv::new(
+        &get_artifacts,
+        &get_metadata,
+        (state.cross_file_config.packages_enabled && state.package_library_ready)
+            .then_some(state.package_library.as_ref()),
+    );
+
+    let fallback_uri = match &alias.source {
+        crate::selective_import::ImportSource::Package(name) => {
+            Url::parse(&format!("package:{name}"))
+                .unwrap_or_else(|_| Url::parse("package:unknown").unwrap())
+        }
+        crate::selective_import::ImportSource::LocalModule(uri) => uri.clone(),
+    };
+
+    let names: Vec<&str> = match rhs_name {
+        Some(name) if alias.exports.exports(name) => vec![name],
+        Some(_) => Vec::new(),
+        None => alias.exports.members.iter().map(String::as_str).collect(),
+    };
+    let mut candidates = Vec::with_capacity(names.len());
+    let mut contributor_ranks = HashMap::new();
+    for name in names {
+        let provenance =
+            crate::box_use::ModuleExportEnv::member_provenance(&env, &alias.source, name);
+        // Completion can use a source-level fallback for display metadata, but a
+        // definition request must never fabricate a package/module location.
+        if rhs_name.is_some() && provenance.is_none() {
+            continue;
+        }
+        let (candidate_uri, line, column, end_column) = provenance
+            .map(|p| (p.uri, p.line, p.column, p.end_column.max(p.column)))
+            .unwrap_or_else(|| (fallback_uri.clone(), 0, 0, 0));
+        contributor_ranks.entry(candidate_uri.clone()).or_insert(0);
+        candidates.push(Candidate {
+            name: name.to_string(),
+            uri: candidate_uri,
+            effect: EffectPos {
+                line: 0,
+                utf16_column: 0,
+            },
+            name_range: Range {
+                start: Position::new(line, column),
+                end: Position::new(line, end_column),
+            },
+            fn_scope: None,
+            lhs_pos: Position::new(alias.provenance.line, alias.provenance.column),
+        });
+    }
+
+    CandidateBatch {
+        candidates,
+        cursor_uri: cursor_uri.clone(),
+        cursor,
+        contributor_ranks,
+        contributor_distances: HashMap::new(),
+    }
+}
+
 /// Resolves go-to-definition for a qualified member RHS (`bar` in `foo$bar` or
 /// `foo@bar`).
 ///
@@ -565,6 +661,45 @@ pub fn resolve_qualified_member(
         op,
         &DiagCancelToken::never(),
     )
+}
+
+/// Return the installed-package identity behind a visible selective namespace
+/// alias at `path`. This is the non-navigational counterpart to qualified-member
+/// resolution: package members have no source location, but hover can still use
+/// their exact package ownership for attribution and cached help.
+pub(crate) fn selective_namespace_package(
+    state: &WorldState,
+    uri: &Url,
+    position: Position,
+    path: &QualifiedPath,
+    member: &str,
+) -> Option<String> {
+    if !path.segments.is_empty() {
+        return None;
+    }
+    let mut prefix_cache = crate::cross_file::scope::ParentPrefixCache::new();
+    let scope = crate::handlers::get_cross_file_scope_with_cache(
+        state,
+        uri,
+        position.line,
+        position.character,
+        &DiagCancelToken::never(),
+        &mut prefix_cache,
+        Some(state.package_state.scope_contribution()),
+    );
+    let raw_head = path.head.as_str();
+    let bare_head = crate::handlers::unquote_backtick_name(raw_head).unwrap_or(raw_head);
+    let alias = scope
+        .namespace_import_aliases
+        .get(raw_head)
+        .or_else(|| scope.namespace_import_aliases.get(bare_head))?;
+    if !alias.exports.exports(member) {
+        return None;
+    }
+    match &alias.source {
+        crate::selective_import::ImportSource::Package(package) => Some(package.clone()),
+        crate::selective_import::ImportSource::LocalModule(_) => None,
+    }
 }
 
 /// Cancellation-aware variant of [`resolve_qualified_member`].
@@ -770,6 +905,16 @@ fn collect_qualified_member_candidates_with_cancel(
         path
     };
     let lhs_name = path.head.as_str();
+
+    // A selective-import namespace is a private export boundary, not an ordinary
+    // R object and not a package load. Handle it before the constructor/member-
+    // assignment collector so private module names and transitive source scope
+    // can never leak through `alias$...` discovery.
+    if let Some(alias) = scope.namespace_import_aliases.get(lhs_name) {
+        return Some(namespace_import_candidate_batch(
+            state, uri, position, path, rhs_name, alias,
+        ));
+    }
 
     if symbol.source_uri.as_str().starts_with("package:") {
         return None;
@@ -2016,8 +2161,12 @@ fn nth_line(text: &str, n: usize) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::handlers::{DiagCancelToken, goto_definition, goto_definition_with_cancel};
+    use crate::handlers::{
+        DiagCancelToken, goto_definition, goto_definition_with_cancel, hover, references,
+    };
     use crate::state::{Document, WorldState};
+    use std::collections::HashSet;
+    use std::fs;
     use std::sync::Arc;
     use std::time::SystemTime;
     use tower_lsp::lsp_types::{GotoDefinitionResponse, Position, Url};
@@ -2039,7 +2188,9 @@ mod tests {
     fn add_indexed_doc(state: &mut WorldState, uri: &str, text: &str) -> Url {
         let url = Url::parse(uri).expect("uri");
         let doc = Document::new_with_uri(text, None, &url);
-        let metadata = Arc::new(crate::cross_file::extract_metadata(text));
+        let mut metadata = crate::cross_file::extract_metadata(text);
+        crate::cross_file::enrich_box_import_resolutions(&mut metadata, &url);
+        let metadata = Arc::new(metadata);
         let artifacts = Arc::new(if let Some(tree) = doc.tree.as_ref() {
             crate::cross_file::scope::compute_artifacts_with_metadata(
                 &url,
@@ -2320,6 +2471,475 @@ mod tests {
         .into_iter()
         .map(|completion| completion.name)
         .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn selective_namespace_completion_and_definition_respect_exports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let module_path = dir.path().join("mod.r");
+        let importer_path = dir.path().join("main.R");
+        let module_code = "box::export(public)\npublic <- 1\nprivate <- 2\n";
+        let importer_code = "\
+box::use(./mod)
+mod$
+mod$public
+mod$private
+mod[[\"public\"]]
+mod$public$child
+";
+        fs::write(&module_path, module_code).expect("write module");
+        fs::write(&importer_path, importer_code).expect("write importer");
+
+        let mut state = fresh_state();
+        let module_url = Url::from_file_path(&module_path).expect("module url");
+        let importer_url = Url::from_file_path(&importer_path).expect("importer url");
+        add_indexed_doc(&mut state, module_url.as_str(), module_code);
+        add_indexed_doc(&mut state, importer_url.as_str(), importer_code);
+
+        let module_spec = loc(goto_definition(&state, &importer_url, Position::new(0, 12)));
+        assert_eq!(module_spec.uri, module_url);
+        assert_eq!(module_spec.range, tower_lsp::lsp_types::Range::default());
+
+        let path = dollar_path("mod", &[]);
+        let dollar = super::complete_qualified_members(
+            &state,
+            &importer_url,
+            Position::new(1, 4),
+            &path,
+            crate::extract_op::ExtractOp::Dollar,
+        );
+        let at = super::complete_qualified_members(
+            &state,
+            &importer_url,
+            Position::new(1, 4),
+            &path,
+            crate::extract_op::ExtractOp::At,
+        );
+        assert_eq!(
+            dollar
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["public"]
+        );
+        assert_eq!(at, dollar, "`$` and `@` must share the export boundary");
+
+        let definition = super::resolve_qualified_member(
+            &state,
+            &importer_url,
+            Position::new(2, 5),
+            &path,
+            "public",
+            crate::extract_op::ExtractOp::Dollar,
+        )
+        .expect("exported member definition");
+        assert_eq!(definition.uri, module_url);
+        assert_eq!(definition.range.start, Position::new(1, 0));
+        assert_eq!(definition.range.end, Position::new(1, 6));
+
+        assert!(
+            super::resolve_qualified_member(
+                &state,
+                &importer_url,
+                Position::new(3, 5),
+                &path,
+                "private",
+                crate::extract_op::ExtractOp::Dollar,
+            )
+            .is_none(),
+            "non-exported module objects must remain private"
+        );
+
+        let literal = loc(goto_definition(&state, &importer_url, Position::new(4, 7)));
+        assert_eq!(literal.uri, module_url);
+        assert_eq!(literal.range.start, Position::new(1, 0));
+        assert_eq!(literal.range.end, Position::new(1, 6));
+
+        assert!(
+            super::resolve_qualified_member(
+                &state,
+                &importer_url,
+                Position::new(5, 12),
+                &dollar_path("mod", &["public"]),
+                "child",
+                crate::extract_op::ExtractOp::Dollar,
+            )
+            .is_none(),
+            "nested module values must not fall back to ordinary object scanning"
+        );
+    }
+
+    #[test]
+    fn selective_member_references_follow_identity_across_renames() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let module_path = dir.path().join("mod.r");
+        let importer_path = dir.path().join("main.R");
+        let second_path = dir.path().join("second.R");
+        let unrelated_path = dir.path().join("unrelated.R");
+        let module_code = "box::export(public)\npublic <- 1\nprivate <- 2\n";
+        let importer_code = "\
+box::use(./mod)
+box::use(./mod[attached = public])
+mod$public
+mod@public
+mod[[\"public\"]]
+attached()
+other <- list(public = 1)
+other$public
+";
+        let second_code = "box::use(./mod[public])\npublic()\n";
+        let unrelated_code = "public <- 99\npublic()\n";
+        for (path, code) in [
+            (&module_path, module_code),
+            (&importer_path, importer_code),
+            (&second_path, second_code),
+            (&unrelated_path, unrelated_code),
+        ] {
+            fs::write(path, code).expect("write fixture");
+        }
+
+        let mut state = fresh_state();
+        let module_url = Url::from_file_path(&module_path).expect("module url");
+        let importer_url = Url::from_file_path(&importer_path).expect("importer url");
+        let second_url = Url::from_file_path(&second_path).expect("second url");
+        let unrelated_url = Url::from_file_path(&unrelated_path).expect("unrelated url");
+        add_indexed_doc(&mut state, module_url.as_str(), module_code);
+        add_indexed_doc(&mut state, importer_url.as_str(), importer_code);
+        add_indexed_doc(&mut state, second_url.as_str(), second_code);
+        add_indexed_doc(&mut state, unrelated_url.as_str(), unrelated_code);
+
+        for (uri, position) in [
+            (&importer_url, Position::new(1, 17)),
+            (&importer_url, Position::new(1, 28)),
+            (&second_url, Position::new(0, 17)),
+        ] {
+            let definition = loc(goto_definition(&state, uri, position));
+            assert_eq!(definition.uri, module_url);
+            assert_eq!(definition.range.start, Position::new(1, 0));
+            assert_eq!(definition.range.end, Position::new(1, 6));
+        }
+
+        let module_spec = loc(goto_definition(&state, &importer_url, Position::new(1, 12)));
+        assert_eq!(module_spec.uri, module_url);
+        assert_eq!(module_spec.range, tower_lsp::lsp_types::Range::default());
+        assert!(
+            goto_definition(&state, &importer_url, Position::new(1, 14)).is_none(),
+            "the attachment-list bracket is outside the module-spec hit range"
+        );
+
+        let mut from_qualified =
+            references(&state, &importer_url, Position::new(2, 6)).expect("qualified references");
+        let mut from_definition =
+            references(&state, &module_url, Position::new(1, 2)).expect("definition references");
+        let mut from_renamed =
+            references(&state, &importer_url, Position::new(5, 2)).expect("renamed references");
+        let mut from_renamed_declaration = references(&state, &importer_url, Position::new(1, 17))
+            .expect("renamed declaration references");
+        let mut from_exported_declaration = references(&state, &importer_url, Position::new(1, 28))
+            .expect("exported declaration references");
+        let sort_key = |location: &tower_lsp::lsp_types::Location| {
+            (
+                location.uri.as_str().to_string(),
+                location.range.start.line,
+                location.range.start.character,
+                location.range.end.character,
+            )
+        };
+        from_qualified.sort_by_key(&sort_key);
+        from_definition.sort_by_key(&sort_key);
+        from_renamed.sort_by_key(&sort_key);
+        from_renamed_declaration.sort_by_key(&sort_key);
+        from_exported_declaration.sort_by_key(&sort_key);
+        assert_eq!(from_definition, from_qualified);
+        assert_eq!(from_renamed, from_qualified);
+        assert_eq!(from_renamed_declaration, from_qualified);
+        assert_eq!(from_exported_declaration, from_qualified);
+        assert_eq!(from_qualified.len(), 9);
+        assert!(from_qualified.iter().any(|location| {
+            location.uri == module_url
+                && location.range.start == Position::new(1, 0)
+                && location.range.end == Position::new(1, 6)
+        }));
+        assert!(from_qualified.iter().any(|location| {
+            location.uri == importer_url
+                && location.range.start == Position::new(5, 0)
+                && location.range.end == Position::new(5, 8)
+        }));
+        assert!(from_qualified.iter().any(|location| {
+            location.uri == second_url
+                && location.range.start == Position::new(1, 0)
+                && location.range.end == Position::new(1, 6)
+        }));
+        assert!(
+            from_qualified
+                .iter()
+                .all(|location| location.uri != unrelated_url),
+            "same-name bindings outside the selective import identity must not leak"
+        );
+        assert!(
+            from_qualified.iter().all(|location| {
+                !(location.uri == importer_url && location.range.start.line == 7)
+            }),
+            "ordinary object members with the same name must not leak"
+        );
+    }
+
+    #[test]
+    fn backticked_selective_attachment_navigation_and_references_use_bare_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let module_path = dir.path().join("mod.r");
+        let importer_path = dir.path().join("main.R");
+        let module_code = "box::export(`%>%`)\n`%>%` <- function(x, y = 1) x\n";
+        let importer_code = "box::use(./mod[`pipe op` = `%>%`])\n`pipe op`(1)\n";
+        fs::write(&module_path, module_code).expect("write module");
+        fs::write(&importer_path, importer_code).expect("write importer");
+
+        let mut state = fresh_state();
+        let module_url = Url::from_file_path(&module_path).expect("module url");
+        let importer_url = Url::from_file_path(&importer_path).expect("importer url");
+        add_indexed_doc(&mut state, module_url.as_str(), module_code);
+        add_indexed_doc(&mut state, importer_url.as_str(), importer_code);
+
+        let use_scope = crate::handlers::get_cross_file_scope(
+            &state,
+            &importer_url,
+            1,
+            2,
+            &crate::handlers::DiagCancelToken::never(),
+            Some(state.package_state.scope_contribution()),
+        );
+        assert!(use_scope.symbols.contains_key("pipe op"));
+
+        for position in [
+            Position::new(0, 17),
+            Position::new(0, 29),
+            Position::new(1, 2),
+        ] {
+            let definition = loc(goto_definition(&state, &importer_url, position));
+            assert_eq!(definition.uri, module_url);
+            assert_eq!(definition.range.start, Position::new(1, 0));
+            assert_eq!(definition.range.end, Position::new(1, 5));
+        }
+
+        let from_declaration = references(&state, &importer_url, Position::new(0, 17))
+            .expect("backticked declaration references");
+        let from_use = references(&state, &importer_url, Position::new(1, 2))
+            .expect("backticked use references");
+        assert_eq!(from_declaration.len(), 4, "locations: {from_declaration:?}");
+        assert_eq!(from_declaration.len(), from_use.len());
+        assert!(from_declaration.iter().any(|location| {
+            location.uri == module_url && location.range.start == Position::new(1, 0)
+        }));
+    }
+
+    #[test]
+    fn selective_namespace_alias_references_follow_import_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let module_path = dir.path().join("mod.r");
+        let importer_path = dir.path().join("main.R");
+        let second_path = dir.path().join("second.R");
+        let module_code = "box::export(public)\npublic <- 1\n";
+        let importer_code = "\
+box::use(./mod)
+mod$public
+mod <- list(public = 2)
+mod$public
+";
+        let second_code = "box::use(./mod)\nmod$public\n";
+        for (path, code) in [
+            (&module_path, module_code),
+            (&importer_path, importer_code),
+            (&second_path, second_code),
+        ] {
+            fs::write(path, code).expect("write fixture");
+        }
+
+        let mut state = fresh_state();
+        let module_url = Url::from_file_path(&module_path).expect("module url");
+        let importer_url = Url::from_file_path(&importer_path).expect("importer url");
+        let second_url = Url::from_file_path(&second_path).expect("second url");
+        add_indexed_doc(&mut state, module_url.as_str(), module_code);
+        add_indexed_doc(&mut state, importer_url.as_str(), importer_code);
+        add_indexed_doc(&mut state, second_url.as_str(), second_code);
+
+        let mut from_declaration = references(&state, &importer_url, Position::new(0, 12))
+            .expect("declaration references");
+        let mut from_use =
+            references(&state, &importer_url, Position::new(1, 1)).expect("alias references");
+        let sort_key = |location: &tower_lsp::lsp_types::Location| {
+            (
+                location.uri.as_str().to_string(),
+                location.range.start.line,
+                location.range.start.character,
+                location.range.end.character,
+            )
+        };
+        from_declaration.sort_by_key(&sort_key);
+        from_use.sort_by_key(&sort_key);
+        assert_eq!(from_declaration, from_use);
+        assert_eq!(from_use.len(), 2, "locations: {from_use:?}");
+        assert!(from_use.iter().any(|location| {
+            location.uri == importer_url
+                && location.range.start == Position::new(0, 11)
+                && location.range.end == Position::new(0, 14)
+        }));
+        assert!(from_use.iter().any(|location| {
+            location.uri == importer_url
+                && location.range.start == Position::new(1, 0)
+                && location.range.end == Position::new(1, 3)
+        }));
+        assert!(
+            from_use.iter().all(|location| location.uri != second_url),
+            "a separate import site with the same alias must not share identity"
+        );
+        assert!(
+            from_use.iter().all(|location| {
+                !(location.uri == importer_url && location.range.start.line >= 2)
+            }),
+            "shadowing must end the namespace alias lifecycle"
+        );
+    }
+
+    #[test]
+    fn selective_namespace_hover_uses_closed_module_provenance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let module_path = dir.path().join("mod.r");
+        let importer_path = dir.path().join("main.R");
+        let module_code = "box::export(public)\npublic <- 1\nprivate <- 2\n";
+        let importer_code = "\
+box::use(./mod)
+mod$public
+mod@public
+mod[[\"public\"]]
+mod$private
+";
+        fs::write(&module_path, module_code).expect("write module");
+        fs::write(&importer_path, importer_code).expect("write importer");
+
+        let mut state = fresh_state();
+        let module_url = Url::from_file_path(&module_path).expect("module url");
+        let importer_url = Url::from_file_path(&importer_path).expect("importer url");
+        add_indexed_doc(&mut state, module_url.as_str(), module_code);
+        state.open_document(importer_url.clone(), importer_code, Some(1));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        for position in [
+            Position::new(1, 6),
+            Position::new(2, 6),
+            Position::new(3, 7),
+        ] {
+            let result = runtime
+                .block_on(hover(&state, &importer_url, position))
+                .expect("exported member hover");
+            let value = match result.contents {
+                tower_lsp::lsp_types::HoverContents::Markup(markup) => markup.value,
+                other => panic!("expected markup hover, got {other:?}"),
+            };
+            assert!(value.contains("public <- 1"), "hover was {value:?}");
+        }
+
+        assert!(
+            runtime
+                .block_on(hover(&state, &importer_url, Position::new(4, 6)))
+                .is_none(),
+            "private module members must not receive hover"
+        );
+    }
+
+    #[test]
+    fn selective_package_namespace_completion_uses_cached_exports_without_navigation() {
+        let mut state = fresh_state();
+        let mut package = crate::package_library::PackageInfo::new(
+            "fakepkg".to_string(),
+            HashSet::from(["alpha".to_string(), "beta".to_string()]),
+        );
+        package.exports_completeness = crate::package_library::MemberCompleteness::Complete;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(state.package_library.insert_package(package));
+        state.package_library_ready = true;
+        let snapshot = state
+            .package_library
+            .namespace_exports_snapshot_sync("fakepkg");
+        assert_eq!(
+            snapshot.completeness,
+            crate::package_library::MemberCompleteness::Complete
+        );
+        assert_eq!(
+            snapshot.members,
+            HashSet::from(["alpha".to_string(), "beta".to_string()])
+        );
+
+        let code = "box::use(fp = fakepkg)\nfp$alpha\nfp$missing\nfp$\n";
+        let uri = add_indexed_doc(&mut state, "file:///package-import.R", code);
+        let path = dollar_path("fp", &[]);
+        let mut names = super::complete_qualified_members(
+            &state,
+            &uri,
+            Position::new(3, 3),
+            &path,
+            crate::extract_op::ExtractOp::Dollar,
+        )
+        .into_iter()
+        .map(|item| item.name)
+        .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(
+            super::resolve_qualified_member(
+                &state,
+                &uri,
+                Position::new(1, 5),
+                &path,
+                "alpha",
+                crate::extract_op::ExtractOp::Dollar,
+            )
+            .is_none(),
+            "package members have no navigable file provenance"
+        );
+        assert!(
+            super::resolve_qualified_member(
+                &state,
+                &uri,
+                Position::new(2, 5),
+                &path,
+                "missing",
+                crate::extract_op::ExtractOp::Dollar,
+            )
+            .is_none(),
+            "complete package metadata must not fabricate absent members"
+        );
+
+        state.open_document(uri.clone(), code, Some(1));
+        state.help_cache.insert(
+            "alpha",
+            Some("fakepkg"),
+            Some("cached alpha help".to_string()),
+        );
+        assert_eq!(
+            super::selective_namespace_package(&state, &uri, Position::new(1, 5), &path, "alpha",),
+            Some("fakepkg".to_string())
+        );
+        let result = runtime
+            .block_on(hover(&state, &uri, Position::new(1, 5)))
+            .expect("package-backed namespace hover");
+        let value = match result.contents {
+            tower_lsp::lsp_types::HoverContents::Markup(markup) => markup.value,
+            other => panic!("expected markup hover, got {other:?}"),
+        };
+        assert!(value.contains("fakepkg"), "hover was {value:?}");
+        assert!(value.contains("cached alpha help"), "hover was {value:?}");
+        assert!(
+            runtime
+                .block_on(hover(&state, &uri, Position::new(2, 5)))
+                .is_none(),
+            "absent package members must not receive hover"
+        );
     }
 
     #[test]

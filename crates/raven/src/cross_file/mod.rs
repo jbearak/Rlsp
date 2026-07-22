@@ -212,6 +212,12 @@ pub fn extract_metadata_with_tree(
         meta.tar_source_requests = tar_source_requests;
         meta.list_files_source_requests = list_files_source_requests;
         meta.namespace_references = source_detect::detect_namespace_references(tree, content);
+
+        // box::use() imports and box::export() / #' @export interface (#662).
+        // Surface parse only; path resolution and scope consumption live in
+        // `crate::box_use` and are applied by downstream cross-file phases.
+        meta.box_imports = crate::box_use::detect_box_imports(tree, content);
+        meta.box_exports = crate::box_use::parse_box_exports(tree, content);
     } else {
         log::warn!("Failed to parse R code with tree-sitter during metadata extraction");
     }
@@ -227,4 +233,18 @@ pub fn extract_metadata_with_tree(
     );
 
     meta
+}
+
+/// Persist local `{box}` module resolution outcomes into metadata during
+/// detached analysis. This is the only cross-file entry point that performs the
+/// box resolver's filesystem work; committed graph/scope/request consumers use
+/// the stored source identity and never re-read directories.
+pub(crate) fn enrich_box_import_resolutions(
+    meta: &mut CrossFileMetadata,
+    importing_uri: &tower_lsp::lsp_types::Url,
+) {
+    crate::box_use::path::enrich_local_imports(importing_uri, &mut meta.box_imports);
+    if let Some(exports) = &mut meta.box_exports {
+        crate::box_use::path::enrich_local_imports(importing_uri, &mut exports.reexports);
+    }
 }

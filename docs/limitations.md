@@ -11,6 +11,24 @@ Raven is under active development. The gaps below reflect features that exist in
 - **Raw path identity for closed symlink spellings** — Raven's dependency graph, file caches, workspace indexes, and diagnostic publication keep raw URI spellings rather than globally canonicalizing paths, so closed files reached through different symlink spellings can remain distinct identities. Open buffers are bridged: a case or symlink alias of an on-disk file is authoritative for the corresponding graph URI while it is open, including package-internal scope and workspace `.Rprofile` prelude ownership; diagnostics still publish to the URI spelling the editor opened. Raven still avoids full filesystem canonicalization because it follows symlinks and can diverge from the uncanonicalized paths used by the workspace index. The source-path resolver may correct case-only mismatches so graph edges match the on-disk workspace-index spelling. See [Cross-File & Package Awareness — Open buffers, disk state, and closing files](./cross-file.md#open-buffers-disk-state-and-closing-files).
 - **Member navigation only for static `$`/`@`/literal-`[[` accessors** — go-to-definition, hover, and find-references treat a member access as navigable only when it is statically a name: an identifier RHS of `$`/`@` (`foo$bar`), or a **single, positional, literal** string subscript of `[[` (`foo[["bar"]]`, the `$`-equivalent extractor). A subscript that R only resolves at runtime is intentionally **not** unified: computed/dynamic indices (`x[[i]]`, `x[[paste0("a", "b")]]`), numeric indices (`x[[1]]`), named or multi-argument subscripts (`x[[name = "a"]]`, `x[["a", exact = FALSE]]`), strings with escapes, and the single-bracket form `x["bar"]` (which returns a sub-container, not the element). See [Go-to-Definition](./go-to-definition.md#-and--member-resolution) and [Find References](./find-references.md#scope-and-pooling).
 
+## box module system (`box::use`)
+
+Raven models the statically analyzable subset of the [box](https://klmr.me/box/) module system across diagnostics, completion, hover, go-to-definition, find-references, dependency revalidation, the language server, and `raven check`. See [Cross-File & Package Awareness — box module imports](./cross-file.md#box-module-imports-boxuse).
+
+**Only static `box::use()` is recognised.** The call must be a literal `box::use(...)` / `box:::use(...)`. Programmatic invocation — `do.call(box::use, ...)`, aliasing `box::use` to another name, or building the argument list at runtime — is not recognised.
+
+**Local modules must be explicit relative paths.** A bare name is always treated as an installed package; a local module *must* begin with `./` or `../`. The following non-local module lookups are **not** supported and fail conservatively (they neither bind names nor emit misleading diagnostics):
+
+- Non-local search-path specs such as `foo/bar` (a module found via a search path rather than relative to the importing file).
+- `options(box.path = ...)` and the `R_BOX_PATH` environment variable.
+- Remote modules and box's global-module directory.
+
+**Local resolution differs from `source()`.** box paths resolve relative to the importing file's own directory and intentionally ignore `# raven: cd`, the implicit testthat/testit working directory, and the workspace-root fallback. Resolution is case-sensitive: a path that exists only under a different case is reported as a mismatch, not silently corrected. Ambiguous case-insensitive collisions (only possible on a case-sensitive filesystem) fail closed.
+
+**No runtime module execution.** Raven does not execute module code, evaluate load/unload hooks or other side effects, or inspect dynamically-created exports. Marker-less legacy export sets are therefore treated as incomplete: known members are available, but absence is not diagnosed unless the module has an authoritative explicit export interface. Installed-package imports use Raven's installed, frozen, or downloaded package export metadata under the same completeness rule.
+
+**Static member access only.** Namespace-member completion, hover, navigation, and identity-aware references cover `$`, `@`, and a single positional literal-string `[[...]]` subscript. Computed subscripts and nested runtime values are not evaluated. Installed-package members are available for completion and diagnostics but do not navigate to package source files.
+
 ## R Markdown / Quarto
 
 R chunk bodies in `.Rmd` / `.Rmarkdown` / `.qmd` documents are fully analyzed as first-class R code. The following gaps are accepted limitations of the current implementation:

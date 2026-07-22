@@ -222,6 +222,7 @@ fn open_disk_fallback_target(
         workspace_root.as_ref(),
         &state.workspace_exclusions,
     );
+    crate::cross_file::enrich_box_import_resolutions(&mut meta, uri);
     state.open_document_with_language_id_and_metadata(
         uri.clone(),
         text,
@@ -398,6 +399,7 @@ fn materialize_cli_contextual_provider(
         workspace_root,
         &state.workspace_exclusions,
     );
+    crate::cross_file::enrich_box_import_resolutions(&mut metadata, &execution.uri);
     let artifacts = std::sync::Arc::new(match tree.as_ref() {
         Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
             &execution.uri,
@@ -1049,6 +1051,17 @@ fn reported_packages_to_warm(
             // dataset object names. Unlike `library()` these are not attached,
             // but their `data/` enumeration must be cached.
             packages.extend(entry.data_packages.iter().cloned());
+            // Issue #662: static `box::use(package)` imports need the same
+            // canonical package metadata warm-up as the LSP. They do not attach
+            // the package; warming only makes the selective export boundary
+            // available to diagnostics and scope resolution.
+            packages.extend(entry.metadata.box_imports.iter().filter_map(
+                |import| match &import.spec {
+                    crate::box_use::BoxSpec::Package(package) => Some(package.clone()),
+                    crate::box_use::BoxSpec::LocalModule { .. }
+                    | crate::box_use::BoxSpec::Unsupported(_) => None,
+                },
+            ));
         } else if is_chunk_file(path) {
             // Chunk files are outside the R-only scan, so they have no index
             // entry. Read + construct a throwaway Document best-effort so its
@@ -1062,13 +1075,21 @@ fn reported_packages_to_warm(
                     crate::state::Document::new_with_language_id(&text, Some(1), &uri, Some("rmd"));
                 packages.extend(doc.loaded_packages.iter().cloned());
                 packages.extend(doc.data_packages.iter().cloned());
+                let metadata = crate::cross_file::extract_metadata(&doc.analysis_text());
                 packages.extend(
-                    crate::cross_file::extract_metadata(&doc.analysis_text())
+                    metadata
                         .library_calls
-                        .into_iter()
+                        .iter()
                         .filter(|call| call.requires_attached.is_some())
-                        .map(|call| call.package),
+                        .map(|call| call.package.clone()),
                 );
+                packages.extend(metadata.box_imports.iter().filter_map(
+                    |import| match &import.spec {
+                        crate::box_use::BoxSpec::Package(package) => Some(package.clone()),
+                        crate::box_use::BoxSpec::LocalModule { .. }
+                        | crate::box_use::BoxSpec::Unsupported(_) => None,
+                    },
+                ));
             }
         }
     }
@@ -3710,6 +3731,21 @@ infixContinuationStyle = "indented"
     }
 
     #[test]
+    fn warming_includes_box_package_from_indexed_r_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("analysis.R"),
+            "box::use(syntheticBoxPackage)\n",
+        )
+        .unwrap();
+        let warm = warm_set_for(tmp.path());
+        assert!(
+            warm.contains("syntheticBoxPackage"),
+            "static box package imports must contribute to the CLI warm set: {warm:?}"
+        );
+    }
+
+    #[test]
     fn warming_includes_conditional_p_load_target_from_indexed_r_file() {
         let tmp = TempDir::new().unwrap();
         fs::write(
@@ -3812,6 +3848,21 @@ infixContinuationStyle = "indented"
             warm.contains("survival"),
             "data(lung, package = \"survival\") in an Rmd chunk must contribute \
              `survival` to the warm set: {warm:?}"
+        );
+    }
+
+    #[test]
+    fn warming_includes_box_package_from_chunk_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("report.qmd"),
+            "# Report\n\n```{r}\nbox::use(chunkBoxPackage)\n```\n",
+        )
+        .unwrap();
+        let warm = warm_set_for(tmp.path());
+        assert!(
+            warm.contains("chunkBoxPackage"),
+            "static box imports in masked R chunks must be warmed: {warm:?}"
         );
     }
 

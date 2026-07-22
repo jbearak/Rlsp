@@ -460,8 +460,9 @@ impl OpenDocumentStore {
     pub fn insert(&mut self, uri: Url, document: Document) -> Option<Document> {
         let replaced = self.records.get(&uri).map(|record| record.document.clone());
         let analysis_text = document.analysis_text();
-        let metadata = Arc::new(crate::cross_file::extract_metadata(&analysis_text));
-        self.install(uri, document, metadata, None);
+        let mut metadata = crate::cross_file::extract_metadata(&analysis_text);
+        crate::cross_file::enrich_box_import_resolutions(&mut metadata, &uri);
+        self.install(uri, document, Arc::new(metadata), None);
         replaced
     }
 }

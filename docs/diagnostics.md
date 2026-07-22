@@ -34,8 +34,11 @@ are governed only by their severity settings). The suppressible analyzer codes a
 | `syntax-error` | Parse errors (the umbrella code; most parse errors carry it directly, but `chained-comparison` is a sub-kind that carries its own code) | No |
 | `unresolved-source-path` | A `source()` / forward-directive path (`# raven: source` / `# raven: run` / `# raven: include`) **or** a backward-directive path (`# raven: sourced-by` / `# raven: run-by` / `# raven: included-by`) that does not resolve to a file — missing, outside the workspace, or case-ambiguous (2+ case-insensitive matches) | No |
 | `source-path-case-mismatch` | A `source()` / forward-directive **or** backward-directive (`# raven: sourced-by` etc.) path that resolves only by a case difference from the real filename (`templates.r` vs `templates.R`) | No |
+| `box-module-not-found` | A static relative `box::use(./module)` target does not resolve to a file module or `__init__.r` / `__init__.R` module | No |
+| `box-module-case-mismatch` | A static relative box module target exists only under a different filename case | No |
+| `box-export-not-found` | A named/renamed box attachment is absent from a complete module or package export set | Yes |
 | `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
-| `package-not-installed` | `library()` / `require()` of a package that is not installed (also fires on `pkg::member` / `pkg:::member` when `pkg` is not installed) | Yes |
+| `package-not-installed` | `library()` / `require()` / static `box::use()` of a package that is not installed (also fires on `pkg::member` / `pkg:::member` when `pkg` is not installed) | Yes |
 | `package-outside-active-library` | A package exists in a vanilla system/user library but is unavailable in the active renv project library; child of `package-not-installed` | Yes |
 | `namespace-member-not-found` | `pkg::member` where a *complete* package export set has no such exported object (never for `pkg:::member`) | Yes |
 | `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below | No |
@@ -100,6 +103,7 @@ If the symbol is defined later in the same file at top level, the message also r
 - A definition above the usage in the same file
 - A definition in a sourced file (via `source()` or directives)
 - A package export from a loaded `library()`
+- A namespace alias or attached member from a static `box::use()` import
 - A declaration directive (`# raven: var`, `# raven: func`)
 - A `# raven: ignore` on the line
 

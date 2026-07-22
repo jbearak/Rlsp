@@ -304,15 +304,29 @@ pub struct CrossFileMetadata {
     /// Detected `pkg::member` namespace references (issue #503).
     #[serde(default)]
     pub namespace_references: Vec<NamespaceReference>,
+    /// Static `box::use()` module imports parsed from this file (issue #662),
+    /// in document order. Surface-level parse only; local-module path resolution
+    /// and lowering into a
+    /// [`SelectiveImportRequest`](crate::selective_import::SelectiveImportRequest)
+    /// happen in [`crate::box_use::path`]. Empty for a file with no box imports.
+    #[serde(default)]
+    pub box_imports: Vec<crate::box_use::BoxImport>,
+    /// This file's box *export* interface (issue #662), present only when the
+    /// file uses an explicit box export marker (`box::export()` / `#' @export`).
+    /// `None` means "no explicit markers"; a consumer that treats the file as a
+    /// box module derives legacy default exports from the live top-level scope on
+    /// demand rather than storing the legacy set on every ordinary script.
+    #[serde(default)]
+    pub box_exports: Option<crate::box_use::BoxExports>,
 }
 
 impl CrossFileMetadata {
-    /// Package names referenced by lexical package loaders or the targets
-    /// pipeline worker-package declaration.
+    /// Package names referenced by lexical package loaders, targets pipeline
+    /// declarations, or static selective package imports.
     ///
-    /// This is a warming/inventory view only. Semantic scope keeps the two
-    /// channels separate because ordinary loaders are position-sensitive while
-    /// targets packages are pipeline-level.
+    /// This is a warming/inventory view only. Semantic scope keeps all channels
+    /// separate: ordinary loaders are position-sensitive, targets packages are
+    /// pipeline-level, and selective imports expose only requested exports.
     pub fn referenced_packages(&self) -> impl Iterator<Item = &str> {
         self.library_calls
             .iter()
@@ -321,6 +335,15 @@ impl CrossFileMetadata {
                 self.targets_pipeline_packages
                     .iter()
                     .map(|declaration| declaration.package.as_str()),
+            )
+            .chain(
+                self.box_imports
+                    .iter()
+                    .filter_map(|import| match &import.spec {
+                        crate::box_use::BoxSpec::Package(package) => Some(package.as_str()),
+                        crate::box_use::BoxSpec::LocalModule { .. }
+                        | crate::box_use::BoxSpec::Unsupported(_) => None,
+                    }),
             )
     }
 }
@@ -851,6 +874,53 @@ pub fn enrich_metadata_with_inherited_wd<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn referenced_packages_include_static_box_packages_only() {
+        let metadata = CrossFileMetadata {
+            box_imports: vec![
+                crate::box_use::BoxImport {
+                    local_resolution: None,
+                    spec: crate::box_use::BoxSpec::Package("dplyr".to_string()),
+                    explicit_alias: None,
+                    attach: Vec::new(),
+                    line: 0,
+                    column: 0,
+                    end_column: 5,
+                    function_scoped: false,
+                },
+                crate::box_use::BoxImport {
+                    local_resolution: None,
+                    spec: crate::box_use::BoxSpec::LocalModule {
+                        up_levels: 0,
+                        components: vec!["helpers".to_string()],
+                    },
+                    explicit_alias: None,
+                    attach: Vec::new(),
+                    line: 1,
+                    column: 0,
+                    end_column: 9,
+                    function_scoped: false,
+                },
+                crate::box_use::BoxImport {
+                    local_resolution: None,
+                    spec: crate::box_use::BoxSpec::Unsupported("search/path".to_string()),
+                    explicit_alias: None,
+                    attach: Vec::new(),
+                    line: 2,
+                    column: 0,
+                    end_column: 11,
+                    function_scoped: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            metadata.referenced_packages().collect::<Vec<_>>(),
+            vec!["dplyr"]
+        );
+    }
 
     fn shiny(role: ShinyFileRole, mode: ShinyApplicationMode) -> ShinyApplicationMetadata {
         ShinyApplicationMetadata {

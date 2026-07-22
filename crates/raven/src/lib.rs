@@ -18,6 +18,7 @@ pub mod test_utils;
 
 // Transitive dependencies of the above modules:
 pub mod backend;
+pub mod box_use;
 pub mod builtins;
 pub mod chunks;
 pub mod completion_context;
@@ -48,6 +49,7 @@ pub mod qualified_resolve;
 pub mod r_names;
 pub mod r_subprocess;
 pub mod roxygen;
+pub mod selective_import;
 pub mod stan_builtins;
 pub mod utf16;
 pub mod workspace_index;

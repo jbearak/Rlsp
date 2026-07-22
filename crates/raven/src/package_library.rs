@@ -254,6 +254,17 @@ pub enum NamespaceMemberStatus {
     Unknown,
 }
 
+/// Immutable synchronous snapshot of one package namespace's exported members.
+///
+/// This is the set-valued counterpart of [`NamespaceMemberStatus`]. Consumers
+/// such as selective imports need to expand wildcard attachment while preserving
+/// whether a missing member is genuinely absent or merely unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceExportSnapshot {
+    pub members: HashSet<String>,
+    pub completeness: MemberCompleteness,
+}
+
 /// Cached package information
 ///
 /// Stores all relevant information about an R package including its exports,
@@ -1072,6 +1083,67 @@ impl PackageLibrary {
         }
 
         None
+    }
+
+    /// Return a cache/provider-only snapshot of one package's namespace exports.
+    ///
+    /// Never spawns R, touches disk, or mutates the cache. The authority and
+    /// completeness rules match [`Self::namespace_member_status_sync`]: cached
+    /// metadata wins when complete or partial; unknown cached positives are
+    /// retained while provider metadata is consulted; provider absence is
+    /// authoritative only when no local installation could be newer than the
+    /// provider snapshot.
+    pub fn namespace_exports_snapshot_sync(&self, package: &str) -> NamespaceExportSnapshot {
+        if is_load_all_sentinel(package) {
+            return NamespaceExportSnapshot {
+                members: HashSet::new(),
+                completeness: MemberCompleteness::Unknown,
+            };
+        }
+
+        let mut members = HashSet::new();
+        let extend_members = |members: &mut HashSet<String>, info: &PackageInfo| {
+            members.extend(info.exports.iter().cloned());
+            members.extend(info.lazy_data.iter().cloned());
+            members.extend(info.data_aliases.values().flatten().cloned());
+        };
+
+        if let Some(info) = self.packages.load().get(package) {
+            extend_members(&mut members, info);
+            match info.exports_completeness {
+                MemberCompleteness::Complete | MemberCompleteness::Partial => {
+                    return NamespaceExportSnapshot {
+                        members,
+                        completeness: info.exports_completeness,
+                    };
+                }
+                MemberCompleteness::Unknown => {}
+            }
+        }
+
+        if let Some(info) = self.resolve_from_providers(package) {
+            extend_members(&mut members, &info);
+            // Keep this request-path snapshot genuinely disk-free. When any
+            // local library path exists, a local installation may be newer than
+            // the provider record, so provider absence is not authoritative
+            // until background warming publishes the installed metadata. With
+            // no local libraries, downloaded/embedded provider completeness is
+            // authoritative on its own.
+            let completeness = if self.lib_paths().is_empty() {
+                info.exports_completeness
+            } else {
+                MemberCompleteness::Unknown
+            };
+            return NamespaceExportSnapshot {
+                members,
+                completeness,
+            };
+        }
+
+        NamespaceExportSnapshot {
+            members,
+            completeness: MemberCompleteness::Unknown,
+        }
     }
 
     /// Synchronous, cache/provider-only `pkg::member` authority. Never spawns R,
@@ -4836,6 +4908,36 @@ mod tests {
         assert_eq!(cached.name, "dplyr");
         assert!(cached.exports.contains("mutate"));
         assert!(cached.exports.contains("filter"));
+    }
+
+    #[tokio::test]
+    async fn namespace_export_snapshot_preserves_members_and_completeness() {
+        let lib = PackageLibrary::new_empty();
+        let mut info = PackageInfo::new(
+            "boxpkg".to_string(),
+            ["exported".to_string()].into_iter().collect(),
+        );
+        info.lazy_data.push("dataset".to_string());
+        info.data_aliases.insert(
+            "bundle".to_string(),
+            vec!["object_one".to_string(), "object_two".to_string()],
+        );
+        info.exports_completeness = MemberCompleteness::Complete;
+        lib.insert_package(info).await;
+
+        let snapshot = lib.namespace_exports_snapshot_sync("boxpkg");
+        assert_eq!(snapshot.completeness, MemberCompleteness::Complete);
+        assert_eq!(
+            snapshot.members,
+            ["exported", "dataset", "object_one", "object_two"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+
+        let unknown = lib.namespace_exports_snapshot_sync("not-cached");
+        assert_eq!(unknown.completeness, MemberCompleteness::Unknown);
+        assert!(unknown.members.is_empty());
     }
 
     #[tokio::test]

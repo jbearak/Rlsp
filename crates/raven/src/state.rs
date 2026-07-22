@@ -12561,12 +12561,14 @@ pub fn scan_workspace_with_exclusions(
     }
 
     for (uri, entry) in &mut entries {
+        let metadata = Arc::make_mut(&mut entry.metadata);
         let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
-            Arc::make_mut(&mut entry.metadata),
+            metadata,
             uri,
             workspace_root.as_ref(),
             exclusions,
         );
+        crate::cross_file::enrich_box_import_resolutions(metadata, uri);
         let analysis = entry.contents.to_string();
         entry.artifacts = Arc::new(match entry.tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(

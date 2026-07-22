@@ -57,6 +57,12 @@ pub const PACKAGE_OUTSIDE_ACTIVE_LIBRARY: &str = "package-outside-active-library
 /// exported member or data object. Never emitted for `pkg:::member` (internal
 /// access) or from partial/unknown metadata. See `namespace_member_status_sync`.
 pub const NAMESPACE_MEMBER_NOT_FOUND: &str = "namespace-member-not-found";
+/// A static local `box::use()` spec that resolves to no file module or `__init__`.
+pub const BOX_MODULE_NOT_FOUND: &str = "box-module-not-found";
+/// A static local `box::use()` spec whose on-disk spelling differs only by case.
+pub const BOX_MODULE_CASE_MISMATCH: &str = "box-module-case-mismatch";
+/// A selected `box::use()` attachment that is absent from a complete export set.
+pub const BOX_EXPORT_NOT_FOUND: &str = "box-export-not-found";
 /// A `# raven: expect[...]` (or, under the global sweep, any suppression)
 /// that suppressed nothing. Hint severity. F2.
 pub const UNUSED_SUPPRESSION: &str = "unused-suppression";
@@ -87,6 +93,9 @@ pub const ANALYZER_CODES: &[&str] = &[
     ASSIGN_TO_STRING_LITERAL,
     PACKAGE_NOT_INSTALLED,
     NAMESPACE_MEMBER_NOT_FOUND,
+    BOX_MODULE_NOT_FOUND,
+    BOX_MODULE_CASE_MISMATCH,
+    BOX_EXPORT_NOT_FOUND,
     UNUSED_SUPPRESSION,
 ];
 
@@ -105,6 +114,7 @@ pub const SUPPRESSIBLE_ANALYZER_CODES: &[&str] = &[
     PACKAGE_NOT_INSTALLED,
     PACKAGE_OUTSIDE_ACTIVE_LIBRARY,
     NAMESPACE_MEMBER_NOT_FOUND,
+    BOX_EXPORT_NOT_FOUND,
 ];
 
 /// Canonical lint codes, kebab-case (the suppression spelling of the
