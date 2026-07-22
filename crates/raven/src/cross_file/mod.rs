@@ -218,6 +218,7 @@ pub fn extract_metadata_with_tree(
         // `crate::box_use` and are applied by downstream cross-file phases.
         meta.box_imports = crate::box_use::detect_box_imports(tree, content);
         meta.box_exports = crate::box_use::parse_box_exports(tree, content);
+        meta.import_calls = crate::import_pkg::detect::detect_import_calls(tree, content);
     } else {
         log::warn!("Failed to parse R code with tree-sitter during metadata extraction");
     }
@@ -235,16 +236,33 @@ pub fn extract_metadata_with_tree(
     meta
 }
 
-/// Persist local `{box}` module resolution outcomes into metadata during
-/// detached analysis. This is the only cross-file entry point that performs the
-/// box resolver's filesystem work; committed graph/scope/request consumers use
-/// the stored source identity and never re-read directories.
+/// Persist local `{box}` module resolution outcomes into metadata in tests and
+/// box-only helpers that have no workspace context. Production mixed-dialect
+/// analysis must call [`enrich_selective_import_resolutions`] so `{import}` keeps
+/// its workspace-root fallback.
 pub(crate) fn enrich_box_import_resolutions(
     meta: &mut CrossFileMetadata,
     importing_uri: &tower_lsp::lsp_types::Url,
+) {
+    enrich_selective_import_resolutions(meta, importing_uri, None);
+}
+
+/// Enrich both selective-import dialects, supplying the workspace root needed
+/// by `{import}`'s normal forward fallback tiers.
+pub(crate) fn enrich_selective_import_resolutions(
+    meta: &mut CrossFileMetadata,
+    importing_uri: &tower_lsp::lsp_types::Url,
+    workspace_root: Option<&tower_lsp::lsp_types::Url>,
 ) {
     crate::box_use::path::enrich_local_imports(importing_uri, &mut meta.box_imports);
     if let Some(exports) = &mut meta.box_exports {
         crate::box_use::path::enrich_local_imports(importing_uri, &mut exports.reexports);
     }
+    let metadata_snapshot = meta.clone();
+    crate::import_pkg::path::enrich_local_imports(
+        importing_uri,
+        &metadata_snapshot,
+        &mut meta.import_calls,
+        workspace_root,
+    );
 }

@@ -512,11 +512,11 @@ modules own it, split by concern:
 
 - `crates/raven/src/selective_import.rs` — the **syntax-agnostic** data model.
   `SelectiveImportRequest` carries an `ImportSource` (a package name, or a
-  resolved local-module `Url`), optional `NamespaceBinding`, `AttachBinding`s,
-  and import provenance. Resolution combines it with an `ExportSet` carrying an
+  dialect-bearing resolved local-module identity), optional `NamespaceBinding`,
+  `AttachBinding`s, destination, exclusions, and import provenance. Resolution combines it with an `ExportSet` carrying an
   `ExportCompleteness` marker and per-member provenance. It is deliberately
-  independent of any surface syntax so it can back a future second syntax
-  (#663) unchanged. Its interface hash folds semantic import/export boundaries,
+  independent of surface parsing and backs both box and `{import}` (#663). Its
+  interface hash folds semantic import/export boundaries,
   not source-line provenance, so moving an unchanged import does not churn
   dependents.
 - `crates/raven/src/box_use/` — everything **box-specific**:
@@ -535,6 +535,12 @@ modules own it, split by concern:
   - `resolve.rs` combines explicit or legacy module exports with package
     snapshots, resolves recursive named/renamed/wildcard re-exports with cycle
     and depth guards, and preserves exact original-definition provenance.
+- `crates/raven/src/import_pkg/` owns `{import}` detection, exact literal-script
+  path lowering, and its separate partial live-private-environment export
+  policy. `CrossFileMetadata::selective_import_requests` is the centralized
+  lowering iterator used by scope and graph code. Named destinations stay in a
+  lower-priority layer in both recursive and streaming scope; they are never
+  namespace aliases.
 
 `CrossFileMetadata` stores `box_imports: Vec<BoxImport>` and
 `box_exports: Option<BoxExports>` (both `#[serde(default)]`). Local imports also

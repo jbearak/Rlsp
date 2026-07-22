@@ -311,6 +311,11 @@ pub struct CrossFileMetadata {
     /// happen in [`crate::box_use::path`]. Empty for a file with no box imports.
     #[serde(default)]
     pub box_imports: Vec<crate::box_use::BoxImport>,
+    /// Statically supported `import::from`, `import::here`, and `import::into`
+    /// calls (issue #663), in document order. Local script identities are
+    /// enriched during detached analysis.
+    #[serde(default)]
+    pub import_calls: Vec<crate::import_pkg::ImportCall>,
     /// This file's box *export* interface (issue #662), present only when the
     /// file uses an explicit box export marker (`box::export()` / `#' @export`).
     /// `None` means "no explicit markers"; a consumer that treats the file as a
@@ -344,6 +349,30 @@ impl CrossFileMetadata {
                         crate::box_use::BoxSpec::LocalModule { .. }
                         | crate::box_use::BoxSpec::Unsupported(_) => None,
                     }),
+            )
+            .chain(
+                self.import_calls
+                    .iter()
+                    .filter_map(crate::import_pkg::ImportCall::package_name),
+            )
+    }
+
+    /// Central syntax-independent lowering iterator used by scope and graph
+    /// consumers. Surface-specific path and call parsing stays in its dialect.
+    pub fn selective_import_requests<'a>(
+        &'a self,
+        importing_uri: &'a Url,
+    ) -> impl Iterator<Item = crate::selective_import::SelectiveImportRequest> + 'a {
+        self.box_imports
+            .iter()
+            .filter_map(move |import| {
+                let source = import.resolved_source()?;
+                Some(import.lower(importing_uri, source))
+            })
+            .chain(
+                self.import_calls
+                    .iter()
+                    .filter_map(move |import| import.lower(importing_uri)),
             )
     }
 }

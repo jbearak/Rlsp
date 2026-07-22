@@ -25,6 +25,17 @@ Raven models the statically analyzable subset of the [box](https://klmr.me/box/)
 
 **Local resolution differs from `source()`.** box paths resolve relative to the importing file's own directory and intentionally ignore `# raven: cd`, the implicit testthat/testit working directory, and the workspace-root fallback. Resolution is case-sensitive: a path that exists only under a different case is reported as a mismatch, not silently corrected. Ambiguous case-insensitive collisions (only possible on a case-sensitive filesystem) fail closed.
 
+## import package
+
+Raven models the static first phase of `import::from()`, `import::here()`, and
+`import::into()`: literal package or `.R`/`.r` script sources, literal
+`.directory` and named destinations, explicit/renamed selections, `.all`, and
+static `.except`. It does not execute R, model detach/S3 side effects, follow
+URL or pins modules, or evaluate dynamic `.character_only`, `.library`,
+`.directory`, `.into`, source, or member expressions. Environment-valued
+destinations and `import:::` internal imports are not modeled. Unsupported calls
+are inert rather than partially guessed.
+
 **No runtime module execution.** Raven does not execute module code, evaluate load/unload hooks or other side effects, or inspect dynamically-created exports. Marker-less legacy export sets are therefore treated as incomplete: known members are available, but absence is not diagnosed unless the module has an authoritative explicit export interface. Installed-package imports use Raven's installed, frozen, or downloaded package export metadata under the same completeness rule.
 
 **Static member access only.** Namespace-member completion, hover, navigation, and identity-aware references cover `$`, `@`, and a single positional literal-string `[[...]]` subscript. Computed subscripts and nested runtime values are not evaluated. Installed-package members are available for completion and diagnostics but do not navigate to package source files.

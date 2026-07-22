@@ -68,7 +68,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use crate::selective_import::{
-    AttachBinding, ExportCompleteness, ExportSet, ImportProvenance, ImportSource, NamespaceBinding,
+    AttachBinding, ExportCompleteness, ExportSet, ImportDestination, ImportProvenance,
+    ImportSource, LocalModuleDialect, LocalModuleIdentity, NamespaceBinding,
     SelectiveImportRequest,
 };
 
@@ -196,7 +197,10 @@ impl BoxImport {
         match (&self.spec, &self.local_resolution) {
             (BoxSpec::Package(package), _) => Some(ImportSource::Package(package.clone())),
             (BoxSpec::LocalModule { .. }, Some(LocalModuleResolution::Resolved(uri))) => {
-                Some(ImportSource::LocalModule(uri.clone()))
+                Some(ImportSource::LocalModule(LocalModuleIdentity::new(
+                    uri.clone(),
+                    LocalModuleDialect::Box,
+                )))
             }
             (BoxSpec::LocalModule { .. }, _) | (BoxSpec::Unsupported(_), _) => None,
         }
@@ -244,6 +248,9 @@ impl BoxImport {
             source,
             namespace,
             attach,
+            destination: ImportDestination::CurrentEnvironment,
+            excluded_exports: Default::default(),
+            wildcard_skips_explicit_exports: false,
             function_scoped: self.function_scoped,
             provenance: ImportProvenance {
                 uri: importing_uri.clone(),

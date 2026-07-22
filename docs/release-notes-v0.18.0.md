@@ -1,6 +1,8 @@
-# Raven v0.18.0 — box module system (`box::use`)
+# Raven v0.18.0 — selective module imports
 
 Raven 0.18.0 adds static understanding of the [box](https://klmr.me/box/) R module system. Raven now recognises `box::use()` imports and `box::export()` / `#' @export` interface declarations, resolves local module paths, and models each import as a first-class *selective import* that is deliberately distinct from a package `library()` load and from an ordinary `source()` relationship.
+
+It also recognizes the static first phase of the [`import`](https://rticulate.github.io/import/) package: `import::from()`, `import::here()`, and `import::into()` with package or literal `.R`/`.r` script sources, selected and renamed names, `.all`, static `.except`, literal `.directory`, and default or literal named destinations. Current-environment imports are lexical and position-sensitive; named destinations are lower-priority fallback bindings, not namespace objects. Script modules expose a partial live private top-level environment (including dotted names and nested top-level `import::here()` bindings) without adopting box export-marker rules. Wildcards de-duplicate an already selected exported identity, while a different later wildcard export targeting the same local name follows R's sequential last-write-wins behavior. Completion, hover, signatures, go-to-definition, and identity-aware references use the same selected binding without exposing unrelated package exports or private script members.
 
 ## Highlights
 
@@ -30,7 +32,7 @@ Raven diagnoses missing modules, case-only path mismatches, missing packages, an
 
 ### A reusable model for future syntaxes
 
-The semantics above are captured in a syntax-agnostic *selective import* abstraction (source identity, export set with a completeness marker, namespace alias, attach bindings, provenance, and interface hashing). box is the first producer; the abstraction is designed to back a second module syntax without changing its semantics.
+The semantics above are captured in a shared *selective import* abstraction (dialect-bearing source identity, export set with a completeness marker, namespace alias, attach bindings, destination, exclusions, provenance, and interface hashing). `{box}` and `{import}` keep their own detectors, path rules, and module-export policies while reusing that scope and dependency pipeline.
 
 ## Supported static forms vs. dynamic non-goals
 

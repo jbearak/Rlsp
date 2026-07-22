@@ -12568,7 +12568,11 @@ pub fn scan_workspace_with_exclusions(
             workspace_root.as_ref(),
             exclusions,
         );
-        crate::cross_file::enrich_box_import_resolutions(metadata, uri);
+        crate::cross_file::enrich_selective_import_resolutions(
+            metadata,
+            uri,
+            workspace_root.as_ref(),
+        );
         let analysis = entry.contents.to_string();
         entry.artifacts = Arc::new(match entry.tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(

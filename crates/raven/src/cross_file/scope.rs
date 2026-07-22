@@ -21,8 +21,6 @@ use super::source_detect::{
 };
 use super::static_path::LazyStaticBindings;
 use super::types::{ForwardSource, byte_offset_to_utf16_column};
-use crate::box_use::ModuleExportEnv;
-use crate::box_use::resolve::ImportResolver;
 use crate::selective_import::{ImportSource, SelectiveImportRequest};
 
 // ============================================================================
@@ -912,6 +910,9 @@ impl Default for ScopeArtifacts {
 #[derive(Debug, Clone, Default)]
 pub struct ScopeAtPosition {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
+    /// Lower-priority named `{import}` search-path environments. Kept separate
+    /// while events execute so lexical/current-environment bindings always win.
+    named_search_path: NamedSearchPath,
     /// Top-level removals still in effect at this position.
     ///
     /// Ordinary cross-file consumers historically needed only the surviving
@@ -971,6 +972,77 @@ pub struct ScopeAtPosition {
     /// alias as an ordinary bound name) and never expressed as a fake package
     /// load. See [`NamespaceImportAlias`].
     pub namespace_import_aliases: HashMap<Arc<str>, NamespaceImportAlias>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NamedSearchPath {
+    /// Search order, closest environment first.
+    environments: Vec<(String, HashMap<Arc<str>, ScopedSymbol>)>,
+    /// Names inserted into the owning scope's flat symbol view only by the final
+    /// fallback projection. Forward `source()` merges use this marker to keep
+    /// attached environments separate from lexical/current-environment symbols.
+    projected_names: HashSet<Arc<str>>,
+}
+
+impl NamedSearchPath {
+    fn bind(&mut self, destination: &str, bindings: SelectiveSymbolBindings) {
+        self.projected_names.clear();
+        if let Some((_, environment)) = self
+            .environments
+            .iter_mut()
+            .find(|(name, _)| name == destination)
+        {
+            environment.extend(bindings);
+        } else {
+            self.environments
+                .insert(0, (destination.to_string(), bindings.into_iter().collect()));
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&ScopedSymbol> {
+        self.environments
+            .iter()
+            .find_map(|(_, environment)| environment.get(name))
+    }
+
+    fn merge_from(&mut self, other: &NamedSearchPath) {
+        self.merge_from_filtered(other, |_| true);
+    }
+
+    fn merge_from_filtered(
+        &mut self,
+        other: &NamedSearchPath,
+        keep: impl Fn(&ScopedSymbol) -> bool,
+    ) {
+        for (destination, environment) in other.environments.iter().rev() {
+            let bindings = environment
+                .iter()
+                .filter(|(_, symbol)| keep(symbol))
+                .map(|(name, symbol)| (name.clone(), symbol.clone()))
+                .collect::<SelectiveSymbolBindings>();
+            if !bindings.is_empty() {
+                self.bind(destination, bindings);
+            }
+        }
+    }
+
+    fn is_projected(&self, name: &str) -> bool {
+        self.projected_names.contains(name)
+    }
+
+    fn project_fallbacks(&mut self, symbols: &mut HashMap<Arc<str>, ScopedSymbol>) {
+        self.projected_names.clear();
+        for (_, environment) in &self.environments {
+            for (name, symbol) in environment {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    symbols.entry(name.clone())
+                {
+                    entry.insert(symbol.clone());
+                    self.projected_names.insert(name.clone());
+                }
+            }
+        }
+    }
 }
 
 fn record_visible_position(
@@ -2731,14 +2803,10 @@ pub fn compute_artifacts_with_metadata(
     // decide whether the import is function-scoped (binds only inside its
     // function) or top-level (cross-file visible), exactly like a `Def`.
     if let Some(metadata) = metadata {
-        for import in &metadata.box_imports {
-            let Some(source) = import.resolved_source() else {
-                continue;
-            };
-            let request = import.lower(uri, source);
+        for request in metadata.selective_import_requests(uri) {
             artifacts.timeline.push(ScopeEvent::SelectiveImport {
-                line: import.line,
-                column: import.column,
+                line: request.provenance.line,
+                column: request.provenance.column,
                 request,
                 runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
@@ -6319,7 +6387,7 @@ pub struct DataAliasProvider<'a> {
 
 /// Query-time seam for resolving [`ScopeEvent::SelectiveImport`] events (issue
 /// #662), mirroring [`DataAliasProvider`]. It wraps a
-/// [`ModuleExportEnv`], which production wires
+/// [`ImportEnv`](crate::selective_import::ImportEnv), which production wires
 /// to the package library (installed / frozen / bundled exports) for package
 /// sources and to the cross-file artifacts / metadata for local-module sources.
 ///
@@ -6331,7 +6399,7 @@ pub struct DataAliasProvider<'a> {
 /// set), and attributes per-member provenance to the true definition site.
 pub struct SelectiveImportProvider<'a> {
     /// The module/package export environment resolution reads from.
-    pub env: &'a dyn ModuleExportEnv,
+    pub env: &'a dyn crate::selective_import::ImportEnv,
 }
 
 /// The retained identity of a selective import's *namespace alias* binding, so
@@ -6380,7 +6448,10 @@ impl crate::selective_import::ImportEnv for UnresolvedImportEnv {
     fn package_exports(&self, _package: &str) -> crate::selective_import::ExportSet {
         crate::selective_import::ExportSet::unresolved()
     }
-    fn module_exports(&self, _uri: &Url) -> Option<crate::selective_import::ExportSet> {
+    fn module_exports(
+        &self,
+        _module: &crate::selective_import::LocalModuleIdentity,
+    ) -> Option<crate::selective_import::ExportSet> {
         None
     }
 }
@@ -6456,10 +6527,17 @@ fn apply_selective_import(
 
     let (symbols, aliases) =
         resolve_selective_import_bindings(request, importing_uri, imp_line, imp_col, provider);
-    for (name, symbol) in symbols {
-        scope.removed_names.remove(&name);
-        scope.parent_prefix_symbol_names.remove(&name);
-        scope.symbols.insert(name, symbol);
+    match &request.destination {
+        crate::selective_import::ImportDestination::CurrentEnvironment => {
+            for (name, symbol) in symbols {
+                scope.removed_names.remove(&name);
+                scope.parent_prefix_symbol_names.remove(&name);
+                scope.symbols.insert(name, symbol);
+            }
+        }
+        crate::selective_import::ImportDestination::NamedSearchPath(destination) => {
+            scope.named_search_path.bind(destination, symbols);
+        }
     }
     for (name, alias) in aliases {
         scope.namespace_import_aliases.insert(name, alias);
@@ -6483,16 +6561,17 @@ fn resolve_selective_import_bindings(
     provider: Option<&SelectiveImportProvider<'_>>,
 ) -> (SelectiveSymbolBindings, SelectiveNamespaceBindings) {
     let resolved = match provider {
-        Some(p) => request.resolve(&ImportResolver::new(p.env)),
+        Some(p) => request.resolve(p.env),
         None => request.resolve(&UnresolvedImportEnv),
     };
 
-    // Pseudo URI for a member with no known definition site (a package member,
-    // or a local member whose provenance the env did not supply).
-    let fallback_uri = || match &request.source {
-        ImportSource::Package(name) => Url::parse(&format!("package:{}", name))
-            .unwrap_or_else(|_| Url::parse("package:unknown").unwrap()),
-        ImportSource::LocalModule(uri) => uri.clone(),
+    // Pseudo URI for a member with no known definition site. A selective package
+    // member retains its exported/source identity in the URI fragment so renamed
+    // locals can query the correct help topic/formals and references can stay
+    // identity-based. Local unresolved provenance falls back to the module URI.
+    let fallback_uri = |exported: Option<&str>| match &request.source {
+        ImportSource::Package(name) => package_symbol_uri(name, exported),
+        ImportSource::LocalModule(module) => module.uri.clone(),
     };
 
     let mut symbols = Vec::new();
@@ -6548,7 +6627,7 @@ fn resolve_selective_import_bindings(
                 p.signature.clone(),
             ),
             None => (
-                fallback_uri(),
+                fallback_uri(binding.exported.as_deref()),
                 0,
                 0,
                 crate::utf16::utf16_len(binding.local.as_str()),
@@ -7127,9 +7206,12 @@ where
 ///
 /// Same-file leak filters from commits 91c3617/65b2959 are applied while
 /// computing this struct; the cached value is post-filter and safe to reuse.
+/// Named search-path environments remain separate from `symbols`, so a closer
+/// attachment in the queried child can outrank an older parent attachment.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ParentPrefix {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
+    named_search_path: NamedSearchPath,
     pub chain: Vec<Url>,
     pub visible_positions: HashMap<Url, (u32, u32)>,
     pub depth_exceeded: Vec<(Url, u32, u32)>,
@@ -7159,6 +7241,7 @@ impl ParentPrefix {
         // WI2b hook cache/serve a caller-dependent scope under a URI-only key.
         let Self {
             symbols,
+            named_search_path,
             chain,
             visible_positions,
             depth_exceeded,
@@ -7169,6 +7252,7 @@ impl ParentPrefix {
             package_origins,
         } = self;
         symbols.is_empty()
+            && named_search_path.environments.is_empty()
             && chain.is_empty()
             && visible_positions.is_empty()
             && depth_exceeded.is_empty()
@@ -7528,6 +7612,12 @@ where
                 // Backward parent walk: selective imports never lend upward.
                 None,
             );
+            for name in std::mem::take(&mut parent_scope.named_search_path.projected_names) {
+                parent_scope.symbols.remove(&name);
+            }
+            parent_scope
+                .named_search_path
+                .merge_from(&contribution.named_search_path);
             for name in contribution.removed_names {
                 parent_scope.symbols.remove(&name);
                 parent_scope.parent_prefix_symbol_names.remove(&name);
@@ -7559,12 +7649,29 @@ where
                 parent_scope.targets_only_attached_packages.remove(&package);
                 parent_scope.attached_packages.insert(package);
             }
+            parent_scope
+                .named_search_path
+                .project_fallbacks(&mut parent_scope.symbols);
         }
 
-        // Merge parent symbols (they are available at the START of this file).
-        // NonInheriting destinations receive declaration facts only. Global and
-        // proven CurrentFrame calls inherit ordinary bindings available through
-        // the corresponding global/call environment.
+        // Merge parent symbols and attached search-path environments (they are
+        // available at the START of this file). NonInheriting destinations
+        // receive declaration facts only. Global and proven CurrentFrame calls
+        // inherit ordinary bindings available through the corresponding
+        // global/call environment.
+        //
+        // A completed parent scope includes a flat projection of its named
+        // fallbacks. Carry the environments separately and omit those projected
+        // names from the lexical prefix, otherwise a child attachment can never
+        // outrank an older parent attachment.
+        let parent_projected_names = parent_scope.named_search_path.projected_names.clone();
+        if !declared_only_parent {
+            prefix
+                .named_search_path
+                .merge_from_filtered(&parent_scope.named_search_path, |symbol| {
+                    symbol.source_uri != *uri
+                });
+        }
         //
         // Filter out symbols whose `source_uri` is the current file: those
         // are *our own* bindings and their visibility at the query position
@@ -7580,7 +7687,7 @@ where
             if i & 63 == 0 && is_cancelled() {
                 return prefix;
             }
-            if symbol.source_uri == *uri {
+            if symbol.source_uri == *uri || parent_projected_names.contains(&name) {
                 continue;
             }
             if declared_only_parent {
@@ -7813,8 +7920,12 @@ where
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
     let mut contribution = ChildSourceContribution::default();
-    let initial_symbols = initial_scope.symbols.clone();
+    let mut initial_symbols = initial_scope.symbols.clone();
+    for name in &initial_scope.named_search_path.projected_names {
+        initial_symbols.remove(name);
+    }
     let mut rolling_symbols = initial_symbols.clone();
+    let mut rolling_named_search_path = initial_scope.named_search_path.clone();
     // Shiny helpers evaluate in a support child of the global environment. A
     // helper `rm(x)` can remove only a support binding; when no such binding
     // exists, an inherited global `x` remains visible. Keep the initial layer so
@@ -7878,6 +7989,7 @@ where
         } else {
             Arc::new(ParentPrefix {
                 symbols: rolling_symbols.clone(),
+                named_search_path: rolling_named_search_path.clone(),
                 inherited_packages: rolling_packages.clone(),
                 attached_packages: rolling_attached_packages.clone(),
                 targets_only_loaded_packages: rolling_targets_only_loaded.clone(),
@@ -7942,6 +8054,10 @@ where
         contribution
             .depth_exceeded
             .extend(member_scope.depth_exceeded.iter().cloned());
+        contribution
+            .named_search_path
+            .merge_from(&member_scope.named_search_path);
+        rolling_named_search_path = member_scope.named_search_path.clone();
 
         // Removals cross member boundaries because every script evaluates in
         // the same targets environment. Shiny's target is a support CHILD of
@@ -7963,9 +8079,13 @@ where
         }
 
         // Parent-prefix-only names are inherited environment, not bindings
-        // produced by executing this member.
+        // produced by executing this member. Named-search-path projections stay
+        // visible to later members through `rolling_named_search_path`, but remain
+        // attached fallbacks rather than becoming lexical batch contributions.
         for (name, symbol) in member_scope.symbols {
-            if member_scope.parent_prefix_symbol_names.contains(&name) {
+            if member_scope.parent_prefix_symbol_names.contains(&name)
+                || member_scope.named_search_path.is_projected(&name)
+            {
                 continue;
             }
             rolling_symbols.insert(name.clone(), symbol.clone());
@@ -8358,6 +8478,9 @@ where
         match pre_computed_prefix {
             Some(prefix_arc) => {
                 let prefix = prefix_arc.as_ref();
+                scope
+                    .named_search_path
+                    .merge_from(&prefix.named_search_path);
                 for (name, symbol) in &prefix.symbols {
                     match scope.symbols.entry(name.clone()) {
                         std::collections::hash_map::Entry::Occupied(_) => {}
@@ -8412,6 +8535,9 @@ where
                     forward_child_memo,
                 );
 
+                scope
+                    .named_search_path
+                    .merge_from(&prefix.named_search_path);
                 // Merge by move (no extra clones) — `entry().or_insert` for
                 // symbols preserves the depth-0 base_exports injection above
                 // and the "first parent wins" semantics within the prefix.
@@ -8969,19 +9095,28 @@ where
                             &child_scope.visible_positions,
                         );
                         if !package_effects_only {
-                            // Merge child symbols (local definitions take
-                            // precedence). The forward-source leak rule (same-file
-                            // + parent-prefix-only) lives in
+                            // Merge child lexical/current-environment symbols and
+                            // attached search-path environments as distinct layers.
+                            // The child scope's final flat projection contains both;
+                            // projected fallbacks must not become lexical bindings in
+                            // the parent or block a later, closer attachment.
+                            scope
+                                .named_search_path
+                                .merge_from(&child_scope.named_search_path);
+                            // The forward-source leak rule (same-file +
+                            // parent-prefix-only) lives in
                             // `child_source_symbol_is_leak`.
                             let child_parent_prefix_symbol_names =
                                 child_scope.parent_prefix_symbol_names.clone();
                             for (name, symbol) in child_scope.symbols {
-                                if child_source_symbol_is_leak(
-                                    &symbol,
-                                    &name,
-                                    uri,
-                                    &child_parent_prefix_symbol_names,
-                                ) {
+                                if child_scope.named_search_path.is_projected(&name)
+                                    || child_source_symbol_is_leak(
+                                        &symbol,
+                                        &name,
+                                        uri,
+                                        &child_parent_prefix_symbol_names,
+                                    )
+                                {
                                     continue;
                                 }
                                 // This name is genuinely produced by executing this
@@ -9123,6 +9258,9 @@ where
                     data_alias_provider,
                     selective_import_provider,
                 );
+                scope
+                    .named_search_path
+                    .merge_from(&contribution.named_search_path);
                 for name in contribution.removed_names {
                     scope.symbols.remove(&name);
                     scope.parent_prefix_symbol_names.remove(&name);
@@ -9413,6 +9551,9 @@ where
         append_rprofile_prelude(&mut scope, contribution_uri, contrib);
     }
 
+    scope
+        .named_search_path
+        .project_fallbacks(&mut scope.symbols);
     retain_current_namespace_import_aliases(&mut scope);
 
     // Issue #483 (WI2b): populate the persistent standalone cache. Only the
@@ -9647,6 +9788,42 @@ fn compute_contribution_symbol_names(
 /// prefix — that prefix also covers external package-export pseudo-URIs
 /// (`package:dplyr`, `package:base`, ...) which need different handling.
 pub const PACKAGE_INTERNAL_URI: &str = "package:///internal";
+
+/// Build an external package-symbol pseudo-URI.
+///
+/// Ordinary attached-package symbols use `package:<pkg>`. Selective package
+/// imports additionally retain the exported/source member in the URL fragment,
+/// `package:<pkg>#<exported>`, so a renamed local binding can keep its package
+/// ownership and source identity without widening [`ScopedSymbol`]. `Url`
+/// percent-encodes the fragment; consumers must use [`package_export_from_uri`]
+/// rather than slicing it directly.
+pub(crate) fn package_symbol_uri(package: &str, exported: Option<&str>) -> Url {
+    let mut uri = Url::parse(&format!("package:{package}"))
+        .unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
+    uri.set_fragment(exported);
+    uri
+}
+
+/// Return the external package name carried by a package pseudo-URI.
+///
+/// The synthetic package-internal URI is deliberately excluded: it represents
+/// workspace source, not an installed package that can be queried for help or
+/// formals.
+pub(crate) fn package_name_from_uri(uri: &Url) -> Option<&str> {
+    if is_package_internal_uri(uri) {
+        return None;
+    }
+    let package = uri.as_str().strip_prefix("package:")?.split('#').next()?;
+    (!package.is_empty() && !package.starts_with("//")).then_some(package)
+}
+
+/// Return the decoded exported member retained on a selective package binding.
+/// `None` means this is an ordinary package pseudo-URI rather than a selective
+/// member identity.
+pub(crate) fn package_export_from_uri(uri: &Url) -> Option<std::borrow::Cow<'_, str>> {
+    uri.fragment()
+        .map(|fragment| percent_encoding::percent_decode_str(fragment).decode_utf8_lossy())
+}
 
 /// Returns `true` when `uri` is the synthetic package-internal URI produced by
 /// `append_package_contribution`.
@@ -10072,6 +10249,7 @@ pub(crate) fn append_rprofile_prelude(
 #[derive(Debug, Clone, Default)]
 struct ScopeFrame {
     symbols: HashMap<Arc<str>, ScopedSymbol>,
+    named_search_path: NamedSearchPath,
     packages: HashSet<String>,
     attached_packages: HashSet<String>,
     package_origins: HashMap<String, HashSet<Arc<Url>>>,
@@ -10118,6 +10296,7 @@ struct ScopeFrame {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ChildSourceContribution {
     pub symbols: HashMap<Arc<str>, ScopedSymbol>,
+    named_search_path: NamedSearchPath,
     pub removed_names: HashSet<Arc<str>>,
     pub packages: HashSet<String>,
     pub attached_packages: HashSet<String>,
@@ -10128,6 +10307,9 @@ pub(crate) struct ChildSourceContribution {
 }
 
 fn merge_tar_batch_into_frame(frame: &mut ScopeFrame, contribution: ChildSourceContribution) {
+    frame
+        .named_search_path
+        .merge_from(&contribution.named_search_path);
     for name in contribution.removed_names {
         frame.symbols.remove(&name);
         frame.removed_names.insert(name);
@@ -11078,6 +11260,9 @@ where
                 // borrow `self` mutably for `pick_frame_mut`.
                 let contrib = self.source_contributions[&key].clone();
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
+                    frame
+                        .named_search_path
+                        .merge_from(&contrib.named_search_path);
                     // First-source-wins: mirror the recursive resolver's
                     // `scope.symbols.entry(name).or_insert(symbol)` at
                     // scope.rs:3632. When two `source()` calls bring the
@@ -11229,9 +11414,16 @@ where
                     provider,
                 );
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
-                    for (name, symbol) in symbols {
-                        frame.removed_names.remove(&name);
-                        frame.symbols.insert(name, symbol);
+                    match &request.destination {
+                        crate::selective_import::ImportDestination::CurrentEnvironment => {
+                            for (name, symbol) in symbols {
+                                frame.removed_names.remove(&name);
+                                frame.symbols.insert(name, symbol);
+                            }
+                        }
+                        crate::selective_import::ImportDestination::NamedSearchPath(
+                            destination,
+                        ) => frame.named_search_path.bind(destination, symbols),
                     }
                     for (name, alias) in aliases {
                         frame.namespace_import_aliases.insert(name, alias);
@@ -11304,6 +11496,9 @@ where
             symbols.remove(name);
             parent_prefix_symbol_names.remove(name);
         }
+        let mut named_search_path = prefix.named_search_path.clone();
+        named_search_path.merge_from(&frame.named_search_path);
+        named_search_path.project_fallbacks(&mut symbols);
 
         let mut package_origins = prefix.package_origins.clone();
         for (package, origins) in &frame.package_origins {
@@ -11315,6 +11510,7 @@ where
 
         ScopeAtPosition {
             symbols,
+            named_search_path,
             removed_names: frame.removed_names.clone(),
             chain: Vec::new(),
             parent_prefix_symbol_names,
@@ -11481,6 +11677,25 @@ where
         if prefix.symbols.contains_key(name) {
             return true;
         }
+        if self.contribution_symbol_names.contains(name) {
+            return true;
+        }
+        // Named search-path imports are fallback bindings below every lexical
+        // frame/prefix contribution.
+        for (_iv, frame) in self.function_stack.iter().rev() {
+            if frame.named_search_path.get(name).is_some() {
+                return true;
+            }
+        }
+        if self
+            .choose_global_frame()
+            .named_search_path
+            .get(name)
+            .is_some()
+            || self.choose_prefix().named_search_path.get(name).is_some()
+        {
+            return true;
+        }
         // Package contribution last — keeps the streaming visibility view
         // aligned with the recursive resolver's depth-0
         // `append_package_contribution`. The out-of-scope diagnostic
@@ -11488,7 +11703,7 @@ where
         // fallthrough; otherwise a contribution-provided name would be
         // misreported as "used before available" relative to a forward
         // `source()` that happens to export the same name.
-        self.contribution_symbol_names.contains(name)
+        false
     }
 
     /// Materialize a full `ScopeAtPosition` at the cursor. The resulting
@@ -11520,6 +11735,7 @@ where
         );
         let mut scope = ScopeAtPosition {
             symbols: prefix.symbols.clone(),
+            named_search_path: prefix.named_search_path.clone(),
             removed_names: HashSet::new(),
             chain,
             parent_prefix_symbol_names: prefix.symbols.keys().cloned().collect(),
@@ -11560,6 +11776,9 @@ where
                 .namespace_import_aliases
                 .insert(name.clone(), alias.clone());
         }
+        scope
+            .named_search_path
+            .merge_from(&global.named_search_path);
         for pkg in &global.packages {
             scope.targets_only_loaded_packages.remove(pkg);
             scope.loaded_packages.insert(pkg.clone());
@@ -11586,6 +11805,7 @@ where
                     .namespace_import_aliases
                     .insert(name.clone(), alias.clone());
             }
+            scope.named_search_path.merge_from(&frame.named_search_path);
             for pkg in &frame.packages {
                 scope.targets_only_loaded_packages.remove(pkg);
                 scope.loaded_packages.insert(pkg.clone());
@@ -11700,6 +11920,9 @@ where
             append_rprofile_prelude(&mut scope, contribution_uri, contrib);
         }
 
+        scope
+            .named_search_path
+            .project_fallbacks(&mut scope.symbols);
         retain_current_namespace_import_aliases(&mut scope);
         scope
     }
@@ -11760,7 +11983,15 @@ where
                 is_declared: false,
             });
         }
-        None
+        for (_iv, frame) in self.function_stack.iter().rev() {
+            if let Some(symbol) = frame.named_search_path.get(name) {
+                return Some(symbol.clone());
+            }
+        }
+        if let Some(symbol) = self.choose_global_frame().named_search_path.get(name) {
+            return Some(symbol.clone());
+        }
+        self.choose_prefix().named_search_path.get(name).cloned()
     }
 
     /// Pick the prefix slot matching the cursor's current state. With
@@ -11969,6 +12200,9 @@ where
                     self.source_contributions.insert(key, contrib);
                 }
                 let contrib = self.source_contributions[&key].clone();
+                frame
+                    .named_search_path
+                    .merge_from(&contrib.named_search_path);
                 // First-source-wins: see the matching note in
                 // `apply_event_to_strict`'s Source branch.
                 for (name, symbol) in contrib.symbols {
@@ -12092,9 +12326,16 @@ where
                     *column,
                     self.selective_import_provider,
                 );
-                for (name, symbol) in symbols {
-                    frame.removed_names.remove(&name);
-                    frame.symbols.insert(name, symbol);
+                match &request.destination {
+                    crate::selective_import::ImportDestination::CurrentEnvironment => {
+                        for (name, symbol) in symbols {
+                            frame.removed_names.remove(&name);
+                            frame.symbols.insert(name, symbol);
+                        }
+                    }
+                    crate::selective_import::ImportDestination::NamedSearchPath(destination) => {
+                        frame.named_search_path.bind(destination, symbols);
+                    }
                 }
                 for (name, alias) in aliases {
                     frame.namespace_import_aliases.insert(name, alias);
@@ -12294,16 +12535,22 @@ where
         );
 
         if !package_effects_only {
+            contrib
+                .named_search_path
+                .merge_from(&child_scope.named_search_path);
             // Forward-source leak rule (same-file + parent-prefix-only) lives in
-            // `child_source_symbol_is_leak`.
+            // `child_source_symbol_is_leak`. The child's final named-search-path
+            // projection is also excluded from lexical contribution.
             let child_parent_prefix_symbol_names = child_scope.parent_prefix_symbol_names.clone();
             for (name, symbol) in child_scope.symbols {
-                if child_source_symbol_is_leak(
-                    &symbol,
-                    &name,
-                    self.queried_uri,
-                    &child_parent_prefix_symbol_names,
-                ) {
+                if child_scope.named_search_path.is_projected(&name)
+                    || child_source_symbol_is_leak(
+                        &symbol,
+                        &name,
+                        self.queried_uri,
+                        &child_parent_prefix_symbol_names,
+                    )
+                {
                     continue;
                 }
                 contrib.symbols.entry(name).or_insert(symbol);
@@ -12586,6 +12833,21 @@ mod tests {
 
     fn test_uri() -> Url {
         Url::parse("file:///test.R").unwrap()
+    }
+
+    #[test]
+    fn selective_package_uri_round_trips_non_syntactic_export() {
+        let uri = package_symbol_uri("syntheticPkg", Some("a name/%value"));
+        assert_eq!(package_name_from_uri(&uri), Some("syntheticPkg"));
+        assert_eq!(
+            package_export_from_uri(&uri).as_deref(),
+            Some("a name/%value")
+        );
+
+        let ordinary = package_symbol_uri("syntheticPkg", None);
+        assert_eq!(package_name_from_uri(&ordinary), Some("syntheticPkg"));
+        assert!(package_export_from_uri(&ordinary).is_none());
+        assert!(package_name_from_uri(&Url::parse(PACKAGE_INTERNAL_URI).unwrap()).is_none());
     }
 
     /// Assert that the public metadata-free builder is the exact
@@ -35028,6 +35290,133 @@ mod package_contribution_tests {
     }
 
     #[test]
+    fn tar_batch_preserves_named_destinations_as_ordered_fallbacks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("R")).unwrap();
+        let first_code = "import::from(dplyr, x, .into = 'older')\n";
+        let second_code = "import::from(tidyr, x, .into = 'closer')\nx\n";
+        std::fs::write(root.join("R/01-first.R"), first_code).unwrap();
+        std::fs::write(root.join("R/02-second.R"), second_code).unwrap();
+        let parent_path = root.join("_targets.R");
+        let parent_code = "targets::tar_source('R')\nx\n";
+        std::fs::write(&parent_path, parent_code).unwrap();
+
+        let root_uri = Url::from_directory_path(root).unwrap();
+        let parent_uri = Url::from_file_path(&parent_path).unwrap();
+        let first_uri = Url::from_file_path(root.join("R/01-first.R")).unwrap();
+        let second_uri = Url::from_file_path(root.join("R/02-second.R")).unwrap();
+        let mut parent_metadata = crate::cross_file::extract_metadata(parent_code);
+        crate::cross_file::tar_source::finalize_tar_source_requests(
+            &mut parent_metadata,
+            &parent_uri,
+            Some(&root_uri),
+        );
+        let first_metadata = crate::cross_file::extract_metadata(first_code);
+        let second_metadata = crate::cross_file::extract_metadata(second_code);
+        let metadata: HashMap<Url, Arc<super::super::types::CrossFileMetadata>> = [
+            (parent_uri.clone(), Arc::new(parent_metadata.clone())),
+            (first_uri.clone(), Arc::new(first_metadata.clone())),
+            (second_uri.clone(), Arc::new(second_metadata.clone())),
+        ]
+        .into_iter()
+        .collect();
+        let artifacts: HashMap<Url, Arc<ScopeArtifacts>> = [
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                first_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &first_uri,
+                    &parse_r(first_code),
+                    first_code,
+                    Some(&first_metadata),
+                )),
+            ),
+            (
+                second_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &second_uri,
+                    &parse_r(second_code),
+                    second_code,
+                    Some(&second_metadata),
+                )),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root_uri), |_| None);
+        let base_exports = HashSet::new();
+        let env = SelectiveTestEnv {
+            exports: crate::selective_import::ExportSet::complete(["x"]),
+            provenance: None,
+        };
+        let provider = SelectiveImportProvider { env: &env };
+
+        for (uri, line) in [(&second_uri, 1), (&parent_uri, 1)] {
+            let scope = scope_at_position_with_graph_with_package_query_uri(
+                uri,
+                line,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root_uri),
+                10,
+                &base_exports,
+                false,
+                super::super::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+                Some(&provider),
+                None,
+            );
+            assert_eq!(
+                scope.symbols["x"].source_uri.as_str(),
+                "package:tidyr#x",
+                "the closer named destination must win in {uri}"
+            );
+        }
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new_with_standalone_cache_and_package_query_uri(
+            &parent_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root_uri),
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+            Some(&provider),
+            None,
+            None,
+        )
+        .expect("tar import stream");
+        stream.advance_to(1, u32::MAX);
+        assert_eq!(
+            stream.snapshot().symbols["x"].source_uri.as_str(),
+            "package:tidyr#x"
+        );
+    }
+
+    #[test]
     fn tar_option_packages_flow_into_tar_member_and_member_definition_flows_back() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -38275,17 +38664,16 @@ mod package_contribution_tests {
         provenance: Option<crate::selective_import::MemberProvenance>,
     }
 
-    impl crate::box_use::ModuleExportEnv for SelectiveTestEnv {
-        fn box_exports(&self, _uri: &Url) -> Option<crate::box_use::BoxExports> {
-            None
-        }
-
-        fn legacy_exports(&self, _uri: &Url) -> crate::selective_import::ExportSet {
-            crate::selective_import::ExportSet::unresolved()
-        }
-
+    impl crate::selective_import::ImportEnv for SelectiveTestEnv {
         fn package_exports(&self, _package: &str) -> crate::selective_import::ExportSet {
             self.exports.clone()
+        }
+
+        fn module_exports(
+            &self,
+            _module: &crate::selective_import::LocalModuleIdentity,
+        ) -> Option<crate::selective_import::ExportSet> {
+            Some(self.exports.clone())
         }
 
         fn member_provenance(
@@ -38413,6 +38801,279 @@ mod package_contribution_tests {
     }
 
     #[test]
+    fn import_pkg_current_and_named_destination_scope_stream_parity() {
+        let exports = crate::selective_import::ExportSet::complete(["x", "y"]);
+
+        let here = "import::here(dplyr, x)\nx";
+        let (recursive, streamed) = selective_scope_pair(here, 1, u32::MAX, exports.clone());
+        assert!(recursive.symbols.contains_key("x"));
+        assert_eq!(streamed.symbols, recursive.symbols);
+
+        let named = "x <- 1\nimport::from(dplyr, x, y, .into = 'tools')\nx + y";
+        let (recursive, streamed) = selective_scope_pair(named, 2, u32::MAX, exports);
+        assert_eq!(
+            recursive.symbols["x"].source_uri.as_str(),
+            "file:///selective/main.R"
+        );
+        assert!(recursive.symbols.contains_key("y"));
+        assert!(recursive.namespace_import_aliases.is_empty());
+        assert_eq!(streamed.symbols, recursive.symbols);
+    }
+
+    #[test]
+    fn sourced_named_destination_remains_search_path_not_lexical() {
+        let root = Url::parse("file:///selective-source/").unwrap();
+        let parent_uri = root.join("parent.R").unwrap();
+        let child_uri = root.join("child.R").unwrap();
+        let parent_code = concat!(
+            "source('child.R')\n",
+            "import::from(tidyr, x, .into = 'b')\n",
+            "x\n",
+        );
+        let child_code = "import::from(dplyr, x, .into = 'a')\n";
+        let parent_metadata = Arc::new(crate::cross_file::extract_metadata(parent_code));
+        let child_metadata = Arc::new(crate::cross_file::extract_metadata(child_code));
+        let metadata = HashMap::from([
+            (parent_uri.clone(), parent_metadata.clone()),
+            (child_uri.clone(), child_metadata.clone()),
+        ]);
+        let artifacts = HashMap::from([
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                child_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &child_uri,
+                    &parse_r(child_code),
+                    child_code,
+                    Some(&child_metadata),
+                )),
+            ),
+        ]);
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root), |_| None);
+        let base_exports = HashSet::new();
+        let env = SelectiveTestEnv {
+            exports: crate::selective_import::ExportSet::complete(["x"]),
+            provenance: None,
+        };
+        let provider = SelectiveImportProvider { env: &env };
+
+        let recursive = scope_at_position_with_graph_with_package_query_uri(
+            &parent_uri,
+            2,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+            Some(&provider),
+            None,
+        );
+        assert_eq!(
+            recursive.symbols["x"].source_uri.as_str(),
+            "package:tidyr#x"
+        );
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new_with_standalone_cache_and_package_query_uri(
+            &parent_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+            Some(&provider),
+            None,
+            None,
+        )
+        .expect("source import stream");
+        stream.advance_to(2, u32::MAX);
+        assert_eq!(stream.snapshot().symbols, recursive.symbols);
+    }
+
+    #[test]
+    fn parent_named_destination_remains_fallback_in_child_prefix() {
+        let root = Url::parse("file:///selective-parent-prefix/").unwrap();
+        let parent_uri = root.join("parent.R").unwrap();
+        let child_uri = root.join("child.R").unwrap();
+        let parent_code = concat!(
+            "import::from(dplyr, x, .into = 'older')\n",
+            "source('child.R')\n",
+        );
+        let child_code = "import::from(tidyr, x, .into = 'closer')\nx\n";
+        let parent_metadata = Arc::new(crate::cross_file::extract_metadata(parent_code));
+        let child_metadata = Arc::new(crate::cross_file::extract_metadata(child_code));
+        let metadata = HashMap::from([
+            (parent_uri.clone(), parent_metadata.clone()),
+            (child_uri.clone(), child_metadata.clone()),
+        ]);
+        let artifacts = HashMap::from([
+            (
+                parent_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &parent_uri,
+                    &parse_r(parent_code),
+                    parent_code,
+                    Some(&parent_metadata),
+                )),
+            ),
+            (
+                child_uri.clone(),
+                Arc::new(compute_artifacts_with_metadata(
+                    &child_uri,
+                    &parse_r(child_code),
+                    child_code,
+                    Some(&child_metadata),
+                )),
+            ),
+        ]);
+        let get_artifacts = |uri: &Url| artifacts.get(uri).cloned();
+        let get_metadata = |uri: &Url| metadata.get(uri).cloned();
+        let mut graph = super::super::dependency::DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_metadata, Some(&root), |_| None);
+        let base_exports = HashSet::new();
+        let env = SelectiveTestEnv {
+            exports: crate::selective_import::ExportSet::complete(["x"]),
+            provenance: None,
+        };
+        let provider = SelectiveImportProvider { env: &env };
+
+        let recursive = scope_at_position_with_graph_with_package_query_uri(
+            &child_uri,
+            1,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+            Some(&provider),
+            None,
+        );
+        assert_eq!(
+            recursive.symbols["x"].source_uri.as_str(),
+            "package:tidyr#x"
+        );
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new_with_standalone_cache_and_package_query_uri(
+            &child_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            super::super::config::BackwardDependencyMode::Auto,
+            &|| false,
+            &prefix_cache,
+            None,
+            None,
+            Some(&provider),
+            None,
+            None,
+        )
+        .expect("child import stream");
+        stream.advance_to(1, u32::MAX);
+        let streamed = stream.snapshot();
+        assert_eq!(streamed.symbols["x"].source_uri.as_str(), "package:tidyr#x");
+        assert_eq!(streamed.symbols, recursive.symbols);
+    }
+
+    #[test]
+    fn import_pkg_named_destination_survives_local_removal_as_fallback() {
+        let code = "x <- 1\nimport::from(dplyr, x)\nrm(x)\nx";
+        let exports = crate::selective_import::ExportSet::complete(["x"]);
+        let (recursive, streamed) = selective_scope_pair(code, 3, u32::MAX, exports);
+        assert_eq!(
+            recursive.symbols["x"].source_uri.as_str(),
+            "package:dplyr#x"
+        );
+        assert_eq!(streamed.symbols, recursive.symbols);
+    }
+
+    #[test]
+    fn import_pkg_all_except_and_alias_use_exported_identity() {
+        let code = concat!(
+            "import::here(dplyr, keep = filter, .all = TRUE, ",
+            ".except = c('lag'))\n",
+            "keep + select + filter + lag",
+        );
+        let exports = crate::selective_import::ExportSet::complete(["filter", "lag", "select"]);
+        let (recursive, streamed) = selective_scope_pair(code, 1, u32::MAX, exports);
+        assert!(recursive.symbols.contains_key("keep"));
+        assert!(recursive.symbols.contains_key("select"));
+        assert!(!recursive.symbols.contains_key("filter"));
+        assert!(!recursive.symbols.contains_key("lag"));
+        assert_eq!(streamed.symbols, recursive.symbols);
+    }
+
+    #[test]
+    fn import_pkg_bindings_are_position_sensitive() {
+        let code = "before\nimport::from(dplyr, after)\nafter";
+        let exports = crate::selective_import::ExportSet::complete(["after"]);
+        let (before, before_stream) = selective_scope_pair(code, 0, u32::MAX, exports.clone());
+        assert!(!before.symbols.contains_key("after"));
+        assert_eq!(before_stream.symbols, before.symbols);
+        let (after, after_stream) = selective_scope_pair(code, 2, u32::MAX, exports);
+        assert!(after.symbols.contains_key("after"));
+        assert_eq!(after_stream.symbols, after.symbols);
+    }
+
+    #[test]
+    fn import_pkg_function_calls_remain_lexical_for_both_destinations() {
+        let exports = crate::selective_import::ExportSet::complete(["current", "fallback"]);
+        let code = concat!(
+            "f <- function() {\n",
+            "  import::here(dplyr, current)\n",
+            "  import::from(dplyr, fallback)\n",
+            "  current + fallback\n",
+            "}\n",
+            "current + fallback\n",
+        );
+        let (inside, inside_stream) = selective_scope_pair(code, 3, u32::MAX, exports.clone());
+        assert!(inside.symbols.contains_key("current"));
+        assert!(inside.symbols.contains_key("fallback"));
+        assert_eq!(inside_stream.symbols, inside.symbols);
+
+        let (outside, outside_stream) = selective_scope_pair(code, 5, u32::MAX, exports);
+        assert!(!outside.symbols.contains_key("current"));
+        assert!(!outside.symbols.contains_key("fallback"));
+        assert_eq!(outside_stream.symbols, outside.symbols);
+    }
+
+    #[test]
     fn selective_import_preserves_attached_function_kind_and_signature() {
         let source_uri = Url::parse("file:///selective/module.r").unwrap();
         let importing_uri = Url::parse("file:///selective/main.r").unwrap();
@@ -38429,12 +39090,20 @@ mod package_contribution_tests {
         };
         let provider = SelectiveImportProvider { env: &env };
         let request = crate::selective_import::SelectiveImportRequest {
-            source: crate::selective_import::ImportSource::LocalModule(source_uri.clone()),
+            source: crate::selective_import::ImportSource::LocalModule(
+                crate::selective_import::LocalModuleIdentity::new(
+                    source_uri.clone(),
+                    crate::selective_import::LocalModuleDialect::Box,
+                ),
+            ),
             namespace: None,
             attach: vec![crate::selective_import::AttachBinding::Renamed {
                 local: "renamed".to_string(),
                 exported: "original".to_string(),
             }],
+            destination: crate::selective_import::ImportDestination::CurrentEnvironment,
+            excluded_exports: Default::default(),
+            wildcard_skips_explicit_exports: false,
             function_scoped: false,
             provenance: crate::selective_import::ImportProvenance {
                 uri: importing_uri.clone(),

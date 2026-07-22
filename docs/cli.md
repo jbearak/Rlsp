@@ -43,6 +43,7 @@ Diagnostics reported (subject to configured severities — see [diagnostics.md](
 - Syntax errors and semantic checks (e.g. assignment-in-condition, mixed logical operators).
 - The native style lints (when enabled via `raven.toml` / `.lintr`).
 - Cross-file diagnostics: missing sourced files, circular dependencies, exceeded max source-chain depth, redundant directives, out-of-scope usage, and case-only path mismatches (in `source()` calls, forward directives, and backward `# raven: sourced-by`-style directives). On a case-sensitive CI filesystem a case-only mismatch (e.g. `source("scripts/templates.r")` for an on-disk `templates.R`) is a **warning**, so it exceeds the default `--max-severity info` and fails the build — surfacing a portability bug that, for a forward `source()`, would also break it at runtime on Linux. See [Diagnostics → Source path case mismatch](diagnostics.md#source-path-case-mismatch).
+- Static `{box}` and `{import}` selective-import scope, missing-module, package, and authoritative missing-export diagnostics use the same analysis as the language server.
 - Missing-package warnings (`library(notInstalled)`) — see [Missing-package reporting in CI](#missing-package-reporting-in-ci); `raven check` suppresses these by default.
 - Undefined-variable diagnostics, accounting for cross-file and package scope.
 

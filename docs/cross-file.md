@@ -557,6 +557,39 @@ emit misleading diagnostics. See
 [Limitations](limitations.md#box-module-system-boxuse) for the exact static
 boundary.
 
+## import package selective imports
+
+Raven recognizes static double-colon `import::from()`, `import::here()`, and
+`import::into()` calls. Package sources use Raven's package export snapshots.
+Literal `.R`/`.r` sources are private script modules resolved with Raven's
+forward path context; a literal `.directory` is supported. The extension is
+part of the source and no box-style candidate names are inferred.
+
+Explicit names and `local = exported` aliases are supported. `.all = TRUE` adds
+known exports, `.all = FALSE` disables that expansion, and a nonempty static
+`.except` implies `.all` unless explicitly disabled. Exclusions compare the
+exported/source name, so excluding an export also removes its explicit alias.
+An explicit alias plus `.all` does not additionally attach the bare export.
+Imports otherwise follow R's sequential assignment behavior: if a different
+later export from `.all` targets the same local name, that later binding wins.
+
+`here()` contributes to the current lexical environment from the call position;
+inside a function its effect stays in that function. `from()` uses the lower-
+priority `"imports"` destination by default, and literal named `.into`/`into()`
+destinations are supported. These are fallback bindings below lexical/current-
+environment bindings, not namespace objects, and never enable `$` access.
+
+A script module's candidate interface is its partial live private top-level
+environment, including dotted names and top-level `import::here()` bindings.
+Synthetic `.packageName` and `__last_modified__` names are excluded. Box export
+markers do not govern `{import}` modules. Local relationships use non-lending
+`SelectiveModule` edges, so edits revalidate importers without ordinary scope or
+NSE lending.
+
+Dynamic `.character_only`, computed sources/options/destinations, URL/pins
+modules, environment-valued destinations, detach simulation, and `import:::`
+calls are outside this first phase and remain inert.
+
 ## NSE directive propagation
 
 `# raven: nse` declarations (see [Non-Standard Evaluation](non-standard-evaluation.md) and [directives](directives.md#nse-declarations)) are cross-file facts, like defined symbols and `library()` loads: a declaration governs undefined-variable suppression for its named callee in every file connected to it through the resolved `source()` graph, in both directions and transitively. Declare a helper's NSE contract once — next to its `library()` call, its definition, or in a sourced setup file — and the corresponding false positives are suppressed at call sites in the connected files.

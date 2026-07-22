@@ -37,8 +37,11 @@ are governed only by their severity settings). The suppressible analyzer codes a
 | `box-module-not-found` | A static relative `box::use(./module)` target does not resolve to a file module or `__init__.r` / `__init__.R` module | No |
 | `box-module-case-mismatch` | A static relative box module target exists only under a different filename case | No |
 | `box-export-not-found` | A named/renamed box attachment is absent from a complete module or package export set | Yes |
+| `import-module-not-found` | A literal `.R`/`.r` `{import}` script module cannot be resolved | No |
+| `import-module-case-mismatch` | A literal `{import}` script path exists only under a different filename case | No |
+| `import-export-not-found` | An explicit `{import}` selection is absent from a complete package export snapshot | Yes |
 | `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
-| `package-not-installed` | `library()` / `require()` / static `box::use()` of a package that is not installed (also fires on `pkg::member` / `pkg:::member` when `pkg` is not installed) | Yes |
+| `package-not-installed` | `library()` / `require()` / a static selective import of a package that is not installed (also fires on `pkg::member` / `pkg:::member` when `pkg` is not installed) | Yes |
 | `package-outside-active-library` | A package exists in a vanilla system/user library but is unavailable in the active renv project library; child of `package-not-installed` | Yes |
 | `namespace-member-not-found` | `pkg::member` where a *complete* package export set has no such exported object (never for `pkg:::member`) | Yes |
 | `unused-suppression` | A `# raven: expect[...]` (or, under the global sweep, any suppression) that suppressed nothing — see below | No |

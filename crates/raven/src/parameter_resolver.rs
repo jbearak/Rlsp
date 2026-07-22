@@ -412,8 +412,8 @@ pub fn resolve(
 
     // If namespace is specified, we already checked the cache above.
     // For unqualified names, try to find which package exports this function.
-    let resolved_package = if let Some(ns) = namespace {
-        Some(ns.to_string())
+    let resolved_package_member = if let Some(ns) = namespace {
+        Some((ns.to_string(), function_name.to_string()))
     } else {
         let lookup_key =
             crate::handlers::unquote_backtick_name(function_name).unwrap_or(function_name);
@@ -421,106 +421,103 @@ pub fn resolve(
             .symbols
             .get(function_name)
             .or_else(|| scope.symbols.get(lookup_key))
-            .and_then(|symbol| symbol.source_uri.as_str().strip_prefix("package:"))
-            .filter(|package| !package.is_empty())
-            .map(str::to_string);
+            .and_then(|symbol| {
+                let package = crate::cross_file::scope::package_name_from_uri(&symbol.source_uri)?;
+                let exported =
+                    crate::cross_file::scope::package_export_from_uri(&symbol.source_uri)
+                        .map_or_else(|| function_name.to_string(), |name| name.into_owned());
+                Some((package.to_string(), exported))
+            });
         selective_package.or_else(|| {
             // Resolve the true owner package (issue #407) so formals come from
             // the package that actually defines the function (e.g. `dplyr` for
-            // a `mutate` made visible through `library(tidyverse)`), not the
+            // a `mutate` made visible through `library(tidyverse)`, not the
             // aggregate that merely made it visible.
             let pkg_list: Vec<String> = all_packages.to_vec();
             state
                 .package_library
                 .find_package_owner_for_symbol(function_name, &pkg_list)
+                .map(|package| (package, function_name.to_string()))
         })
     };
 
-    if let Some(ref pkg_name) = resolved_package {
+    if let Some((pkg_name, exported_name)) = resolved_package_member {
         // A load_all() internal resolves to the synthetic sentinel package,
-        // which is not installed and must never be sent to the R subprocess
-        // (`get_function_formals` already rejects it as an invalid package
-        // name, but short-circuit here so we never build a sentinel cache key
-        // or attempt the query). Local/cross-file resolution already ran above,
-        // so returning None here simply declines package-formal resolution (the
-        // caller then falls back to generic signature help).
-        if crate::package_library::is_load_all_sentinel(pkg_name) {
+        // which is not installed and must never be sent to the R subprocess.
+        if crate::package_library::is_load_all_sentinel(&pkg_name) {
             return None;
         }
-        let cache_key = format!("{}::{}", pkg_name, function_name);
-        if let Some(sig) = cache.get_package(&cache_key) {
+        let cache_key = format!("{}::{}", pkg_name, exported_name);
+        if let Some(mut sig) = cache.get_package(&cache_key) {
+            sig.name = function_name.to_string();
             return Some(sig);
         }
 
         // R subprocess integration with graceful degradation (Requirement 11.1, 11.2, 11.3)
-        // Query R for function formals using get_function_formals
+        // Query the source/exported member while preserving the local alias in
+        // the returned signature.
         if let Some(r_subprocess) = state.package_library.r_subprocess() {
-            // Get tokio runtime handle for async call from sync context
             let handle = match tokio::runtime::Handle::try_current() {
                 Ok(h) => h,
                 Err(_) => {
                     log::trace!(
                         "No tokio runtime available for R subprocess query; skipping package function {}::{}",
                         pkg_name,
-                        function_name
+                        exported_name
                     );
                     return None;
                 }
             };
 
-            // Call async get_function_formals from sync context
             let formals_result = handle.block_on(r_subprocess.get_function_formals(
-                function_name,
-                Some(pkg_name),
+                &exported_name,
+                Some(&pkg_name),
                 !is_internal,
             ));
 
             match formals_result {
                 Ok(params) => {
-                    // Success: build signature, cache it, and return
-                    let signature = FunctionSignature {
-                        name: function_name.to_string(),
+                    let cached_signature = FunctionSignature {
+                        name: exported_name.clone(),
                         parameters: params,
                         source: SignatureSource::RSubprocess {
                             package: Some(pkg_name.clone()),
                         },
                     };
-                    cache.insert_package(cache_key, signature.clone());
+                    cache.insert_package(cache_key, cached_signature.clone());
+                    let mut signature = cached_signature;
+                    signature.name = function_name.to_string();
                     log::trace!(
                         "Resolved package function {}::{} via R subprocess ({} params)",
                         pkg_name,
-                        function_name,
+                        exported_name,
                         signature.parameters.len()
                     );
                     return Some(signature);
                 }
                 Err(e) => {
-                    // Graceful degradation: log error and return None
-                    // Timeouts are logged at warn level (Requirement 11.3)
-                    // Other errors (parse failures, missing functions) at trace level
                     if e.to_string().contains("timeout") || e.to_string().contains("timed out") {
                         log::warn!(
                             "R subprocess timeout querying formals for {}::{}: {}",
                             pkg_name,
-                            function_name,
+                            exported_name,
                             e
                         );
                     } else {
                         log::trace!(
                             "Failed to get formals for {}::{} from R subprocess: {}",
                             pkg_name,
-                            function_name,
+                            exported_name,
                             e
                         );
                     }
-                    // Fall through to return None (standard completions will still appear)
                 }
             }
         } else {
             log::trace!(
                 "No R subprocess available; cannot query formals for {}::{}",
                 pkg_name,
-                function_name
+                exported_name
             );
         }
     }
@@ -954,7 +951,7 @@ fn get_scope(
             lookup: &data_lookup,
             base_packages: state.package_library.base_packages(),
         });
-    let import_env = crate::box_use::ArtifactModuleExportEnv::new(
+    let import_env = crate::selective_import::ArtifactSelectiveImportEnv::new(
         &get_artifacts,
         &get_metadata,
         (state.cross_file_config.packages_enabled && state.package_library_ready)
@@ -1444,6 +1441,59 @@ f(beta = 2)
                 package: Some(ref package)
             } if package == "pkgA"
         ));
+    }
+
+    #[tokio::test]
+    async fn renamed_import_package_function_uses_exported_cache_key_and_local_display_name() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        state.package_library = Arc::new(PackageLibrary::new_empty());
+        state
+            .package_library
+            .insert_package(PackageInfo::new(
+                "syntheticPkg".to_string(),
+                HashSet::from(["source_member".to_string()]),
+            ))
+            .await;
+
+        let uri = Url::parse("file:///workspace/main.R").unwrap();
+        let code = "import::here(syntheticPkg, local_alias = source_member)\nlocal_alias(\n";
+        state.open_document(uri.clone(), code, Some(1));
+        let cache = SignatureCache::new(10);
+        cache.insert_package(
+            "syntheticPkg::source_member".to_string(),
+            FunctionSignature {
+                name: "source_member".to_string(),
+                parameters: vec![ParameterInfo {
+                    name: "from_source".to_string(),
+                    default_value: None,
+                    is_dots: false,
+                }],
+                source: SignatureSource::RSubprocess {
+                    package: Some("syntheticPkg".to_string()),
+                },
+            },
+        );
+
+        let signature = resolve(
+            &state,
+            &cache,
+            "local_alias",
+            None,
+            false,
+            &uri,
+            tower_lsp::lsp_types::Position::new(1, 12),
+        )
+        .expect("renamed package function must resolve exported cached formals");
+        assert_eq!(signature.name, "local_alias");
+        assert_eq!(signature.parameters[0].name, "from_source");
+        assert!(cache.get_package("syntheticPkg::local_alias").is_none());
     }
 
     #[cfg(unix)]

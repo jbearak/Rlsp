@@ -1279,21 +1279,15 @@ impl DependencyGraph {
         // unsupported specs contribute NO file edge; missing/case-mismatch
         // module diagnostics are computed separately from metadata.
         let mut module_edges: Vec<DependencyEdge> = Vec::new();
-        for import in &meta.box_imports {
-            // Only local-module specs resolve to a file edge.
-            if !matches!(import.spec, crate::box_use::BoxSpec::LocalModule { .. }) {
-                continue;
-            }
-            let Some(crate::selective_import::ImportSource::LocalModule(source_uri)) =
-                import.resolved_source()
-            else {
+        for request in meta.selective_import_requests(uri) {
+            let crate::selective_import::ImportSource::LocalModule(source) = request.source else {
                 continue;
             };
             module_edges.push(DependencyEdge {
                 from: uri.clone(),
-                to: source_uri,
-                call_site_line: Some(import.line),
-                call_site_column: Some(import.column),
+                to: source.uri,
+                call_site_line: Some(request.provenance.line),
+                call_site_column: Some(request.provenance.column),
                 tar_source_ordinal: None,
                 source_batch_kind: None,
                 // Locality/chdir/sys are irrelevant for a non-lending module
@@ -1303,7 +1297,7 @@ impl DependencyGraph {
                 locality: SourceLocality::Global,
                 chdir: false,
                 is_sys_source: false,
-                is_function_scoped: import.function_scoped,
+                is_function_scoped: request.function_scoped,
                 is_directive: false,
                 is_backward_directive: false,
                 non_lending: false,
@@ -1545,6 +1539,30 @@ impl DependencyGraph {
             .get(uri)
             .map(|edges| edges.iter().collect())
             .unwrap_or_default()
+    }
+
+    /// Return `roots` plus every local module reachable only through typed
+    /// [`DependencyEdgeKind::SelectiveModule`] edges.
+    ///
+    /// Package warming uses this closure to discover package imports nested in
+    /// already-indexed `{box}` / `{import}` modules without treating ordinary
+    /// `source()` children as module-private execution. Cycles are harmless and
+    /// each URI appears once.
+    pub fn selective_module_closure(&self, roots: impl IntoIterator<Item = Url>) -> HashSet<Url> {
+        let mut closure = HashSet::new();
+        let mut pending: Vec<Url> = roots.into_iter().collect();
+        while let Some(uri) = pending.pop() {
+            if !closure.insert(uri.clone()) {
+                continue;
+            }
+            pending.extend(
+                self.get_dependencies(&uri)
+                    .into_iter()
+                    .filter(|edge| edge.is_selective_module())
+                    .map(|edge| edge.to.clone()),
+            );
+        }
+        closure
     }
 
     fn record_visited_budget_truncation(&self) {
@@ -2738,6 +2756,37 @@ mod tests {
         assert!(
             !ordinary_only.contains(&importer),
             "selective edges must not propagate ordinary source scope or NSE/func declarations"
+        );
+    }
+
+    #[test]
+    fn import_script_edges_reuse_selective_non_lending_revalidation() {
+        let (temp, root) = create_temp_workspace(&["main.R", "mod.R"]);
+        let importer = temp_url(&temp, "main.R");
+        let module = temp_url(&temp, "mod.R");
+        let mut metadata = crate::cross_file::extract_metadata("import::here('mod.R', exported)\n");
+        crate::cross_file::enrich_selective_import_resolutions(
+            &mut metadata,
+            &importer,
+            Some(&root),
+        );
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&importer, &metadata, Some(&root), |_| None);
+
+        let dependencies = graph.get_dependencies(&importer);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].to, module);
+        assert!(dependencies[0].is_selective_module());
+        assert!(!dependencies[0].lends_scope());
+        assert!(
+            graph
+                .revalidation_consistent_set(&module, 16, 128)
+                .any(|uri| uri.as_str() == importer.as_str())
+        );
+        assert!(
+            !graph
+                .revalidation_consistent_set_over_ordinary_source(&module, 16, 128)
+                .any(|uri| uri.as_str() == importer.as_str())
         );
     }
 
