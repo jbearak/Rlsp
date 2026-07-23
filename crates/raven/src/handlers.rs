@@ -70408,12 +70408,14 @@ mod file_type_tests {
         for expected in [
             "normal",
             "normal_lpdf",
+            "normal_lupdf",
             "normal_cdf",
             "normal_lcdf",
             "normal_lccdf",
             "normal_rng",
             "poisson",
             "poisson_lpmf",
+            "poisson_lupmf",
             "poisson_cdf",
             "poisson_lcdf",
             "poisson_lccdf",
@@ -70424,12 +70426,15 @@ mod file_type_tests {
             "loglogistic_cdf",
             "categorical",
             "categorical_lpmf",
+            "categorical_lupmf",
             "categorical_rng",
             "multi_normal",
             "multi_normal_lpdf",
+            "multi_normal_lupdf",
             "multi_normal_rng",
             "wiener",
             "wiener_lpdf",
+            "wiener_lupdf",
         ] {
             assert!(
                 labels.contains(expected),
@@ -70447,7 +70452,9 @@ mod file_type_tests {
 
         for invalid in [
             "poisson_lpdf",
+            "poisson_lupdf",
             "normal_lpmf",
+            "normal_lupmf",
             "categorical_cdf",
             "categorical_lcdf",
             "categorical_lccdf",
@@ -70497,7 +70504,7 @@ mod file_type_tests {
     fn test_stan_distribution_completion_metadata() {
         let items = empty_stan_completion_items();
 
-        for label in ["normal", "normal_lpdf", "poisson_lpmf"] {
+        for label in ["normal", "normal_lpdf", "normal_lupdf", "poisson_lpmf"] {
             let item = items
                 .iter()
                 .find(|item| item.label == label)

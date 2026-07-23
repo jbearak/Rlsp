@@ -153,9 +153,9 @@ For `.stan`, `.jags`, and `.bugs` files, Raven offers completions tailored to ea
 | Language | What's offered |
 |---|---|
 | **JAGS** | Keywords (`model`, `data`, `for`, `in`, `if`, `else`), distributions (`dnorm`, `dgamma`, …), built-in functions (`abs`, `log`, …), and file-local symbols |
-| **Stan** | Types (`int`, `real`, `vector`, …), block keywords (`data`, `parameters`, `model`, …), control flow (`if`, `for`, `while`, …), bare distribution names for sampling statements (`normal`, `poisson`, `multi_normal`, …), valid probability variants (`normal_lpdf`, `normal_lcdf`, `poisson_lpmf`, `poisson_rng`, …), a broad curated set of math and matrix functions, and file-local symbols |
+| **Stan** | Types (`int`, `real`, `vector`, …), block keywords (`data`, `parameters`, `model`, …), control flow (`if`, `for`, `while`, …), bare distribution names for sampling statements (`normal`, `poisson`, `multi_normal`, …), valid normalized and unnormalized probability variants (`normal_lpdf`, `normal_lupdf`, `poisson_lpmf`, `poisson_lupmf`, …), a broad curated set of math and matrix functions, and file-local symbols |
 
-Stan probability variants are curated per distribution family, so invalid combinations such as `poisson_lpdf` and `categorical_cdf` are never suggested. These completions are static rather than context-sensitive: Raven offers the same built-in set throughout a Stan file. File-local symbols are discovered by scanning the current file for variable declarations and assignments. R-specific reserved words are excluded from JAGS completions to avoid noise.
+Stan probability variants are curated per distribution family, including unnormalized `_lupdf` and `_lupmf` forms where the corresponding density or mass function exists. Other suffixes also follow each family's actual API, so invalid combinations such as `poisson_lpdf` and `categorical_cdf` are never suggested. These completions are static rather than context-sensitive: Raven offers the same built-in set throughout a Stan file. File-local symbols are discovered by scanning the current file for variable declarations and assignments. R-specific reserved words are excluded from JAGS completions to avoid noise.
 
 ## Scope Rules Summary
 

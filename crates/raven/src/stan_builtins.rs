@@ -2,9 +2,10 @@
 //!
 //! These tables target Stan approximately version 2.35 and are used by the
 //! completion handler for `.stan` files. Bare distribution names serve sampling
-//! statements such as `y ~ normal(mu, sigma)`. Distribution suffixes are listed
-//! explicitly per family because Stan's availability is irregular: for example,
-//! `poisson_lpdf` and `categorical_cdf` do not exist.
+//! statements such as `y ~ normal(mu, sigma)`. The supported probability-function
+//! suffixes are `_lpdf`, `_lupdf`, `_lpmf`, `_lupmf`, `_cdf`, `_lcdf`, `_lccdf`,
+//! and `_rng`. They are listed explicitly per family because Stan's availability
+//! is irregular: for example, `poisson_lpdf` and `categorical_cdf` do not exist.
 
 /// Built-in Stan types.
 pub static STAN_TYPES: &[&str] = &[
@@ -50,20 +51,22 @@ pub static STAN_CONTROL_FLOW: &[&str] = &[
 pub struct StanDistribution {
     /// The bare distribution name used in sampling statements.
     pub name: &'static str,
-    /// Valid suffixes that form callable probability functions for this family.
+    /// Valid `_lpdf`, `_lupdf`, `_lpmf`, `_lupmf`, `_cdf`, `_lcdf`, `_lccdf`,
+    /// or `_rng` suffixes for this family.
     pub suffixes: &'static [&'static str],
 }
 
-const CONTINUOUS_FULL: &[&str] = &["_lpdf", "_cdf", "_lcdf", "_lccdf", "_rng"];
-const DISCRETE_FULL: &[&str] = &["_lpmf", "_cdf", "_lcdf", "_lccdf", "_rng"];
-const CONTINUOUS_LOG_CDF_RNG: &[&str] = &["_lpdf", "_lcdf", "_lccdf", "_rng"];
-const CONTINUOUS_CDF_RNG: &[&str] = &["_lpdf", "_cdf", "_rng"];
-const CONTINUOUS_RNG: &[&str] = &["_lpdf", "_rng"];
-const DISCRETE_RNG: &[&str] = &["_lpmf", "_rng"];
-const CONTINUOUS_DENSITY: &[&str] = &["_lpdf"];
-const DISCRETE_MASS: &[&str] = &["_lpmf"];
+const CONTINUOUS_FULL: &[&str] = &["_lpdf", "_lupdf", "_cdf", "_lcdf", "_lccdf", "_rng"];
+const DISCRETE_FULL: &[&str] = &["_lpmf", "_lupmf", "_cdf", "_lcdf", "_lccdf", "_rng"];
+const CONTINUOUS_LOG_CDF_RNG: &[&str] = &["_lpdf", "_lupdf", "_lcdf", "_lccdf", "_rng"];
+const CONTINUOUS_CDF_RNG: &[&str] = &["_lpdf", "_lupdf", "_cdf", "_rng"];
+const CONTINUOUS_RNG: &[&str] = &["_lpdf", "_lupdf", "_rng"];
+const DISCRETE_RNG: &[&str] = &["_lpmf", "_lupmf", "_rng"];
+const CONTINUOUS_DENSITY: &[&str] = &["_lpdf", "_lupdf"];
+const DISCRETE_MASS: &[&str] = &["_lpmf", "_lupmf"];
 
-/// Stan distributions and the valid generated probability-function variants.
+/// Stan distributions and their valid `_lpdf`, `_lupdf`, `_lpmf`, `_lupmf`,
+/// `_cdf`, `_lcdf`, `_lccdf`, and `_rng` variants.
 pub static STAN_DISTRIBUTIONS: &[StanDistribution] = &[
     StanDistribution {
         name: "bernoulli",
@@ -575,7 +578,9 @@ mod tests {
 
     #[test]
     fn stan_distribution_suffixes_are_well_formed() {
-        const SUPPORTED_SUFFIXES: &[&str] = &["_lpdf", "_lpmf", "_cdf", "_lcdf", "_lccdf", "_rng"];
+        const SUPPORTED_SUFFIXES: &[&str] = &[
+            "_lpdf", "_lupdf", "_lpmf", "_lupmf", "_cdf", "_lcdf", "_lccdf", "_rng",
+        ];
 
         for distribution in STAN_DISTRIBUTIONS {
             for suffix in distribution.suffixes {
