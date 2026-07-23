@@ -386,6 +386,11 @@ mod jags_catalog_editor_tests {
 
         let (alias, _) = hover_value("model { y ~ dbin|om(0.5, 10) }").await.unwrap();
         assert!(alias.contains("alias of `dbin`"));
+
+        let (comment_separated, _) = hover_value("model { x <- sq|rt /* gap */ (1) }")
+            .await
+            .unwrap();
+        assert!(comment_separated.contains("sqrt(x)"));
     }
 
     #[tokio::test]
@@ -398,6 +403,10 @@ mod jags_catalog_editor_tests {
             "model { unk|nown(1) }",
             "model { x <- db|ern(0.5) }",
             "model { y ~ me|xp(1) }",
+            "model { sq|rt + (1) }",
+            "model { sq|rt <- (1) }",
+            "model { sq|rt; (1) }",
+            "model { sq|rt 1 (2) }",
         ] {
             assert!(hover_value(source).await.is_none(), "{source}");
         }
@@ -449,6 +458,10 @@ mod jags_catalog_editor_tests {
         let (empty, active) = signature("sum(|)").unwrap();
         assert_eq!(empty.label, "sum(value, ...)");
         assert_eq!(active, 0);
+
+        let (comment_separated, active) = signature("sqrt /* gap */ (1|)").unwrap();
+        assert_eq!(comment_separated.label, "sqrt(x)");
+        assert_eq!(active, 0);
     }
 
     #[test]
@@ -461,32 +474,56 @@ mod jags_catalog_editor_tests {
             "dnorm(1, /* comm|ent */ 2)",
             "dnorm(\"quoted |noise\", 1)",
             "dnorm('quoted |noise', 1)",
+            "sqrt + (1|)",
+            "sqrt <- (1|)",
+            "sqrt = (1|)",
+            "sqrt; (1|)",
+            "sqrt 1 (2|)",
         ] {
             assert!(signature(source).is_none(), "{source}");
         }
     }
 
     #[test]
-    fn goto_fallback_excludes_every_catalog_name_and_alias() {
-        let mut names = std::collections::BTreeSet::new();
-        names.extend(crate::jags_builtins::JAGS_KEYWORDS.iter().copied());
-        names.extend(crate::jags_builtins::JAGS_CONTEXTUAL_SYNTAX.iter().copied());
-        names.extend(
-            crate::jags_builtins::JAGS_CALLABLES
-                .iter()
-                .map(|entry| entry.name),
-        );
-        names.extend(
-            crate::jags_builtins::JAGS_DISTRIBUTIONS
-                .iter()
-                .map(|entry| entry.name),
-        );
-        let text = names.iter().copied().collect::<Vec<_>>().join("\n");
-        let (state, uri) = state_with_jags(&text);
-        for (line, name) in names.into_iter().enumerate() {
+    fn goto_plain_catalog_named_data_uses_first_occurrence_fallback() {
+        let text = "acos\ndbern\nT\nI\nmodel {\n  x <- acos\n  y <- dbern\n  z <- T\n  w <- I\n}";
+        let (state, uri) = state_with_jags(text);
+        for (name, expected_line) in [("acos", 0), ("dbern", 1), ("T", 2), ("I", 3)] {
+            let occurrence = collect_jags_identifier_occurrences(text)
+                .into_iter()
+                .filter(|occurrence| occurrence.name == name)
+                .nth(1)
+                .unwrap();
+            let response = goto_definition(
+                &state,
+                &uri,
+                Position::new(occurrence.line, occurrence.start_col),
+            )
+            .unwrap_or_else(|| panic!("plain {name} should navigate"));
+            let GotoDefinitionResponse::Scalar(location) = response else {
+                panic!("plain {name} should have one definition")
+            };
+            assert_eq!(location.range.start.line, expected_line, "{name}");
+        }
+    }
+
+    #[test]
+    fn goto_actual_catalog_calls_and_syntax_remain_inert() {
+        for source in [
+            "model { x <- ac|os(1) }",
+            "model { x ~ db|ern(0.5) }",
+            "model { x ~ dnorm(0, 1) |T(0,) }",
+            "mo|del { x <- 1 }",
+            "da|ta { x <- 1 }",
+            "model { fo|r (i in 1:N) { x[i] <- 1 } }",
+            "model { for (i i|n 1:N) { x[i] <- 1 } }",
+            "va|r x",
+        ] {
+            let (text, position) = marked(source);
+            let (state, uri) = state_with_jags(&text);
             assert!(
-                goto_definition(&state, &uri, Position::new(line as u32, 0)).is_none(),
-                "goto fallback exposed builtin {name}"
+                goto_definition(&state, &uri, position).is_none(),
+                "syntax/catalog call navigated: {source}"
             );
         }
     }
@@ -20428,6 +20465,20 @@ fn jags_builtin_hover(text: &str, position: Position) -> Option<Hover> {
     Some(markdown_hover(value, site.range))
 }
 
+fn is_jags_builtin_occurrence(text: &str, position: Position) -> bool {
+    if crate::jags::syntax_site_at_position(text, position) {
+        return true;
+    }
+    let Some(site) = crate::jags::call_site_at_position(text, position) else {
+        return false;
+    };
+    if site.after_tilde {
+        crate::jags_builtins::distribution(&site.name).is_some()
+    } else {
+        crate::jags_builtins::callable(&site.name).is_some()
+    }
+}
+
 fn collect_stan_references(
     occurrences: &[StanIdentifierOccurrence],
     name: &str,
@@ -24181,16 +24232,18 @@ pub fn goto_definition_with_cancel(
         let occurrences = collect_jags_identifier_occurrences(&text);
         let target = stan_identifier_at_position(&occurrences, position)?;
 
+        // Syntax and catalog calls have no file-local definition. The same
+        // spelling in a plain identifier position may be a valid data input,
+        // so only the occurrence's lexical role is excluded.
+        if is_jags_builtin_occurrence(&text, position) {
+            return None;
+        }
+
         // Try definition candidates first, then fall back to first occurrence
         // (covers data inputs and constants that have no assignment in the JAGS file).
-        // Skip the fallback for builtins/keywords — they have no user definition.
-        let is_builtin = crate::jags_builtins::is_builtin_name(&target.name);
         let location = find_jags_definition(&text, &target.name, position)
             .map(|def| (def.line, def.start_col, def.end_col))
             .or_else(|| {
-                if is_builtin {
-                    return None;
-                }
                 occurrences
                     .iter()
                     .find(|o| o.name == target.name)

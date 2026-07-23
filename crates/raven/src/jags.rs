@@ -220,6 +220,73 @@ fn tokenize(text: &str) -> Vec<Token> {
     tokenize_until(text, text.len()).0
 }
 
+/// Returns whether the raw span contains only whitespace and comments.
+///
+/// JAGS comments are lexical whitespace, so a terminated block comment or a
+/// line comment followed by a newline may separate a callee from `(`. Any
+/// operator, assignment, literal, semicolon, quoted fragment, or other code is
+/// a barrier even when the lightweight token stream does not otherwise retain
+/// it.
+fn is_trivia_span(text: &str, start: usize, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = start;
+    let mut state = LexState::Code;
+
+    while index < end {
+        match state {
+            LexState::Code => {
+                if bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                } else if bytes[index] == b'#' {
+                    state = LexState::LineComment;
+                    index += 1;
+                } else if bytes[index] == b'/' && index + 1 < end && bytes[index + 1] == b'*' {
+                    state = LexState::BlockComment;
+                    index += 2;
+                } else if !bytes[index].is_ascii() {
+                    let character = text[index..end]
+                        .chars()
+                        .next()
+                        .expect("index is on a UTF-8 boundary within the span");
+                    if !character.is_whitespace() {
+                        return false;
+                    }
+                    index += character.len_utf8();
+                } else {
+                    return false;
+                }
+            }
+            LexState::LineComment => {
+                if bytes[index] == b'\n' {
+                    state = LexState::Code;
+                }
+                index += 1;
+            }
+            LexState::BlockComment => {
+                if bytes[index] == b'*' && index + 1 < end && bytes[index + 1] == b'/' {
+                    state = LexState::Code;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            LexState::DoubleQuoted | LexState::SingleQuoted => return false,
+        }
+    }
+
+    state == LexState::Code
+}
+
+fn token_follows_with_trivia(text: &str, previous: &Token, next: &Token) -> bool {
+    is_trivia_span(text, previous.end_byte, next.start_byte)
+}
+
+fn identifier_follows_tilde(text: &str, tokens: &[Token], index: usize) -> bool {
+    index > 0
+        && matches!(tokens[index - 1].kind, TokenKind::Tilde)
+        && token_follows_with_trivia(text, &tokens[index - 1], &tokens[index])
+}
+
 fn byte_offset_at_position(text: &str, position: Position) -> usize {
     let mut line_start = 0usize;
     let mut current_line = 0u32;
@@ -251,14 +318,88 @@ pub fn call_site_at_position(text: &str, position: Position) -> Option<JagsCallS
     let TokenKind::Identifier(name) = &tokens[index].kind else {
         return None;
     };
-    if !matches!(tokens.get(index + 1)?.kind, TokenKind::LeftParen) {
+    let left_paren = tokens.get(index + 1)?;
+    if !matches!(left_paren.kind, TokenKind::LeftParen)
+        || !token_follows_with_trivia(text, &tokens[index], left_paren)
+    {
         return None;
     }
     Some(JagsCallSite {
         name: name.clone(),
         range: tokens[index].range,
-        after_tilde: index > 0 && matches!(tokens[index - 1].kind, TokenKind::Tilde),
+        after_tilde: identifier_follows_tilde(text, &tokens, index),
     })
+}
+
+fn identifier_is_for_iterator_separator(text: &str, tokens: &[Token], index: usize) -> bool {
+    let Some(previous) = index.checked_sub(1).and_then(|i| tokens.get(i)) else {
+        return false;
+    };
+    if !matches!(previous.kind, TokenKind::Identifier(_))
+        || !token_follows_with_trivia(text, previous, &tokens[index])
+    {
+        return false;
+    }
+
+    let mut parenthesis_depth = 0usize;
+    for open_index in (0..index).rev() {
+        match tokens[open_index].kind {
+            TokenKind::RightParen => parenthesis_depth += 1,
+            TokenKind::LeftParen if parenthesis_depth == 0 => {
+                let Some(keyword_index) = open_index.checked_sub(1) else {
+                    return false;
+                };
+                return matches!(
+                    &tokens[keyword_index].kind,
+                    TokenKind::Identifier(name) if name == "for"
+                ) && token_follows_with_trivia(
+                    text,
+                    &tokens[keyword_index],
+                    &tokens[open_index],
+                );
+            }
+            TokenKind::LeftParen => parenthesis_depth -= 1,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Returns whether the identifier under `position` is acting as JAGS syntax.
+///
+/// This recognizes block introducers, loop syntax, `var` declarations, and
+/// call-shaped `T`/`I` bounds. Plain identifiers named `T` or `I` are not
+/// syntax and remain eligible for file-local navigation.
+pub fn syntax_site_at_position(text: &str, position: Position) -> bool {
+    let cursor = byte_offset_at_position(text, position);
+    let tokens = tokenize(text);
+    let Some(index) = tokens.iter().position(|token| {
+        token.start_byte <= cursor
+            && cursor < token.end_byte
+            && matches!(token.kind, TokenKind::Identifier(_))
+    }) else {
+        return false;
+    };
+    let TokenKind::Identifier(name) = &tokens[index].kind else {
+        return false;
+    };
+
+    let next_with_trivia = |kind: TokenKind| {
+        tokens.get(index + 1).is_some_and(|next| {
+            next.kind == kind && token_follows_with_trivia(text, &tokens[index], next)
+        })
+    };
+
+    match name.as_str() {
+        "data" | "model" => next_with_trivia(TokenKind::LeftBrace),
+        "for" | "T" | "I" => next_with_trivia(TokenKind::LeftParen),
+        "var" => tokens.get(index + 1).is_some_and(|next| {
+            matches!(next.kind, TokenKind::Identifier(_))
+                && token_follows_with_trivia(text, &tokens[index], next)
+        }),
+        "in" => identifier_is_for_iterator_separator(text, &tokens, index),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -291,9 +432,9 @@ pub fn active_call_at_position(text: &str, position: Position) -> Option<JagsAct
                 }) = index
                     .checked_sub(1)
                     .and_then(|previous| tokens.get(previous))
+                    .filter(|previous| token_follows_with_trivia(text, previous, token))
                 {
-                    let after_tilde =
-                        index >= 2 && matches!(tokens[index - 2].kind, TokenKind::Tilde);
+                    let after_tilde = identifier_follows_tilde(text, &tokens, index - 1);
                     delimiters.push(Delimiter::Call(JagsActiveCall {
                         name: name.clone(),
                         range: *range,
@@ -374,6 +515,56 @@ mod tests {
     fn plain_identifiers_and_unknown_spacing_without_call_are_inert() {
         assert!(call_site_at_position("dnorm + 1", Position::new(0, 2)).is_none());
         assert!(call_site_at_position("dnorm /* unfinished", Position::new(0, 2)).is_none());
+    }
+
+    #[test]
+    fn discarded_code_between_identifier_and_group_is_a_call_barrier() {
+        for code in [
+            "sqrt + (1)",
+            "sqrt <- (1)",
+            "sqrt = (1)",
+            "sqrt; (1)",
+            "sqrt 1 (2)",
+        ] {
+            assert!(
+                call_site_at_position(code, Position::new(0, 2)).is_none(),
+                "call site: {code}"
+            );
+            assert!(
+                active_call_at_position(code, Position::new(0, code.len() as u32 - 1)).is_none(),
+                "active call: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_and_completed_comments_may_separate_a_real_call() {
+        for (code, cursor) in [
+            ("sqrt /* comment */ (1)", Position::new(0, 21)),
+            ("sqrt # comment\n (1)", Position::new(1, 2)),
+        ] {
+            assert_eq!(
+                call_site_at_position(code, Position::new(0, 2))
+                    .unwrap()
+                    .name,
+                "sqrt"
+            );
+            assert_eq!(active_call_at_position(code, cursor).unwrap().name, "sqrt");
+        }
+    }
+
+    #[test]
+    fn syntax_sites_distinguish_plain_contextual_names() {
+        assert!(syntax_site_at_position(
+            "x ~ dnorm(0, 1) T(0,)",
+            Position::new(0, 16)
+        ));
+        assert!(syntax_site_at_position(
+            "for (i in 1:N)",
+            Position::new(0, 7)
+        ));
+        assert!(!syntax_site_at_position("T + I", Position::new(0, 0)));
+        assert!(!syntax_site_at_position("T + I", Position::new(0, 4)));
     }
 
     #[test]
