@@ -19774,6 +19774,21 @@ fn is_r_only_jags_completion_name(name: &str) -> bool {
         || matches!(name, "library" | "require")
 }
 
+fn push_stan_keyword_completion(
+    label: &str,
+    items: &mut Vec<CompletionItem>,
+    seen_names: &mut HashSet<String>,
+) {
+    if seen_names.insert(label.to_string()) {
+        items.push(CompletionItem {
+            label: label.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, label)),
+            ..Default::default()
+        });
+    }
+}
+
 fn push_stan_function_completion(
     label: String,
     items: &mut Vec<CompletionItem>,
@@ -19798,38 +19813,17 @@ fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
 
     // Add Stan types
     for ty in crate::stan_builtins::STAN_TYPES {
-        if seen_names.insert(ty.to_string()) {
-            items.push(CompletionItem {
-                label: ty.to_string(),
-                kind: Some(CompletionItemKind::KEYWORD),
-                sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, ty)),
-                ..Default::default()
-            });
-        }
+        push_stan_keyword_completion(ty, &mut items, &mut seen_names);
     }
 
     // Add Stan block keywords
     for kw in crate::stan_builtins::STAN_BLOCK_KEYWORDS {
-        if seen_names.insert(kw.to_string()) {
-            items.push(CompletionItem {
-                label: kw.to_string(),
-                kind: Some(CompletionItemKind::KEYWORD),
-                sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, kw)),
-                ..Default::default()
-            });
-        }
+        push_stan_keyword_completion(kw, &mut items, &mut seen_names);
     }
 
     // Add Stan control flow
     for cf in crate::stan_builtins::STAN_CONTROL_FLOW {
-        if seen_names.insert(cf.to_string()) {
-            items.push(CompletionItem {
-                label: cf.to_string(),
-                kind: Some(CompletionItemKind::KEYWORD),
-                sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, cf)),
-                ..Default::default()
-            });
-        }
+        push_stan_keyword_completion(cf, &mut items, &mut seen_names);
     }
 
     // Add Stan distributions and their valid probability-function variants
