@@ -281,6 +281,7 @@ pub fn extract_metadata_with_tree(
 /// box-only helpers that have no workspace context. Production mixed-dialect
 /// analysis must call [`enrich_selective_import_resolutions`] so `{import}` keeps
 /// its workspace-root fallback.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn enrich_box_import_resolutions(
     meta: &mut CrossFileMetadata,
     importing_uri: &tower_lsp::lsp_types::Url,
