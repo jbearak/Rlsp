@@ -1,0 +1,514 @@
+[
+  {
+    "name": "pairwise-000",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-001",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-002",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-003",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-004",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-005",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-006",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-007",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-008",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-009",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-010",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-011",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-012",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-013",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-014",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-015",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-016",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-017",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-018",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-019",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-020",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-021",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-022",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-023",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-024",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-025",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-026",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-027",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-028",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-029",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-030",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-031",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-032",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-033",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-034",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-035",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-036",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-037",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-038",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-039",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-040",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-041",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-042",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-043",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-044",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-045",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-046",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-047",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-048",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-049",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-050",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-051",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-052",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-053",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-054",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-055",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-056",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-057",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-058",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-059",
+    "code": "data { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-060",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-061",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-062",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-063",
+    "code": "data { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sigma;\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-064",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-065",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-066",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-067",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-068",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-069",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-070",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-071",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-072",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-073",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-074",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-075",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-076",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-077",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-078",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-079",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-080",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-081",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-082",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-083",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-084",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-085",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-086",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-087",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-088",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-089",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-090",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-091",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-092",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-093",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-094",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-095",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = theta + sigma; }\n"
+  },
+  {
+    "name": "pairwise-096",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-097",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-098",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-099",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-100",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-101",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-102",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-103",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-104",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-105",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-106",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-107",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-108",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-109",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-110",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-111",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-112",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-113",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-114",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-115",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-116",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-117",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-118",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-119",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-120",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-121",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-122",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-123",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-124",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-125",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  y ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-126",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ normal(0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  },
+  {
+    "name": "pairwise-127",
+    "code": "functions { real sq(real x) { return x * x; } }\ndata { int<lower=1> N; vector[N] y; }\ntransformed data { real y_bar = mean(y); }\nparameters { real theta; real<lower=0> sigma; }\ntransformed parameters { real shifted = theta + 1; }\nmodel {\n  theta ~ student_t(4, 0, 1);\n  sigma ~ exponential(1);\n  if (theta > 0) target += -0.01 * theta;\n  for (n in 1:N) y[n] ~ normal(theta, sigma);\n  target += -0.0001 * sq(sigma);\n}\ngenerated quantities { real draw = normal_rng(theta, sigma); }\n"
+  }
+]

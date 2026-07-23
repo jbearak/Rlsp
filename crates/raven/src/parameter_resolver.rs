@@ -538,9 +538,8 @@ pub(crate) fn get_text_and_tree(
     state: &WorldState,
     uri: &Url,
 ) -> Option<(String, tree_sitter::Tree)> {
-    // 1. Open documents. Return the analysis text (masked for Rmd) so
-    //    the caller's byte-offset slices into `tree` align; identical to the
-    //    raw text for plain R / JAGS / Stan.
+    // 1. Open documents. Return the analysis text (masked when required) so
+    //    the caller's byte-offset slices into `tree` align.
     if let Some(doc) = state.documents.get(uri) {
         if let Some(tree) = &doc.tree {
             return Some((doc.analysis_text(), tree.clone()));

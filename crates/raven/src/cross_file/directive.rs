@@ -513,6 +513,39 @@ fn patterns() -> &'static DirectivePatterns {
     })
 }
 
+/// Whether `line` is a full-line Raven directive recognized by the canonical
+/// directive grammar in its current header context.
+///
+/// Stan analysis uses this to geometry-mask Raven's comment directives before
+/// handing the document to the Stan grammar. Keeping the decision here, beside
+/// the parser's compiled patterns, prevents the mask from growing a second,
+/// drifting directive vocabulary. Same-line suppression markers are accepted
+/// only when the whole source line is a comment; trailing markers on code are
+/// therefore never hidden from the Stan parser.
+pub(crate) fn is_recognized_full_line_directive(line: &str, in_header: bool) -> bool {
+    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+    if !line.trim_start().starts_with('#') {
+        return false;
+    }
+    let patterns = patterns();
+
+    (in_header
+        && (patterns.backward.is_match(line)
+            || patterns.working_dir.is_match(line)
+            || patterns.standalone.is_match(line)))
+        || patterns.forward.is_match(line)
+        || patterns.ignore.is_match(line)
+        || patterns.ignore_next.is_match(line)
+        || patterns.raven_ignore.is_match(line)
+        || patterns.raven_ignore_next.is_match(line)
+        || patterns.raven_ignore_start.is_match(line)
+        || patterns.raven_ignore_end.is_match(line)
+        || patterns.raven_ignore_file.is_match(line)
+        || patterns.declare_var.is_match(line)
+        || patterns.declare_func.is_match(line)
+        || patterns.nse.is_match(line)
+}
+
 /// Parse directives from file content.
 /// Extracts @lsp-* directives including sourced-by, source, working-directory, and ignore directives.
 ///

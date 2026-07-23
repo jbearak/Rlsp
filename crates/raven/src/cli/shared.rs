@@ -153,6 +153,14 @@ pub fn is_r_file(p: &Path) -> bool {
     )
 }
 
+/// True for `.stan`, matched case-insensitively to agree with Raven's
+/// canonical file-type classifier. `.stanfunctions` is intentionally excluded.
+pub fn is_stan_file(p: &Path) -> bool {
+    p.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("stan"))
+}
+
 /// True for chunk-bearing document extensions (`.Rmd` / `.Rmarkdown` / `.qmd`),
 /// matched case-insensitively so the CLI walk agrees with the canonical
 /// [`crate::chunks::classify_chunk_document`] (which lowercases the whole
@@ -208,7 +216,9 @@ pub fn collect_r_file_paths_with_exclusions(
 /// directory). Results are unsorted; callers that need deterministic order
 /// sort afterwards.
 pub fn collect_check_target_paths(dir: &Path, out: &mut Vec<PathBuf>) {
-    crate::state::collect_files_matching(dir, out, |p| is_r_file(p) || is_chunk_file(p));
+    crate::state::collect_files_matching(dir, out, |p| {
+        is_r_file(p) || is_chunk_file(p) || is_stan_file(p)
+    });
 }
 
 pub fn collect_check_target_paths_with_exclusions(
@@ -219,7 +229,7 @@ pub fn collect_check_target_paths_with_exclusions(
     crate::state::collect_files_matching_with_exclusions(
         dir,
         out,
-        |p| is_r_file(p) || is_chunk_file(p),
+        |p| is_r_file(p) || is_chunk_file(p) || is_stan_file(p),
         exclusions,
     );
 }
@@ -618,6 +628,9 @@ mod tests {
         assert!(!is_chunk_file(Path::new("a.R")));
         assert!(!is_chunk_file(Path::new("a.txt")));
         assert!(!is_chunk_file(Path::new("a.rmdx")));
+        assert!(is_stan_file(Path::new("a.stan")));
+        assert!(is_stan_file(Path::new("a.StAn")));
+        assert!(!is_stan_file(Path::new("a.stanfunctions")));
     }
 
     #[test]
@@ -653,6 +666,9 @@ mod tests {
         // case-insensitive).
         fs::write(tmp.path().join("f.QMD"), "prose\n").unwrap();
         fs::write(tmp.path().join("g.RMARKDOWN"), "prose\n").unwrap();
+        fs::write(tmp.path().join("model.stan"), "model {}\n").unwrap();
+        fs::write(tmp.path().join("mixed.StAn"), "model {}\n").unwrap();
+        fs::write(tmp.path().join("helper.stanfunctions"), "functions {}\n").unwrap();
         fs::write(tmp.path().join("f.txt"), "not source\n").unwrap();
         fs::create_dir(tmp.path().join(".git")).unwrap();
         fs::write(tmp.path().join(".git/g.R"), "3\n").unwrap();
@@ -661,9 +677,13 @@ mod tests {
         collect_check_target_paths(tmp.path(), &mut out);
         // a.R + sub/b.r + c.Rmd + d.Rmarkdown + e.qmd + .Rmarkdown + f.QMD +
         // g.RMARKDOWN; .txt skipped; .git pruned.
-        assert_eq!(out.len(), 8, "got {out:?}");
-        assert!(out.iter().all(|p| is_r_file(p) || is_chunk_file(p)));
+        assert_eq!(out.len(), 10, "got {out:?}");
+        assert!(
+            out.iter()
+                .all(|p| is_r_file(p) || is_chunk_file(p) || is_stan_file(p))
+        );
         assert!(out.iter().any(|p| is_chunk_file(p)));
+        assert_eq!(out.iter().filter(|p| is_stan_file(p)).count(), 2);
     }
 
     #[cfg(unix)]

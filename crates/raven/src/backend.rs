@@ -10044,6 +10044,7 @@ fn prepare_open_graph_plan(
 
 struct CapturedOpenEditFallback {
     chunk_kind: crate::chunks::ChunkKind,
+    file_type: crate::file_type::FileType,
     analysis_text: String,
     precomputed_metadata: Option<crate::cross_file::CrossFileMetadata>,
     old_metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
@@ -10109,6 +10110,7 @@ fn capture_open_edit_fallback(
         .extend(state.documents.keys().cloned());
     CapturedOpenEditFallback {
         chunk_kind: prepared.document().chunk_kind,
+        file_type: prepared.document().file_type,
         analysis_text: prepared.document().analysis_text(),
         precomputed_metadata: None,
         old_metadata,
@@ -10134,6 +10136,9 @@ fn derive_open_edit_fallback(
     captured: CapturedOpenEditFallback,
 ) -> (crate::cross_file::CrossFileMetadata, PreparedOpenCommitPlan) {
     let mut local_metadata = captured.precomputed_metadata.unwrap_or_else(|| {
+        if captured.file_type == crate::file_type::FileType::Stan {
+            return crate::cross_file::CrossFileMetadata::default();
+        }
         let mut metadata = crate::cross_file::extract_metadata_from_analysis_for_kind(
             captured.chunk_kind,
             &captured.analysis_text,
@@ -11258,20 +11263,21 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
         };
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&fs_metadata, &content);
-        let analysis =
-            crate::cross_file::analysis_text_for_kind(captured.chunk_kind, &content).into_owned();
-        let tree = crate::parser_pool::with_parser(|parser| parser.parse(&analysis, None));
-        let mut metadata = crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
+        let document = crate::state::Document::new_with_kind(
+            &content,
+            None,
+            crate::file_type::file_type_from_uri(&root.uri),
             captured.chunk_kind,
-            &analysis,
-            tree.as_ref(),
         );
-        crate::cross_file::resolve_system_file_sources(
-            &mut metadata,
-            captured.system_file_workspace_name.as_deref(),
-            captured.package_workspace_root.as_deref(),
-            &captured.library_paths,
-        );
+        let mut metadata = document.cross_file_metadata();
+        if document.file_type != crate::file_type::FileType::Stan {
+            crate::cross_file::resolve_system_file_sources(
+                &mut metadata,
+                captured.system_file_workspace_name.as_deref(),
+                captured.package_workspace_root.as_deref(),
+                &captured.library_paths,
+            );
+        }
         root.metadata = Some(Arc::new(metadata));
         root.content = Some(content.clone());
         captured
@@ -11291,7 +11297,7 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
             snapshot: Some(snapshot.clone()),
             decoded_source: true,
         });
-        disk_material.insert(root.uri.clone(), (content, analysis, tree, snapshot));
+        disk_material.insert(root.uri.clone(), (content, document, snapshot));
     }
 
     let metadata_lookup = |uri: &Url| captured.metadata_map.get(uri).cloned();
@@ -11303,42 +11309,38 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
     for root in &captured.roots {
         if let Some(metadata) = root.metadata.as_ref() {
             let mut semantic = metadata.as_ref().clone();
-            if root
-                .owner_uri
-                .as_ref()
-                .is_some_and(|owner| owner != &root.uri)
-                || disk_material.contains_key(&root.uri)
-            {
-                semantic.inherited_working_directory = None;
-                crate::cross_file::enrich_metadata_with_inherited_wd(
+            let is_stan =
+                crate::file_type::file_type_from_uri(&root.uri) == crate::file_type::FileType::Stan;
+            if !is_stan {
+                if root
+                    .owner_uri
+                    .as_ref()
+                    .is_some_and(|owner| owner != &root.uri)
+                    || disk_material.contains_key(&root.uri)
+                {
+                    semantic.inherited_working_directory = None;
+                    crate::cross_file::enrich_metadata_with_inherited_wd(
+                        &mut semantic,
+                        &root.uri,
+                        captured.workspace_root.as_ref(),
+                        metadata_lookup,
+                        captured.max_chain_depth,
+                    );
+                }
+                crate::cross_file::enrich_selective_import_resolutions(
                     &mut semantic,
                     &root.uri,
                     captured.workspace_root.as_ref(),
-                    metadata_lookup,
-                    captured.max_chain_depth,
+                );
+                let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+                    &mut semantic,
+                    &root.uri,
+                    captured.workspace_root.as_ref(),
+                    &captured.exclusions,
                 );
             }
-            crate::cross_file::enrich_selective_import_resolutions(
-                &mut semantic,
-                &root.uri,
-                captured.workspace_root.as_ref(),
-            );
-            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
-                &mut semantic,
-                &root.uri,
-                captured.workspace_root.as_ref(),
-                &captured.exclusions,
-            );
-            let disk_artifacts = disk_material.get(&root.uri).map(|(_, analysis, tree, _)| {
-                Arc::new(match tree.as_ref() {
-                    Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
-                        &root.uri,
-                        tree,
-                        analysis,
-                        Some(&semantic),
-                    ),
-                    None => crate::cross_file::scope::ScopeArtifacts::default(),
-                })
+            let disk_artifacts = disk_material.get(&root.uri).map(|(_, document, _)| {
+                Arc::new(document.cross_file_artifacts(&root.uri, &semantic))
             });
             if root.uri == captured.uri {
                 replacement_interface_hash = disk_artifacts
@@ -11367,16 +11369,16 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
                 parent_content,
                 make_non_lending: root.make_non_lending,
             });
-            if let Some((content, analysis, tree, snapshot)) = disk_material.remove(&root.uri) {
+            if let Some((content, document, snapshot)) = disk_material.remove(&root.uri) {
                 let artifacts =
                     disk_artifacts.expect("disk material always derives finalized artifacts");
                 close_disk_installs.push(PreparedOpenCloseDiskInstall {
                     uri: root.uri.clone(),
                     entry: crate::workspace_index::IndexEntry {
                         contents: ropey::Rope::from_str(&content),
-                        tree: tree.clone(),
-                        loaded_packages: extract_loaded_packages_from_metadata(&semantic),
-                        data_packages: crate::state::extract_data_packages(&tree, &analysis),
+                        tree: document.tree.clone(),
+                        loaded_packages: document.loaded_packages.clone(),
+                        data_packages: document.data_packages.clone(),
                         snapshot: snapshot.clone(),
                         metadata: Arc::new(semantic.clone()),
                         artifacts,
@@ -11816,12 +11818,9 @@ fn derive_open_install_analysis(
             })
         })
     };
-    let analysis_text = captured.document.analysis_text();
-    let mut metadata = crate::cross_file::extract_metadata_from_analysis_for_kind(
-        captured.document.chunk_kind,
-        &analysis_text,
-    );
-    if !local_only {
+    let is_stan = captured.document.file_type == crate::file_type::FileType::Stan;
+    let mut metadata = captured.document.cross_file_metadata();
+    if !local_only && !is_stan {
         crate::cross_file::enrich_metadata_with_inherited_wd(
             &mut metadata,
             &captured.uri,
@@ -11836,18 +11835,21 @@ fn derive_open_install_analysis(
             &captured.library_paths,
         );
     }
-    crate::cross_file::enrich_selective_import_resolutions(
-        &mut metadata,
-        &captured.uri,
-        captured.workspace_root.as_ref(),
-    );
-    let selected_shiny_entry =
+    let selected_shiny_entry = if is_stan {
+        None
+    } else {
+        crate::cross_file::enrich_selective_import_resolutions(
+            &mut metadata,
+            &captured.uri,
+            captured.workspace_root.as_ref(),
+        );
         crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
             &mut metadata,
             &captured.uri,
             captured.workspace_root.as_ref(),
             &captured.exclusions,
-        );
+        )
+    };
 
     let mut prerequisites = OpenInstallPrerequisites {
         workspace_root: captured.workspace_root.clone(),
@@ -11855,7 +11857,7 @@ fn derive_open_install_analysis(
         max_backward_depth: captured.max_backward_depth,
         ..OpenInstallPrerequisites::default()
     };
-    if captured.on_demand_enabled && !local_only {
+    if captured.on_demand_enabled && !local_only && !is_stan {
         let opened_support_file = metadata
             .shiny_application
             .as_ref()
@@ -11990,15 +11992,11 @@ fn derive_open_install_analysis(
         });
     }
 
-    let artifacts = Arc::new(match captured.document.tree.as_ref() {
-        Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
-            &captured.uri,
-            tree,
-            &analysis_text,
-            Some(&metadata),
-        ),
-        None => crate::cross_file::scope::ScopeArtifacts::default(),
-    });
+    let artifacts = Arc::new(
+        captured
+            .document
+            .cross_file_artifacts(&captured.uri, &metadata),
+    );
     let mut packages_to_prefetch = Vec::new();
     if captured.packages_enabled {
         packages_to_prefetch = extract_loaded_packages_from_metadata(&metadata);
@@ -12259,34 +12257,41 @@ fn derive_open_metadata_reenrichment(
         })
     };
 
-    let mut metadata = crate::cross_file::extract_metadata_from_analysis_for_kind(
-        captured.chunk_kind,
-        &captured.analysis_text,
-    );
-    crate::cross_file::enrich_metadata_with_inherited_wd(
-        &mut metadata,
-        &captured.uri,
-        captured.workspace_root.as_ref(),
-        metadata_lookup,
-        captured.max_chain_depth,
-    );
-    crate::cross_file::enrich_selective_import_resolutions(
-        &mut metadata,
-        &captured.uri,
-        captured.workspace_root.as_ref(),
-    );
-    crate::cross_file::resolve_system_file_sources(
-        &mut metadata,
-        captured.workspace_name.as_deref(),
-        captured.package_workspace_root.as_deref(),
-        &captured.library_paths,
-    );
-    let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
-        &mut metadata,
-        &captured.uri,
-        captured.workspace_root.as_ref(),
-        &captured.exclusions,
-    );
+    let is_stan = captured.file_type == crate::file_type::FileType::Stan;
+    let mut metadata = if is_stan {
+        crate::cross_file::CrossFileMetadata::default()
+    } else {
+        crate::cross_file::extract_metadata_from_analysis_for_kind(
+            captured.chunk_kind,
+            &captured.analysis_text,
+        )
+    };
+    if !is_stan {
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut metadata,
+            &captured.uri,
+            captured.workspace_root.as_ref(),
+            metadata_lookup,
+            captured.max_chain_depth,
+        );
+        crate::cross_file::enrich_selective_import_resolutions(
+            &mut metadata,
+            &captured.uri,
+            captured.workspace_root.as_ref(),
+        );
+        crate::cross_file::resolve_system_file_sources(
+            &mut metadata,
+            captured.workspace_name.as_deref(),
+            captured.package_workspace_root.as_deref(),
+            &captured.library_paths,
+        );
+        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+            &mut metadata,
+            &captured.uri,
+            captured.workspace_root.as_ref(),
+            &captured.exclusions,
+        );
+    }
 
     let input_root = captured.graph_roots.first().unwrap_or(&captured.uri);
     let mut graph = Vec::with_capacity(captured.graph_roots.len());
@@ -13320,12 +13325,26 @@ async fn resync_file_from_disk(
     // Mask Rmd/Quarto prose so directives/source()/library() come from chunk
     // bodies only (#343), then parse ONCE and derive both metadata and
     // artifacts from the same tree.
-    let analysis = crate::cross_file::analysis_text_for_kind(effective_chunk_kind, &content);
-    let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None));
-    let mut cross_file_meta = crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
-        effective_chunk_kind,
-        &analysis,
-        tree.as_ref(),
+    let file_type = crate::file_type::file_type_from_uri(uri);
+    let stan_document = (file_type == crate::file_type::FileType::Stan)
+        .then(|| crate::state::Document::new_with_uri(&content, None, uri));
+    let analysis = stan_document.as_ref().map_or_else(
+        || crate::cross_file::analysis_text_for_kind(effective_chunk_kind, &content).into_owned(),
+        crate::state::Document::analysis_text,
+    );
+    let tree = stan_document.as_ref().map_or_else(
+        || crate::parser_pool::with_parser(|parser| parser.parse(&analysis, None)),
+        |document| document.tree.clone(),
+    );
+    let mut cross_file_meta = stan_document.as_ref().map_or_else(
+        || {
+            crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
+                effective_chunk_kind,
+                &analysis,
+                tree.as_ref(),
+            )
+        },
+        crate::state::Document::cross_file_metadata,
     );
 
     let snapshot =
@@ -13352,25 +13371,29 @@ async fn resync_file_from_disk(
         let ws = state.package_state.workspace();
         let ws_name = ws.map(|w| w.name.as_str());
         let ws_root = ws.map(|w| w.root.as_path());
-        crate::cross_file::resolve_system_file_sources(
-            &mut cross_file_meta,
-            ws_name,
-            ws_root,
-            state.package_library.lib_paths(),
-        );
+        if stan_document.is_none() {
+            crate::cross_file::resolve_system_file_sources(
+                &mut cross_file_meta,
+                ws_name,
+                ws_root,
+                state.package_library.lib_paths(),
+            );
+        }
 
         let workspace_root = state.workspace_folders.first().cloned();
         let consumed_context_uris = std::cell::RefCell::new(Vec::new());
-        crate::cross_file::enrich_metadata_with_inherited_wd(
-            &mut cross_file_meta,
-            uri,
-            workspace_root.as_ref(),
-            |parent_uri| {
-                consumed_context_uris.borrow_mut().push(parent_uri.clone());
-                state.get_enriched_metadata(parent_uri)
-            },
-            state.cross_file_config.max_chain_depth,
-        );
+        if stan_document.is_none() {
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut cross_file_meta,
+                uri,
+                workspace_root.as_ref(),
+                |parent_uri| {
+                    consumed_context_uris.borrow_mut().push(parent_uri.clone());
+                    state.get_enriched_metadata(parent_uri)
+                },
+                state.cross_file_config.max_chain_depth,
+            );
+        }
         let basis = state.capture_closed_removal_analysis_basis(uri);
         (
             basis,
@@ -13380,17 +13403,19 @@ async fn resync_file_from_disk(
         )
     };
 
-    crate::cross_file::enrich_selective_import_resolutions(
-        &mut cross_file_meta,
-        uri,
-        workspace_root.as_ref(),
-    );
-    let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
-        &mut cross_file_meta,
-        uri,
-        workspace_root.as_ref(),
-        &exclusions,
-    );
+    if stan_document.is_none() {
+        crate::cross_file::enrich_selective_import_resolutions(
+            &mut cross_file_meta,
+            uri,
+            workspace_root.as_ref(),
+        );
+        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+            &mut cross_file_meta,
+            uri,
+            workspace_root.as_ref(),
+            &exclusions,
+        );
+    }
 
     // Snapshot the remaining graph inputs after the walk without weakening the
     // pre-walk basis. If anything changed between the two read sections, the
@@ -13496,18 +13521,27 @@ async fn resync_file_from_disk(
 
     // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression
     // for declared symbols)
-    let artifacts = std::sync::Arc::new(match tree.as_ref() {
-        Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
-            uri,
-            tree,
-            &analysis,
-            Some(&cross_file_meta),
-        ),
-        None => crate::cross_file::scope::ScopeArtifacts::default(),
-    });
+    let artifacts = std::sync::Arc::new(stan_document.as_ref().map_or_else(
+        || match tree.as_ref() {
+            Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+                uri,
+                tree,
+                &analysis,
+                Some(&cross_file_meta),
+            ),
+            None => crate::cross_file::scope::ScopeArtifacts::default(),
+        },
+        |document| document.cross_file_artifacts(uri, &cross_file_meta),
+    ));
     let new_interface_hash = artifacts.interface_hash;
-    let loaded_packages = extract_loaded_packages_from_metadata(&cross_file_meta);
-    let data_packages = crate::state::extract_data_packages(&tree, &analysis);
+    let loaded_packages = stan_document.as_ref().map_or_else(
+        || extract_loaded_packages_from_metadata(&cross_file_meta),
+        |document| document.loaded_packages.clone(),
+    );
+    let data_packages = stan_document.as_ref().map_or_else(
+        || crate::state::extract_data_packages(&tree, &analysis),
+        |document| document.data_packages.clone(),
+    );
 
     let fresh_entry = crate::workspace_index::IndexEntry {
         contents: ropey::Rope::from_str(&content),
@@ -16281,15 +16315,19 @@ async fn run_debounced_diagnostics(
     }
 
     // Perform async missing file existence checks (non-blocking I/O)
-    let diagnostics = handlers::diagnostics_async_standalone(
-        &affected_uri,
-        sync_diagnostics,
-        &snapshot.directive_meta,
-        workspace_folder.as_ref(),
-        missing_file_severity,
-        snapshot.cross_file_config.case_mismatch_severity,
-    )
-    .await;
+    let diagnostics = if snapshot.file_type == crate::file_type::FileType::R {
+        handlers::diagnostics_async_standalone(
+            &affected_uri,
+            sync_diagnostics,
+            &snapshot.directive_meta,
+            workspace_folder.as_ref(),
+            missing_file_severity,
+            snapshot.cross_file_config.case_mismatch_severity,
+        )
+        .await
+    } else {
+        sync_diagnostics
+    };
 
     if cancel.is_cancelled() {
         log::trace!(
@@ -18420,10 +18458,7 @@ impl LanguageServer for Backend {
             let prepared = state.prepare_document_changes(&uri, changes.clone(), version);
             let detached_analysis_affected = prepared.as_ref().is_some_and(|prepared| {
                 let document = prepared.document();
-                let metadata = crate::cross_file::extract_metadata_from_analysis_for_kind(
-                    document.chunk_kind,
-                    &document.analysis_text(),
-                );
+                let metadata = document.cross_file_metadata();
                 metadata.has_source_batch_topology()
                     || !metadata.box_imports.is_empty()
                     || !metadata.import_calls.is_empty()
@@ -19882,6 +19917,11 @@ impl LanguageServer for Backend {
                     return Ok(None);
                 }
             };
+
+            if doc.file_type == crate::file_type::FileType::Stan {
+                log::trace!("on_type_formatting: unsupported document type: {}", uri);
+                return Ok(None);
+            }
 
             // Rmd/Quarto: indentation is first-class inside R chunk bodies,
             // but prose/YAML maps to blank masked lines. Keep the guard on raw
@@ -21751,15 +21791,27 @@ impl Backend {
             let state = self.state.read().await;
             state.chunk_kind_for_closed_file(file_uri)
         };
-        let analysis_text_cow = crate::cross_file::analysis_text_for_kind(chunk_kind, &content);
-        let analysis_text: &str = &analysis_text_cow;
-        let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis_text, None));
-        let mut cross_file_meta =
-            crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
-                chunk_kind,
-                analysis_text,
-                tree.as_ref(),
-            );
+        let stan_document = (crate::file_type::file_type_from_uri(file_uri)
+            == crate::file_type::FileType::Stan)
+            .then(|| crate::state::Document::new_with_uri(&content, None, file_uri));
+        let analysis_text = stan_document.as_ref().map_or_else(
+            || crate::cross_file::analysis_text_for_kind(chunk_kind, &content).into_owned(),
+            crate::state::Document::analysis_text,
+        );
+        let tree = stan_document.as_ref().map_or_else(
+            || crate::parser_pool::with_parser(|parser| parser.parse(&analysis_text, None)),
+            |document| document.tree.clone(),
+        );
+        let mut cross_file_meta = stan_document.as_ref().map_or_else(
+            || {
+                crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
+                    chunk_kind,
+                    &analysis_text,
+                    tree.as_ref(),
+                )
+            },
+            crate::state::Document::cross_file_metadata,
+        );
 
         let (
             workspace_root,
@@ -21778,16 +21830,18 @@ impl Backend {
             let packages_enabled = state.cross_file_config.packages_enabled;
             let consumed_context_uris = std::cell::RefCell::new(Vec::new());
 
-            crate::cross_file::enrich_metadata_with_inherited_wd(
-                &mut cross_file_meta,
-                file_uri,
-                workspace_root.as_ref(),
-                |parent_uri| {
-                    consumed_context_uris.borrow_mut().push(parent_uri.clone());
-                    state.get_enriched_metadata(parent_uri)
-                },
-                max_chain_depth,
-            );
+            if stan_document.is_none() {
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut cross_file_meta,
+                    file_uri,
+                    workspace_root.as_ref(),
+                    |parent_uri| {
+                        consumed_context_uris.borrow_mut().push(parent_uri.clone());
+                        state.get_enriched_metadata(parent_uri)
+                    },
+                    max_chain_depth,
+                );
+            }
 
             let (parent_content, attempted_parents) = collect_backward_parent_content_with(
                 file_uri,
@@ -21834,41 +21888,52 @@ impl Backend {
 
         // Persist local selective-module identities off-lock after inherited-WD
         // enrichment and with the captured workspace fallback context.
-        crate::cross_file::enrich_selective_import_resolutions(
-            &mut cross_file_meta,
-            file_uri,
-            workspace_root.as_ref(),
-        );
-
-        // Resolve system.file() source entries into concrete paths so
-        // transitive on-demand walks don't stop at this hop.
-        crate::cross_file::resolve_system_file_sources(
-            &mut cross_file_meta,
-            sys_file_ws_name.as_deref(),
-            sys_file_ws_root.as_deref(),
-            &sys_file_lib_paths,
-        );
-        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
-            &mut cross_file_meta,
-            file_uri,
-            workspace_root.as_ref(),
-            &exclusions,
-        );
-        let artifacts = std::sync::Arc::new(match tree.as_ref() {
-            Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+        if stan_document.is_none() {
+            crate::cross_file::enrich_selective_import_resolutions(
+                &mut cross_file_meta,
                 file_uri,
-                tree,
-                analysis_text,
-                Some(&cross_file_meta),
-            ),
-            None => crate::cross_file::scope::ScopeArtifacts::default(),
-        });
+                workspace_root.as_ref(),
+            );
+
+            // Resolve system.file() source entries into concrete paths so
+            // transitive on-demand walks don't stop at this hop.
+            crate::cross_file::resolve_system_file_sources(
+                &mut cross_file_meta,
+                sys_file_ws_name.as_deref(),
+                sys_file_ws_root.as_deref(),
+                &sys_file_lib_paths,
+            );
+            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+                &mut cross_file_meta,
+                file_uri,
+                workspace_root.as_ref(),
+                &exclusions,
+            );
+        }
+        let artifacts = std::sync::Arc::new(stan_document.as_ref().map_or_else(
+            || match tree.as_ref() {
+                Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+                    file_uri,
+                    tree,
+                    &analysis_text,
+                    Some(&cross_file_meta),
+                ),
+                None => crate::cross_file::scope::ScopeArtifacts::default(),
+            },
+            |document| document.cross_file_artifacts(file_uri, &cross_file_meta),
+        ));
 
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
 
-        let loaded_packages = extract_loaded_packages_from_metadata(&cross_file_meta);
-        let data_packages = crate::state::extract_data_packages(&tree, analysis_text);
+        let loaded_packages = stan_document.as_ref().map_or_else(
+            || extract_loaded_packages_from_metadata(&cross_file_meta),
+            |document| document.loaded_packages.clone(),
+        );
+        let data_packages = stan_document.as_ref().map_or_else(
+            || crate::state::extract_data_packages(&tree, &analysis_text),
+            |document| document.data_packages.clone(),
+        );
         let packages_to_prefetch = if packages_enabled {
             loaded_packages.clone()
         } else {
@@ -22276,16 +22341,29 @@ impl Backend {
             let state = self.state.read().await;
             state.chunk_kind_for_closed_file(file_uri)
         };
-        let analysis_text_cow = crate::cross_file::analysis_text_for_kind(chunk_kind, &content);
-        let analysis_text: &str = &analysis_text_cow;
-        let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis_text, None));
-        let mut cross_file_meta =
-            crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
-                chunk_kind,
-                analysis_text,
-                tree.as_ref(),
-            );
-        if cross_file_meta.working_directory.is_none()
+        let stan_document = (crate::file_type::file_type_from_uri(file_uri)
+            == crate::file_type::FileType::Stan)
+            .then(|| crate::state::Document::new_with_uri(&content, None, file_uri));
+        let analysis_text = stan_document.as_ref().map_or_else(
+            || crate::cross_file::analysis_text_for_kind(chunk_kind, &content).into_owned(),
+            crate::state::Document::analysis_text,
+        );
+        let tree = stan_document.as_ref().map_or_else(
+            || crate::parser_pool::with_parser(|parser| parser.parse(&analysis_text, None)),
+            |document| document.tree.clone(),
+        );
+        let mut cross_file_meta = stan_document.as_ref().map_or_else(
+            || {
+                crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
+                    chunk_kind,
+                    &analysis_text,
+                    tree.as_ref(),
+                )
+            },
+            crate::state::Document::cross_file_metadata,
+        );
+        if stan_document.is_none()
+            && cross_file_meta.working_directory.is_none()
             && cross_file_meta.inherited_working_directory.is_none()
         {
             cross_file_meta.inherited_working_directory =
@@ -22364,38 +22442,49 @@ impl Backend {
 
         // Persist local selective-module identities off-lock after inherited-WD
         // enrichment and with the captured workspace fallback context.
-        crate::cross_file::enrich_selective_import_resolutions(
-            &mut cross_file_meta,
-            file_uri,
-            workspace_root.as_ref(),
-        );
-
-        // Resolve system.file() source entries into concrete paths so
-        // transitive on-demand walks don't stop at this hop.
-        crate::cross_file::resolve_system_file_sources(
-            &mut cross_file_meta,
-            sys_file_ws_name.as_deref(),
-            sys_file_ws_root.as_deref(),
-            &sys_file_lib_paths,
-        );
-        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
-            &mut cross_file_meta,
-            file_uri,
-            workspace_root.as_ref(),
-            &exclusions,
-        );
-        let artifacts = std::sync::Arc::new(match tree.as_ref() {
-            Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+        if stan_document.is_none() {
+            crate::cross_file::enrich_selective_import_resolutions(
+                &mut cross_file_meta,
                 file_uri,
-                tree,
-                analysis_text,
-                Some(&cross_file_meta),
-            ),
-            None => crate::cross_file::scope::ScopeArtifacts::default(),
-        });
+                workspace_root.as_ref(),
+            );
 
-        let loaded_packages = extract_loaded_packages_from_metadata(&cross_file_meta);
-        let data_packages = crate::state::extract_data_packages(&tree, analysis_text);
+            // Resolve system.file() source entries into concrete paths so
+            // transitive on-demand walks don't stop at this hop.
+            crate::cross_file::resolve_system_file_sources(
+                &mut cross_file_meta,
+                sys_file_ws_name.as_deref(),
+                sys_file_ws_root.as_deref(),
+                &sys_file_lib_paths,
+            );
+            let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+                &mut cross_file_meta,
+                file_uri,
+                workspace_root.as_ref(),
+                &exclusions,
+            );
+        }
+        let artifacts = std::sync::Arc::new(stan_document.as_ref().map_or_else(
+            || match tree.as_ref() {
+                Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+                    file_uri,
+                    tree,
+                    &analysis_text,
+                    Some(&cross_file_meta),
+                ),
+                None => crate::cross_file::scope::ScopeArtifacts::default(),
+            },
+            |document| document.cross_file_artifacts(file_uri, &cross_file_meta),
+        ));
+
+        let loaded_packages = stan_document.as_ref().map_or_else(
+            || extract_loaded_packages_from_metadata(&cross_file_meta),
+            |document| document.loaded_packages.clone(),
+        );
+        let data_packages = stan_document.as_ref().map_or_else(
+            || crate::state::extract_data_packages(&tree, &analysis_text),
+            |document| document.data_packages.clone(),
+        );
         let packages_to_prefetch = if packages_enabled {
             loaded_packages.clone()
         } else {
@@ -23289,12 +23378,18 @@ pub(crate) async fn publish_diagnostics_inner(
     // lock-free (see DiagnosticsSnapshot doc comment in handlers.rs).
     // Replicate the remaining `handlers::diagnostics` early-exits via
     // snapshot fields, which already mirror `doc.file_type` from build time.
+    let snapshot_file_type = snapshot.as_ref().map(|snapshot| snapshot.file_type);
     let sync_diagnostics = match snapshot {
         // Rmd/Quarto documents flow through too (issue #343): the snapshot
         // carries the masked analysis text + tree, so `diagnostics_from_snapshot`
-        // sees only real R chunk-body content. JAGS/Stan stay suppressed via the
-        // `file_type == R` condition.
-        Some(snap) if snap.file_type == crate::file_type::FileType::R => {
+        // sees only real R chunk-body content. Stan follows its syntax-only
+        // collector; JAGS remains suppressed.
+        Some(snap)
+            if matches!(
+                snap.file_type,
+                crate::file_type::FileType::R | crate::file_type::FileType::Stan
+            ) =>
+        {
             handlers::diagnostics_from_snapshot(&snap, uri, &handlers::DiagCancelToken::never())
                 .unwrap_or_default()
         }
@@ -23306,19 +23401,22 @@ pub(crate) async fn publish_diagnostics_inner(
     // publishing missing-file diagnostics while the sync phase was
     // empty. When disabled, publish an explicit empty `Vec` so the
     // client clears any prior diagnostics for the URI.
-    let diagnostics = if diagnostics_enabled {
-        handlers::diagnostics_async_standalone(
-            uri,
-            sync_diagnostics,
-            &directive_meta,
-            workspace_folder.as_ref(),
-            missing_file_severity,
-            case_mismatch_severity,
-        )
-        .await
-    } else {
-        Vec::new()
-    };
+    let diagnostics =
+        if diagnostics_enabled && snapshot_file_type == Some(crate::file_type::FileType::R) {
+            handlers::diagnostics_async_standalone(
+                uri,
+                sync_diagnostics,
+                &directive_meta,
+                workspace_folder.as_ref(),
+                missing_file_severity,
+                case_mismatch_severity,
+            )
+            .await
+        } else if diagnostics_enabled {
+            sync_diagnostics
+        } else {
+            Vec::new()
+        };
 
     pause_if_armed_for_test(state_arc, uri).await;
 
@@ -28781,6 +28879,113 @@ mod tests {
                 fresh.diagnostics.iter().all(|d| d.range.start.line >= 2),
                 "published diagnostics must come from the reopened text \
                  (line >= 2), never the retired lifecycle's (line 0): {:?}",
+                fresh.diagnostics
+            );
+        }
+
+        /// Stan uses the same diagnostics gate and lifecycle epochs as R. A
+        /// retired syntax worker must not publish into a same-version reopened
+        /// Stan buffer merely because both document revisions are zero.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stale_stan_direct_worker_cannot_publish_into_reopened_lifecycle() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("reopen-race.stan");
+            let old_text = "data { int N }\nmodel {}\n";
+            let new_text = "\n\nmodel {\n  target += ;\n}\n";
+            std::fs::write(&path, old_text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "stan".into(),
+                        version: 1,
+                        text: old_text.into(),
+                    },
+                })
+                .await;
+
+            let pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_test_pause
+                .arm(uri.clone());
+            let worker = {
+                let state_arc = backend.state.clone();
+                let client = backend.client.clone();
+                let task_uri = uri.clone();
+                tokio::spawn(async move {
+                    super::super::publish_diagnostics_inner(&state_arc, &client, &task_uri).await;
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), pause.wait_arrived())
+                .await
+                .expect("old Stan worker must reach the pre-commit pause");
+
+            backend
+                .did_close(DidCloseTextDocumentParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                })
+                .await;
+            let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("Stan close must clear diagnostics")
+                .expect("client socket remains open");
+            let cleared: PublishDiagnosticsParams =
+                serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
+            assert_eq!(cleared.uri, uri);
+            assert!(cleared.diagnostics.is_empty());
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "stan".into(),
+                        version: 1,
+                        text: new_text.into(),
+                    },
+                })
+                .await;
+
+            pause.release();
+            worker.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err(),
+                "the retired Stan worker must not publish after close+reopen"
+            );
+
+            backend.publish_diagnostics(&uri).await;
+            let fresh = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("reopened Stan lifecycle must publish at the same version")
+                .expect("client socket remains open");
+            let fresh: PublishDiagnosticsParams =
+                serde_json::from_value(fresh.params().unwrap().clone()).unwrap();
+            assert_eq!(fresh.uri, uri);
+            assert!(!fresh.diagnostics.is_empty());
+            assert!(
+                fresh.diagnostics.iter().all(|d| d.range.start.line >= 2),
+                "only reopened Stan text may publish: {:?}",
                 fresh.diagnostics
             );
         }
@@ -51131,6 +51336,226 @@ lineLength = 200
         );
     }
 
+    #[tokio::test]
+    async fn stan_lsp_open_change_clear_and_close_lifecycle() {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::Request;
+        use tower_lsp::lsp_types::{
+            DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+            PublishDiagnosticsParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+            TextDocumentItem, VersionedTextDocumentIdentifier,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let invalid = "data { int N }\nmodel {}\n";
+        let path = tmp.path().join("model.stan");
+        fs::write(&path, invalid).unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Url::from_directory_path(tmp.path()).unwrap(),
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(serde_json::json!({
+                        "diagnosticUris": [uri.to_string()],
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false }
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+        let backend = svc.inner();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+        }
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "stan".into(),
+                    version: 1,
+                    text: invalid.into(),
+                },
+            })
+            .await;
+
+        backend.publish_diagnostics(&uri).await;
+        let v1 = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("Stan v1 diagnostics must publish")
+            .expect("client socket remains open");
+        let v1: PublishDiagnosticsParams =
+            serde_json::from_value(v1.params().unwrap().clone()).unwrap();
+        assert_eq!(v1.uri, uri);
+        assert!(!v1.diagnostics.is_empty());
+        assert!(
+            v1.diagnostics
+                .iter()
+                .all(|finding| finding.range.start.line == 0)
+        );
+
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "data { int N; }\nmodel {}\n".to_string(),
+                }],
+            })
+            .await;
+        backend.publish_diagnostics(&uri).await;
+        let v2 = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("Stan v2 clear must publish")
+            .expect("client socket remains open");
+        let v2: PublishDiagnosticsParams =
+            serde_json::from_value(v2.params().unwrap().clone()).unwrap();
+        assert!(v2.diagnostics.is_empty());
+
+        let invalid_v3 = "model {\n  target += ;\n}\n";
+        fs::write(&path, invalid_v3).unwrap();
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 3,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: invalid_v3.to_string(),
+                }],
+            })
+            .await;
+        backend.publish_diagnostics(&uri).await;
+        let v3 = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("Stan v3 diagnostics must publish")
+            .expect("client socket remains open");
+        let v3: PublishDiagnosticsParams =
+            serde_json::from_value(v3.params().unwrap().clone()).unwrap();
+        assert!(!v3.diagnostics.is_empty());
+        assert!(v3.diagnostics.iter().all(|finding| {
+            finding.range.start.line == 1
+                && finding.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "syntax-error".to_string(),
+                    ))
+        }));
+
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            })
+            .await;
+        let close = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("Stan close must publish an empty clear")
+            .expect("client socket remains open");
+        let close: PublishDiagnosticsParams =
+            serde_json::from_value(close.params().unwrap().clone()).unwrap();
+        assert_eq!(close.uri, uri);
+        assert!(close.diagnostics.is_empty());
+
+        let document = {
+            let state = backend.state.read().await;
+            assert!(state.get_document(&uri).is_none());
+            assert!(state.diagnostics_gate.current_epoch(&uri).is_none());
+            let entry = state
+                .workspace_index
+                .get(&uri)
+                .expect("close must install the disk-backed Stan entry");
+            assert_eq!(entry.tree.as_ref().unwrap().root_node().kind(), "program");
+            assert!(entry.metadata.sources.is_empty());
+            assert!(entry.artifacts.exported_interface.is_empty());
+            assert!(entry.loaded_packages.is_empty());
+            assert!(entry.data_packages.is_empty());
+            crate::state::document_from_workspace_entry(
+                &uri,
+                &entry,
+                state.chunk_kind_for_closed_file(&uri),
+            )
+        };
+        let mut diagnostic_state = super::WorldState::new();
+        diagnostic_state.workspace_scan_complete = true;
+        diagnostic_state.documents.insert(uri.clone(), document);
+        assert!(!snapshot_diagnostics(&diagnostic_state, &uri).is_empty());
+    }
+
+    #[tokio::test]
+    async fn untitled_stan_uses_language_id_and_r_only_handlers_are_inert() {
+        use tower_lsp::lsp_types::{
+            DidOpenTextDocumentParams, DocumentOnTypeFormattingParams, FormattingOptions,
+            SignatureHelpParams, TextDocumentIdentifier, TextDocumentItem,
+            TextDocumentPositionParams,
+        };
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let uri = Url::parse("untitled:stan-buffer").unwrap();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "stan".to_string(),
+                    version: 1,
+                    text: "model { target += ; }\n".to_string(),
+                },
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(!snapshot_diagnostics(&state, &uri).is_empty());
+        drop(state);
+
+        let text_position = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: Position::new(0, 18),
+        };
+        assert!(
+            backend
+                .signature_help(SignatureHelpParams {
+                    text_document_position_params: text_position.clone(),
+                    work_done_progress_params: Default::default(),
+                    context: None,
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .on_type_formatting(DocumentOnTypeFormattingParams {
+                    text_document_position: text_position,
+                    ch: "\n".to_string(),
+                    options: FormattingOptions {
+                        tab_size: 2,
+                        insert_spaces: true,
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// Open an Rmd document through the real `did_open` path. Returns the owned
     /// `LspService` (keep it alive for the test's duration), the backend's URI,
     /// and the `TempDir` backing the file. Shared by the on-type-formatting
@@ -56749,7 +57174,10 @@ infixContinuationStyle = "aligned"
     ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
         let snapshot =
             crate::handlers::DiagnosticsSnapshot::build(state, uri).expect("snapshot must build");
-        if snapshot.file_type == crate::file_type::FileType::R {
+        if matches!(
+            snapshot.file_type,
+            crate::file_type::FileType::R | crate::file_type::FileType::Stan
+        ) {
             crate::handlers::diagnostics_from_snapshot(
                 &snapshot,
                 uri,

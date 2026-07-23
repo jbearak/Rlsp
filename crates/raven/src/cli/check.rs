@@ -22,7 +22,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Url};
 use crate::cli::shared::{
     ColorChoice, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR, OutputFormat, SeverityLevel,
     absolute_path, collect_check_target_paths_with_exclusions, encoding_diagnostic, is_chunk_file,
-    is_r_file, parse_color_choice, parse_output_format, parse_severity_level, render,
+    is_r_file, is_stan_file, parse_color_choice, parse_output_format, parse_severity_level, render,
     resolve_color_from_env,
 };
 
@@ -196,33 +196,48 @@ fn open_disk_fallback_target(
     // the URI to classify it as Rmd and masks the prose), "r" otherwise.
     // `file_type_from_language_id("rmd")` is `None`, so the `FileType` still
     // falls back to R via the URI — only the chunk masking differs.
-    let language_id = if is_chunk_file(path) { "rmd" } else { "r" };
+    let is_stan = is_stan_file(path);
+    let language_id = if is_chunk_file(path) {
+        "rmd"
+    } else if is_stan {
+        "stan"
+    } else {
+        "r"
+    };
     let workspace_root = state.workspace_folders.first().cloned();
     let max_chain_depth = state.cross_file_config.max_chain_depth;
-    let mut meta = crate::cross_file::extract_metadata_for_path(uri.path(), text);
-    crate::cross_file::enrich_metadata_with_inherited_wd(
-        &mut meta,
-        uri,
-        workspace_root.as_ref(),
-        |parent_uri| state.get_enriched_metadata(parent_uri),
-        max_chain_depth,
-    );
+    let mut meta = if is_stan {
+        crate::cross_file::CrossFileMetadata::default()
+    } else {
+        crate::cross_file::extract_metadata_for_path(uri.path(), text)
+    };
+    if !is_stan {
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut meta,
+            uri,
+            workspace_root.as_ref(),
+            |parent_uri| state.get_enriched_metadata(parent_uri),
+            max_chain_depth,
+        );
 
-    // Resolve system.file() source entries into concrete paths
-    {
+        // Resolve system.file() source entries into concrete paths.
         let ws = state.package_state.workspace();
         let ws_name = ws.map(|w| w.name.as_str());
         let ws_root = ws.map(|w| w.root.as_path());
         let lib_paths = state.package_library.lib_paths();
         crate::cross_file::resolve_system_file_sources(&mut meta, ws_name, ws_root, lib_paths);
+        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+            &mut meta,
+            uri,
+            workspace_root.as_ref(),
+            &state.workspace_exclusions,
+        );
+        crate::cross_file::enrich_selective_import_resolutions(
+            &mut meta,
+            uri,
+            workspace_root.as_ref(),
+        );
     }
-    let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
-        &mut meta,
-        uri,
-        workspace_root.as_ref(),
-        &state.workspace_exclusions,
-    );
-    crate::cross_file::enrich_selective_import_resolutions(&mut meta, uri, workspace_root.as_ref());
     state.open_document_with_language_id_and_metadata(
         uri.clone(),
         text,
@@ -365,26 +380,25 @@ fn materialize_cli_contextual_provider(
     let Ok(fs_metadata) = std::fs::metadata(&path) else {
         return false;
     };
-    let analysis = crate::cross_file::analysis_text_for_path(execution.uri.path(), &content);
-    let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None));
-    let mut metadata =
-        crate::cross_file::extract_metadata_with_tree(analysis.as_ref(), tree.as_ref());
-    if metadata.working_directory.is_none()
-        && metadata.inherited_working_directory.is_none()
-        && let Some(inherited) = execution.context.inherited_working_directory.as_ref()
-    {
-        metadata.inherited_working_directory = Some(inherited.to_string_lossy().into_owned());
-    }
-    if metadata.working_directory.is_none() && metadata.inherited_working_directory.is_none() {
-        crate::cross_file::enrich_metadata_with_inherited_wd(
-            &mut metadata,
-            &execution.uri,
-            workspace_root,
-            |candidate| state.get_enriched_metadata(candidate),
-            state.cross_file_config.max_chain_depth,
-        );
-    }
-    {
+    let document = crate::state::Document::new_with_uri(&content, None, &execution.uri);
+    let is_stan = document.file_type == crate::file_type::FileType::Stan;
+    let mut metadata = document.cross_file_metadata();
+    if !is_stan {
+        if metadata.working_directory.is_none()
+            && metadata.inherited_working_directory.is_none()
+            && let Some(inherited) = execution.context.inherited_working_directory.as_ref()
+        {
+            metadata.inherited_working_directory = Some(inherited.to_string_lossy().into_owned());
+        }
+        if metadata.working_directory.is_none() && metadata.inherited_working_directory.is_none() {
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut metadata,
+                &execution.uri,
+                workspace_root,
+                |candidate| state.get_enriched_metadata(candidate),
+                state.cross_file_config.max_chain_depth,
+            );
+        }
         let workspace = state.package_state.workspace();
         crate::cross_file::resolve_system_file_sources(
             &mut metadata,
@@ -392,35 +406,27 @@ fn materialize_cli_contextual_provider(
             workspace.map(|value| value.root.as_path()),
             state.package_library.lib_paths(),
         );
-    }
-    let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
-        &mut metadata,
-        &execution.uri,
-        workspace_root,
-        &state.workspace_exclusions,
-    );
-    crate::cross_file::enrich_selective_import_resolutions(
-        &mut metadata,
-        &execution.uri,
-        workspace_root,
-    );
-    let artifacts = std::sync::Arc::new(match tree.as_ref() {
-        Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+        let _ = crate::cross_file::tar_source::finalize_tar_source_requests_with_exclusions(
+            &mut metadata,
             &execution.uri,
-            tree,
-            analysis.as_ref(),
-            Some(&metadata),
-        ),
-        None => crate::cross_file::scope::ScopeArtifacts::default(),
-    });
+            workspace_root,
+            &state.workspace_exclusions,
+        );
+        crate::cross_file::enrich_selective_import_resolutions(
+            &mut metadata,
+            &execution.uri,
+            workspace_root,
+        );
+    }
+    let artifacts = std::sync::Arc::new(document.cross_file_artifacts(&execution.uri, &metadata));
     let snapshot =
         crate::cross_file::file_cache::FileSnapshot::with_content_hash(&fs_metadata, &content);
     let metadata = std::sync::Arc::new(metadata);
     let entry = crate::workspace_index::IndexEntry {
         contents: ropey::Rope::from_str(&content),
-        tree: tree.clone(),
-        loaded_packages: crate::state::extract_loaded_packages(&tree, analysis.as_ref()),
-        data_packages: crate::state::extract_data_packages(&tree, analysis.as_ref()),
+        tree: document.tree.clone(),
+        loaded_packages: document.loaded_packages.clone(),
+        data_packages: document.data_packages.clone(),
         snapshot: snapshot.clone(),
         metadata: metadata.clone(),
         artifacts,
@@ -1579,6 +1585,9 @@ async fn finalize_file_diagnostics(
     missing_file_severity: Option<DiagnosticSeverity>,
     case_mismatch_severity: crate::cross_file::CaseMismatchSeverity,
 ) -> Vec<Diagnostic> {
+    if crate::file_type::file_type_from_uri(uri) != crate::file_type::FileType::R {
+        return sync_diags;
+    }
     crate::handlers::diagnostics_async_standalone(
         uri,
         sync_diags,
@@ -1846,7 +1855,7 @@ fn collect_report_targets_with_exclusions(
             if abs.is_dir() {
                 collect_check_target_paths_with_exclusions(&abs, &mut out, exclusions);
             } else if abs.is_file() {
-                if is_r_file(&abs) || is_chunk_file(&abs) {
+                if is_r_file(&abs) || is_chunk_file(&abs) || is_stan_file(&abs) {
                     out.push(abs);
                 }
                 // Other file types: silently ignored, matching lint's walk.
@@ -3271,6 +3280,114 @@ infixContinuationStyle = "indented"
             }
             all
         })
+    }
+
+    #[test]
+    fn check_discovers_stan_and_reports_only_syntax_errors() {
+        let tmp = TempDir::new().unwrap();
+        let invalid = tmp.path().join("invalid.stan");
+        let valid = tmp.path().join("valid.StAn");
+        let semantic = tmp.path().join("semantic.stan");
+        fs::write(&invalid, "data { int N }\nmodel {}\n").unwrap();
+        fs::write(
+            &valid,
+            "parameters { real x; } model { x ~ normal(0, 1); }\n",
+        )
+        .unwrap();
+        fs::write(&semantic, "model { target += unknown_value; }\n").unwrap();
+        fs::write(
+            tmp.path().join("helper.stanfunctions"),
+            "functions { real helper(real x) { return x; } }\n",
+        )
+        .unwrap();
+
+        let args = base_args(tmp.path());
+        let findings = collect_diagnostics_blocking(&args);
+        assert!(!findings.is_empty());
+        assert!(findings.iter().all(|(path, diagnostic)| {
+            path.ends_with("invalid.stan")
+                && diagnostic.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "syntax-error".to_string(),
+                    ))
+        }));
+        assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn explicit_mixed_case_stan_uses_stan_disk_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let model = tmp.path().join("model.STAN");
+        fs::write(&model, "model { target += ; }\n").unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![model.clone()];
+        let findings = collect_diagnostics_blocking(&args);
+        assert!(!findings.is_empty());
+        let expected = model.canonicalize().unwrap();
+        assert!(
+            findings
+                .iter()
+                .all(|(path, _)| path.canonicalize().unwrap() == expected)
+        );
+    }
+
+    #[test]
+    fn stan_raven_path_directive_does_not_run_r_missing_file_phase() {
+        let tmp = TempDir::new().unwrap();
+        let model = tmp.path().join("model.stan");
+        fs::write(&model, "# raven: source missing.R\nmodel {}\n").unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![model];
+        assert!(collect_diagnostics_blocking(&args).is_empty());
+        assert_eq!(run_blocking(args), EXIT_OK);
+    }
+
+    #[test]
+    fn contextual_cli_materialization_keeps_stan_analysis_inert() {
+        let tmp = TempDir::new().unwrap();
+        let model = tmp.path().join("contextual.stan");
+        fs::write(&model, "data { int N }\nmodel {}\n").unwrap();
+        let uri = Url::from_file_path(&model).unwrap();
+        let workspace_root = Url::from_directory_path(tmp.path()).unwrap();
+        let execution = crate::cross_file::tar_source::ContextualProviderExecution {
+            uri: uri.clone(),
+            context: crate::cross_file::path_resolve::PathContext::forward_without_metadata(
+                &uri,
+                Some(&workspace_root),
+            )
+            .unwrap(),
+            prefer_supplied_path_context: true,
+            contextual: true,
+        };
+        let mut state = crate::state::WorldState::new();
+        state.workspace_scan_complete = true;
+        state.workspace_folders = vec![workspace_root.clone()];
+        assert!(materialize_cli_contextual_provider(
+            &mut state,
+            &execution,
+            Some(&workspace_root)
+        ));
+
+        let document = {
+            let entry = state.workspace_index.get(&uri).unwrap();
+            assert_eq!(entry.tree.as_ref().unwrap().root_node().kind(), "program");
+            assert!(entry.metadata.sources.is_empty());
+            assert!(entry.metadata.working_directory.is_none());
+            assert!(entry.metadata.inherited_working_directory.is_none());
+            assert!(entry.artifacts.exported_interface.is_empty());
+            assert!(entry.loaded_packages.is_empty());
+            assert!(entry.data_packages.is_empty());
+            crate::state::document_from_workspace_entry(
+                &uri,
+                &entry,
+                state.chunk_kind_for_closed_file(&uri),
+            )
+        };
+        state.documents.insert(uri.clone(), document);
+        assert!(
+            !crate::handlers::diagnostics(&state, &uri, &crate::handlers::DiagCancelToken::never())
+                .is_empty()
+        );
     }
 
     /// Like `collect_diagnostics_blocking` but drives the REAL parallel

@@ -92,6 +92,21 @@ Raven surfaces parse errors from the tree-sitter R grammar whenever the document
 
 The `Mismatched brackets` message also covers wrong-closer typos where the user typed an unexpected closer immediately after an unclosed opener (e.g. `f(}` produces a single `` Mismatched brackets: `(` opened here; close with `)` not `}`. `` diagnostic rather than two separate ones).
 
+### Stan Parse Errors
+
+Raven also reports syntax errors in `.stan` files, both in the editor and from
+`raven check`. This is deliberately syntax-only: Raven does not type-check Stan,
+resolve includes, validate identifiers or distribution signatures, or run the
+Stan compiler. Code that is syntactically well formed but semantically invalid
+therefore remains silent. Stan findings use the same non-suppressible
+`syntax-error` code and obey only the master `raven.diagnostics.enabled` switch.
+
+Full-line, recognized Raven directives are geometry-preserving Raven
+extensions and do not create Stan parse errors. Stan's own `#include` remains
+part of the Stan grammar; unknown `#` lines are diagnosed. Raven does not check
+whether an include target exists. `.stanfunctions` helper files are not checked
+as standalone Stan programs.
+
 ### Undefined Variables
 
 | Diagnostic | Default Severity | Trigger |

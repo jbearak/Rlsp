@@ -209,6 +209,11 @@ use tree_sitter::Parser;
 use url::Url;
 
 use raven::test_utils::fixture_workspace::{FixtureConfig, create_fixture_workspace};
+use raven::{
+    file_type::FileType,
+    handlers::{DiagCancelToken, diagnostics},
+    state::{Document, WorldState},
+};
 
 /// Create a tree-sitter parser configured for R.
 fn make_r_parser() -> Parser {
@@ -253,6 +258,58 @@ fn generate_r_code_of_size(target_bytes: usize) -> String {
     }
 
     content
+}
+
+fn generate_stan_code_of_size(target_bytes: usize, malformed: bool) -> String {
+    let mut content = String::from("parameters { real theta; }\nmodel {\n");
+    let statement = if malformed {
+        "  target += normal_lpdf(theta | 0, 1)\n"
+    } else {
+        "  target += normal_lpdf(theta | 0, 1);\n"
+    };
+    while content.len() + statement.len() + 2 < target_bytes {
+        content.push_str(statement);
+    }
+    content.push_str("}\n");
+    content
+}
+
+fn analyze_stan(code: &str) -> usize {
+    let uri = Url::parse("untitled:stan-performance-budget").unwrap();
+    let mut state = WorldState::new();
+    state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
+    diagnostics(&state, &uri, &DiagCancelToken::never()).len()
+}
+
+#[test]
+fn budget_stan_parse_and_diagnostics_100kb_valid() {
+    let code = generate_stan_code_of_size(100 * 1024, false);
+    let _ = analyze_stan(&code);
+    let elapsed = median_of_3(|| assert_eq!(analyze_stan(&code), 0));
+    assert_within_budget("stan_parse_and_diagnostics_100kb_valid", elapsed, 250);
+}
+
+#[test]
+fn budget_stan_parse_and_diagnostics_100kb_malformed_is_bounded() {
+    let code = generate_stan_code_of_size(100 * 1024, true);
+    let lines = code.lines().count();
+    let first_count = analyze_stan(&code);
+    assert!(first_count > 0);
+    assert!(
+        first_count <= lines,
+        "malformed Stan diagnostic count must remain linearly bounded"
+    );
+    let elapsed = median_of_3(|| {
+        let count = analyze_stan(&code);
+        assert!(count <= lines);
+    });
+    assert_within_budget("stan_parse_and_diagnostics_100kb_malformed", elapsed, 250);
+}
+
+#[test]
+fn stan_document_constructor_uses_the_stan_grammar() {
+    let document = Document::new_with_file_type("model {}\n", None, FileType::Stan);
+    assert_eq!(document.tree.unwrap().root_node().kind(), "program");
 }
 
 // ---------------------------------------------------------------------------

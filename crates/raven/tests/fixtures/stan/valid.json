@@ -1,0 +1,234 @@
+[
+  {
+    "name": "empty-model",
+    "code": "model {}\n"
+  },
+  {
+    "name": "data-integer",
+    "code": "data { int<lower=0> N; }\nmodel {}\n"
+  },
+  {
+    "name": "data-real-array",
+    "code": "data { int<lower=1> N; array[N] real y; }\nmodel {}\n"
+  },
+  {
+    "name": "modern-array",
+    "code": "data { int N; array[N, 2] real x; }\nmodel {}\n"
+  },
+  {
+    "name": "vector-data",
+    "code": "data { int N; vector[N] x; }\nmodel {}\n"
+  },
+  {
+    "name": "row-vector-data",
+    "code": "data { int N; row_vector[N] x; }\nmodel {}\n"
+  },
+  {
+    "name": "matrix-data",
+    "code": "data { int N; matrix[N, N] x; }\nmodel {}\n"
+  },
+  {
+    "name": "complex-data",
+    "code": "data { complex z; complex_vector[2] z2; }\nmodel {}\n"
+  },
+  {
+    "name": "tuple-data",
+    "code": "data { tuple(real, int) pair; }\nmodel {}\n"
+  },
+  {
+    "name": "constrained-data",
+    "code": "data { real<lower=0, upper=1> p; }\nmodel {}\n"
+  },
+  {
+    "name": "transformed-data",
+    "code": "data { real x; }\ntransformed data { real y = x + 1; }\nmodel {}\n"
+  },
+  {
+    "name": "parameter-real",
+    "code": "parameters { real mu; }\nmodel { mu ~ normal(0, 1); }\n"
+  },
+  {
+    "name": "parameter-vector",
+    "code": "parameters { vector[3] beta; }\nmodel { beta ~ normal(0, 1); }\n"
+  },
+  {
+    "name": "parameter-simplex",
+    "code": "parameters { simplex[3] p; }\nmodel { p ~ dirichlet(rep_vector(1.0, 3)); }\n"
+  },
+  {
+    "name": "parameter-corr",
+    "code": "parameters { corr_matrix[2] R; }\nmodel { R ~ lkj_corr(2); }\n"
+  },
+  {
+    "name": "transformed-parameters",
+    "code": "parameters { real x; }\ntransformed parameters { real y = exp(x); }\nmodel { x ~ normal(0, 1); }\n"
+  },
+  {
+    "name": "generated-quantities",
+    "code": "parameters { real x; }\nmodel { x ~ normal(0, 1); }\ngenerated quantities { real y = normal_rng(x, 1); }\n"
+  },
+  {
+    "name": "function-real",
+    "code": "functions { real twice(real x) { return 2 * x; } }\nmodel {}\n"
+  },
+  {
+    "name": "function-vector",
+    "code": "functions { vector center(vector x) { return x - mean(x); } }\nmodel {}\n"
+  },
+  {
+    "name": "function-array",
+    "code": "functions { array[] real copy(array[] real x) { return x; } }\nmodel {}\n"
+  },
+  {
+    "name": "if-else",
+    "code": "parameters { real x; }\nmodel { if (x > 0) target += -x; else target += x; }\n"
+  },
+  {
+    "name": "while-loop",
+    "code": "model { int n = 0; while (n < 3) { n += 1; } }\n"
+  },
+  {
+    "name": "for-loop",
+    "code": "data { int<lower=1> N; }\nmodel { for (n in 1:N) target += 0; }\n"
+  },
+  {
+    "name": "nested-loop",
+    "code": "data { int<lower=1> N; }\nmodel { for (n in 1:N) for (m in 1:N) target += 0; }\n"
+  },
+  {
+    "name": "break-continue",
+    "code": "model { for (n in 1:10) { if (n == 2) continue; if (n == 8) break; } }\n"
+  },
+  {
+    "name": "sampling-normal",
+    "code": "data { real y; }\nparameters { real mu; }\nmodel { y ~ normal(mu, 1); }\n"
+  },
+  {
+    "name": "sampling-truncation",
+    "code": "data { real<lower=0> y; }\nparameters { real mu; }\nmodel { y ~ normal(mu, 1) T[0, ]; }\n"
+  },
+  {
+    "name": "target-statement",
+    "code": "parameters { real x; }\nmodel { target += normal_lpdf(x | 0, 1); }\n"
+  },
+  {
+    "name": "jacobian-statement",
+    "code": "parameters { real<lower=0> x; }\ntransformed parameters { real y = log(x); jacobian += log(x); }\nmodel {}\n"
+  },
+  {
+    "name": "slices",
+    "code": "data { vector[5] x; }\ntransformed data { vector[3] y = x[2:4]; }\nmodel {}\n"
+  },
+  {
+    "name": "multi-index",
+    "code": "data { matrix[3, 3] x; }\ntransformed data { real y = x[2, 3]; }\nmodel {}\n"
+  },
+  {
+    "name": "ternary",
+    "code": "data { int flag; }\ntransformed data { real x = flag ? 1.0 : 0.0; }\nmodel {}\n"
+  },
+  {
+    "name": "logical",
+    "code": "data { int a; int b; }\nmodel { if (a == 1 && b != 2) target += 0; }\n"
+  },
+  {
+    "name": "comments",
+    "code": "// leading\n/* block */\nmodel { // inline\n  target += 0;\n}\n"
+  },
+  {
+    "name": "string-print",
+    "code": "model { print(\"hello\", 1); }\n"
+  },
+  {
+    "name": "unicode-comment",
+    "code": "// 😀 λ café\nmodel {}\n"
+  },
+  {
+    "name": "scientific-numbers",
+    "code": "transformed data { real x = 1.2e-3; real y = 2E+4; }\nmodel {}\n"
+  },
+  {
+    "name": "compound-assignment",
+    "code": "model { real x = 1; x += 2; x *= 3; }\n"
+  },
+  {
+    "name": "reject-call",
+    "code": "model { if (0 == 1) reject(\"never\"); }\n"
+  },
+  {
+    "name": "profile-block",
+    "code": "model { profile(\"work\") { target += 0; } }\n"
+  },
+  {
+    "name": "ordered-type",
+    "code": "parameters { ordered[4] cutpoints; }\nmodel { cutpoints ~ normal(0, 1); }\n"
+  },
+  {
+    "name": "positive-ordered-type",
+    "code": "parameters { positive_ordered[4] gaps; }\nmodel { gaps ~ lognormal(0, 1); }\n"
+  },
+  {
+    "name": "unit-vector-type",
+    "code": "parameters { unit_vector[4] direction; }\nmodel {}\n"
+  },
+  {
+    "name": "sum-to-zero-type",
+    "code": "parameters { sum_to_zero_vector[4] effects; }\nmodel {}\n"
+  },
+  {
+    "name": "complex-row-vector-type",
+    "code": "data { complex_row_vector[3] z; }\nmodel {}\n"
+  },
+  {
+    "name": "complex-matrix-type",
+    "code": "data { complex_matrix[2, 3] z; }\nmodel {}\n"
+  },
+  {
+    "name": "covariance-types",
+    "code": "parameters { cov_matrix[3] sigma; cholesky_factor_cov[3] l_sigma; }\nmodel {}\n"
+  },
+  {
+    "name": "correlation-types",
+    "code": "parameters { corr_matrix[3] omega; cholesky_factor_corr[3] l_omega; }\nmodel {}\n"
+  },
+  {
+    "name": "column-stochastic-matrix",
+    "code": "parameters { column_stochastic_matrix[2, 3] transition; }\nmodel {}\n"
+  },
+  {
+    "name": "row-stochastic-matrix",
+    "code": "parameters { row_stochastic_matrix[2, 3] transition; }\nmodel {}\n"
+  },
+  {
+    "name": "offset-multiplier",
+    "code": "data { real mu; real<lower=0> sigma; }\nparameters { real<offset=mu, multiplier=sigma> theta; }\nmodel {}\n"
+  },
+  {
+    "name": "tuple-packing-projection",
+    "code": "transformed data { tuple(real, int) pair = (1.5, 2); real x = pair.1; int n = pair.2; }\nmodel {}\n"
+  },
+  {
+    "name": "array-literal",
+    "code": "transformed data { array[3] int values = {1, 2, 3}; int x = values[2]; }\nmodel {}\n"
+  },
+  {
+    "name": "vector-literal",
+    "code": "transformed data { vector[3] values = [1, 2, 3]'; real x = values[2]; }\nmodel {}\n"
+  },
+  {
+    "name": "data-qualified-function-argument",
+    "code": "functions { real scaled_sum(data int n, vector x) { return sum(x) / n; } }\ndata { int<lower=1> n; vector[n] x; }\ntransformed data { real avg = scaled_sum(n, x); }\nmodel {}\n"
+  },
+  {
+    "name": "matrix-mixed-indexing",
+    "code": "data { matrix[4, 4] x; }\ntransformed data { matrix[2, 2] y = x[2:3, {1, 4}]; }\nmodel {}\n"
+  },
+  {
+    "name": "array-multi-indexing",
+    "code": "data { array[3, 4] real x; }\ntransformed data { array[2] real y = x[{1, 3}, 2]; }\nmodel {}\n"
+  },
+  {
+    "name": "row-vector-literal-indexing",
+    "code": "transformed data { row_vector[4] x = [1, 2, 3, 4]; row_vector[2] y = x[{1, 4}]; }\nmodel {}\n"
+  }
+]
