@@ -19793,40 +19793,42 @@ fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
     let mut items = Vec::new();
     let mut seen_names = HashSet::new();
 
+    // Add file-local symbols first so they shadow same-named built-ins
+    collect_stan_document_completions(text, uri, &mut items, &mut seen_names);
+
     // Add Stan types
     for ty in crate::stan_builtins::STAN_TYPES {
-        items.push(CompletionItem {
-            label: ty.to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, ty)),
-            ..Default::default()
-        });
-        seen_names.insert(ty.to_string());
+        if seen_names.insert(ty.to_string()) {
+            items.push(CompletionItem {
+                label: ty.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, ty)),
+                ..Default::default()
+            });
+        }
     }
 
     // Add Stan block keywords
     for kw in crate::stan_builtins::STAN_BLOCK_KEYWORDS {
-        if !seen_names.contains(*kw) {
+        if seen_names.insert(kw.to_string()) {
             items.push(CompletionItem {
                 label: kw.to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
                 sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, kw)),
                 ..Default::default()
             });
-            seen_names.insert(kw.to_string());
         }
     }
 
     // Add Stan control flow
     for cf in crate::stan_builtins::STAN_CONTROL_FLOW {
-        if !seen_names.contains(*cf) {
+        if seen_names.insert(cf.to_string()) {
             items.push(CompletionItem {
                 label: cf.to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
                 sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, cf)),
                 ..Default::default()
             });
-            seen_names.insert(cf.to_string());
         }
     }
 
@@ -19846,9 +19848,6 @@ fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
     for func in crate::stan_builtins::STAN_FUNCTIONS {
         push_stan_function_completion(func.to_string(), &mut items, &mut seen_names);
     }
-
-    // Add file-local symbols
-    collect_stan_document_completions(text, uri, &mut items, &mut seen_names);
 
     CompletionResponse::Array(items)
 }
@@ -70386,19 +70385,23 @@ mod file_type_tests {
         }
     }
 
-    fn empty_stan_completion_items() -> Vec<CompletionItem> {
+    fn stan_completion_items(text: &str) -> Vec<CompletionItem> {
         let uri = Url::parse("file:///test/model.stan").unwrap();
         let mut state = crate::state::WorldState::new();
         state.documents.insert(
             uri.clone(),
-            crate::state::Document::new_with_uri("", None, &uri),
+            crate::state::Document::new_with_uri(text, None, &uri),
         );
 
         let result = completion(&state, &uri, Position::new(0, 0), None);
         let Some(CompletionResponse::Array(items)) = result else {
-            panic!("Expected completion items for empty Stan document");
+            panic!("Expected completion items for Stan document");
         };
         items
+    }
+
+    fn empty_stan_completion_items() -> Vec<CompletionItem> {
+        stan_completion_items("")
     }
 
     #[test]
@@ -70518,6 +70521,22 @@ mod file_type_tests {
         let items = empty_stan_completion_items();
         let labels: HashSet<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(labels.len(), items.len());
+    }
+
+    #[test]
+    fn test_stan_local_symbol_shadows_bare_distribution_builtin() {
+        let items = stan_completion_items("data { real normal; }");
+        let matching: Vec<&CompletionItem> =
+            items.iter().filter(|item| item.label == "normal").collect();
+
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].kind, Some(CompletionItemKind::FIELD));
+        assert!(
+            matching[0]
+                .sort_text
+                .as_deref()
+                .is_some_and(|sort_text| sort_text.starts_with(SORT_PREFIX_SCOPE))
+        );
     }
 
     #[test]
