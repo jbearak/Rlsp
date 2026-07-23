@@ -19184,7 +19184,15 @@ fn mask_stan_non_code(text: &str) -> String {
                     idx += 1;
                     state = StanLexState::String;
                 } else {
-                    masked.push(bytes[idx] as char);
+                    // Preserve one output byte per source byte. Stan code is
+                    // ASCII, but incomplete editor buffers can contain other
+                    // Unicode; casting each UTF-8 byte to `char` would expand
+                    // it and invalidate source byte offsets used on the mask.
+                    masked.push(if bytes[idx].is_ascii() {
+                        bytes[idx] as char
+                    } else {
+                        ' '
+                    });
                     idx += 1;
                 }
             }
@@ -19456,6 +19464,267 @@ fn stan_identifier_at_position(
             && position.character >= occurrence.start_col
             && position.character < occurrence.end_col
     })
+}
+
+fn stan_next_non_whitespace(
+    source_lines: &[&str],
+    masked_lines: &[&str],
+    occurrence: &StanIdentifierOccurrence,
+) -> Option<char> {
+    for (line_idx, line) in masked_lines
+        .iter()
+        .enumerate()
+        .skip(occurrence.line as usize)
+    {
+        let start = if line_idx == occurrence.line as usize {
+            utf16_column_to_byte_offset(source_lines.get(line_idx)?, occurrence.end_col)
+        } else {
+            0
+        };
+        if let Some(character) = line[start..]
+            .chars()
+            .find(|character| !character.is_whitespace())
+        {
+            return Some(character);
+        }
+    }
+    None
+}
+
+fn stan_previous_non_whitespace(
+    source_lines: &[&str],
+    masked_lines: &[&str],
+    occurrence: &StanIdentifierOccurrence,
+) -> Option<char> {
+    for line_idx in (0..=occurrence.line as usize).rev() {
+        let line = *masked_lines.get(line_idx)?;
+        let end = if line_idx == occurrence.line as usize {
+            utf16_column_to_byte_offset(source_lines.get(line_idx)?, occurrence.start_col)
+        } else {
+            line.len()
+        };
+        if let Some(character) = line[..end]
+            .chars()
+            .rev()
+            .find(|character| !character.is_whitespace())
+        {
+            return Some(character);
+        }
+    }
+    None
+}
+
+fn stan_reference_url(anchor: &str) -> String {
+    format!(
+        "https://mc-stan.org/docs/{}/functions-reference/functions_index.html#{}",
+        crate::stan_builtins::STAN_DOCS_VERSION,
+        anchor
+    )
+}
+
+fn stan_has_function_definition(masked: &str, target: &str) -> bool {
+    let bytes = masked.as_bytes();
+
+    for brace in bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'{').then_some(index))
+    {
+        let mut close = brace;
+        while close > 0 && bytes[close - 1].is_ascii_whitespace() {
+            close -= 1;
+        }
+        if close == 0 || bytes[close - 1] != b')' {
+            continue;
+        }
+
+        let mut cursor = close;
+        let mut depth = 0usize;
+        let mut open = None;
+        while cursor > 0 {
+            cursor -= 1;
+            match bytes[cursor] {
+                b')' => depth += 1,
+                b'(' if depth == 1 => {
+                    open = Some(cursor);
+                    break;
+                }
+                b'(' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        let Some(open) = open else {
+            continue;
+        };
+
+        let mut name_end = open;
+        while name_end > 0 && bytes[name_end - 1].is_ascii_whitespace() {
+            name_end -= 1;
+        }
+        let mut name_start = name_end;
+        while name_start > 0 && is_stan_identifier_continue(bytes[name_start - 1]) {
+            name_start -= 1;
+        }
+        if name_start == name_end || !is_stan_identifier_start(bytes[name_start]) {
+            continue;
+        }
+
+        let name = &masked[name_start..name_end];
+        if name == target && !matches!(name, "if" | "for" | "while" | "profile") {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Returns the unnormalized probability function used by distribution
+/// statements and whether the distribution has a density or probability mass
+/// function.
+fn stan_unnormalized_probability_function(
+    canonical_function: &str,
+) -> Option<(String, &'static str)> {
+    if let Some(base) = canonical_function.strip_suffix("_lpdf") {
+        Some((format!("{base}_lupdf"), "density"))
+    } else {
+        canonical_function
+            .strip_suffix("_lpmf")
+            .map(|base| (format!("{base}_lupmf"), "probability mass"))
+    }
+}
+
+enum StanBuiltinHoverTarget {
+    Function(&'static crate::stan_builtins::StanCallable),
+    Distribution {
+        distribution: &'static crate::stan_builtins::StanDistribution,
+        normalized_function: &'static crate::stan_builtins::StanCallable,
+        in_distribution_statement: bool,
+    },
+}
+
+/// Appends compiler signatures and their bounded-overload notice to a hover.
+fn push_stan_hover_signatures(value: &mut String, callable: &crate::stan_builtins::StanCallable) {
+    if callable.signatures.is_empty() {
+        return;
+    }
+
+    value.push_str("```stan\n");
+    value.push_str(&callable.signatures.join("\n"));
+    value.push_str("\n```\n\n");
+    if callable.signature_count > callable.signatures.len() {
+        value.push_str(&format!(
+            "_Showing {} of {} compiler overloads._\n\n",
+            callable.signatures.len(),
+            callable.signature_count
+        ));
+    }
+}
+
+fn stan_builtin_hover(text: &str, position: Position) -> Option<Hover> {
+    let occurrences = collect_stan_identifier_occurrences(text);
+    let occurrence = stan_identifier_at_position(&occurrences, position)?;
+
+    let masked = mask_stan_non_code(text);
+    let source_lines: Vec<&str> = text.lines().collect();
+    let masked_lines: Vec<&str> = masked.lines().collect();
+    if stan_next_non_whitespace(&source_lines, &masked_lines, occurrence) != Some('(') {
+        return None;
+    }
+
+    let after_tilde =
+        stan_previous_non_whitespace(&source_lines, &masked_lines, occurrence) == Some('~');
+    // Distribution-statement syntax always names a distribution, even when an
+    // ordinary user-defined function has the same name. For other calls,
+    // suppress a built-in hover when the file defines that callable, but do
+    // not suppress for same-named variables or loop indices: Stan resolves
+    // those separately.
+    if !after_tilde && stan_has_function_definition(&masked, &occurrence.name) {
+        return None;
+    }
+    let target = if after_tilde {
+        let distribution = crate::stan_builtins::distribution(&occurrence.name)?;
+        let normalized_function = crate::stan_builtins::callable(distribution.canonical_function)?;
+        StanBuiltinHoverTarget::Distribution {
+            distribution,
+            normalized_function,
+            in_distribution_statement: true,
+        }
+    } else if let Some(callable) = crate::stan_builtins::callable(&occurrence.name) {
+        StanBuiltinHoverTarget::Function(callable)
+    } else {
+        // Retain useful hover while a distribution statement is incomplete,
+        // but label the bare call as invalid instead of presenting it as an
+        // alias for the normalized probability function.
+        let distribution = crate::stan_builtins::distribution(&occurrence.name)?;
+        let normalized_function = crate::stan_builtins::callable(distribution.canonical_function)?;
+        StanBuiltinHoverTarget::Distribution {
+            distribution,
+            normalized_function,
+            in_distribution_statement: false,
+        }
+    };
+
+    let value = match target {
+        StanBuiltinHoverTarget::Function(callable) => {
+            let mut value = format!(
+                "**Stan {} function — `{}`**\n\n",
+                crate::stan_builtins::STAN_COMPILER_VERSION,
+                callable.name
+            );
+            push_stan_hover_signatures(&mut value, callable);
+            value.push_str(&format!(
+                "[Open in the Stan Functions Reference]({})",
+                stan_reference_url(callable.name)
+            ));
+            value
+        }
+        StanBuiltinHoverTarget::Distribution {
+            distribution,
+            normalized_function,
+            in_distribution_statement,
+        } => {
+            let mut value = String::new();
+            let statement_subject = if in_distribution_statement {
+                value.push_str(&format!(
+                    "`{}(...)` here is distribution-statement notation. ",
+                    distribution.name
+                ));
+                "The statement"
+            } else {
+                value.push_str(&format!(
+                    "`{}(...)` is not a standalone Stan function. The bare name is distribution notation valid on the right side of `~`. ",
+                    distribution.name
+                ));
+                "A distribution statement"
+            };
+
+            let (unnormalized_function, probability_kind) =
+                stan_unnormalized_probability_function(distribution.canonical_function)?;
+            value.push_str(&format!(
+                "{statement_subject} contributes the unnormalized log {probability_kind} from `{unnormalized_function}(...)` to `target`. Truncation syntax, when present, adds normalization adjustments.\n\n"
+            ));
+            value.push_str(&format!(
+                "**Normalized log {probability_kind} function — `{}`**\n\n_Stan {} compiler signatures:_\n\n",
+                normalized_function.name,
+                crate::stan_builtins::STAN_COMPILER_VERSION,
+            ));
+            push_stan_hover_signatures(&mut value, normalized_function);
+            value.push_str(&format!(
+                "[Open {} in the Stan Functions Reference]({})",
+                normalized_function.name,
+                stan_reference_url(normalized_function.name)
+            ));
+            value
+        }
+    };
+
+    Some(markdown_hover(
+        value,
+        Range {
+            start: Position::new(occurrence.line, occurrence.start_col),
+            end: Position::new(occurrence.line, occurrence.end_col),
+        },
+    ))
 }
 
 fn collect_stan_references(
@@ -19826,21 +20095,15 @@ fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
         push_stan_keyword_completion(cf, &mut items, &mut seen_names);
     }
 
-    // Add Stan distributions and their valid probability-function variants
+    // Add bare distribution names used by distribution statements. Their callable
+    // probability variants are part of the generated compiler catalog below.
     for distribution in crate::stan_builtins::STAN_DISTRIBUTIONS {
         push_stan_function_completion(distribution.name.to_string(), &mut items, &mut seen_names);
-        for suffix in distribution.suffixes {
-            push_stan_function_completion(
-                format!("{}{}", distribution.name, suffix),
-                &mut items,
-                &mut seen_names,
-            );
-        }
     }
 
-    // Add ordinary Stan functions
-    for func in crate::stan_builtins::STAN_FUNCTIONS {
-        push_stan_function_completion(func.to_string(), &mut items, &mut seen_names);
+    // Add compiler-known Stan callables.
+    for callable in crate::stan_builtins::STAN_CALLABLES {
+        push_stan_function_completion(callable.name.to_string(), &mut items, &mut seen_names);
     }
 
     CompletionResponse::Array(items)
@@ -21658,7 +21921,10 @@ fn resolve_directive_origin(
 
 /// Provide hover information for the symbol at a given text document position.
 ///
-/// Tries, in order (see `docs/hover.md` for the user-facing contract):
+/// Stan documents use a separate text-based path: compiler-known callables and
+/// distributions show signatures from Raven's pinned compiler catalog and a
+/// versioned link to the Stan Functions Reference. R documents try, in order
+/// (see `docs/hover.md` for the user-facing contract):
 /// 1. Namespace qualifier `pkg::name`: the member side resolves the qualified help topic; the package side (`pkg`) shows the package's `DESCRIPTION` `Title`/`Description` (#382 step 1).
 /// 2. Structural labels — *resolve where possible, otherwise suppress* (#382 steps 2-4, layered on top of `is_structural_label`): a named-argument label → a user function's exact formal; a parameter name at a definition site → its `@param` roxygen; an `obj$name`/`obj@slot` member → its local definition (via `qualified_resolve`). A label that resolves to none of these falls through to the `is_structural_label` backstop and produces nothing — **resolve-or-suppress, never resolve-or-attribute**, so the #379 `from {base}` misattribution cannot recur.
 /// 3. Cross-file symbol resolution (including local definitions), returning an extracted definition or signature with source attribution.
@@ -21686,6 +21952,9 @@ fn resolve_directive_origin(
 /// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
 pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
     let doc = state.get_document(uri)?;
+    if doc.file_type == FileType::Stan {
+        return stan_builtin_hover(&doc.text(), position);
+    }
     if doc.file_type != FileType::R {
         return None;
     }
@@ -69460,12 +69729,215 @@ generated quantities {
         (state, uri)
     }
 
+    fn stan_hover_value(code: &str, name: &str, nth: usize) -> Option<(String, Range)> {
+        let (state, uri) = make_state(code);
+        let occurrence = nth_stan_occurrence(code, name, nth);
+        let hover = hover_blocking(
+            &state,
+            &uri,
+            Position::new(occurrence.line, occurrence.start_col),
+        )?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("expected markup hover");
+        };
+        Some((markup.value, hover.range.expect("Stan hover range")))
+    }
+
     fn nth_stan_occurrence(code: &str, name: &str, nth: usize) -> StanIdentifierOccurrence {
         collect_stan_identifier_occurrences(code)
             .into_iter()
             .filter(|occurrence| occurrence.name == name)
             .nth(nth)
             .unwrap_or_else(|| panic!("Missing occurrence {} for '{}'", nth, name))
+    }
+
+    #[test]
+    fn stan_hover_shows_compiler_signatures_and_versioned_reference() {
+        let code = "model { target += normal_lpdf(0 | 0, 1); }";
+        let (value, range) = stan_hover_value(code, "normal_lpdf", 0).expect("builtin hover");
+        let occurrence = nth_stan_occurrence(code, "normal_lpdf", 0);
+
+        assert!(value.contains("Stan 2.39.0 function — `normal_lpdf`"));
+        assert!(value.contains("normal_lpdf(real, real, real) => real"));
+        assert!(value.contains("Showing 12 of 64 compiler overloads"));
+        assert!(value.contains(
+            "https://mc-stan.org/docs/2_39/functions-reference/functions_index.html#normal_lpdf"
+        ));
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(occurrence.line, occurrence.start_col),
+                Position::new(occurrence.line, occurrence.end_col)
+            )
+        );
+    }
+
+    #[test]
+    fn stan_hover_explains_continuous_distribution_statement_semantics() {
+        let code = concat!(
+            "parameters { real beta; real<lower=0> sigma_beta; }\n",
+            "model { beta  ~ normal(0, sigma_beta); }",
+        );
+        let (value, _) = stan_hover_value(code, "normal", 0).expect("distribution hover");
+
+        assert!(value.starts_with("`normal(...)` here is distribution-statement notation."));
+        assert!(value.contains(
+            "`normal(...)` here is distribution-statement notation. The statement contributes the unnormalized log density from `normal_lupdf(...)`"
+        ));
+        assert!(value.contains("Normalized log density function — `normal_lpdf`"));
+        assert!(value.contains("Stan 2.39.0 compiler signatures"));
+        assert!(value.contains("normal_lpdf(real, real, real) => real"));
+        assert!(value.contains("functions_index.html#normal_lpdf"));
+    }
+
+    #[test]
+    fn stan_hover_explains_discrete_distribution_statement_semantics() {
+        let code = "data { int y; } model { y ~ poisson(2); }";
+        let (value, _) = stan_hover_value(code, "poisson", 0).expect("distribution hover");
+
+        assert!(value.contains("unnormalized log probability mass from `poisson_lupmf(...)`"));
+        assert!(value.contains("Normalized log probability mass function — `poisson_lpmf`"));
+        assert!(value.contains("poisson_lpmf(int, real) => real"));
+        assert!(value.contains("functions_index.html#poisson_lpmf"));
+    }
+
+    #[test]
+    fn stan_hover_handles_parameter_free_distribution_statements() {
+        let code = "parameters { real z; } model { z ~ std_normal(); }";
+        let (value, _) = stan_hover_value(code, "std_normal", 0).expect("distribution hover");
+
+        assert!(value.contains("unnormalized log density from `std_normal_lupdf(...)`"));
+        assert!(value.contains("Normalized log density function — `std_normal_lpdf`"));
+        assert!(value.contains("std_normal_lpdf(real) => real"));
+    }
+
+    #[test]
+    fn stan_hover_prefers_an_exact_callable_outside_distribution_statements() {
+        let code = "transformed data { real x = beta(1, 2); }";
+        let (value, _) = stan_hover_value(code, "beta", 0).expect("function hover");
+
+        assert!(value.contains("function — `beta`"));
+        assert!(!value.contains("distribution — `beta`"));
+        assert!(value.contains("beta(int, int) => real"));
+    }
+
+    #[test]
+    fn stan_hover_labels_a_bare_distribution_outside_distribution_statements() {
+        let code = "model { normal(0, 1); }";
+        let (value, _) = stan_hover_value(code, "normal", 0).expect("distribution fallback");
+
+        assert!(value.starts_with("`normal(...)` is not a standalone Stan function."));
+        assert!(value.contains("not a standalone Stan function"));
+        assert!(value.contains("valid on the right side of `~`"));
+        assert!(value.contains("unnormalized log density from `normal_lupdf(...)`"));
+        assert!(value.contains("Normalized log density function — `normal_lpdf`"));
+        assert!(value.contains("normal_lpdf(real, real, real) => real"));
+    }
+
+    #[test]
+    fn stan_hover_supports_manual_compiler_callables_without_signatures() {
+        let code = "model { print(\"hello\"); }";
+        let (value, _) = stan_hover_value(code, "print", 0).expect("manual callable hover");
+
+        assert!(value.contains("function — `print`"));
+        assert!(!value.contains("```stan"));
+        assert!(value.contains("functions_index.html#print"));
+    }
+
+    #[test]
+    fn stan_hover_is_inert_for_unknown_non_calls_comments_and_strings() {
+        let (state, uri) = make_state("model { mystery(1); real normal_lpdf; }");
+        assert!(hover_blocking(&state, &uri, Position::new(0, 9)).is_none());
+        assert!(hover_blocking(&state, &uri, Position::new(0, 26)).is_none());
+
+        let (state, uri) =
+            make_state("// normal_lpdf(0 | 0, 1)\nmodel { print(\"normal_lpdf\"); }");
+        assert!(hover_blocking(&state, &uri, Position::new(0, 4)).is_none());
+        assert!(hover_blocking(&state, &uri, Position::new(1, 16)).is_none());
+    }
+
+    #[test]
+    fn stan_hover_does_not_misattribute_a_local_function() {
+        let code = concat!(
+            "functions {\n",
+            "  real normal_lpdf(\n",
+            "    real x, real mu, real sigma, real extra\n",
+            "  ) {\n",
+            "    return extra;\n",
+            "  }\n",
+            "}\n",
+            "model { target += normal_lpdf(0 | 0, 1, 2); }\n",
+        );
+        let (state, uri) = make_state(code);
+        let occurrence = nth_stan_occurrence(code, "normal_lpdf", 1);
+
+        assert!(
+            hover_blocking(
+                &state,
+                &uri,
+                Position::new(occurrence.line, occurrence.start_col)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn stan_hover_is_not_suppressed_by_same_named_values() {
+        let code = concat!(
+            "model {\n",
+            "  real exp = 1;\n",
+            "  for (sqrt in 1:2) {\n",
+            "    target += exp(1) + sqrt(1);\n",
+            "  }\n",
+            "}\n",
+        );
+
+        assert!(stan_hover_value(code, "exp", 1).is_some());
+        assert!(stan_hover_value(code, "sqrt", 1).is_some());
+    }
+
+    #[test]
+    fn stan_hover_distribution_statement_wins_over_a_same_named_user_function() {
+        let code = concat!(
+            "functions { real normal(real x) { return x; } }\n",
+            "model { 0 ~ normal(0, 1); }\n",
+        );
+        let (value, _) = stan_hover_value(code, "normal", 1).expect("distribution hover");
+
+        assert!(value.starts_with("`normal(...)` here is distribution-statement notation."));
+    }
+
+    #[test]
+    fn stan_hover_ignores_declaration_like_text_in_block_comments() {
+        let code = concat!(
+            "/* real normal_lpdf(real x, real mu, real sigma) { } */\n",
+            "model { target += normal_lpdf(0 | 0, 1); }\n",
+        );
+
+        assert!(stan_hover_value(code, "normal_lpdf", 0).is_some());
+    }
+
+    #[test]
+    fn stan_hover_handles_newlines_and_utf16_ranges() {
+        let code = "model { print(\"😀\"); normal_lpdf\n  (0 | 0, 1); }";
+        let (state, uri) = make_state(code);
+        let hover = hover_blocking(&state, &uri, Position::new(0, 21)).expect("multiline hover");
+
+        assert_eq!(
+            hover.range,
+            Some(Range::new(Position::new(0, 21), Position::new(0, 32)))
+        );
+    }
+
+    #[test]
+    fn stan_hover_handles_crlf_and_non_ascii_in_incomplete_code() {
+        let crlf = "model {\r\n  normal_lpdf\r\n  (0 | 0, 1);\r\n}\r\n";
+        let (state, uri) = make_state(crlf);
+        assert!(hover_blocking(&state, &uri, Position::new(1, 2)).is_some());
+
+        let incomplete = "model { ☃ qr(1); }";
+        let (state, uri) = make_state(incomplete);
+        assert!(hover_blocking(&state, &uri, Position::new(0, 10)).is_some());
     }
 
     fn stan_occurrence_on_line(
@@ -70335,17 +70807,13 @@ mod file_type_tests {
                         "Stan completions missing distribution '{}'",
                         distribution.name
                     );
-                    for suffix in distribution.suffixes {
-                        let label = format!("{}{}", distribution.name, suffix);
-                        assert!(
-                            labels.contains(&label),
-                            "Stan completions missing distribution function '{}'",
-                            label
-                        );
-                    }
                 }
-                for func in crate::stan_builtins::STAN_FUNCTIONS {
-                    assert!(labels.contains(*func), "Stan completions missing function '{}'", func);
+                for callable in crate::stan_builtins::STAN_CALLABLES {
+                    assert!(
+                        labels.contains(callable.name),
+                        "Stan completions missing function '{}'",
+                        callable.name
+                    );
                 }
             } else {
                 panic!("Expected Some(CompletionResponse::Array) for Stan file");

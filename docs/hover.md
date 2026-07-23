@@ -1,6 +1,6 @@
 # Hover
 
-Hovering over an identifier shows what the symbol is, where it's defined, and — for package exports — the R help text. Hover uses the same position-aware, cross-file scope model as [completions](completion.md), [diagnostics](diagnostics.md), and [go-to-definition](go-to-definition.md), so the package attributed at the cursor matches what's in scope under Raven's static model — namely, packages brought in via `library()` / `require()` (or via `loadNamespace()`, which Raven treats as an attach signal even though R itself only loads the namespace), plus namespace qualifiers and declared symbols.
+Hovering over an identifier shows what the symbol is and, when available, its signature or documentation. R hover uses the same position-aware, cross-file scope model as [completions](completion.md), [diagnostics](diagnostics.md), and [go-to-definition](go-to-definition.md), so the package attributed at the cursor matches what's in scope under Raven's static model — namely, packages brought in via `library()` / `require()` (or via `loadNamespace()`, which Raven treats as an attach signal even though R itself only loads the namespace), plus namespace qualifiers and declared symbols. Stan has a separate compiler-catalog hover described below.
 
 ## What You See
 
@@ -19,9 +19,21 @@ Hovering over an identifier shows what the symbol is, where it's defined, and �
 
 Hover returns nothing for symbols R doesn't recognize and that aren't in scope, and for structural labels it cannot resolve (see step 2 below).
 
+## Stan Hover
+
+In a `.stan` file, hovering a compiler-known function call shows representative compiler signatures and a link to the versioned [Stan Functions Reference](https://mc-stan.org/docs/2_39/functions-reference/functions_index.html). The link targets the callable's alphabetical-index anchor; compiler aliases that the reference does not document separately land at the index. Raven bundles metadata generated through the `stanc3` npm package 2.39.1, whose bundled compiler identifies itself as 2.39.0, so hover requires neither a local Stan installation nor a runtime subprocess or network request.
+
+Distribution-statement syntax is distribution-aware: hovering `normal` in `y ~ normal(mu, sigma)` explains that the bare name is notation after `~`. The statement contributes the unnormalized log density from `normal_lupdf` to `target`. The hover labels the displayed `normal_lpdf` compiler signatures as the normalized log-density function and links to that reference entry. Discrete distributions are described analogously with `_lupmf` and `_lpmf`; truncation syntax may add normalization adjustments beyond the unnormalized probability-function contribution.
+
+Outside a distribution statement, an exact callable wins when a name is ambiguous; for example, `beta(1, 2)` describes the beta special function rather than the beta distribution. Bare distribution names with no exact callable still get distribution hover for incomplete code, but the hover clearly says that forms such as `normal(...)` are not standalone Stan functions and are valid only on the right side of `~`.
+
+Some Stan functions have hundreds of overloads. Hover shows at most 12 representative signatures and reports the full compiler overload count. Compiler-known statement-like callables such as `print()` and `reject()` have a reference link even when stanc does not expose a conventional signature for them.
+
+Stan hover is intentionally limited to call sites. It returns nothing for names in comments or strings, plain non-call identifiers, unknown functions, and ordinary calls resolved to a user-defined function in the current file. Same-named variables do not suppress callable hover, and distribution-statement syntax remains distribution-aware even when an ordinary user function has the distribution's name. Raven does not yet extract documentation for user-defined Stan functions.
+
 ## Resolution Order
 
-Hover tries sources in this order and stops at the first match. This matches the logic in `crates/raven/src/handlers.rs::hover`:
+For R documents, hover tries sources in this order and stops at the first match. This matches the R path in `crates/raven/src/handlers.rs::hover`:
 
 1. **Namespace qualifier.** If the cursor is inside a `pkg::name` or `pkg:::name` expression, the qualifier wins — even if the file-local scope would resolve `name` to something else. Without this rule, hovering `filter` inside `dplyr::filter(...)` could show `stats::filter` whenever the workspace happened to surface that one first. The two sides differ: hovering the **member** (`filter`) shows that topic's help, while hovering the **package** (`dplyr`) shows the package's `Title`/`Description` from its installed `DESCRIPTION` (and nothing when it is not installed, since the `package-not-installed` diagnostic already reports that) — not a `dplyr::dplyr` help artifact.
 2. **Structural labels: resolve where possible, otherwise suppress.** An identifier that never refers to a value at runtime — a named-argument label (`title` in `labs(title = ...)`), a function-parameter name, or the member name in `obj$name` — is not a plain value lookup, so hover must never attribute it to a definition or package (the misleading `from {base}` bug). But where Raven has something *correct* to show, it resolves rather than suppressing:
@@ -97,6 +109,7 @@ This isn't a Raven bug. Both extensions are answering the hover request independ
 - **No navigation to installed package sources.** Hover attributes a symbol to its package and links to the help viewer, but cmd-click on a package export does not jump into the package's source. See [Go-to-Definition: Package Exports](go-to-definition.md#package-exports).
 - **R-help fallback is async.** The first hover for a topic spawns an R subprocess to render help; re-hovering the same topic uses the cached result.
 - **R Markdown / Quarto: chunk bodies only.** Hover (and its help-panel link) works on identifiers inside R code chunks of `.Rmd` and `.qmd` documents. Hovering prose, YAML front matter, or a non-R chunk produces nothing.
+- **Stan user functions.** Raven suppresses built-in attribution when a name is declared locally, but does not yet show the local Stan function's signature or comments.
 
 ## Related
 

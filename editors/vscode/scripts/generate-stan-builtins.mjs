@@ -1,0 +1,228 @@
+import { createRequire } from "node:module";
+import { readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import {
+  dump_stan_math_distributions,
+  dump_stan_math_signatures,
+  stanc_version,
+} from "stanc3";
+
+const require = createRequire(import.meta.url);
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(scriptDir, "../../..");
+const outputPath = path.join(
+  repoRoot,
+  "crates",
+  "raven",
+  "src",
+  "stan_builtins_generated.rs",
+);
+const stancPackage = JSON.parse(
+  readFileSync(require.resolve("stanc3/package.json"), "utf8"),
+);
+
+const EXPECTED_STANC_PACKAGE_VERSION = "2.39.1";
+const DOCS_VERSION = "2_39";
+const MAX_HOVER_SIGNATURES = 12;
+
+if (stancPackage.version !== EXPECTED_STANC_PACKAGE_VERSION) {
+  throw new Error(
+    `Expected stanc3 package ${EXPECTED_STANC_PACKAGE_VERSION}, found ${stancPackage.version}`,
+  );
+}
+
+const compilerVersionMatch = /^stanc3 v(\d+\.\d+\.\d+)$/.exec(stanc_version ?? "");
+if (!compilerVersionMatch) {
+  throw new Error(`Unexpected stanc compiler version: ${stanc_version}`);
+}
+const compilerVersion = compilerVersionMatch[1];
+const expectedDocsVersion = compilerVersion.split(".").slice(0, 2).join("_");
+if (DOCS_VERSION !== expectedDocsVersion) {
+  throw new Error(
+    `Expected Stan docs ${expectedDocsVersion} for compiler ${compilerVersion}, found ${DOCS_VERSION}`,
+  );
+}
+
+const MANUAL_FUNCTIONS = [
+  "algebra_solver",
+  "algebra_solver_newton",
+  "dae",
+  "dae_tol",
+  "fatal_error",
+  "integrate_1d",
+  "integrate_ode",
+  "integrate_ode_adams",
+  "integrate_ode_bdf",
+  "integrate_ode_rk45",
+  "laplace_latent_bernoulli_logit_rng",
+  "laplace_latent_neg_binomial_2_log_rng",
+  "laplace_latent_poisson_log_rng",
+  "laplace_latent_rng",
+  "laplace_latent_tol_bernoulli_logit_rng",
+  "laplace_latent_tol_neg_binomial_2_log_rng",
+  "laplace_latent_tol_poisson_log_rng",
+  "laplace_latent_tol_rng",
+  "laplace_marginal",
+  "laplace_marginal_bernoulli_logit_lpmf",
+  "laplace_marginal_neg_binomial_2_log_lpmf",
+  "laplace_marginal_poisson_log_lpmf",
+  "laplace_marginal_tol",
+  "laplace_marginal_tol_bernoulli_logit_lpmf",
+  "laplace_marginal_tol_neg_binomial_2_log_lpmf",
+  "laplace_marginal_tol_poisson_log_lpmf",
+  "map_rect",
+  "ode_adams",
+  "ode_adams_tol",
+  "ode_adjoint_tol_ctl",
+  "ode_bdf",
+  "ode_bdf_tol",
+  "ode_ckrk",
+  "ode_ckrk_tol",
+  "ode_rk45",
+  "ode_rk45_tol",
+  "print",
+  "reduce_sum",
+  "reduce_sum_static",
+  "reject",
+  "solve_newton",
+  "solve_newton_tol",
+  "solve_powell",
+  "solve_powell_tol",
+  "target",
+];
+
+function compareAscii(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function rustString(value) {
+  return JSON.stringify(value);
+}
+
+function collectCallables() {
+  const signatures = new Map();
+
+  for (const rawLine of dump_stan_math_signatures().split("\n")) {
+    const line = rawLine.trim();
+    const openParen = line.indexOf("(");
+    if (openParen <= 0) continue;
+    const name = line.slice(0, openParen);
+    const entries = signatures.get(name) ?? [];
+    entries.push(line);
+    signatures.set(name, entries);
+  }
+
+  // Higher-order, variadic, and embedded-Laplace callables are typechecked by
+  // stanc but omitted from the flat signature dump because they do not have a
+  // fixed monomorphic signature.
+  for (const name of MANUAL_FUNCTIONS) {
+    if (!signatures.has(name)) signatures.set(name, []);
+  }
+
+  // stanc exposes the normalized probability signatures. Stan also provides
+  // the corresponding unnormalized aliases, which are legal callables and
+  // must stay in completion/hover even though they are absent from the dump.
+  for (const [name, entries] of [...signatures]) {
+    const suffix = name.endsWith("_lpdf")
+      ? "_lpdf"
+      : name.endsWith("_lpmf")
+        ? "_lpmf"
+        : null;
+    if (!suffix) continue;
+    const unnormalized = name.replace(suffix, suffix === "_lpdf" ? "_lupdf" : "_lupmf");
+    if (signatures.has(unnormalized)) continue;
+    signatures.set(
+      unnormalized,
+      entries.map((entry) => unnormalized + entry.slice(name.length)),
+    );
+  }
+
+  return [...signatures]
+    .sort(([left], [right]) => compareAscii(left, right))
+    .map(([name, entries]) => ({
+      name,
+      signatures: entries.slice(0, MAX_HOVER_SIGNATURES),
+      signatureCount: entries.length,
+    }));
+}
+
+function collectDistributions(callableNames) {
+  const distributions = [];
+  for (const rawLine of dump_stan_math_distributions().split("\n")) {
+    const [rawName] = rawLine.split(":", 1);
+    const name = rawName?.trim();
+    if (!name) continue;
+
+    const density = `${name}_lpdf`;
+    const mass = `${name}_lpmf`;
+    const canonicalFunction = callableNames.has(density) ? density : mass;
+    if (!callableNames.has(canonicalFunction)) {
+      // stanc includes RNG-only distribution families (currently
+      // `hmm_latent`) in this dump. They cannot be used with sampling syntax,
+      // so they belong in the callable catalog but not the distribution map.
+      continue;
+    }
+    distributions.push({ name, canonicalFunction });
+  }
+  return distributions.sort((left, right) => compareAscii(left.name, right.name));
+}
+
+function renderGeneratedSource() {
+  const callables = collectCallables();
+  const callableNames = new Set(callables.map(({ name }) => name));
+  const distributions = collectDistributions(callableNames);
+  const lines = [
+    "// @generated by `bun editors/vscode/scripts/generate-stan-builtins.mjs`.",
+    "// Source: stanc3 compiler metadata. DO NOT EDIT BY HAND.",
+    "",
+    `pub const STANC_PACKAGE_VERSION: &str = ${rustString(EXPECTED_STANC_PACKAGE_VERSION)};`,
+    `pub const STAN_COMPILER_VERSION: &str = ${rustString(compilerVersion)};`,
+    `pub const STAN_DOCS_VERSION: &str = ${rustString(DOCS_VERSION)};`,
+    "",
+    "#[rustfmt::skip]",
+    "pub static STAN_CALLABLES: &[StanCallable] = &[",
+  ];
+
+  for (const callable of callables) {
+    lines.push("    StanCallable {");
+    lines.push(`        name: ${rustString(callable.name)},`);
+    lines.push("        signatures: &[");
+    for (const signature of callable.signatures) {
+      lines.push(`            ${rustString(signature)},`);
+    }
+    lines.push("        ],");
+    lines.push(`        signature_count: ${callable.signatureCount},`);
+    lines.push("    },");
+  }
+  lines.push(
+    "];",
+    "",
+    "#[rustfmt::skip]",
+    "pub static STAN_DISTRIBUTIONS: &[StanDistribution] = &[",
+  );
+  for (const distribution of distributions) {
+    lines.push("    StanDistribution {");
+    lines.push(`        name: ${rustString(distribution.name)},`);
+    lines.push(
+      `        canonical_function: ${rustString(distribution.canonicalFunction)},`,
+    );
+    lines.push("    },");
+  }
+  lines.push("];");
+
+  return `${lines.join("\n")}\n`;
+}
+
+const generated = renderGeneratedSource();
+if (process.argv.includes("--check")) {
+  const current = readFileSync(outputPath, "utf8");
+  if (current !== generated) {
+    throw new Error(
+      `Stan builtin catalog is stale. Run:\n  bun editors/vscode/scripts/generate-stan-builtins.mjs`,
+    );
+  }
+} else {
+  writeFileSync(outputPath, generated);
+}

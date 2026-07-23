@@ -1,7 +1,7 @@
 {
   "name": "raven-r",
   "displayName": "Raven - R Language Server",
-  "description": "R language server with cross-file awareness, diagnostics, completion, and navigation. Also provides lightweight support for Stan and JAGS/BUGS (syntax highlighting, completions, navigation, outline).",
+  "description": "R language server with cross-file awareness, diagnostics, completion, and navigation. Also provides lightweight support for Stan and JAGS/BUGS (syntax highlighting, completions, Stan hover, navigation, outline).",
   "keywords": [
     "R",
     "language server",
@@ -2461,6 +2461,7 @@
     "fast-check": "^4.5.3",
     "jsdom": "^29.1.1",
     "mocha": "^11.0.0",
+    "stanc3": "2.39.1",
     "svelte": "^5.55.7",
     "svelte-preprocess": "^6.0.0",
     "typescript": "^5.0.0"
