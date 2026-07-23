@@ -19683,31 +19683,30 @@ fn stan_builtin_hover(text: &str, position: Position) -> Option<Hover> {
             normalized_function,
             in_distribution_statement,
         } => {
-            let mut value = format!(
-                "**Stan {} distribution — `{}`**\n\n",
-                crate::stan_builtins::STAN_COMPILER_VERSION,
-                distribution.name
-            );
-            if in_distribution_statement {
+            let mut value = String::new();
+            let statement_subject = if in_distribution_statement {
                 value.push_str(&format!(
-                    "`{}(...)` here is distribution-statement notation, not a call to a function named `{}`.\n\n",
-                    distribution.name, distribution.name
-                ));
-            } else {
-                value.push_str(&format!(
-                    "`{}(...)` is not a standalone Stan function. The bare name is distribution notation valid on the right side of `~`.\n\n",
+                    "`{}(...)` here is distribution-statement notation. ",
                     distribution.name
                 ));
-            }
+                "The statement"
+            } else {
+                value.push_str(&format!(
+                    "`{}(...)` is not a standalone Stan function. The bare name is distribution notation valid on the right side of `~`. ",
+                    distribution.name
+                ));
+                "A distribution statement"
+            };
 
             let (unnormalized_function, probability_kind) =
                 stan_unnormalized_probability_function(distribution.canonical_function)?;
             value.push_str(&format!(
-                "The statement contributes the unnormalized log {probability_kind} from `{unnormalized_function}(...)` to `target`. Truncation syntax, when present, adds normalization adjustments.\n\n"
+                "{statement_subject} contributes the unnormalized log {probability_kind} from `{unnormalized_function}(...)` to `target`. Truncation syntax, when present, adds normalization adjustments.\n\n"
             ));
             value.push_str(&format!(
-                "_Normalized log {probability_kind} function — `{}`:_\n\n",
-                normalized_function.name
+                "**Normalized log {probability_kind} function — `{}`**\n\n_Stan {} compiler signatures:_\n\n",
+                normalized_function.name,
+                crate::stan_builtins::STAN_COMPILER_VERSION,
             ));
             push_stan_hover_signatures(&mut value, normalized_function);
             value.push_str(&format!(
@@ -69781,10 +69780,12 @@ generated quantities {
         );
         let (value, _) = stan_hover_value(code, "normal", 0).expect("distribution hover");
 
-        assert!(value.contains("Stan 2.39.0 distribution — `normal`"));
-        assert!(value.contains("distribution-statement notation"));
-        assert!(value.contains("unnormalized log density from `normal_lupdf(...)`"));
+        assert!(value.starts_with("`normal(...)` here is distribution-statement notation."));
+        assert!(value.contains(
+            "`normal(...)` here is distribution-statement notation. The statement contributes the unnormalized log density from `normal_lupdf(...)`"
+        ));
         assert!(value.contains("Normalized log density function — `normal_lpdf`"));
+        assert!(value.contains("Stan 2.39.0 compiler signatures"));
         assert!(value.contains("normal_lpdf(real, real, real) => real"));
         assert!(value.contains("functions_index.html#normal_lpdf"));
     }
@@ -69825,7 +69826,7 @@ generated quantities {
         let code = "model { normal(0, 1); }";
         let (value, _) = stan_hover_value(code, "normal", 0).expect("distribution fallback");
 
-        assert!(value.contains("distribution — `normal`"));
+        assert!(value.starts_with("`normal(...)` is not a standalone Stan function."));
         assert!(value.contains("not a standalone Stan function"));
         assert!(value.contains("valid on the right side of `~`"));
         assert!(value.contains("unnormalized log density from `normal_lupdf(...)`"));
