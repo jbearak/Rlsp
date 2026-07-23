@@ -19774,9 +19774,24 @@ fn is_r_only_jags_completion_name(name: &str) -> bool {
         || matches!(name, "library" | "require")
 }
 
+fn push_stan_function_completion(
+    label: String,
+    items: &mut Vec<CompletionItem>,
+    seen_names: &mut HashSet<String>,
+) {
+    if seen_names.insert(label.clone()) {
+        items.push(CompletionItem {
+            sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, label)),
+            label,
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        });
+    }
+}
+
 fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
     let mut items = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
+    let mut seen_names = HashSet::new();
 
     // Add Stan types
     for ty in crate::stan_builtins::STAN_TYPES {
@@ -19815,17 +19830,21 @@ fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
         }
     }
 
-    // Add Stan functions
-    for func in crate::stan_builtins::STAN_FUNCTIONS {
-        if !seen_names.contains(*func) {
-            items.push(CompletionItem {
-                label: func.to_string(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, func)),
-                ..Default::default()
-            });
-            seen_names.insert(func.to_string());
+    // Add Stan distributions and their valid probability-function variants
+    for distribution in crate::stan_builtins::STAN_DISTRIBUTIONS {
+        push_stan_function_completion(distribution.name.to_string(), &mut items, &mut seen_names);
+        for suffix in distribution.suffixes {
+            push_stan_function_completion(
+                format!("{}{}", distribution.name, suffix),
+                &mut items,
+                &mut seen_names,
+            );
         }
+    }
+
+    // Add ordinary Stan functions
+    for func in crate::stan_builtins::STAN_FUNCTIONS {
+        push_stan_function_completion(func.to_string(), &mut items, &mut seen_names);
     }
 
     // Add file-local symbols
@@ -70317,6 +70336,21 @@ mod file_type_tests {
                 for cf in crate::stan_builtins::STAN_CONTROL_FLOW {
                     assert!(labels.contains(*cf), "Stan completions missing control flow '{}'", cf);
                 }
+                for distribution in crate::stan_builtins::STAN_DISTRIBUTIONS {
+                    assert!(
+                        labels.contains(distribution.name),
+                        "Stan completions missing distribution '{}'",
+                        distribution.name
+                    );
+                    for suffix in distribution.suffixes {
+                        let label = format!("{}{}", distribution.name, suffix);
+                        assert!(
+                            labels.contains(&label),
+                            "Stan completions missing distribution function '{}'",
+                            label
+                        );
+                    }
+                }
                 for func in crate::stan_builtins::STAN_FUNCTIONS {
                     assert!(labels.contains(*func), "Stan completions missing function '{}'", func);
                 }
@@ -70350,6 +70384,140 @@ mod file_type_tests {
                 panic!("Expected Some(CompletionResponse::Array) for Stan file");
             }
         }
+    }
+
+    fn empty_stan_completion_items() -> Vec<CompletionItem> {
+        let uri = Url::parse("file:///test/model.stan").unwrap();
+        let mut state = crate::state::WorldState::new();
+        state.documents.insert(
+            uri.clone(),
+            crate::state::Document::new_with_uri("", None, &uri),
+        );
+
+        let result = completion(&state, &uri, Position::new(0, 0), None);
+        let Some(CompletionResponse::Array(items)) = result else {
+            panic!("Expected completion items for empty Stan document");
+        };
+        items
+    }
+
+    #[test]
+    fn test_stan_completions_include_representative_distribution_names() {
+        let labels: HashSet<String> = empty_stan_completion_items()
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+
+        for expected in [
+            "normal",
+            "normal_lpdf",
+            "normal_cdf",
+            "normal_lcdf",
+            "normal_lccdf",
+            "normal_rng",
+            "poisson",
+            "poisson_lpmf",
+            "poisson_cdf",
+            "poisson_lcdf",
+            "poisson_lccdf",
+            "poisson_rng",
+            "std_normal",
+            "std_normal_lcdf",
+            "beta_proportion_lcdf",
+            "loglogistic_cdf",
+            "categorical",
+            "categorical_lpmf",
+            "categorical_rng",
+            "multi_normal",
+            "multi_normal_lpdf",
+            "multi_normal_rng",
+            "wiener",
+            "wiener_lpdf",
+        ] {
+            assert!(
+                labels.contains(expected),
+                "missing Stan completion: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stan_completions_exclude_invalid_distribution_variants() {
+        let labels: HashSet<String> = empty_stan_completion_items()
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+
+        for invalid in [
+            "poisson_lpdf",
+            "normal_lpmf",
+            "categorical_cdf",
+            "categorical_lcdf",
+            "categorical_lccdf",
+            "multi_normal_cdf",
+            "wiener_rng",
+            "binomial_logit_rng",
+            "beta_proportion_cdf",
+            "loglogistic_lcdf",
+            "loglogistic_lccdf",
+        ] {
+            assert!(
+                !labels.contains(invalid),
+                "invalid Stan completion: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stan_completions_include_representative_math_and_matrix_functions() {
+        let labels: HashSet<String> = empty_stan_completion_items()
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+
+        for expected in [
+            "log1p_exp",
+            "inv_Phi",
+            "log_sum_exp",
+            "to_row_vector",
+            "append_array",
+            "rep_row_vector",
+            "dot_product",
+            "diag_pre_multiply",
+            "cholesky_decompose",
+            "eigenvalues_sym",
+            "mdivide_left_spd",
+            "matrix_exp",
+        ] {
+            assert!(
+                labels.contains(expected),
+                "missing Stan completion: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stan_distribution_completion_metadata() {
+        let items = empty_stan_completion_items();
+
+        for label in ["normal", "normal_lpdf", "poisson_lpmf"] {
+            let item = items
+                .iter()
+                .find(|item| item.label == label)
+                .unwrap_or_else(|| panic!("missing Stan completion: {label}"));
+            assert_eq!(item.kind, Some(CompletionItemKind::FUNCTION));
+            assert_eq!(
+                item.sort_text.as_deref(),
+                Some(format!("4-{label}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn test_stan_completion_labels_are_unique() {
+        let items = empty_stan_completion_items();
+        let labels: HashSet<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels.len(), items.len());
     }
 
     #[test]

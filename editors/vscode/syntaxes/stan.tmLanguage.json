@@ -54,7 +54,7 @@
     },
     "distribution-suffix": {
       "name": "support.function.distribution.stan",
-      "match": "\\b\\w+(_lpdf|_lpmf|_lcdf|_lccdf|_rng)\\b"
+      "match": "\\b\\w+(_lpdf|_lpmf|_cdf|_lcdf|_lccdf|_rng)\\b"
     },
     "numeric": {
       "name": "constant.numeric.stan",

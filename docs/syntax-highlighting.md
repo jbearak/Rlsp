@@ -111,6 +111,6 @@ Registered for `.stan`, `.Stan`, `.STAN`. The grammar recognizes:
 - **Type keywords** — `int`, `real`, `vector`, `row_vector`, `matrix`, `simplex`, `unit_vector`, `ordered`, `positive_ordered`, `corr_matrix`, `cov_matrix`, `cholesky_factor_corr`, `cholesky_factor_cov`, `void`, `array`, `complex`, `complex_vector`, `complex_row_vector`, `complex_matrix`, `tuple`.
 - **Constraint keywords** — `lower`, `upper`, `offset`, `multiplier`.
 - **Control flow** — `for`, `in`, `while`, `if`, `else`, `return`, `break`, `continue`, `print`, `reject`, `profile`.
-- **Distribution-suffix functions** — any identifier ending in `_lpdf`, `_lpmf`, `_lcdf`, `_lccdf`, or `_rng`, so user-defined and library-defined density/sampling functions both highlight consistently.
+- **Distribution-suffix functions** — any identifier ending in `_lpdf`, `_lpmf`, `_cdf`, `_lcdf`, `_lccdf`, or `_rng`, so user-defined and library-defined density/sampling functions both highlight consistently.
 - **Numeric literals** — integer, decimal, and scientific notation.
 - **Operators** — `<-`, `~`, `&&`, `||`, comparisons, arithmetic, and the Stan-specific `'` (transpose), `%` (mod), `!`, `?`, `:`.
