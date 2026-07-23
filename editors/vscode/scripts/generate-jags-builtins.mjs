@@ -4,7 +4,9 @@ import { fileURLToPath } from "node:url";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "../../..");
-const manifestPath = path.join(scriptDir, "jags-builtins-4.3.2.tsv");
+const manifestPath =
+  process.env.RAVEN_JAGS_BUILTINS_MANIFEST ??
+  path.join(scriptDir, "jags-builtins-4.3.2.tsv");
 const outputPath = path.join(
   repoRoot,
   "crates",
@@ -21,6 +23,18 @@ const EXPECTED_SOURCE_SHA256 =
 const EXPECTED_MODULES = ["basemod", "bugs"];
 const EXPECTED_KEYWORDS = ["data", "for", "in", "model", "var"];
 const EXPECTED_CONTEXTUAL = ["I", "T"];
+const EXPECTED_COMPILER_CALLABLES = new Set(["dim", "length"]);
+const EXPECTED_BASEMOD_CALLABLES = new Set(["pow"]);
+
+// JAGS registers `pow` as the spelling of the compiler's `^` operator rather
+// than as an alias to another named callable. Keep external canonical targets
+// closed to this one independently verified exception.
+const EXTERNAL_CANONICAL_EXCEPTIONS = new Map([
+  [
+    "callable:pow",
+    { canonicalName: "^", module: "basemod", arity: 2 },
+  ],
+]);
 
 function compareAscii(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -34,6 +48,92 @@ function assertEqual(actual, expected, label) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(
       `${label} mismatch: expected ${JSON.stringify(expected)}, found ${JSON.stringify(actual)}`,
+    );
+  }
+}
+
+function validateAliases(entries) {
+  const byRoleAndName = new Map(
+    entries.map((entry) => [`${entry.kind}:${entry.name}`, entry]),
+  );
+
+  for (const entry of entries) {
+    if (entry.canonicalName === entry.name) continue;
+
+    const key = `${entry.kind}:${entry.name}`;
+    const exception = EXTERNAL_CANONICAL_EXCEPTIONS.get(key);
+    if (exception) {
+      if (
+        entry.canonicalName !== exception.canonicalName ||
+        entry.module !== exception.module ||
+        entry.arity !== exception.arity
+      ) {
+        throw new Error(
+          `External canonical exception ${entry.name} must remain ` +
+            `${exception.module}:${exception.canonicalName}/${exception.arity}`,
+        );
+      }
+      continue;
+    }
+
+    const canonical = byRoleAndName.get(
+      `${entry.kind}:${entry.canonicalName}`,
+    );
+    if (!canonical) {
+      throw new Error(
+        `Canonical target ${entry.canonicalName} for ${entry.kind} alias ` +
+          `${entry.name} does not resolve to a same-role entry`,
+      );
+    }
+    if (canonical.canonicalName !== canonical.name) {
+      throw new Error(
+        `Canonical target ${canonical.name} for ${entry.kind} alias ` +
+          `${entry.name} is itself an alias`,
+      );
+    }
+    if (entry.module !== canonical.module) {
+      throw new Error(
+        `Alias ${entry.name} module ${entry.module} does not match canonical ` +
+          `${canonical.name} module ${canonical.module}`,
+      );
+    }
+    if (entry.arity !== canonical.arity) {
+      throw new Error(
+        `Alias ${entry.name} arity ${entry.arity} does not match canonical ` +
+          `${canonical.name} arity ${canonical.arity}`,
+      );
+    }
+  }
+}
+
+function validateKindModule(entry) {
+  if (entry.kind === "keyword" || entry.kind === "contextual") {
+    if (entry.module !== "compiler") {
+      throw new Error(
+        `Invalid kind/module pair ${entry.kind}/${entry.module} for ${entry.name}`,
+      );
+    }
+    return;
+  }
+
+  if (entry.kind === "distribution") {
+    if (entry.module !== "bugs") {
+      throw new Error(
+        `Invalid kind/module pair distribution/${entry.module} for ${entry.name}`,
+      );
+    }
+    return;
+  }
+
+  const expectedModule = EXPECTED_COMPILER_CALLABLES.has(entry.name)
+    ? "compiler"
+    : EXPECTED_BASEMOD_CALLABLES.has(entry.name)
+      ? "basemod"
+      : "bugs";
+  if (entry.module !== expectedModule) {
+    throw new Error(
+      `Invalid kind/module pair callable/${entry.module} for ${entry.name}; ` +
+        `expected ${expectedModule}`,
     );
   }
 }
@@ -83,9 +183,18 @@ function parseManifest() {
     if (!/^(?:[A-Za-z][A-Za-z0-9._]*|\^)$/.test(canonicalName)) {
       throw new Error(`Invalid canonical name ${canonicalName} on manifest line ${index + 1}`);
     }
+    if (!/^(?:-1|0|[1-9][0-9]*)$/.test(rawArity)) {
+      throw new Error(
+        `Invalid arity ${JSON.stringify(rawArity)} on manifest line ${index + 1}; ` +
+          "expected -1 or an unsigned base-10 integer",
+      );
+    }
     const arity = Number(rawArity);
-    if (!Number.isInteger(arity) || arity < -1) {
-      throw new Error(`Invalid arity ${rawArity} on manifest line ${index + 1}`);
+    if (!Number.isSafeInteger(arity)) {
+      throw new Error(
+        `Invalid arity ${JSON.stringify(rawArity)} on manifest line ${index + 1}; ` +
+          "value exceeds JavaScript's exact integer range",
+      );
     }
     entries.push({ kind, module, name, canonicalName, arity });
   }
@@ -112,13 +221,8 @@ function parseManifest() {
     EXPECTED_CONTEXTUAL,
     "Contextual syntax",
   );
-  if (
-    entries
-      .filter((entry) => entry.kind === "distribution")
-      .some((entry) => entry.module !== "bugs")
-  ) {
-    throw new Error("Only the automatically loaded bugs module may provide distributions");
-  }
+  validateAliases(entries);
+  for (const entry of entries) validateKindModule(entry);
 
   return { version, sourceUrl, sourceSha256, entries };
 }
