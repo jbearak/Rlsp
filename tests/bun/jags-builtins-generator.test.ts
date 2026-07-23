@@ -127,6 +127,16 @@ test("JAGS generator rejects an invalid callable module", () => {
   expectRejected(manifest, /Invalid kind\/module pair callable\/basemod for abs/);
 });
 
+test("JAGS generator rejects pow made spuriously self-canonical", () => {
+  const manifest = mutateEntry(sourceManifest, "callable", "pow", (fields) => {
+    fields[3] = "pow";
+  });
+  expectRejected(
+    manifest,
+    /External canonical exception pow must remain basemod:\^\/2/,
+  );
+});
+
 test("JAGS generator accepts the documented pow-to-operator exception", () => {
   expect(sourceManifest).toContain("callable\tbasemod\tpow\t^\t2");
   const result = runGenerator(sourceManifest);

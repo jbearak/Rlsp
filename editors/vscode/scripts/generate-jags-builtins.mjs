@@ -56,13 +56,13 @@ function validateAliases(entries) {
   const byRoleAndName = new Map(
     entries.map((entry) => [`${entry.kind}:${entry.name}`, entry]),
   );
+  const seenExternalExceptions = new Set();
 
   for (const entry of entries) {
-    if (entry.canonicalName === entry.name) continue;
-
     const key = `${entry.kind}:${entry.name}`;
     const exception = EXTERNAL_CANONICAL_EXCEPTIONS.get(key);
     if (exception) {
+      seenExternalExceptions.add(key);
       if (
         entry.canonicalName !== exception.canonicalName ||
         entry.module !== exception.module ||
@@ -75,6 +75,8 @@ function validateAliases(entries) {
       }
       continue;
     }
+
+    if (entry.canonicalName === entry.name) continue;
 
     const canonical = byRoleAndName.get(
       `${entry.kind}:${entry.canonicalName}`,
@@ -102,6 +104,12 @@ function validateAliases(entries) {
         `Alias ${entry.name} arity ${entry.arity} does not match canonical ` +
           `${canonical.name} arity ${canonical.arity}`,
       );
+    }
+  }
+
+  for (const key of EXTERNAL_CANONICAL_EXCEPTIONS.keys()) {
+    if (!seenExternalExceptions.has(key)) {
+      throw new Error(`Missing external canonical exception entry ${key}`);
     }
   }
 }
