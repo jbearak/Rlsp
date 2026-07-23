@@ -69897,14 +69897,14 @@ generated quantities {
     }
 
     #[test]
-    fn stan_sampling_hover_wins_over_a_same_named_user_function() {
+    fn stan_hover_distribution_statement_wins_over_a_same_named_user_function() {
         let code = concat!(
             "functions { real normal(real x) { return x; } }\n",
             "model { 0 ~ normal(0, 1); }\n",
         );
         let (value, _) = stan_hover_value(code, "normal", 1).expect("distribution hover");
 
-        assert!(value.contains("distribution — `normal`"));
+        assert!(value.starts_with("`normal(...)` here is distribution-statement notation."));
     }
 
     #[test]
