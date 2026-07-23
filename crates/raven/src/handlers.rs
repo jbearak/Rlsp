@@ -19578,6 +19578,48 @@ fn stan_has_function_definition(masked: &str, target: &str) -> bool {
     false
 }
 
+/// Returns the unnormalized probability function used by distribution
+/// statements and whether the distribution has a density or probability mass
+/// function.
+fn stan_unnormalized_probability_function(
+    canonical_function: &str,
+) -> Option<(String, &'static str)> {
+    if let Some(base) = canonical_function.strip_suffix("_lpdf") {
+        Some((format!("{base}_lupdf"), "density"))
+    } else {
+        canonical_function
+            .strip_suffix("_lpmf")
+            .map(|base| (format!("{base}_lupmf"), "probability mass"))
+    }
+}
+
+enum StanBuiltinHoverTarget {
+    Function(&'static crate::stan_builtins::StanCallable),
+    Distribution {
+        distribution: &'static crate::stan_builtins::StanDistribution,
+        normalized_function: &'static crate::stan_builtins::StanCallable,
+        in_distribution_statement: bool,
+    },
+}
+
+/// Appends compiler signatures and their bounded-overload notice to a hover.
+fn push_stan_hover_signatures(value: &mut String, callable: &crate::stan_builtins::StanCallable) {
+    if callable.signatures.is_empty() {
+        return;
+    }
+
+    value.push_str("```stan\n");
+    value.push_str(&callable.signatures.join("\n"));
+    value.push_str("\n```\n\n");
+    if callable.signature_count > callable.signatures.len() {
+        value.push_str(&format!(
+            "_Showing {} of {} compiler overloads._\n\n",
+            callable.signatures.len(),
+            callable.signature_count
+        ));
+    }
+}
+
 fn stan_builtin_hover(text: &str, position: Position) -> Option<Hover> {
     let occurrences = collect_stan_identifier_occurrences(text);
     let occurrence = stan_identifier_at_position(&occurrences, position)?;
@@ -19591,59 +19633,91 @@ fn stan_builtin_hover(text: &str, position: Position) -> Option<Hover> {
 
     let after_tilde =
         stan_previous_non_whitespace(&source_lines, &masked_lines, occurrence) == Some('~');
-    // Sampling syntax always names a distribution, even when an ordinary
-    // user-defined function has the same name. For other calls, suppress a
-    // built-in hover when the file defines that callable, but do not suppress
-    // for same-named variables or loop indices: Stan resolves those separately.
+    // Distribution-statement syntax always names a distribution, even when an
+    // ordinary user-defined function has the same name. For other calls,
+    // suppress a built-in hover when the file defines that callable, but do
+    // not suppress for same-named variables or loop indices: Stan resolves
+    // those separately.
     if !after_tilde && stan_has_function_definition(&masked, &occurrence.name) {
         return None;
     }
-    let (kind, display_name, callable, anchor) = if after_tilde {
+    let target = if after_tilde {
         let distribution = crate::stan_builtins::distribution(&occurrence.name)?;
-        let callable = crate::stan_builtins::callable(distribution.canonical_function)?;
-        (
-            "distribution",
-            distribution.name,
-            callable,
-            distribution.canonical_function,
-        )
+        let normalized_function = crate::stan_builtins::callable(distribution.canonical_function)?;
+        StanBuiltinHoverTarget::Distribution {
+            distribution,
+            normalized_function,
+            in_distribution_statement: true,
+        }
     } else if let Some(callable) = crate::stan_builtins::callable(&occurrence.name) {
-        ("function", callable.name, callable, callable.name)
+        StanBuiltinHoverTarget::Function(callable)
     } else {
-        // Bare distribution names such as `normal` have no callable with that
-        // exact name. Keep hover useful in incomplete code before `~` is typed.
+        // Retain useful hover while a distribution statement is incomplete,
+        // but label the bare call as invalid instead of presenting it as an
+        // alias for the normalized probability function.
         let distribution = crate::stan_builtins::distribution(&occurrence.name)?;
-        let callable = crate::stan_builtins::callable(distribution.canonical_function)?;
-        (
-            "distribution",
-            distribution.name,
-            callable,
-            distribution.canonical_function,
-        )
+        let normalized_function = crate::stan_builtins::callable(distribution.canonical_function)?;
+        StanBuiltinHoverTarget::Distribution {
+            distribution,
+            normalized_function,
+            in_distribution_statement: false,
+        }
     };
 
-    let mut value = format!(
-        "**Stan {} {} — `{}`**\n\n",
-        crate::stan_builtins::STAN_COMPILER_VERSION,
-        kind,
-        display_name
-    );
-    if !callable.signatures.is_empty() {
-        value.push_str("```stan\n");
-        value.push_str(&callable.signatures.join("\n"));
-        value.push_str("\n```\n\n");
-        if callable.signature_count > callable.signatures.len() {
+    let value = match target {
+        StanBuiltinHoverTarget::Function(callable) => {
+            let mut value = format!(
+                "**Stan {} function — `{}`**\n\n",
+                crate::stan_builtins::STAN_COMPILER_VERSION,
+                callable.name
+            );
+            push_stan_hover_signatures(&mut value, callable);
             value.push_str(&format!(
-                "_Showing {} of {} compiler overloads._\n\n",
-                callable.signatures.len(),
-                callable.signature_count
+                "[Open in the Stan Functions Reference]({})",
+                stan_reference_url(callable.name)
             ));
+            value
         }
-    }
-    value.push_str(&format!(
-        "[Open in the Stan Functions Reference]({})",
-        stan_reference_url(anchor)
-    ));
+        StanBuiltinHoverTarget::Distribution {
+            distribution,
+            normalized_function,
+            in_distribution_statement,
+        } => {
+            let mut value = format!(
+                "**Stan {} distribution — `{}`**\n\n",
+                crate::stan_builtins::STAN_COMPILER_VERSION,
+                distribution.name
+            );
+            if in_distribution_statement {
+                value.push_str(&format!(
+                    "`{}(...)` here is distribution-statement notation, not a call to a function named `{}`.\n\n",
+                    distribution.name, distribution.name
+                ));
+            } else {
+                value.push_str(&format!(
+                    "`{}(...)` is not a standalone Stan function. The bare name is distribution notation valid on the right side of `~`.\n\n",
+                    distribution.name
+                ));
+            }
+
+            let (unnormalized_function, probability_kind) =
+                stan_unnormalized_probability_function(distribution.canonical_function)?;
+            value.push_str(&format!(
+                "The statement contributes the unnormalized log {probability_kind} from `{unnormalized_function}(...)` to `target`. Truncation syntax, when present, adds normalization adjustments.\n\n"
+            ));
+            value.push_str(&format!(
+                "_Normalized log {probability_kind} function — `{}`:_\n\n",
+                normalized_function.name
+            ));
+            push_stan_hover_signatures(&mut value, normalized_function);
+            value.push_str(&format!(
+                "[Open {} in the Stan Functions Reference]({})",
+                normalized_function.name,
+                stan_reference_url(normalized_function.name)
+            ));
+            value
+        }
+    };
 
     Some(markdown_hover(
         value,
@@ -20022,7 +20096,7 @@ fn stan_completion(text: &str, uri: &Url) -> CompletionResponse {
         push_stan_keyword_completion(cf, &mut items, &mut seen_names);
     }
 
-    // Add bare distribution names used by sampling statements. Their callable
+    // Add bare distribution names used by distribution statements. Their callable
     // probability variants are part of the generated compiler catalog below.
     for distribution in crate::stan_builtins::STAN_DISTRIBUTIONS {
         push_stan_function_completion(distribution.name.to_string(), &mut items, &mut seen_names);
@@ -69700,17 +69774,44 @@ generated quantities {
     }
 
     #[test]
-    fn stan_hover_maps_sampling_syntax_to_the_distribution_density() {
-        let code = "model { 0 ~ normal(0, 1); }";
+    fn stan_hover_explains_continuous_distribution_statement_semantics() {
+        let code = concat!(
+            "parameters { real beta; real<lower=0> sigma_beta; }\n",
+            "model { beta  ~ normal(0, sigma_beta); }",
+        );
         let (value, _) = stan_hover_value(code, "normal", 0).expect("distribution hover");
 
         assert!(value.contains("Stan 2.39.0 distribution — `normal`"));
+        assert!(value.contains("distribution-statement notation"));
+        assert!(value.contains("unnormalized log density from `normal_lupdf(...)`"));
+        assert!(value.contains("Normalized log density function — `normal_lpdf`"));
         assert!(value.contains("normal_lpdf(real, real, real) => real"));
         assert!(value.contains("functions_index.html#normal_lpdf"));
     }
 
     #[test]
-    fn stan_hover_prefers_an_exact_callable_outside_sampling_syntax() {
+    fn stan_hover_explains_discrete_distribution_statement_semantics() {
+        let code = "data { int y; } model { y ~ poisson(2); }";
+        let (value, _) = stan_hover_value(code, "poisson", 0).expect("distribution hover");
+
+        assert!(value.contains("unnormalized log probability mass from `poisson_lupmf(...)`"));
+        assert!(value.contains("Normalized log probability mass function — `poisson_lpmf`"));
+        assert!(value.contains("poisson_lpmf(int, real) => real"));
+        assert!(value.contains("functions_index.html#poisson_lpmf"));
+    }
+
+    #[test]
+    fn stan_hover_handles_parameter_free_distribution_statements() {
+        let code = "parameters { real z; } model { z ~ std_normal(); }";
+        let (value, _) = stan_hover_value(code, "std_normal", 0).expect("distribution hover");
+
+        assert!(value.contains("unnormalized log density from `std_normal_lupdf(...)`"));
+        assert!(value.contains("Normalized log density function — `std_normal_lpdf`"));
+        assert!(value.contains("std_normal_lpdf(real) => real"));
+    }
+
+    #[test]
+    fn stan_hover_prefers_an_exact_callable_outside_distribution_statements() {
         let code = "transformed data { real x = beta(1, 2); }";
         let (value, _) = stan_hover_value(code, "beta", 0).expect("function hover");
 
@@ -69720,11 +69821,15 @@ generated quantities {
     }
 
     #[test]
-    fn stan_hover_falls_back_to_a_bare_distribution_outside_sampling_syntax() {
+    fn stan_hover_labels_a_bare_distribution_outside_distribution_statements() {
         let code = "model { normal(0, 1); }";
         let (value, _) = stan_hover_value(code, "normal", 0).expect("distribution fallback");
 
         assert!(value.contains("distribution — `normal`"));
+        assert!(value.contains("not a standalone Stan function"));
+        assert!(value.contains("valid on the right side of `~`"));
+        assert!(value.contains("unnormalized log density from `normal_lupdf(...)`"));
+        assert!(value.contains("Normalized log density function — `normal_lpdf`"));
         assert!(value.contains("normal_lpdf(real, real, real) => real"));
     }
 

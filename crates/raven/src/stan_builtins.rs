@@ -59,7 +59,7 @@ pub struct StanCallable {
     pub signature_count: usize,
 }
 
-/// A Stan distribution accepted by sampling-statement syntax.
+/// A Stan distribution accepted by distribution-statement syntax.
 pub struct StanDistribution {
     /// The bare distribution name used after `~`.
     pub name: &'static str,
@@ -77,7 +77,7 @@ pub fn callable(name: &str) -> Option<&'static StanCallable> {
         .map(|index| &STAN_CALLABLES[index])
 }
 
-/// Looks up a sampling-statement distribution by its exact name.
+/// Looks up a distribution-statement distribution by its exact name.
 pub fn distribution(name: &str) -> Option<&'static StanDistribution> {
     STAN_DISTRIBUTIONS
         .binary_search_by(|entry| entry.name.cmp(name))
@@ -110,6 +110,28 @@ mod tests {
                 callable(distribution.canonical_function).is_some(),
                 "missing {} for {}",
                 distribution.canonical_function,
+                distribution.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_distribution_has_an_unnormalized_callable() {
+        for distribution in STAN_DISTRIBUTIONS {
+            let unnormalized =
+                if let Some(base) = distribution.canonical_function.strip_suffix("_lpdf") {
+                    format!("{base}_lupdf")
+                } else if let Some(base) = distribution.canonical_function.strip_suffix("_lpmf") {
+                    format!("{base}_lupmf")
+                } else {
+                    panic!(
+                        "unexpected canonical function {} for {}",
+                        distribution.canonical_function, distribution.name
+                    );
+                };
+            assert!(
+                callable(&unnormalized).is_some(),
+                "missing {unnormalized} for {}",
                 distribution.name
             );
         }
