@@ -97,7 +97,7 @@ The `Mismatched brackets` message also covers wrong-closer typos where the user 
 Raven also reports syntax errors in `.stan` files, both in the editor and from
 `raven check`. This is deliberately syntax-only: Raven does not type-check Stan,
 resolve includes, validate identifiers or distribution signatures, or run the
-Stan compiler. Code that is syntactically well formed but semantically invalid
+Stan compiler. Syntactically well-formed but semantically invalid code
 therefore remains silent. Stan findings use the same non-suppressible
 `syntax-error` code and obey only the master `raven.diagnostics.enabled` switch.
 
