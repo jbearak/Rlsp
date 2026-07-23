@@ -19184,7 +19184,15 @@ fn mask_stan_non_code(text: &str) -> String {
                     idx += 1;
                     state = StanLexState::String;
                 } else {
-                    masked.push(bytes[idx] as char);
+                    // Preserve one output byte per source byte. Stan code is
+                    // ASCII, but incomplete editor buffers can contain other
+                    // Unicode; casting each UTF-8 byte to `char` would expand
+                    // it and invalidate source byte offsets used on the mask.
+                    masked.push(if bytes[idx].is_ascii() {
+                        bytes[idx] as char
+                    } else {
+                        ' '
+                    });
                     idx += 1;
                 }
             }
@@ -19514,19 +19522,65 @@ fn stan_reference_url(anchor: &str) -> String {
     )
 }
 
+fn stan_has_function_definition(masked: &str, target: &str) -> bool {
+    let bytes = masked.as_bytes();
+
+    for brace in bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'{').then_some(index))
+    {
+        let mut close = brace;
+        while close > 0 && bytes[close - 1].is_ascii_whitespace() {
+            close -= 1;
+        }
+        if close == 0 || bytes[close - 1] != b')' {
+            continue;
+        }
+
+        let mut cursor = close;
+        let mut depth = 0usize;
+        let mut open = None;
+        while cursor > 0 {
+            cursor -= 1;
+            match bytes[cursor] {
+                b')' => depth += 1,
+                b'(' if depth == 1 => {
+                    open = Some(cursor);
+                    break;
+                }
+                b'(' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        let Some(open) = open else {
+            continue;
+        };
+
+        let mut name_end = open;
+        while name_end > 0 && bytes[name_end - 1].is_ascii_whitespace() {
+            name_end -= 1;
+        }
+        let mut name_start = name_end;
+        while name_start > 0 && is_stan_identifier_continue(bytes[name_start - 1]) {
+            name_start -= 1;
+        }
+        if name_start == name_end || !is_stan_identifier_start(bytes[name_start]) {
+            continue;
+        }
+
+        let name = &masked[name_start..name_end];
+        if name == target && !matches!(name, "if" | "for" | "while" | "profile") {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn stan_builtin_hover(text: &str, position: Position) -> Option<Hover> {
     let occurrences = collect_stan_identifier_occurrences(text);
     let occurrence = stan_identifier_at_position(&occurrences, position)?;
-
-    // A declaration in this document shadows a built-in. Raven does not yet
-    // extract documentation for user-defined Stan functions, but it must not
-    // misattribute the local symbol to the compiler catalog.
-    if collect_stan_definition_candidates(text)
-        .iter()
-        .any(|declaration| declaration.name == occurrence.name)
-    {
-        return None;
-    }
 
     let masked = mask_stan_non_code(text);
     let source_lines: Vec<&str> = text.lines().collect();
@@ -19537,6 +19591,13 @@ fn stan_builtin_hover(text: &str, position: Position) -> Option<Hover> {
 
     let after_tilde =
         stan_previous_non_whitespace(&source_lines, &masked_lines, occurrence) == Some('~');
+    // Sampling syntax always names a distribution, even when an ordinary
+    // user-defined function has the same name. For other calls, suppress a
+    // built-in hover when the file defines that callable, but do not suppress
+    // for same-named variables or loop indices: Stan resolves those separately.
+    if !after_tilde && stan_has_function_definition(&masked, &occurrence.name) {
+        return None;
+    }
     let (kind, display_name, callable, anchor) = if after_tilde {
         let distribution = crate::stan_builtins::distribution(&occurrence.name)?;
         let callable = crate::stan_builtins::callable(distribution.canonical_function)?;
@@ -69623,7 +69684,7 @@ generated quantities {
         let (value, range) = stan_hover_value(code, "normal_lpdf", 0).expect("builtin hover");
         let occurrence = nth_stan_occurrence(code, "normal_lpdf", 0);
 
-        assert!(value.contains("Stan 2.39.1 function — `normal_lpdf`"));
+        assert!(value.contains("Stan 2.39.0 function — `normal_lpdf`"));
         assert!(value.contains("normal_lpdf(real, real, real) => real"));
         assert!(value.contains("Showing 12 of 64 compiler overloads"));
         assert!(value.contains(
@@ -69643,7 +69704,7 @@ generated quantities {
         let code = "model { 0 ~ normal(0, 1); }";
         let (value, _) = stan_hover_value(code, "normal", 0).expect("distribution hover");
 
-        assert!(value.contains("Stan 2.39.1 distribution — `normal`"));
+        assert!(value.contains("Stan 2.39.0 distribution — `normal`"));
         assert!(value.contains("normal_lpdf(real, real, real) => real"));
         assert!(value.contains("functions_index.html#normal_lpdf"));
     }
@@ -69656,6 +69717,15 @@ generated quantities {
         assert!(value.contains("function — `beta`"));
         assert!(!value.contains("distribution — `beta`"));
         assert!(value.contains("beta(int, int) => real"));
+    }
+
+    #[test]
+    fn stan_hover_falls_back_to_a_bare_distribution_outside_sampling_syntax() {
+        let code = "model { normal(0, 1); }";
+        let (value, _) = stan_hover_value(code, "normal", 0).expect("distribution fallback");
+
+        assert!(value.contains("distribution — `normal`"));
+        assert!(value.contains("normal_lpdf(real, real, real) => real"));
     }
 
     #[test]
@@ -69684,11 +69754,13 @@ generated quantities {
     fn stan_hover_does_not_misattribute_a_local_function() {
         let code = concat!(
             "functions {\n",
-            "  real normal_lpdf(real x, real mu, real sigma) {\n",
-            "    return x;\n",
+            "  real normal_lpdf(\n",
+            "    real x, real mu, real sigma, real extra\n",
+            "  ) {\n",
+            "    return extra;\n",
             "  }\n",
             "}\n",
-            "model { target += normal_lpdf(0, 0, 1); }\n",
+            "model { target += normal_lpdf(0 | 0, 1, 2); }\n",
         );
         let (state, uri) = make_state(code);
         let occurrence = nth_stan_occurrence(code, "normal_lpdf", 1);
@@ -69704,6 +69776,32 @@ generated quantities {
     }
 
     #[test]
+    fn stan_hover_is_not_suppressed_by_same_named_values() {
+        let code = concat!(
+            "model {\n",
+            "  real exp = 1;\n",
+            "  for (sqrt in 1:2) {\n",
+            "    target += exp(1) + sqrt(1);\n",
+            "  }\n",
+            "}\n",
+        );
+
+        assert!(stan_hover_value(code, "exp", 1).is_some());
+        assert!(stan_hover_value(code, "sqrt", 1).is_some());
+    }
+
+    #[test]
+    fn stan_sampling_hover_wins_over_a_same_named_user_function() {
+        let code = concat!(
+            "functions { real normal(real x) { return x; } }\n",
+            "model { 0 ~ normal(0, 1); }\n",
+        );
+        let (value, _) = stan_hover_value(code, "normal", 1).expect("distribution hover");
+
+        assert!(value.contains("distribution — `normal`"));
+    }
+
+    #[test]
     fn stan_hover_ignores_declaration_like_text_in_block_comments() {
         let code = concat!(
             "/* real normal_lpdf(real x, real mu, real sigma) { } */\n",
@@ -69716,16 +69814,24 @@ generated quantities {
     #[test]
     fn stan_hover_handles_newlines_and_utf16_ranges() {
         let code = "model { print(\"😀\"); normal_lpdf\n  (0 | 0, 1); }";
-        let occurrence = nth_stan_occurrence(code, "normal_lpdf", 0);
-        let (_, range) = stan_hover_value(code, "normal_lpdf", 0).expect("multiline hover");
+        let (state, uri) = make_state(code);
+        let hover = hover_blocking(&state, &uri, Position::new(0, 21)).expect("multiline hover");
 
         assert_eq!(
-            range,
-            Range::new(
-                Position::new(occurrence.line, occurrence.start_col),
-                Position::new(occurrence.line, occurrence.end_col)
-            )
+            hover.range,
+            Some(Range::new(Position::new(0, 21), Position::new(0, 32)))
         );
+    }
+
+    #[test]
+    fn stan_hover_handles_crlf_and_non_ascii_in_incomplete_code() {
+        let crlf = "model {\r\n  normal_lpdf\r\n  (0 | 0, 1);\r\n}\r\n";
+        let (state, uri) = make_state(crlf);
+        assert!(hover_blocking(&state, &uri, Position::new(1, 2)).is_some());
+
+        let incomplete = "model { ☃ qr(1); }";
+        let (state, uri) = make_state(incomplete);
+        assert!(hover_blocking(&state, &uri, Position::new(0, 10)).is_some());
     }
 
     fn stan_occurrence_on_line(

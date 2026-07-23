@@ -22,8 +22,10 @@ SOFTWARE.
 
 ---
 
-Raven's generated Stan callable and distribution metadata is derived from
-stanc3 (https://github.com/stan-dev/stanc3), version 2.39.1.
+Raven's generated Stan callable and distribution metadata is derived through
+the stanc3 npm package (https://github.com/WardBrian/npm-stanc3js), version
+2.39.1. Its bundled compiler identifies itself as stanc3 v2.39.0
+(https://github.com/stan-dev/stanc3).
 
 BSD 3-Clause License
 

@@ -122,8 +122,17 @@ mod tests {
     }
 
     #[test]
+    fn generated_catalog_includes_embedded_laplace_callables() {
+        assert!(callable("laplace_marginal").is_some());
+        assert!(callable("laplace_latent_rng").is_some());
+        assert!(callable("laplace_marginal_poisson_log_lpmf").is_some());
+        assert!(callable("laplace_marginal_poisson_log_lupmf").is_some());
+    }
+
+    #[test]
     fn generated_catalog_has_pinned_provenance() {
-        assert_eq!(STAN_COMPILER_VERSION, "2.39.1");
+        assert_eq!(STANC_PACKAGE_VERSION, "2.39.1");
+        assert_eq!(STAN_COMPILER_VERSION, "2.39.0");
         assert_eq!(STAN_DOCS_VERSION, "2_39");
     }
 }

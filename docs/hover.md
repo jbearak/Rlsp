@@ -21,13 +21,13 @@ Hover returns nothing for symbols R doesn't recognize and that aren't in scope, 
 
 ## Stan Hover
 
-In a `.stan` file, hovering a compiler-known function call shows representative compiler signatures and a link to the matching entry in the versioned [Stan Functions Reference](https://mc-stan.org/docs/2_39/functions-reference/functions_index.html). Raven bundles metadata generated from `stanc3` 2.39.1, so hover requires neither a local Stan installation nor a runtime subprocess or network request.
+In a `.stan` file, hovering a compiler-known function call shows representative compiler signatures and a link to the versioned [Stan Functions Reference](https://mc-stan.org/docs/2_39/functions-reference/functions_index.html). The link targets the callable's alphabetical-index anchor; compiler aliases that the reference does not document separately land at the index. Raven bundles metadata generated through the `stanc3` npm package 2.39.1, whose bundled compiler identifies itself as 2.39.0, so hover requires neither a local Stan installation nor a runtime subprocess or network request.
 
 Sampling syntax is distribution-aware: hovering `normal` in `y ~ normal(mu, sigma)` describes the `normal` distribution using its canonical `normal_lpdf` signatures. Outside sampling syntax, an exact callable wins when a name is ambiguous; for example, `beta(1, 2)` describes the beta special function rather than the beta distribution. Bare distribution names with no exact callable still get distribution hover, which keeps incomplete code useful while it is being typed.
 
 Some Stan functions have hundreds of overloads. Hover shows at most 12 representative signatures and reports the full compiler overload count. Compiler-known statement-like callables such as `print()` and `reject()` have a reference link even when stanc does not expose a conventional signature for them.
 
-Stan hover is intentionally limited to call sites. It returns nothing for names in comments or strings, plain non-call identifiers, unknown functions, and names shadowed by a declaration in the current file. Raven does not yet extract documentation for user-defined Stan functions.
+Stan hover is intentionally limited to call sites. It returns nothing for names in comments or strings, plain non-call identifiers, unknown functions, and ordinary calls resolved to a user-defined function in the current file. Same-named variables do not suppress callable hover, and sampling syntax remains distribution-aware even when an ordinary user function has the distribution's name. Raven does not yet extract documentation for user-defined Stan functions.
 
 ## Resolution Order
 
