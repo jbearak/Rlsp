@@ -1,0 +1,166 @@
+[
+  {
+    "name": "missing-data-semicolon",
+    "code": "data { int N }\nmodel {}\n"
+  },
+  {
+    "name": "missing-real-semicolon",
+    "code": "data { real x }\nmodel {}\n"
+  },
+  {
+    "name": "missing-parameter-semicolon",
+    "code": "parameters { real x }\nmodel {}\n"
+  },
+  {
+    "name": "missing-local-semicolon",
+    "code": "model { real x = 1 }\n"
+  },
+  {
+    "name": "missing-target-semicolon",
+    "code": "model { target += 1 }\n"
+  },
+  {
+    "name": "missing-sampling-semicolon",
+    "code": "parameters { real x; } model { x ~ normal(0, 1) }\n"
+  },
+  {
+    "name": "missing-return-semicolon",
+    "code": "functions { real f(real x) { return x } } model {}\n"
+  },
+  {
+    "name": "missing-data-close",
+    "code": "data { int N;\nmodel {}\n"
+  },
+  {
+    "name": "missing-model-close",
+    "code": "model {\n  target += 0;\n"
+  },
+  {
+    "name": "missing-functions-close",
+    "code": "functions { real f(real x) { return x; }\nmodel {}\n"
+  },
+  {
+    "name": "missing-call-close",
+    "code": "model { target += normal_lpdf(1 | 0, 1; }\n"
+  },
+  {
+    "name": "missing-index-close",
+    "code": "data { vector[2] x; } model { target += x[1; }\n"
+  },
+  {
+    "name": "missing-array-close",
+    "code": "data { array[2 real x; } model {}\n"
+  },
+  {
+    "name": "missing-constraint-close",
+    "code": "data { real<lower=0 x; } model {}\n"
+  },
+  {
+    "name": "missing-for-close",
+    "code": "model { for (n in 1:10 { target += 0; } }\n"
+  },
+  {
+    "name": "missing-if-close",
+    "code": "model { if (1 == 1 { target += 0; } }\n"
+  },
+  {
+    "name": "missing-function-paren",
+    "code": "functions { real f(real x { return x; } } model {}\n"
+  },
+  {
+    "name": "missing-block-open",
+    "code": "model target += 0; }\n"
+  },
+  {
+    "name": "unexpected-close",
+    "code": "model { target += 0; }}\n"
+  },
+  {
+    "name": "unexpected-paren",
+    "code": "model { target += (1)); }\n"
+  },
+  {
+    "name": "bad-block-name",
+    "code": "models { target += 0; }\n"
+  },
+  {
+    "name": "split-block-keyword",
+    "code": "generated quantity { real x; }\n"
+  },
+  {
+    "name": "malformed-declaration",
+    "code": "data { real; } model {}\n"
+  },
+  {
+    "name": "missing-identifier",
+    "code": "data { int; } model {}\n"
+  },
+  {
+    "name": "missing-type",
+    "code": "data { x; } model {}\n"
+  },
+  {
+    "name": "bad-array-declaration",
+    "code": "data { array real x; } model {}\n"
+  },
+  {
+    "name": "bad-function-arguments",
+    "code": "functions { real f(real, int y) { return y; } } model {}\n"
+  },
+  {
+    "name": "bad-for-header",
+    "code": "model { for n in 1:10) target += 0; }\n"
+  },
+  {
+    "name": "bad-while-header",
+    "code": "model { while 1 < 2) break; }\n"
+  },
+  {
+    "name": "bad-if-header",
+    "code": "model { if 1 == 1) target += 0; }\n"
+  },
+  {
+    "name": "dangling-operator",
+    "code": "model { target += ; }\n"
+  },
+  {
+    "name": "missing-operand",
+    "code": "model { target += 1 + ; }\n"
+  },
+  {
+    "name": "bad-ternary",
+    "code": "transformed data { real x = 1 ? : 0; } model {}\n"
+  },
+  {
+    "name": "bad-sampling",
+    "code": "parameters { real x; } model { x ~ ; }\n"
+  },
+  {
+    "name": "bad-truncation",
+    "code": "parameters { real x; } model { x ~ normal(0,1) T[; }\n"
+  },
+  {
+    "name": "unterminated-string",
+    "code": "model { print(\"hello); }\n"
+  },
+  {
+    "name": "unterminated-comment",
+    "code": "/* never closes\nmodel {}\n"
+  },
+  {
+    "name": "unknown-hash",
+    "code": "### not a preprocessor directive\nmodel {}\n"
+  },
+  {
+    "name": "bad-include",
+    "code": "#include\nmodel {}\n"
+  },
+  {
+    "name": "invalid-token",
+    "code": "model { target += @; }\n"
+  },
+  {
+    "name": "two-separated-faults",
+    "code": "data { int N }\nparameters { real theta; }\nmodel {\n  target += ;\n}\n"
+  }
+]

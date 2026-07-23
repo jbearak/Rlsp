@@ -150,10 +150,7 @@ impl TestOpenDocuments {
 
     async fn open(&mut self, uri: Url, content: &str, version: i32) {
         let document = Document::new_with_uri(content, Some(version), &uri);
-        let metadata = Arc::new(crate::cross_file::extract_metadata_from_analysis_for_kind(
-            document.chunk_kind,
-            &document.analysis_text(),
-        ));
+        let metadata = Arc::new(document.cross_file_metadata());
         self.records.open(uri, document, metadata, None);
     }
 
@@ -168,10 +165,7 @@ impl TestOpenDocuments {
             .prepare_changes(uri, changes, version)
             .expect("test document must be open");
         let document = prepared.document();
-        let metadata = Arc::new(crate::cross_file::extract_metadata_from_analysis_for_kind(
-            document.chunk_kind,
-            &document.analysis_text(),
-        ));
+        let metadata = Arc::new(document.cross_file_metadata());
         self.records
             .commit_prepared_if_current(uri, prepared, metadata)
             .expect("test update basis must be current");

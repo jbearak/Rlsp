@@ -1251,7 +1251,31 @@ datasets come via the embedded base table, above.)
 
 Brief orientation for modules outside the cross-file and package-library subsystems.
 
-### Generated Stan builtin catalog
+### Stan parsing and generated builtin catalog
+
+Stan documents have their own tree-sitter parse path, pinned by git revision in
+`crates/raven/Cargo.toml`. `Document` retains one Stan tree per text revision;
+diagnostics reuse that tree and walk only outer `ERROR` nodes and standalone
+`MISSING` nodes in source order. Stan documents deliberately contribute empty R
+metadata, scope artifacts, and package sets, and R-only async filesystem
+diagnostics never run for them. Keep those boundaries explicit when adding a
+new document lifecycle or disk fallback path.
+
+Before parsing, `stan::mask_raven_directives` replaces only canonically
+recognized full-line Raven directives with spaces while preserving every byte
+offset, line ending, and leading UTF-8 BOM. It reuses the directive parser's
+recognition rules; Stan `#include` and unknown hash lines remain visible to the
+grammar. The only grammar compatibility check is a zero-width required file
+child on `preproc_include`, which matches stanc's rejection of bare `#include`.
+
+The fixture corpus under `crates/raven/tests/fixtures/stan/` separates compiler-
+valid models, syntax-valid semantic/type failures, syntax-invalid models,
+Raven-extension cases, include cases, and a deterministic generated matrix.
+`editors/vscode/scripts/check-stan-diagnostics-fixtures.mjs` uses the exact-
+pinned stanc3 package as a development-time oracle; it is not part of Raven's
+runtime. CI runs the oracle after `npm ci`. Rust integration tests assert that
+Raven stays silent for both valid groups and reports bounded, stable, UTF-16-
+valid syntax findings for every invalid case.
 
 Stan completion and hover share `crates/raven/src/stan_builtins_generated.rs`, generated from compiler metadata exposed by the exact-pinned `stanc3` development dependency in `editors/vscode/package.json`. The npm package version (currently 2.39.1) and its exported compiler version (currently 2.39.0) are validated and recorded separately. Raven bundles the generated Rust data; it does not load `stanc3`, start a compiler subprocess, or use the network at runtime. Hover retains every callable name and at most 12 representative signatures per name, plus the full overload count. The generator also adds `_lupdf` / `_lupmf` aliases from their normalized compiler signatures, restores higher-order and embedded-Laplace callables omitted from the flat signature dump, and maintains the mapping from sampling-statement distribution names to canonical density or mass functions.
 

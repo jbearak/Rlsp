@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, Url};
 
 use crate::cross_file::revalidation::DiagnosticsEpoch;
-use crate::cross_file::scope::{ScopeArtifacts, compute_artifacts_with_metadata};
+use crate::cross_file::scope::ScopeArtifacts;
 use crate::cross_file::types::CrossFileMetadata;
 use crate::state::Document;
 
@@ -211,13 +211,7 @@ impl OpenDocumentStore {
         document: &Document,
         metadata: &CrossFileMetadata,
     ) -> Arc<ScopeArtifacts> {
-        let analysis_text = document.analysis_text();
-        Arc::new(match document.tree.as_ref() {
-            Some(tree) => {
-                compute_artifacts_with_metadata(uri, tree, &analysis_text, Some(metadata))
-            }
-            None => ScopeArtifacts::default(),
-        })
+        Arc::new(document.cross_file_artifacts(uri, metadata))
     }
 
     fn install(
@@ -459,12 +453,10 @@ impl OpenDocumentStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn insert(&mut self, uri: Url, document: Document) -> Option<Document> {
         let replaced = self.records.get(&uri).map(|record| record.document.clone());
-        let analysis_text = document.analysis_text();
-        let mut metadata = crate::cross_file::extract_metadata_from_analysis_for_kind(
-            document.chunk_kind,
-            &analysis_text,
-        );
-        crate::cross_file::enrich_box_import_resolutions(&mut metadata, &uri);
+        let mut metadata = document.cross_file_metadata();
+        if document.file_type != crate::file_type::FileType::Stan {
+            crate::cross_file::enrich_box_import_resolutions(&mut metadata, &uri);
+        }
         self.install(uri, document, Arc::new(metadata), None);
         replaced
     }

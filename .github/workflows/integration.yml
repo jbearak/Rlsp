@@ -384,6 +384,9 @@ jobs:
       - name: Check Stan builtin catalog is up to date
         run: bun editors/vscode/scripts/generate-stan-builtins.mjs --check
 
+      - name: Validate Stan diagnostic fixtures with stanc3
+        run: node editors/vscode/scripts/check-stan-diagnostics-fixtures.mjs
+
       # `vscode-test` downloads a VS Code build (~150 MB) on first run.
       # Caching it on the .vscode-test.mjs hash keeps PR feedback fast and
       # invalidates the cache when the pinned VS Code version changes.

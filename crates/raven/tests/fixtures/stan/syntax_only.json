@@ -1,0 +1,74 @@
+[
+  {
+    "name": "unknown-variable",
+    "code": "model { target += unknown_value; }\n"
+  },
+  {
+    "name": "unknown-function",
+    "code": "model { target += mystery(1); }\n"
+  },
+  {
+    "name": "unknown-distribution",
+    "code": "parameters { real x; } model { x ~ mystery(0); }\n"
+  },
+  {
+    "name": "type-mismatch-assignment",
+    "code": "transformed data { int x = 1.5; } model {}\n"
+  },
+  {
+    "name": "duplicate-variable",
+    "code": "data { int x; int x; } model {}\n"
+  },
+  {
+    "name": "bad-function-return",
+    "code": "functions { real f(real x) { return [x]'; } } model {}\n"
+  },
+  {
+    "name": "bad-call-arity",
+    "code": "model { target += normal_lpdf(1 | 0); }\n"
+  },
+  {
+    "name": "non-data-size",
+    "code": "parameters { real n; vector[n] x; } model {}\n"
+  },
+  {
+    "name": "assign-parameter",
+    "code": "parameters { real x; } model { x = 2; }\n"
+  },
+  {
+    "name": "rng-in-model",
+    "code": "model { real x = normal_rng(0, 1); }\n"
+  },
+  {
+    "name": "target-in-data",
+    "code": "transformed data { target += 1; } model {}\n"
+  },
+  {
+    "name": "sampling-in-data",
+    "code": "model {} generated quantities { real x; x ~ normal(0, 1); }\n"
+  },
+  {
+    "name": "invalid-bound-reference",
+    "code": "parameters { real<lower=missing_bound> y; } model {}\n"
+  },
+  {
+    "name": "void-value",
+    "code": "functions { void f() { return; } } transformed data { real x = f(); } model {}\n"
+  },
+  {
+    "name": "array-rank-mismatch",
+    "code": "data { array[2] real x; } transformed data { real y = x; } model {}\n"
+  },
+  {
+    "name": "matrix-shape-mismatch",
+    "code": "data { matrix[2,3] x; } transformed data { real z = x; } model {}\n"
+  },
+  {
+    "name": "reserved-redeclaration",
+    "code": "functions { real f(real x) { return x; } real f(real x) { return x; } } model {}\n"
+  },
+  {
+    "name": "break-outside-loop",
+    "code": "model { break; }\n"
+  }
+]

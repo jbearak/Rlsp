@@ -226,8 +226,9 @@ use crate::workspace_index::{
 ///   (and can panic on a non-UTF-8 boundary) because the masked text is a
 ///   different byte string of a different length.
 ///
-/// For plain R / JAGS / Stan documents `analysis_text()` *is* `text()` and the
-/// distinction collapses, so behavior-neutral call sites may use either.
+/// For plain R and JAGS documents `analysis_text()` *is* `text()`. Stan also
+/// has two views when it contains recognized full-line Raven directives: those
+/// lines are blanked geometry-preservingly before parsing.
 ///
 /// `mask_to_r` is **geometry-preserving**: line count and the line/column of
 /// every kept R-body character are identical between the two views. Therefore
@@ -252,9 +253,10 @@ pub struct Document {
     /// `editors/vscode/src/chunks/chunk-detector.ts`.
     pub chunk_kind: ChunkKind,
     /// Masked analysis text for Rmd/Quarto documents (`chunks::mask_to_r` of the
-    /// raw contents), or `None` for plain R / JAGS / Stan. The `tree` is parsed
-    /// from this when present. Kept in sync with `contents` by `apply_change`.
-    /// Exposed read-only via [`analysis_text()`](Document::analysis_text).
+    /// raw contents) and directive-bearing Stan documents, or `None` when no
+    /// mask is needed. The `tree` is parsed from this when present. Kept in sync
+    /// with `contents` by `apply_change`. Exposed read-only via
+    /// [`analysis_text()`](Document::analysis_text).
     masked_text: Option<String>,
     pub version: Option<i32>,
     pub revision: u64,
@@ -295,9 +297,9 @@ impl Document {
     }
 
     /// Shared constructor: builds the analysis representation up front so the
-    /// `tree` is parsed from the right text (masked for Rmd, raw otherwise) and
+    /// `tree` is parsed from the right text (masked when required) and
     /// `loaded_packages` is extracted from the same `(tree, text)` pair.
-    fn new_with_kind(
+    pub(crate) fn new_with_kind(
         text: &str,
         version: Option<i32>,
         file_type: FileType,
@@ -305,16 +307,24 @@ impl Document {
     ) -> Self {
         let contents = Rope::from_str(text);
         // Mask Rmd/Quarto bodies so the R parser only sees real R code; plain R
-        // (and JAGS/Stan) keep their raw text. Routed through the shared
+        // JAGS keeps raw text; Stan masks recognized Raven directives. Routed through the shared
         // `masked_analysis_text` chokepoint so this and the open-document authority can
         // never derive divergent analysis views.
-        let masked_text = crate::cross_file::masked_analysis_text(chunk_kind, text);
+        let masked_text = analysis_mask(chunk_kind, file_type, text);
         let analysis_text = masked_text.as_deref().unwrap_or(text);
         let tree = parse_document_text(analysis_text, file_type);
         // Extract from the SAME text the tree was parsed from, so `library()`
         // calls inside chunks are found and prose mentions are not.
-        let loaded_packages = extract_loaded_packages(&tree, analysis_text);
-        let data_packages = extract_data_packages(&tree, analysis_text);
+        let loaded_packages = if file_type == FileType::Stan {
+            Vec::new()
+        } else {
+            extract_loaded_packages(&tree, analysis_text)
+        };
+        let data_packages = if file_type == FileType::Stan {
+            Vec::new()
+        } else {
+            extract_data_packages(&tree, analysis_text)
+        };
         Self {
             contents,
             tree,
@@ -396,13 +406,19 @@ impl Document {
         // change is acceptable: tree-sitter is fast, and incremental masking is
         // a future optimization. (Plain R already reparses from scratch here,
         // so this is not a regression for the common case.)
-        self.masked_text = crate::cross_file::masked_analysis_text(self.chunk_kind, &raw_text);
-        // `Some(masked)` for Rmd, `None` for plain R (analysis text == raw text).
+        self.masked_text = analysis_mask(self.chunk_kind, self.file_type, &raw_text);
+        // `Some(masked)` for Rmd or directive-bearing Stan, `None` when the
+        // analysis text equals raw source.
         let analysis_text = self.masked_text.as_deref().unwrap_or(&raw_text);
 
         self.tree = parse_document_text(analysis_text, self.file_type);
-        self.loaded_packages = extract_loaded_packages(&self.tree, analysis_text);
-        self.data_packages = extract_data_packages(&self.tree, analysis_text);
+        if self.file_type == FileType::Stan {
+            self.loaded_packages.clear();
+            self.data_packages.clear();
+        } else {
+            self.loaded_packages = extract_loaded_packages(&self.tree, analysis_text);
+            self.data_packages = extract_data_packages(&self.tree, analysis_text);
+        }
     }
 
     pub fn text(&self) -> String {
@@ -410,18 +426,57 @@ impl Document {
     }
 
     /// The text the [`tree`](Document::tree) was parsed from: the masked
-    /// analysis text for Rmd/Quarto documents, the raw text otherwise.
+    /// analysis text for Rmd/Quarto and directive-bearing Stan documents, the
+    /// raw text otherwise.
     ///
     /// Use this — never [`text()`](Document::text) — whenever you slice the
     /// document by byte offsets taken from `tree` (e.g. `node.byte_range()` /
-    /// `node.utf8_text(...)`). For plain R / JAGS / Stan this equals `text()`,
-    /// so the choice is behavior-neutral there. See the [`Document`] type docs
-    /// for the full raw-vs-analysis invariant.
+    /// `node.utf8_text(...)`). For plain R and JAGS this equals `text()`; Stan
+    /// differs only on recognized full-line Raven directives. See the
+    /// [`Document`] type docs for the full raw-vs-analysis invariant.
     pub fn analysis_text(&self) -> String {
         match &self.masked_text {
             Some(masked) => masked.clone(),
             None => self.contents.to_string(),
         }
+    }
+
+    /// Derive R cross-file metadata only for languages whose existing parser
+    /// contract is R-based. Stan owns a different grammar and deliberately
+    /// contributes no R scope, packages, sources, or directives.
+    pub(crate) fn cross_file_metadata(&self) -> crate::cross_file::CrossFileMetadata {
+        if self.file_type == FileType::Stan {
+            crate::cross_file::CrossFileMetadata::default()
+        } else {
+            crate::cross_file::extract_metadata_from_analysis_for_kind(
+                self.chunk_kind,
+                &self.analysis_text(),
+            )
+        }
+    }
+
+    /// Compute metadata-dependent R scope artifacts, or an inert artifact set
+    /// for Stan. This is the shared language boundary for open and closed
+    /// document authorities.
+    pub(crate) fn cross_file_artifacts(
+        &self,
+        uri: &Url,
+        metadata: &crate::cross_file::CrossFileMetadata,
+    ) -> crate::cross_file::scope::ScopeArtifacts {
+        if self.file_type == FileType::Stan {
+            return crate::cross_file::scope::ScopeArtifacts::default();
+        }
+        let analysis_text = self.analysis_text();
+        self.tree
+            .as_ref()
+            .map_or_else(crate::cross_file::scope::ScopeArtifacts::default, |tree| {
+                crate::cross_file::scope::compute_artifacts_with_metadata(
+                    uri,
+                    tree,
+                    &analysis_text,
+                    Some(metadata),
+                )
+            })
     }
 
     /// True when the document is an R Markdown / Quarto document.
@@ -452,14 +507,15 @@ pub(crate) fn document_from_workspace_entry(
     entry: &crate::workspace_index::IndexEntry,
     chunk_kind: ChunkKind,
 ) -> Document {
-    let masked_text = (chunk_kind == ChunkKind::Rmd)
-        .then(|| crate::chunks::mask_to_r(&entry.contents.to_string()));
+    let file_type = file_type_from_uri(uri);
+    let raw_text = entry.contents.to_string();
+    let masked_text = analysis_mask(chunk_kind, file_type, &raw_text);
     Document {
         contents: entry.contents.clone(),
         tree: entry.tree.clone(),
         loaded_packages: entry.loaded_packages.clone(),
         data_packages: entry.data_packages.clone(),
-        file_type: file_type_from_uri(uri),
+        file_type,
         chunk_kind,
         masked_text,
         version: None,
@@ -648,6 +704,14 @@ fn parse_r_text(text: &str) -> Option<Tree> {
     parser.parse(text, None)
 }
 
+/// Derive the byte/line-aligned source view used by the file type's parser.
+fn analysis_mask(chunk_kind: ChunkKind, file_type: FileType, text: &str) -> Option<String> {
+    match file_type {
+        FileType::Stan => crate::stan::mask_raven_directives(text),
+        FileType::R | FileType::Jags => crate::cross_file::masked_analysis_text(chunk_kind, text),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Per-test-thread parse counter used to pin the single-parse batch-edit
@@ -655,15 +719,15 @@ thread_local! {
     static DOCUMENT_PARSE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Parse `text` (the analysis text — masked for Rmd, raw otherwise) into a
-/// tree-sitter tree appropriate for `file_type`. All current file types parse
-/// with the R grammar.
+/// Parse `text` (the already-prepared analysis text) into a
+/// tree-sitter tree appropriate for `file_type`.
 fn parse_document_text(text: &str, file_type: FileType) -> Option<Tree> {
     #[cfg(test)]
     DOCUMENT_PARSE_COUNT.with(|count| count.set(count.get().wrapping_add(1)));
 
     match file_type {
-        FileType::R | FileType::Jags | FileType::Stan => parse_r_text(text),
+        FileType::R | FileType::Jags => parse_r_text(text),
+        FileType::Stan => crate::stan::parse(text),
     }
 }
 
@@ -3207,6 +3271,7 @@ pub(crate) struct CapturedOpenMetadataAnalysis {
     pub(crate) uri: Url,
     pub(crate) expected: AnalysisGeneration,
     pub(crate) chunk_kind: ChunkKind,
+    pub(crate) file_type: FileType,
     pub(crate) analysis_text: String,
     pub(crate) old_metadata: Arc<crate::cross_file::CrossFileMetadata>,
     pub(crate) workspace_root: Option<Url>,
@@ -8108,11 +8173,7 @@ impl WorldState {
         // cache invalidation) are skipped because open docs are
         // authoritative. No reader consults this cache for open documents.
         let document = Document::new_with_language_id(text, version, &uri, language_id);
-        let analysis_text = document.analysis_text();
-        let metadata = Arc::new(crate::cross_file::extract_metadata_from_analysis_for_kind(
-            document.chunk_kind,
-            &analysis_text,
-        ));
+        let metadata = Arc::new(document.cross_file_metadata());
         let lifecycle_epoch = self.diagnostics_gate.current_epoch(&uri);
         self.install_open_document(uri, document, metadata, lifecycle_epoch);
     }
@@ -8207,7 +8268,14 @@ impl WorldState {
         uri: &Url,
         content: &str,
     ) -> crate::cross_file::CrossFileMetadata {
-        crate::cross_file::extract_metadata_for_kind(self.chunk_kind_for_closed_file(uri), content)
+        if file_type_from_uri(uri) == FileType::Stan {
+            crate::cross_file::CrossFileMetadata::default()
+        } else {
+            crate::cross_file::extract_metadata_for_kind(
+                self.chunk_kind_for_closed_file(uri),
+                content,
+            )
+        }
     }
 
     /// Prepare one ordered LSP notification batch against the current record.
@@ -8596,6 +8664,7 @@ impl WorldState {
             uri: uri.clone(),
             expected,
             chunk_kind: record.document().chunk_kind,
+            file_type: record.document().file_type,
             analysis_text: record.document().analysis_text(),
             old_metadata: record.metadata().clone(),
             workspace_root: self.workspace_folders.first().cloned(),
@@ -10414,10 +10483,9 @@ impl WorldState {
         {
             // Parse from `analysis_text()`: masked for Rmd/Quarto (so a
             // `# raven: cd` in prose is ignored while one inside a chunk is a
-            // real directive), raw for everything else (behavior-neutral).
-            return Some(Arc::new(crate::cross_file::directive::parse_directives(
-                &doc.analysis_text(),
-            )));
+            // real directive); Stan uses its own geometry-preserving directive
+            // mask and contributes no R metadata.
+            return Some(Arc::new(doc.cross_file_metadata()));
         }
         if let Some(meta) = self.workspace_index.get_metadata(uri) {
             return Some(meta);
@@ -10461,12 +10529,9 @@ impl WorldState {
                     .get_record(&open_uri)
                     .map(|record| record.metadata().clone())
                     .or_else(|| {
-                        self.documents.get(&open_uri).map(|doc| {
-                            Arc::new(crate::cross_file::extract_metadata_from_analysis_for_kind(
-                                doc.chunk_kind,
-                                &doc.analysis_text(),
-                            ))
-                        })
+                        self.documents
+                            .get(&open_uri)
+                            .map(|doc| Arc::new(doc.cross_file_metadata()))
                     })
             })
             .or_else(|| self.workspace_index.get_metadata(uri))
@@ -11150,8 +11215,6 @@ impl WorldState {
         external_uris.sort();
         external_uris.dedup();
 
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok();
         let mut tar_watch_parents = Vec::new();
 
         for uri in external_uris {
@@ -11169,32 +11232,17 @@ impl WorldState {
             };
 
             let chunk_kind = self.chunk_kind_for_closed_file(&uri);
-            let analysis = crate::cross_file::analysis_text_for_kind(chunk_kind, &content);
-            let tree = parser.parse(analysis.as_ref(), None);
-            let metadata = Arc::new(crate::cross_file::extract_metadata_from_analysis_for_kind(
-                chunk_kind, &analysis,
-            ));
-            let artifacts = tree.as_ref().map_or_else(
-                || Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
-                |t| {
-                    Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
-                        &uri,
-                        t,
-                        &analysis,
-                        Some(&metadata),
-                    ))
-                },
-            );
+            let document =
+                Document::new_with_kind(&content, None, file_type_from_uri(&uri), chunk_kind);
+            let metadata = Arc::new(document.cross_file_metadata());
+            let artifacts = Arc::new(document.cross_file_artifacts(&uri, &metadata));
             let snapshot =
                 crate::cross_file::file_cache::FileSnapshot::with_content_hash(&fs_meta, &content);
-            let loaded_packages = extract_loaded_packages(&tree, &analysis);
-            let data_packages = extract_data_packages(&tree, &analysis);
-
             let entry = crate::workspace_index::IndexEntry {
                 contents: Rope::from_str(&content),
-                tree,
-                loaded_packages,
-                data_packages,
+                tree: document.tree,
+                loaded_packages: document.loaded_packages,
+                data_packages: document.data_packages,
                 snapshot,
                 metadata,
                 artifacts,
@@ -11407,8 +11455,6 @@ pub(crate) fn prepare_system_file_analysis(
         .collect();
     removals.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
 
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok();
     let mut installs = Vec::new();
     let mut content_changed_uris = HashSet::new();
     let mut missing_targets: Vec<_> = referenced_targets
@@ -11468,31 +11514,23 @@ pub(crate) fn prepare_system_file_analysis(
             continue;
         };
         let content = content.clone();
-        let tree = parser.parse(&content, None);
-        let mut metadata = crate::cross_file::extract_metadata(&content);
-        crate::cross_file::resolve_system_file_source_entries(
-            &mut metadata.sources,
-            basis.routing.workspace_name.as_deref(),
-            basis.routing.workspace_root.as_deref(),
-            &basis.routing.library_paths,
-        );
+        let document = Document::new_with_uri(&content, None, &uri);
+        let mut metadata = document.cross_file_metadata();
+        if document.file_type != FileType::Stan {
+            crate::cross_file::resolve_system_file_source_entries(
+                &mut metadata.sources,
+                basis.routing.workspace_name.as_deref(),
+                basis.routing.workspace_root.as_deref(),
+                &basis.routing.library_paths,
+            );
+        }
         let metadata = Arc::new(metadata);
-        let artifacts = tree.as_ref().map_or_else(
-            || Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
-            |tree| {
-                Arc::new(crate::cross_file::scope::compute_artifacts_with_metadata(
-                    &uri,
-                    tree,
-                    &content,
-                    Some(&metadata),
-                ))
-            },
-        );
+        let artifacts = Arc::new(document.cross_file_artifacts(&uri, &metadata));
         let entry = IndexEntry {
             contents: Rope::from_str(&content),
-            loaded_packages: extract_loaded_packages(&tree, &content),
-            data_packages: extract_data_packages(&tree, &content),
-            tree,
+            loaded_packages: document.loaded_packages,
+            data_packages: document.data_packages,
+            tree: document.tree,
             snapshot: snapshot.clone(),
             metadata: metadata.clone(),
             artifacts,
@@ -11985,14 +12023,18 @@ pub(crate) fn derive_workspace_dependency_graph(
             );
         }
         let analysis = entry.contents.to_string();
-        entry.artifacts = Arc::new(match entry.tree.as_ref() {
-            Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
-                uri,
-                tree,
-                &analysis,
-                Some(entry.metadata.as_ref()),
-            ),
-            None => crate::cross_file::scope::ScopeArtifacts::default(),
+        entry.artifacts = Arc::new(if file_type_from_uri(uri) == FileType::Stan {
+            crate::cross_file::scope::ScopeArtifacts::default()
+        } else {
+            match entry.tree.as_ref() {
+                Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+                    uri,
+                    tree,
+                    &analysis,
+                    Some(entry.metadata.as_ref()),
+                ),
+                None => crate::cross_file::scope::ScopeArtifacts::default(),
+            }
         });
     }
     for (uri, metadata) in &mut open_metadata {
@@ -12382,29 +12424,14 @@ fn processed_workspace_document(
     doc: Document,
     snapshot: crate::cross_file::file_cache::FileSnapshot,
 ) -> ProcessedFile {
-    // Pair `doc.tree` with the analysis text it was parsed from (masked for
-    // Rmd/Quarto, raw otherwise) for both metadata extraction and artifact
-    // computation, so byte offsets align (#343). The scan currently never sees
-    // chunk files (`is_stat_model_extension` excludes Rmd/Quarto extensions),
-    // so this is behavior-neutral today; the pairing must stay
-    // analysis-consistent in case that ever changes — feeding raw `&text`
-    // against a masked tree would mis-slice (and panic on a non-UTF-8 boundary
-    // in multibyte prose).
-    let analysis_text = doc.analysis_text();
-
-    let cross_file_meta =
-        crate::cross_file::extract_metadata_from_analysis_for_kind(doc.chunk_kind, &analysis_text);
-
-    let artifacts = std::sync::Arc::new(if let Some(tree) = doc.tree.as_ref() {
-        crate::cross_file::scope::compute_artifacts_with_metadata(
-            &uri,
-            tree,
-            &analysis_text,
-            Some(&cross_file_meta),
-        )
-    } else {
-        crate::cross_file::scope::ScopeArtifacts::default()
-    });
+    // Pair `doc.tree` with the analysis text it was parsed from for both
+    // metadata extraction and artifact computation, so byte offsets align
+    // (#343). The scan excludes chunk documents but includes Stan; the shared
+    // document methods keep Stan inert and preserve its optional directive
+    // mask. The pairing must remain analysis-consistent if chunk scanning is
+    // ever added — feeding raw text against a masked tree can mis-slice.
+    let cross_file_meta = doc.cross_file_metadata();
+    let artifacts = std::sync::Arc::new(doc.cross_file_artifacts(&uri, &cross_file_meta));
 
     let cross_file_meta = Arc::new(cross_file_meta);
 
@@ -12590,14 +12617,18 @@ pub fn scan_workspace_with_exclusions(
             workspace_root.as_ref(),
         );
         let analysis = entry.contents.to_string();
-        entry.artifacts = Arc::new(match entry.tree.as_ref() {
-            Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
-                uri,
-                tree,
-                &analysis,
-                Some(entry.metadata.as_ref()),
-            ),
-            None => crate::cross_file::scope::ScopeArtifacts::default(),
+        entry.artifacts = Arc::new(if file_type_from_uri(uri) == FileType::Stan {
+            crate::cross_file::scope::ScopeArtifacts::default()
+        } else {
+            match entry.tree.as_ref() {
+                Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+                    uri,
+                    tree,
+                    &analysis,
+                    Some(entry.metadata.as_ref()),
+                ),
+                None => crate::cross_file::scope::ScopeArtifacts::default(),
+            }
         });
     }
 
@@ -14758,6 +14789,51 @@ tarchetypes::tar_render(nested, "nested.Rmd")
                 1,
                 "one didChange batch must rebuild the analysis tree once"
             );
+        });
+    }
+
+    #[test]
+    fn stan_document_parses_once_per_batch_and_diagnostics_reuse_the_tree() {
+        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
+        let mut document = Document::new_with_file_type(
+            "parameters { real x; }\nmodel { x ~ normal(0, 1); }\n",
+            Some(1),
+            FileType::Stan,
+        );
+        DOCUMENT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
+        document.apply_changes([
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 18), Position::new(0, 19))),
+                range_length: None,
+                text: "y".to_string(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 8), Position::new(1, 9))),
+                range_length: None,
+                text: "y".to_string(),
+            },
+        ]);
+        DOCUMENT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+
+        let uri = Url::parse("untitled:stan-parse-count").unwrap();
+        let mut state = WorldState::new();
+        state.open_document_with_language_id(uri.clone(), &document.text(), Some(2), Some("stan"));
+        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
+        let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &uri).unwrap();
+        let findings = crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            &uri,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .unwrap();
+        assert!(findings.is_empty());
+        DOCUMENT_PARSE_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "diagnostics must reuse the stored Stan tree"
+            )
         });
     }
 
@@ -17105,6 +17181,191 @@ tarchetypes::tar_render(nested, "nested.Rmd")
                 .get_dependencies(&parent)
                 .iter()
                 .any(|edge| edge.to == member && edge.tar_source_ordinal == Some(0))
+        );
+    }
+
+    #[test]
+    fn workspace_scan_uses_stan_tree_and_keeps_r_analysis_inert() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("model.StAn");
+        std::fs::write(
+            &path,
+            "# raven: source ignored-by-r-analysis.R\ndata { int N; }\nmodel {}\n",
+        )
+        .unwrap();
+        let root = Url::from_directory_path(temp.path()).unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let entries = scan_workspace(&[root], 10);
+        let entry = entries.get(&uri).expect("mixed-case Stan file is indexed");
+        assert_eq!(entry.tree.as_ref().unwrap().root_node().kind(), "program");
+        assert!(!entry.tree.as_ref().unwrap().root_node().has_error());
+        assert!(entry.metadata.sources.is_empty());
+        assert!(entry.metadata.sourced_by.is_empty());
+        assert!(entry.artifacts.exported_interface.is_empty());
+        assert!(entry.loaded_packages.is_empty());
+        assert!(entry.data_packages.is_empty());
+    }
+
+    #[test]
+    fn indexed_stan_document_reconstruction_preserves_masked_tree_text_pair() {
+        let uri = Url::parse("file:///workspace/model.stan").unwrap();
+        let raw = "\u{feff}# raven: source helper.R\r\ndata { int N }\r\nmodel {}\r\n";
+        let document = Document::new_with_uri(raw, None, &uri);
+        let metadata = Arc::new(document.cross_file_metadata());
+        let artifacts = Arc::new(document.cross_file_artifacts(&uri, &metadata));
+        let entry = crate::workspace_index::IndexEntry {
+            contents: document.contents.clone(),
+            tree: document.tree.clone(),
+            loaded_packages: document.loaded_packages.clone(),
+            data_packages: document.data_packages.clone(),
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: raw.len() as u64,
+                content_hash: Some(1),
+            },
+            metadata,
+            artifacts,
+            indexed_at_version: 0,
+        };
+
+        let reconstructed = document_from_workspace_entry(&uri, &entry, ChunkKind::R);
+        assert_eq!(reconstructed.analysis_text(), document.analysis_text());
+        assert_eq!(
+            reconstructed.tree.as_ref().unwrap().root_node().to_sexp(),
+            document.tree.as_ref().unwrap().root_node().to_sexp()
+        );
+
+        let mut open_state = WorldState::new();
+        open_state.workspace_scan_complete = true;
+        open_state.documents.insert(uri.clone(), document);
+        let open_findings = crate::handlers::diagnostics(
+            &open_state,
+            &uri,
+            &crate::handlers::DiagCancelToken::never(),
+        );
+        let mut closed_state = WorldState::new();
+        closed_state.workspace_scan_complete = true;
+        closed_state.workspace_index.insert(uri.clone(), entry);
+        closed_state.documents.insert(uri.clone(), reconstructed);
+        let closed_findings = crate::handlers::diagnostics(
+            &closed_state,
+            &uri,
+            &crate::handlers::DiagCancelToken::never(),
+        );
+        assert_eq!(closed_findings, open_findings);
+        assert!(!closed_findings.is_empty());
+    }
+
+    #[test]
+    fn synchronous_dynamic_materialization_keeps_stan_analysis_inert() {
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        use crate::workspace_index::IndexEntry;
+
+        let temp = tempfile::tempdir().unwrap();
+        let model_path = temp.path().join("dynamic.stan");
+        std::fs::write(&model_path, "data { int N }\nmodel {}\n").unwrap();
+        let model_uri = Url::from_file_path(&model_path).unwrap();
+        let source_uri = Url::parse("file:///workspace/source.R").unwrap();
+        let source_entry = IndexEntry {
+            contents: Rope::from_str("source(system.file('dynamic.stan', package='p'))\n"),
+            tree: None,
+            loaded_packages: Vec::new(),
+            data_packages: Vec::new(),
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: Some(1),
+            },
+            metadata: Arc::new(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    resolved_uri: Some(model_uri.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            artifacts: Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+            indexed_at_version: 0,
+        };
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.workspace_index.insert(source_uri, source_entry);
+        state.index_cross_package_resolved_files();
+
+        let document = {
+            let entry = state.workspace_index.get(&model_uri).unwrap();
+            assert_eq!(entry.tree.as_ref().unwrap().root_node().kind(), "program");
+            assert!(entry.metadata.sources.is_empty());
+            assert!(entry.metadata.working_directory.is_none());
+            assert!(entry.artifacts.exported_interface.is_empty());
+            assert!(entry.loaded_packages.is_empty());
+            assert!(entry.data_packages.is_empty());
+            document_from_workspace_entry(&model_uri, &entry, ChunkKind::R)
+        };
+        let mut diagnostic_state = WorldState::new();
+        diagnostic_state.workspace_scan_complete = true;
+        diagnostic_state
+            .documents
+            .insert(model_uri.clone(), document);
+        assert!(
+            !crate::handlers::diagnostics(
+                &diagnostic_state,
+                &model_uri,
+                &crate::handlers::DiagCancelToken::never()
+            )
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_dynamic_materialization_keeps_stan_analysis_inert() {
+        let library = tempfile::tempdir().unwrap();
+        let package = library.path().join("otherpkg");
+        std::fs::create_dir_all(&package).unwrap();
+        let model_path = package.join("dynamic.stan");
+        std::fs::write(&model_path, "data { int N }\nmodel {}\n").unwrap();
+        let model_uri = Url::from_file_path(&model_path).unwrap();
+        let source = Url::parse("file:///workspace/source.R").unwrap();
+        let text = "source(system.file('dynamic.stan', package = 'otherpkg'))\n";
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.open_document(source.clone(), text, Some(1));
+        let generation = state.documents.get_record(&source).unwrap().generation();
+        state
+            .replace_open_document_metadata_if_current(
+                &source,
+                generation,
+                Arc::new(crate::cross_file::extract_metadata(text)),
+            )
+            .unwrap();
+        let mut package_library = crate::package_library::PackageLibrary::new_empty();
+        package_library.set_lib_paths(vec![library.path().to_path_buf()]);
+        state.install_package_library(Arc::new(package_library), true);
+
+        crate::backend::run_system_file_convergence_for_test(&mut state, None)
+            .await
+            .expect("Stan dynamic target materialization commits");
+        let document = {
+            let entry = state.workspace_index.get(&model_uri).unwrap();
+            assert_eq!(entry.tree.as_ref().unwrap().root_node().kind(), "program");
+            assert!(entry.metadata.sources.is_empty());
+            assert!(entry.metadata.working_directory.is_none());
+            assert!(entry.artifacts.exported_interface.is_empty());
+            assert!(entry.loaded_packages.is_empty());
+            assert!(entry.data_packages.is_empty());
+            document_from_workspace_entry(&model_uri, &entry, ChunkKind::R)
+        };
+        let mut diagnostic_state = WorldState::new();
+        diagnostic_state.workspace_scan_complete = true;
+        diagnostic_state
+            .documents
+            .insert(model_uri.clone(), document);
+        assert!(
+            !crate::handlers::diagnostics(
+                &diagnostic_state,
+                &model_uri,
+                &crate::handlers::DiagCancelToken::never()
+            )
+            .is_empty()
         );
     }
 }

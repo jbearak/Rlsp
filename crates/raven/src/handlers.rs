@@ -66,6 +66,180 @@ impl DiagCancelToken {
     }
 }
 
+#[cfg(test)]
+mod stan_syntax_diagnostic_tests {
+    use super::*;
+
+    fn diagnostics_for(code: &str) -> Vec<Diagnostic> {
+        let uri = Url::parse("untitled:stan-syntax-test").unwrap();
+        let mut state = WorldState::new();
+        state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("Stan snapshot");
+        diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("not cancelled")
+    }
+
+    #[test]
+    fn valid_stan_has_no_diagnostics() {
+        let code = r#"functions {
+  real twice(real x) { return 2 * x; }
+}
+data { int<lower=0> N; array[N] real y; }
+parameters { real mu; real<lower=0> sigma; }
+model {
+  for (n in 1:N) y[n] ~ normal(mu, sigma);
+}
+generated quantities { real z = twice(mu); }
+"#;
+        assert!(diagnostics_for(code).is_empty());
+    }
+
+    #[test]
+    fn stan_reports_syntax_errors_with_stable_code_and_ranges() {
+        let code = "data { int N }\nmodel { target += normal_lpdf(😀 | 0, 1) }\n";
+        let first = diagnostics_for(code);
+        let second = diagnostics_for(code);
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+        for diagnostic in &first {
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(
+                diagnostic.code,
+                Some(NumberOrString::String("syntax-error".to_string()))
+            );
+            let line = code
+                .lines()
+                .nth(diagnostic.range.start.line as usize)
+                .unwrap();
+            assert!(diagnostic.range.start.character <= utf16_len(line));
+            assert!(diagnostic.range.end.character <= utf16_len(line));
+        }
+        for pair in first.windows(2) {
+            assert!(
+                pair[0].range != pair[1].range || pair[0].message != pair[1].message,
+                "duplicate Stan diagnostic: {:?}",
+                pair[0]
+            );
+        }
+    }
+
+    #[test]
+    fn raven_directives_are_masked_but_unknown_hash_lines_are_diagnosed() {
+        assert!(
+            diagnostics_for("# raven: source helper.R\nmodel {}\n").is_empty(),
+            "recognized full-line Raven directives are a Stan syntax extension"
+        );
+        assert!(!diagnostics_for("# raven: made-up value\nmodel {}\n").is_empty());
+    }
+
+    #[test]
+    fn syntax_only_semantic_failures_stay_silent() {
+        let code = "parameters { real x; } model { x ~ not_a_distribution(unknown); }\n";
+        assert!(diagnostics_for(code).is_empty());
+    }
+
+    #[test]
+    fn stan_ranges_stay_valid_for_crlf_astral_text_and_eof_recovery() {
+        let code = "// 😀\r\ndata { int N; }\r\nmodel { target += normal_lpdf(N | 0, 1)\r\n";
+        let findings = diagnostics_for(code);
+        assert!(!findings.is_empty());
+        let lines: Vec<&str> = code.split("\r\n").collect();
+        for diagnostic in findings {
+            let line = lines
+                .get(diagnostic.range.start.line as usize)
+                .copied()
+                .unwrap_or("");
+            let width = utf16_len(line);
+            assert!(diagnostic.range.start.character <= width);
+            assert!(diagnostic.range.end.character <= width);
+        }
+    }
+
+    #[test]
+    fn cancelled_stan_collection_aborts_without_partial_diagnostics() {
+        let code = "data { int N }\nmodel { target += ; }\n";
+        let uri = Url::parse("untitled:cancelled-stan-syntax-test").unwrap();
+        let mut state = WorldState::new();
+        state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("Stan snapshot");
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        assert!(
+            diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::from_token(token))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn master_diagnostics_switch_disables_stan_syntax_diagnostics() {
+        let code = "data { int N }\n";
+        let uri = Url::parse("untitled:disabled-stan-syntax-test").unwrap();
+        let mut state = WorldState::new();
+        state.cross_file_config.diagnostics_enabled = false;
+        state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
+        assert!(diagnostics(&state, &uri, &DiagCancelToken::never()).is_empty());
+    }
+
+    #[test]
+    fn stan_raven_path_navigation_preserves_directive_working_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let include_dir = temp.path().join("includes");
+        std::fs::create_dir(&include_dir).unwrap();
+        let helper = include_dir.join("helper.R");
+        std::fs::write(&helper, "helper <- 1\n").unwrap();
+        let model = temp.path().join("model.stan");
+        let code = "# raven: cd includes\n# raven: source helper.R\nmodel {}\n";
+        std::fs::write(&model, code).unwrap();
+
+        let uri = Url::from_file_path(&model).unwrap();
+        let helper_uri = Url::from_file_path(&helper).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::from_directory_path(temp.path()).unwrap()];
+        state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
+
+        let response = goto_definition_with_cancel(
+            &state,
+            &uri,
+            Position::new(1, 20),
+            &DiagCancelToken::never(),
+        )
+        .expect("Stan Raven directive path must remain navigable");
+        let GotoDefinitionResponse::Scalar(location) = response else {
+            panic!("expected one directive target")
+        };
+        assert_eq!(location.uri, helper_uri);
+    }
+
+    #[tokio::test]
+    async fn jags_hover_preserves_prior_inert_behavior() {
+        let uri = Url::parse("file:///model.jags").unwrap();
+        let mut state = WorldState::new();
+        state.open_document_with_language_id(
+            uri.clone(),
+            "mean <- function(x) x\nmean(1)\n",
+            Some(1),
+            Some("jags"),
+        );
+        assert!(hover(&state, &uri, Position::new(1, 1)).await.is_none());
+    }
+
+    #[test]
+    fn jags_signature_help_preserves_r_compatible_parser_path() {
+        let uri = Url::parse("file:///model.jags").unwrap();
+        let mut state = WorldState::new();
+        state.open_document_with_language_id(
+            uri.clone(),
+            "helper <- function(x, y) x\nhelper(1, 2)\n",
+            Some(1),
+            Some("jags"),
+        );
+        assert!(
+            prepare_signature_help(&state, &uri, Position::new(1, 10)).is_some(),
+            "JAGS signature help historically follows the R-compatible tree path"
+        );
+    }
+}
+
 fn reference_class_field_accessor_matches(field: &str, name: &str) -> bool {
     let mut chars = field.chars();
     let Some(first) = chars.next() else {
@@ -95,12 +269,11 @@ pub(crate) fn empty_base_exports() -> &'static Arc<HashSet<String>> {
 pub(crate) struct DiagnosticsSnapshot {
     // Document data
     pub tree: tree_sitter::Tree,
-    /// Analysis text — `doc.analysis_text()`, the masked text for Rmd/Quarto
-    /// documents and the raw text for everything else. Paired with `tree`,
+    /// Analysis text — `doc.analysis_text()`, including any Rmd/Quarto or Stan
+    /// directive mask. Paired with `tree`,
     /// whose byte offsets reference this exact text (never `doc.text()`); the
     /// two MUST stay consistent so every diagnostic range is a valid document
-    /// coordinate. For plain R / JAGS / Stan this equals the raw text, so the
-    /// choice is behavior-neutral there. See the [`crate::state::Document`]
+    /// coordinate. See the [`crate::state::Document`]
     /// type docs for the full raw-vs-analysis invariant.
     pub text: String,
     // Cross-file state (pre-collected)
@@ -489,10 +662,46 @@ impl DiagnosticsSnapshot {
         let build_start = std::time::Instant::now();
         let doc = open_documents.document(uri)?;
         let tree = doc.tree.as_ref()?.clone();
-        // Analysis text (masked for Rmd/Quarto, raw otherwise). `tree` was
+        // Analysis text (masked for Rmd/Quarto or Stan directives when needed). `tree` was
         // parsed from this exact text, so the two stay consistent and every
         // diagnostic range is a valid document coordinate.
         let text = doc.analysis_text();
+
+        // Stan diagnostics need only the language-correct tree, its aligned
+        // analysis text, cancellation, and the master diagnostics switch.
+        // Construct the same snapshot type with inert R-specific fields so no
+        // R metadata, scope, graph, package, or lint analyzer can consume a
+        // Stan tree. This also keeps the syntax-only path cheap for large
+        // models without introducing a second snapshot architecture.
+        if doc.file_type == FileType::Stan {
+            return Some(DiagnosticsSnapshot {
+                tree,
+                text,
+                directive_meta: Default::default(),
+                cross_file_config: state.cross_file_config.clone(),
+                lint_config: Default::default(),
+                indentation_producer_policy: None,
+                cross_file_graph: Arc::new(crate::cross_file::dependency::DependencyGraph::new()),
+                cross_file_neighborhood_truncated: false,
+                workspace_folders: state.workspace_folders.clone(),
+                base_exports: empty_base_exports().clone(),
+                package_library_ready: false,
+                workspace_scan_complete: state.workspace_scan_complete,
+                any_nse_or_func_directives: false,
+                artifacts_map: HashMap::new(),
+                metadata_map: HashMap::new(),
+                target_authority_names: None,
+                cycle_detection: None,
+                cycle_closing_snippet: None,
+                package_library: state.package_library.clone(),
+                file_type: FileType::Stan,
+                rmd_declared_params: false,
+                parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
+                scope_contribution: Default::default(),
+                package_query_uri: None,
+                standalone_ctx: None,
+            });
+        }
         // Detect a `params:` frontmatter declaration on the RAW text (the
         // analysis `text` above is masked, so its YAML frontmatter is blanked
         // and would never reveal `params:`). Only Rmd/Quarto documents carry a
@@ -824,11 +1033,14 @@ pub(crate) fn diagnostics_from_snapshot(
         return Some(Vec::new());
     }
 
-    // Suppress diagnostics for non-R files (JAGS, Stan)
-    // Use snapshot.file_type (from document) instead of URI-based detection,
-    // so untitled buffers with languageId "jags"/"stan" are correctly identified.
-    if snapshot.file_type != FileType::R {
-        return Some(Vec::new());
+    // Dispatch from the document's language identity, not the URI extension:
+    // untitled Stan buffers carry their type only through `languageId`.
+    match snapshot.file_type {
+        FileType::Stan => {
+            return collect_stan_syntax_errors(snapshot.tree.root_node(), &snapshot.text, cancel);
+        }
+        FileType::Jags => return Some(Vec::new()),
+        FileType::R => {}
     }
 
     // Rmd/Quarto documents are diagnosed against their MASKED analysis text
@@ -3155,7 +3367,8 @@ impl<'a> SymbolExtractor<'a> {
         let body_end = body
             .map(|body| body.end_position())
             .unwrap_or_else(|| node.end_position());
-        let body_is_braced = body.is_some_and(|body| body.kind() == "brace_list");
+        let body_is_braced =
+            body.is_some_and(|body| matches!(body.kind(), "brace_list" | "block_statement"));
         let raw_header = extract_header(node, self.text);
         let header = raw_header
             .trim()
@@ -4084,6 +4297,25 @@ pub fn folding_range(state: &WorldState, uri: &Url) -> Option<Vec<FoldingRange>>
 
     collect_folding_ranges(tree.root_node(), &mut ranges);
 
+    // A Stan top-level block and its `block_statement` share a range. Keep the
+    // existing R/JAGS ordering untouched and remove only these Stan duplicates.
+    if doc.file_type == FileType::Stan {
+        ranges.sort_by_key(|range| {
+            (
+                range.start_line,
+                range.start_character,
+                range.end_line,
+                range.end_character,
+            )
+        });
+        ranges.dedup_by(|left, right| {
+            left.start_line == right.start_line
+                && left.start_character == right.start_character
+                && left.end_line == right.end_line
+                && left.end_character == right.end_character
+        });
+    }
+
     Some(ranges)
 }
 
@@ -4093,7 +4325,19 @@ fn collect_folding_ranges(node: Node, ranges: &mut Vec<FoldingRange>) {
     // Fold braced expressions, function definitions, and control structures
     let should_fold = matches!(
         kind,
-        "brace_list" | "function_definition" | "if_statement" | "for_statement" | "while_statement"
+        "brace_list"
+            | "block_statement"
+            | "function_definition"
+            | "if_statement"
+            | "for_statement"
+            | "while_statement"
+            | "functions"
+            | "data"
+            | "transformed_data"
+            | "parameters"
+            | "transformed_parameters"
+            | "model"
+            | "generated_quantities"
     );
 
     if should_fold && node.start_position().row != node.end_position().row {
@@ -4128,6 +4372,7 @@ pub fn selection_range(
 
     // Byte offsets from `tree` index into the analysis text (masked for Rmd).
     let text = doc.analysis_text();
+
     // For Rmd, a prose position maps to a blank masked line, where
     // `descendant_for_point_range` would return the document root and surface a
     // nonsensical whole-document selection. Restrict to chunk-body positions
@@ -4493,16 +4738,16 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
     // The analysis text is what `tree` was parsed from, so AST symbol extraction
     // (which slices by `tree` byte offsets) must use it. The text-based detectors
     // (chunk fences, `# %%` cells, section dividers, Stan/JAGS block scanning)
-    // must see the verbatim document. For plain R / JAGS / Stan the two are
-    // identical, so a single `analysis_text` binding serves both roles there;
-    // only Rmd/Quarto differ (analysis text is the masked R body), and only the
-    // R branch below materializes the raw text in that case.
+    // normally need the verbatim document. Stan's analysis mask differs only
+    // on Raven directives, which none of its outline detectors should expose;
+    // a single `analysis_text` binding therefore serves both roles. Only the R
+    // branch below materializes raw text for Rmd/Quarto.
     let analysis_text = doc.analysis_text();
 
     let raw_symbols = match doc.file_type {
         FileType::Stan => {
-            // Stan is never an Rmd document, so `analysis_text` is the verbatim
-            // text and serves the raw-text detectors too.
+            // Masked Raven directive lines intentionally remain invisible to
+            // Stan's text-based outline detectors.
             let extractor = SymbolExtractor::new(&analysis_text, tree.root_node());
             let mut raw_symbols =
                 extractor.extract_decorative_sections(ModelCommentStyle::DoubleSlash);
@@ -5033,8 +5278,9 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
         return Vec::new();
     }
 
-    // Suppress diagnostics for non-R files (JAGS, Stan)
-    if document_file_type(state, uri) != FileType::R {
+    // JAGS keeps its historical no-diagnostics behavior. Stan has a dedicated
+    // syntax-only path inside `diagnostics_from_snapshot`.
+    if document_file_type(state, uri) == FileType::Jags {
         return Vec::new();
     }
 
@@ -10041,6 +10287,157 @@ fn minimize_error_range(node: Node, text: &str) -> Range {
 fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
     let mut state = CollectState::default();
     collect_syntax_errors_inner(node, text, diagnostics, &mut state);
+}
+
+/// Collect syntax-only diagnostics from a tree-sitter-stan tree.
+///
+/// Recovery subtrees often contain several nested `ERROR` nodes for one typo.
+/// Raven reports only the outer node, while still letting
+/// [`minimize_error_range`] use a nested `MISSING` node as its anchor. This
+/// keeps malformed blocks visible without cascading across otherwise-valid
+/// declarations. Standalone `MISSING` nodes are reported independently.
+fn collect_stan_syntax_errors(
+    root: Node,
+    text: &str,
+    cancel: &DiagCancelToken,
+) -> Option<Vec<Diagnostic>> {
+    let mut diagnostics = Vec::new();
+    let mut stack = vec![root];
+
+    while let Some(node) = stack.pop() {
+        if cancel.is_cancelled() {
+            return None;
+        }
+
+        // tree-sitter-stan 0.3.1 represents a bare `#include` as a
+        // well-formed `preproc_include` containing a zero-width
+        // `preproc_file`, while stanc3 correctly rejects the missing required
+        // path as syntax. This single structural compatibility check closes
+        // that known grammar gap without resolving or reading includes.
+        if node.kind() == "preproc_include"
+            && let Some(file) = node.child_by_field_name("file")
+            && file.start_byte() == file.end_byte()
+        {
+            let (row, col) = anchor_missing_position(
+                file.start_position().row,
+                file.start_position().column,
+                node.start_position().row,
+                file.start_byte(),
+                text,
+            );
+            diagnostics.push(Diagnostic {
+                range: visible_anchor_range(text, row, col),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                )),
+                message: "Stan code could not be parsed here".to_string(),
+                ..Default::default()
+            });
+            continue;
+        }
+
+        if node.is_error() {
+            let range = clamp_stan_diagnostic_range(text, minimize_error_range(node, text));
+            diagnostics.push(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                )),
+                message: "Stan code could not be parsed here".to_string(),
+                ..Default::default()
+            });
+            // The range helper inspected nested MISSING nodes. Do not recurse:
+            // nested recovery errors describe the same outer parse failure.
+            continue;
+        }
+
+        if node.is_missing() {
+            let (row, col) = anchor_missing_position(
+                node.start_position().row,
+                node.start_position().column,
+                0,
+                node.start_byte(),
+                text,
+            );
+            let kind = node.kind();
+            let message = if matches!(kind, ";" | "," | ")" | "]" | "}" | "in" | "else" | "while") {
+                format!("Missing {kind} in Stan code")
+            } else {
+                "Stan code could not be parsed here".to_string()
+            };
+            diagnostics.push(Diagnostic {
+                range: visible_anchor_range(text, row, col),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String(
+                    crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                )),
+                message,
+                ..Default::default()
+            });
+            continue;
+        }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+
+    diagnostics.sort_by(|left, right| {
+        (
+            left.range.start.line,
+            left.range.start.character,
+            left.range.end.line,
+            left.range.end.character,
+        )
+            .cmp(&(
+                right.range.start.line,
+                right.range.start.character,
+                right.range.end.line,
+                right.range.end.character,
+            ))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    diagnostics.dedup_by(|left, right| left.range == right.range && left.message == right.message);
+    Some(diagnostics)
+}
+
+/// Make a zero-width parser insertion visible without extending beyond the
+/// source line. LSP permits an empty range for an empty line/file; everywhere
+/// else one UTF-16 code unit is highlighted at, or immediately before, the
+/// requested anchor.
+fn visible_anchor_range(text: &str, row: u32, column: u32) -> Range {
+    let line = text.lines().nth(row as usize).unwrap_or("");
+    let width = utf16_len(line);
+    let start = column.min(width);
+    let (start, end) = if start < width {
+        (start, start + 1)
+    } else if width > 0 {
+        (width - 1, width)
+    } else {
+        (0, 0)
+    };
+    Range::new(Position::new(row, start), Position::new(row, end))
+}
+
+fn clamp_stan_diagnostic_range(text: &str, range: Range) -> Range {
+    let line = text.lines().nth(range.start.line as usize).unwrap_or("");
+    let width = utf16_len(line);
+    let start = range.start.character.min(width);
+    let end = if range.end.line == range.start.line {
+        range.end.character.min(width)
+    } else {
+        width
+    };
+    if end > start {
+        Range::new(
+            Position::new(range.start.line, start),
+            Position::new(range.start.line, end),
+        )
+    } else {
+        visible_anchor_range(text, range.start.line, start)
+    }
 }
 
 fn collect_syntax_errors_inner(
@@ -22797,6 +23194,9 @@ pub fn prepare_signature_help(
     position: Position,
 ) -> Option<SignatureHelpContext> {
     let doc = state.get_document(uri)?;
+    if doc.file_type == FileType::Stan {
+        return None;
+    }
     // Rmd/Quarto: signature help is first-class inside R chunk bodies, but a
     // prose position maps to a blank masked line. The call-node search below
     // would already find nothing there, but an explicit guard makes the intent
@@ -23257,6 +23657,48 @@ pub fn goto_definition_with_cancel(
     // R / JAGS / Stan, where this equals the raw text.
     let text = doc.analysis_text();
 
+    // Stan uses a text-based symbol resolver. Run it before any R AST,
+    // attachment, or metadata logic can consume the Stan tree. Raven path
+    // directives remain navigable from the raw source; the analysis text has
+    // those lines geometry-masked for the Stan parser.
+    if doc.file_type == FileType::Stan {
+        let raw_text = doc.text();
+        // Stan does not contribute R cross-file metadata to the workspace
+        // graph. Parse directives locally only so path navigation preserves
+        // established directive semantics such as `# raven: cd`.
+        let directive_metadata = crate::cross_file::directive::parse_directives(&raw_text);
+        if let Some(crate::file_path_intellisense::FilePathNavigationTarget::Directive {
+            directive_type,
+            path,
+        }) = crate::file_path_intellisense::detect_file_path_navigation_target(
+            tree, &raw_text, position,
+        ) && let Some(location) = crate::file_path_intellisense::file_path_definition(
+            crate::file_path_intellisense::FilePathNavigationTarget::Directive {
+                directive_type,
+                path,
+            },
+            uri,
+            &directive_metadata,
+            state.workspace_folders.first(),
+        ) {
+            return Some(GotoDefinitionResponse::Scalar(location));
+        }
+
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let occurrences = collect_stan_identifier_occurrences(&raw_text);
+        let target = stan_identifier_at_position(&occurrences, position)?;
+        let definition = find_stan_definition(&raw_text, &target.name, position)?;
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range: Range {
+                start: Position::new(definition.line, definition.start_col),
+                end: Position::new(definition.line, definition.end_col),
+            },
+        }));
+    }
+
     // Check the navigation-specific file path context first. Completion remains
     // limited to directly typed strings, while navigation also accepts literal
     // path segments inside statically foldable computed source arguments.
@@ -23312,23 +23754,6 @@ pub fn goto_definition_with_cancel(
             .or_else(|| import_module_spec_definition(&metadata, position))
     {
         return Some(GotoDefinitionResponse::Scalar(location));
-    }
-
-    if doc.file_type == FileType::Stan {
-        if cancel.is_cancelled() {
-            return None;
-        }
-        let occurrences = collect_stan_identifier_occurrences(&text);
-        let target = stan_identifier_at_position(&occurrences, position)?;
-        let definition = find_stan_definition(&text, &target.name, position)?;
-
-        return Some(GotoDefinitionResponse::Scalar(Location {
-            uri: uri.clone(),
-            range: Range {
-                start: Position::new(definition.line, definition.start_col),
-                end: Position::new(definition.line, definition.end_col),
-            },
-        }));
     }
 
     if doc.file_type == FileType::Jags {
@@ -24356,8 +24781,8 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     // text; pair byte offsets with it (the cross-file/workspace arms below
     // already use each document's analysis text or the content provider). A
     // prose position maps to a blank masked line, so the identifier lookup
-    // returns None — references is naturally inert on prose. Behavior-neutral
-    // for plain R / JAGS / Stan.
+    // returns None — references is naturally inert on prose. Stan's optional
+    // directive mask likewise keeps Raven metadata out of identifier scans.
     let text = doc.analysis_text();
 
     if doc.file_type == FileType::Stan {
@@ -24501,8 +24926,8 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     find_references_in_tree(tree.root_node(), name, &text, uri, &mut locations);
 
     // Search all authoritative open documents.
-    // Pair each document tree with its analysis text (masked for Rmd/Quarto,
-    // raw otherwise) — never `get_content` (which is RAW): the tree's byte
+    // Pair each document tree with its analysis text (masked when required) —
+    // never `get_content` (which is RAW): the tree's byte
     // offsets index into the masked text, so slicing raw content mis-slices
     // (and can panic on a non-UTF-8 boundary) for Rmd/Quarto files (#343).
     for file_uri in state.documents.uris() {
@@ -70632,9 +71057,11 @@ mod file_type_tests {
         }
 
         // **Validates: Requirements 2.1, 2.2**
-        // Property 3: Stan files produce empty diagnostics
+        // Property 3: arbitrary Stan input produces syntax-only diagnostics
+        // with source-valid ranges. Semantic diagnostics must never leak from
+        // the R analyzer.
         #[test]
-        fn prop_stan_files_produce_empty_diagnostics(
+        fn prop_stan_diagnostics_are_syntax_only_and_in_bounds(
             content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}"
         ) {
             let uri_str = "file:///test/model.stan";
@@ -70644,7 +71071,20 @@ mod file_type_tests {
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = diagnostics(&state, &uri, &DiagCancelToken::never());
-            assert!(result.is_empty(), "Stan file should produce no diagnostics, got {:?}", result);
+            let lines: Vec<&str> = content.lines().collect();
+            for diagnostic in result {
+                prop_assert_eq!(
+                    diagnostic.code,
+                    Some(NumberOrString::String(crate::diagnostic_code::SYNTAX_ERROR.to_string()))
+                );
+                let line = lines
+                    .get(diagnostic.range.start.line as usize)
+                    .copied()
+                    .unwrap_or("");
+                let width = utf16_len(line);
+                prop_assert!(diagnostic.range.start.character <= width);
+                prop_assert!(diagnostic.range.end.character <= width);
+            }
         }
 
         // **Validates: Requirements 10.1, 10.2**
@@ -71269,6 +71709,15 @@ mod block_detector_integration_tests {
             .unwrap();
 
         assert_eq!(loop_symbol.kind, SymbolKind::NAMESPACE);
+        assert_eq!(
+            loop_symbol.range,
+            Range::new(Position::new(1, 2), Position::new(3, 3)),
+            "a braced Stan loop must end at its closing brace, not the next line sentinel"
+        );
+        assert_eq!(
+            loop_symbol.selection_range,
+            Range::new(Position::new(1, 4), Position::new(1, 18))
+        );
         let child_names: Vec<&str> = loop_symbol
             .children
             .as_ref()

@@ -1,0 +1,9 @@
+[
+  {
+    "name": "local-include",
+    "code": "#include helper.stanfunctions\ndata { real x; }\nmodel { target += helper(x); }\n",
+    "includes": {
+      "helper.stanfunctions": "functions { real helper(real x) { return x; } }\n"
+    }
+  }
+]

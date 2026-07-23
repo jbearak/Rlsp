@@ -1,0 +1,22 @@
+[
+  {
+    "name": "canonical-source",
+    "code": "# raven: source helper.R\nmodel {}\n"
+  },
+  {
+    "name": "alias-source",
+    "code": "# @lsp-source helper.R\nmodel {}\n"
+  },
+  {
+    "name": "header-cd-bom",
+    "code": "﻿# raven: cd models\nmodel {}\n"
+  },
+  {
+    "name": "ignore",
+    "code": "# raven: ignore[undefined-variable]\nmodel {}\n"
+  },
+  {
+    "name": "declare",
+    "code": "# raven: var external_value\nmodel {}\n"
+  }
+]
