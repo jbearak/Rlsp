@@ -1251,6 +1251,19 @@ datasets come via the embedded base table, above.)
 
 Brief orientation for modules outside the cross-file and package-library subsystems.
 
+### Generated Stan builtin catalog
+
+Stan completion and hover share `crates/raven/src/stan_builtins_generated.rs`, generated from compiler metadata exposed by the exact-pinned `stanc3` development dependency in `editors/vscode/package.json`. Raven bundles the generated Rust data; it does not load `stanc3`, start a compiler subprocess, or use the network at runtime. Hover retains every callable name and at most 12 representative signatures per name, plus the full overload count. The generator also adds `_lupdf` / `_lupmf` aliases from their normalized compiler signatures and maintains the mapping from sampling-statement distribution names to canonical density or mass functions.
+
+After changing the `stanc3` pin or the generator, regenerate and check the catalog from the repository root:
+
+```sh
+bun editors/vscode/scripts/generate-stan-builtins.mjs
+bun editors/vscode/scripts/generate-stan-builtins.mjs --check
+```
+
+Keep the package pin, `EXPECTED_STANC_VERSION`, `DOCS_VERSION`, generated version constants, `docs/hover.md`, and the stanc3 attribution in `NOTICE` aligned. CI runs the check after `npm ci`; `#[rustfmt::skip]` on the large generated arrays makes the generator output independent of the host Rust toolchain while the surrounding hand-written module remains subject to the normal formatting gate.
+
 ### Quarto process lifecycle
 
 The VS Code extension's Quarto implementation lives under

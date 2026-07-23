@@ -381,6 +381,9 @@ jobs:
         working-directory: editors/vscode
         run: npm ci
 
+      - name: Check Stan builtin catalog is up to date
+        run: bun editors/vscode/scripts/generate-stan-builtins.mjs --check
+
       # `vscode-test` downloads a VS Code build (~150 MB) on first run.
       # Caching it on the .vscode-test.mjs hash keeps PR feedback fast and
       # invalidates the cache when the pinned VS Code version changes.
