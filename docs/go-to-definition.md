@@ -118,7 +118,7 @@ Go-to-definition works inside R code chunks of `.Rmd` and `.qmd` documents. Rave
 For `.stan`, `.jags`, and `.bugs` files, Raven provides best-effort go-to-definition within the current file:
 
 - **Stan** — jumps to the most recent declaration of a variable or function at or before the cursor (or the first declaration if none precede it).
-- **JAGS** — jumps to the most recent assignment at or before the cursor (or the first assignment if none precede it), or falls back to the first occurrence when the symbol is a data input or constant with no assignment in the file. Built-in keywords, distributions, and functions are excluded from the fallback.
+- **JAGS** — jumps to the most recent assignment at or before the cursor (or the first assignment if none precedes it), or falls back to the first occurrence when the symbol is a data input or constant with no assignment in the file. The versioned JAGS catalog excludes all built-in syntax, callables, distributions, and aliases from that fallback.
 
 Identifier resolution is file-local — Raven doesn't build a cross-file scope graph for these languages. File-path navigation (e.g. cmd-click on a path in `# raven: sourced-by`) still works normally. See also [Find References — JAGS and Stan](find-references.md#jags-and-stan).
 

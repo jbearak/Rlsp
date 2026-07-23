@@ -152,8 +152,10 @@ For `.stan`, `.jags`, and `.bugs` files, Raven offers completions tailored to ea
 
 | Language | What's offered |
 |---|---|
-| **JAGS** | Keywords (`model`, `data`, `for`, `in`, `if`, `else`), distributions (`dnorm`, `dgamma`, …), built-in functions (`abs`, `log`, …), and file-local symbols |
+| **JAGS** | Syntax keywords (`var`, `data`, `model`, `for`, `in`), contextual truncation/censoring forms (`T`, `I`), automatically available `basemod`/`bugs` distributions and callables (including aliases), and file-local symbols |
 | **Stan** | Types (`int`, `real`, `vector`, …), block keywords (`data`, `parameters`, `model`, …), control flow (`if`, `for`, `while`, …), bare distribution names for sampling statements (`normal`, `poisson`, `multi_normal`, …), compiler-known callables including normalized and unnormalized probability variants (`normal_lpdf`, `normal_lupdf`, `poisson_lpmf`, `poisson_lupmf`, …), and file-local symbols |
+
+JAGS completion, [hover](hover.md#jags-hover), and signature help share a generated catalog pinned to JAGS 4.3.2. It covers the `basemod` and `bugs` modules that JAGS loads automatically, including compiler-special `length()`/`dim()`, the `pow()` alias, distribution aliases, and the verified `d`/`p`/`q`/`logdensity` callables exposed by those modules. Optional modules are deliberately absent. A name that is both a callable and a distribution appears once. File-local symbols take precedence over a same-named catalog entry. The catalog is static and requires no local JAGS installation, subprocess, network request, or R analysis at runtime.
 
 Stan's built-in callable and distribution catalogs are generated from the compiler metadata in Raven's pinned `stanc3` npm dependency (package 2.39.1, bundled compiler 2.39.0). Unnormalized `_lupdf` and `_lupmf` aliases are included where the compiler exposes the corresponding normalized density or mass function. This avoids invalid combinations such as `poisson_lpdf` and keeps completions and [Stan hover](hover.md#stan-hover) on the same versioned source of truth. These completions are static rather than context-sensitive: Raven offers the same built-in set throughout a Stan file. File-local symbols are discovered by scanning the current file for variable declarations and assignments. R-specific reserved words are excluded from JAGS completions to avoid noise.
 
