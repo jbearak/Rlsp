@@ -23404,9 +23404,10 @@ pub(crate) async fn publish_diagnostics_inner(
     let sync_diagnostics = match snapshot {
         // Rmd/Quarto documents flow through too (issue #343): the snapshot
         // carries the masked analysis text + tree, so `diagnostics_from_snapshot`
-        // sees only real R chunk-body content. Stan follows its syntax-only
-        // collector; JAGS dispatches strict syntax for `.jags`, `.bugs`, and
-        // `.bug` through their shared language identity.
+        // sees only real R chunk-body content. Stan follows its native syntax
+        // and conservative variable-resolution collectors; JAGS dispatches
+        // strict syntax for `.jags`, `.bugs`, and `.bug` through their shared
+        // language identity.
         Some(snap)
             if matches!(
                 snap.file_type,

@@ -175,7 +175,11 @@ resolution model.
 
 Declare symbols created dynamically that the parser cannot detect. These suppress false-positive "undefined variable" diagnostics for symbols from `eval()`, `assign()`, `load()`, or external data loading.
 
-Declaration directives work in any R file, whether or not it participates in cross-file chains.
+Declaration directives work in any R file, whether or not it participates in
+cross-file chains. In Stan, local `# raven: var` and `# raven: func`
+declarations are also honored by the conservative undeclared-variable pass from
+the following line onward. This is local only: it does not create R scope or
+cross-file relationships for a `.stan` file.
 
 ### Variable Declarations
 
@@ -387,6 +391,12 @@ always-on analyzer diagnostics ([Diagnostics](diagnostics.md)) and the opt-in
 [style/lint rules](linting.md) alike. The legacy `@lsp-ignore` /
 `@lsp-ignore-next` markers remain permanent aliases for the line and next-line
 forms.
+
+For Stan, these directives suppress conservative `undefined-variable`
+findings only; native `syntax-error` findings remain non-suppressible. A
+trailing `# raven: ignore` preserves and parses the Stan code before the marker,
+while standalone `ignore-next`, file, and block forms keep their normal line
+targeting.
 
 ### Line and next-line
 

@@ -18,6 +18,42 @@ suite('Ark LSP Extension', () => {
             'Expected diagnostic about undefined variable');
     });
 
+    test('Stan diagnostics report variables but not call or distribution names', async () => {
+        const doc = await openDocument('stan_undefined.stan');
+        const diagnostics = await waitForDiagnostics(doc.uri, 15000);
+        const undefinedVariables = diagnostics.filter(
+            diagnostic => diagnostic.code === 'undefined-variable',
+        );
+        assert.strictEqual(
+            undefinedVariables.length,
+            2,
+            `Expected two Stan undefined variables, got: ${diagnostics.map(d => d.message).join('; ')}`,
+        );
+        assert.deepStrictEqual(
+            undefinedVariables.map(diagnostic => ({
+                message: diagnostic.message,
+                start: [diagnostic.range.start.line, diagnostic.range.start.character],
+                end: [diagnostic.range.end.line, diagnostic.range.end.character],
+            })),
+            [
+                {
+                    message: 'supplied_from_r is not defined',
+                    start: [4, 16],
+                    end: [4, 31],
+                },
+                {
+                    message: 'another_missing is not defined',
+                    start: [5, 12],
+                    end: [5, 27],
+                },
+            ],
+        );
+        assert.ok(
+            !diagnostics.some(diagnostic => /normal|theta|N is not defined/.test(diagnostic.message)),
+            `Stan declarations and distribution names must resolve: ${diagnostics.map(d => d.message).join('; ')}`,
+        );
+    });
+
     test('go-to-definition works for function calls', async () => {
         const doc = await openDocument('definitions.R');
         // Position on 'add' call at line 12 (0-indexed: 11), column 12

@@ -1255,18 +1255,59 @@ Brief orientation for modules outside the cross-file and package-library subsyst
 
 Stan documents have their own tree-sitter parse path, pinned by git revision in
 `crates/raven/Cargo.toml`. `Document` retains one Stan tree per text revision;
-diagnostics reuse that tree and walk only outer `ERROR` nodes and standalone
-`MISSING` nodes in source order. Stan documents deliberately contribute empty R
+diagnostics reuse that tree. The syntax collector walks only outer `ERROR`
+nodes and standalone `MISSING` nodes in source order. The semantic collector in
+`stan_diagnostics.rs` uses the same tree at the shared diagnostics-snapshot
+dispatch seam. Stan documents deliberately contribute empty R
 metadata, scope artifacts, and package sets, and R-only async filesystem
 diagnostics never run for them. Keep those boundaries explicit when adding a
 new document lifecycle or disk fallback path.
 
-Before parsing, `stan::mask_raven_directives` replaces only canonically
-recognized full-line Raven directives with spaces while preserving every byte
-offset, line ending, and leading UTF-8 BOM. It reuses the directive parser's
-recognition rules; Stan `#include` and unknown hash lines remain visible to the
-grammar. The only grammar compatibility check is a zero-width required file
-child on `preproc_include`, which matches stanc's rejection of bare `#include`.
+Before Stan diagnostic parsing, `stan::mask_raven_directives` replaces
+canonically recognized full-line Raven directives, plus the comment suffix of
+a recognized trailing same-line ignore, with spaces while preserving every
+byte offset, line ending, code prefix, and leading UTF-8 BOM. It reuses the
+directive parser's recognition rules; Stan `#include` and unknown hash lines
+remain visible to the grammar. Diagnostic masking and the local directive
+metadata used by Stan semantic diagnostics must first use
+`stan::directive_eligibility_view`, a geometry-preserving, full-document lexical
+scan that blanks only hash bytes inside double-quoted strings, `//` comments,
+and `/* ... */` comments. String and block-comment state persists across lines;
+line-comment state resets at each LF. Within this diagnostic path, never run
+canonical directive regexes on raw Stan lines, because marker-shaped prose
+inside a multiline comment could otherwise become active diagnostic metadata
+or suppression.
+The only grammar compatibility check is a zero-width required file child on
+`preproc_include`, which matches stanc's rejection of bare `#include`.
+
+The fragment-aware semantic pass is eligible only when `program` has a direct
+recognized block. It never discovers blocks below recovery nodes, never
+descends into `ERROR`/`MISSING` for semantic roles, and propagates a
+declaration-incomplete taint only through scopes that recovery may have made
+uncertain. Top-level data, transformed-data, parameter, and
+transformed-parameter taint flows to later blocks; model/generated-quantities
+and lexical taint do not escape their scopes. Any `preproc_include` anywhere
+fails the whole semantic pass closed because preprocessing is explicitly out of
+scope, including includes after blocks or inside nested scopes. Shared
+declaration type dimensions/constraints precede every name, while declarators
+bind left-to-right and the current local is visible in its initializer, matching
+the pinned stanc oracle. `profile_statement` owns a lexical frame even though
+the grammar exposes its statement list directly. A direct recovery node in the
+functions block contributes one or more exact, narrowly inferred likely
+callable-name candidates; it never suppresses unrelated variable names.
+Concrete/MISSING identifier validation prevents zero-width recovery
+diagnostics. The fixed
+`MAX_STAN_SEMANTIC_DIAGNOSTICS = 500` ordered retention set is
+independent of the configurable syntax cap and remains bounded during
+traversal; traversal does not stop at saturation so cancellation remains
+responsive. Tests exercise traversal beyond saturation and 256 nested lexical
+frames.
+
+Stan snapshots parse local directive metadata solely for `# raven: var` /
+`# raven: func` and suppression filtering. This does not populate R artifacts,
+metadata indexes, source edges, packages, or cross-file scope. Combined Stan
+syntax and semantic findings are stable-sorted by source range and exact-
+deduplicated only after both independent collectors finish.
 
 The fixture corpus under `crates/raven/tests/fixtures/stan/` separates compiler-
 valid models, syntax-valid semantic/type failures, syntax-invalid models,
@@ -1274,8 +1315,9 @@ Raven-extension cases, include cases, and a deterministic generated matrix.
 `editors/vscode/scripts/check-stan-diagnostics-fixtures.mjs` uses the exact-
 pinned stanc3 package as a development-time oracle; it is not part of Raven's
 runtime. CI runs the oracle after `npm ci`. Rust integration tests assert that
-Raven stays silent for both valid groups and reports bounded, stable, UTF-16-
-valid syntax findings for every invalid case.
+Raven stays silent for compiler-valid groups, distinguishes clear undeclared
+variables in the semantic/type-invalid group, and reports bounded, stable,
+UTF-16-valid syntax findings for every syntax-invalid case.
 
 Stan and JAGS dispatch through the same native-syntax collector limit from the
 diagnostics snapshot. `maxSyntaxDiagnosticsPerFile = 0` maps to unlimited;

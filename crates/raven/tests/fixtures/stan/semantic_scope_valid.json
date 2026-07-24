@@ -1,0 +1,54 @@
+[
+  {
+    "name": "scope-earlier-valid",
+    "code": "transformed data { real earlier = 1; real later = earlier; } model {}\n"
+  },
+  {
+    "name": "scope-parameters-gq-valid",
+    "code": "parameters { real shared; } model { target += shared; } generated quantities { real y = shared; }\n"
+  },
+  {
+    "name": "declaration-self-initializer-valid",
+    "code": "model { real self = self; }\n"
+  },
+  {
+    "name": "comma-order-valid",
+    "code": "model { real first = 1, second = first, third = second; target += third; }\n"
+  },
+  {
+    "name": "function-inner-scope-valid",
+    "code": "functions { real f(real x) { { real inner = x; return inner; } } } model { target += f(1); }\n"
+  },
+  {
+    "name": "loop-inner-scope-valid",
+    "code": "model { for (n in 1:2) print(n); }\n"
+  },
+  {
+    "name": "branch-inner-scope-valid",
+    "code": "model { if (1) { real branch_local = 1; print(branch_local); } }\n"
+  },
+  {
+    "name": "while-inner-scope-valid",
+    "code": "model { while (0) { real while_local = 1; print(while_local); } }\n"
+  },
+  {
+    "name": "profile-inner-scope-valid",
+    "code": "model { profile(\"work\") { real profile_local = 1; print(profile_local); } }\n"
+  },
+  {
+    "name": "known-hof-value-valid",
+    "code": "functions { real partial_sum(array[] real slice, int start, int end) { return sum(slice); } } data { int N; array[N] real x; } model { target += reduce_sum(partial_sum, x, 1); }\n"
+  },
+  {
+    "name": "prototype-definition-valid",
+    "code": "functions { real declared(real x); real uses(real x) { return declared(x); } real declared(real x) { return x; } } model { target += uses(1); }\n"
+  },
+  {
+    "name": "builtin-call-valid",
+    "code": "model { target += normal_lpdf(0 | 0, 1) + exp(1); }\n"
+  },
+  {
+    "name": "nested-block-valid",
+    "code": "model { { real inner = 1; target += inner; } }\n"
+  }
+]

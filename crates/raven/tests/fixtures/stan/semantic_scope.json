@@ -1,0 +1,47 @@
+[
+  {
+    "name": "scope-later-invalid",
+    "missing": "later",
+    "code": "transformed data { real earlier = later; real later = 1; } model {}\n"
+  },
+  {
+    "name": "scope-model-gq-invalid",
+    "missing": "model_local",
+    "code": "model { real model_local = 1; } generated quantities { real y = model_local; }\n"
+  },
+  {
+    "name": "comma-order-invalid",
+    "missing": "later",
+    "code": "model { real first = later, later = 1; }\n"
+  },
+  {
+    "name": "function-local-invalid",
+    "missing": "inner",
+    "code": "functions { real f(real x) { { real inner = x; } return inner; } } model {}\n"
+  },
+  {
+    "name": "loop-local-invalid",
+    "missing": "n",
+    "code": "model { for (n in 1:2) print(n); print(n); }\n"
+  },
+  {
+    "name": "branch-local-invalid",
+    "missing": "branch_local",
+    "code": "model { if (1) { real branch_local = 1; print(branch_local); } print(branch_local); }\n"
+  },
+  {
+    "name": "while-local-invalid",
+    "missing": "while_local",
+    "code": "model { while (0) { real while_local = 1; print(while_local); } print(while_local); }\n"
+  },
+  {
+    "name": "profile-local-invalid",
+    "missing": "profile_local",
+    "code": "model { profile(\"work\") { real profile_local = 1; print(profile_local); } print(profile_local); }\n"
+  },
+  {
+    "name": "unknown-hof-value-invalid",
+    "missing": "missing_fun",
+    "code": "data { int N; array[N] real x; } model { target += reduce_sum(missing_fun, x, 1); }\n"
+  }
+]

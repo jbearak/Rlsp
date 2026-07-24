@@ -162,9 +162,198 @@ generated quantities { real z = twice(mu); }
     }
 
     #[test]
-    fn syntax_only_semantic_failures_stay_silent() {
+    fn trailing_stan_ignore_never_erases_include_or_unknown_hash_syntax() {
+        let included = diagnostics_for(
+            "#include declarations.stan # raven: ignore\nmodel { target += supplied_by_include; }\n",
+        );
+        assert!(
+            included.is_empty(),
+            "the visible include must fail the semantic pass closed: {included:#?}"
+        );
+
+        let unknown = diagnostics_for("# made-up syntax # raven: ignore\nmodel {}\n");
+        assert_eq!(unknown.len(), 1, "{unknown:#?}");
+        assert_eq!(unknown[0].range.start.line, 0);
+        assert_eq!(
+            unknown[0].code,
+            Some(NumberOrString::String("syntax-error".to_string()))
+        );
+    }
+
+    #[test]
+    fn stan_trailing_ignore_understands_transpose_and_double_quoted_strings() {
+        let transpose = diagnostics_for(
+            "parameters { vector[1] x; }\nmodel { target += sum(x') + missing; } # raven: ignore[undefined-variable]\n",
+        );
+        assert!(transpose.is_empty(), "{transpose:#?}");
+
+        let marker_in_string =
+            diagnostics_for("model { print(\"# raven: ignore\"); target += missing; }\n");
+        assert_eq!(marker_in_string.len(), 1, "{marker_in_string:#?}");
+        assert_eq!(marker_in_string[0].message, "missing is not defined");
+    }
+
+    #[test]
+    fn stan_comment_prose_cannot_become_a_directive_but_real_later_markers_work() {
+        let line_comment = diagnostics_for(
+            "model {\n  target += visible_missing; // note \" # raven: ignore[undefined-variable]\n  target += muted_missing; # raven: ignore[undefined-variable]\n}\n",
+        );
+        assert_eq!(line_comment.len(), 1, "{line_comment:#?}");
+        assert_eq!(line_comment[0].message, "visible_missing is not defined");
+
+        let block_comment = diagnostics_for(
+            "model { target += muted_missing; } /* note \" # raven: ignore */ # raven: ignore[undefined-variable]\n",
+        );
+        assert!(block_comment.is_empty(), "{block_comment:#?}");
+    }
+
+    #[test]
+    fn stan_multiline_block_comment_directives_never_affect_semantics() {
+        for directive in [
+            "# raven: var missing",
+            "# raven: ignore-file[undefined-variable]",
+            "# raven: ignore-start[undefined-variable]",
+        ] {
+            let source = format!("/* opening\n{directive}\n*/\nmodel {{ target += missing; }}\n");
+            let findings = diagnostics_for(&source);
+            assert_eq!(findings.len(), 1, "{directive}: {findings:#?}");
+            assert_eq!(findings[0].message, "missing is not defined", "{directive}");
+        }
+
+        let fake_function = diagnostics_for(
+            "/* opening\n# raven: func missing_fun\n*/\ndata { int N; array[N] real x; }\nmodel { target += reduce_sum(missing_fun, x, 1); }\n",
+        );
+        assert_eq!(fake_function.len(), 1, "{fake_function:#?}");
+        assert_eq!(fake_function[0].message, "missing_fun is not defined");
+
+        let real_after_close = diagnostics_for(
+            "/* opening\n# raven: ignore-file[undefined-variable]\n*/\nmodel { target += muted; } /* note \" # fake */ # raven: ignore[undefined-variable]\n",
+        );
+        assert!(real_after_close.is_empty(), "{real_after_close:#?}");
+    }
+
+    #[test]
+    fn stan_local_declaration_and_ignore_directives_apply_to_semantics_only() {
+        let code = r#"# raven: var injected
+# raven: func host_fun
+data { int N; array[N] real x; }
+model {
+  target += injected;
+  target += reduce_sum(host_fun, x, 1);
+  target += same_line_muted; # raven: ignore[undefined-variable]
+  # raven: ignore-next[undefined-variable]
+  target += next_line_muted;
+  target += clear_missing;
+}
+"#;
+        let findings = diagnostics_for(code);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].message, "clear_missing is not defined");
+
+        let absent = diagnostics_for(
+            "data { int N; array[N] real x; } model { target += injected + reduce_sum(host_fun, x, 1); }",
+        );
+        let absent_messages: Vec<_> = absent
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            absent_messages,
+            ["injected is not defined", "host_fun is not defined"],
+            "host-supplied values still report without explicit var/func directives"
+        );
+    }
+
+    #[test]
+    fn trailing_stan_ignore_preserves_code_and_adjacent_syntax_errors() {
+        let code = "model {\n  target += ; # raven: ignore[undefined-variable]\n}\n";
+        let findings = diagnostics_for(code);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].range.start.line, 1);
+        assert_eq!(
+            findings[0].code,
+            Some(NumberOrString::String("syntax-error".to_string()))
+        );
+    }
+
+    #[test]
+    fn stan_suppression_and_declarations_are_applied_before_semantic_cap() {
+        let mut code = String::from("model {\n");
+        for index in 0..498 {
+            code.push_str(&format!(
+                "  target += muted_{index}; # raven: ignore[undefined-variable]\n"
+            ));
+        }
+        code.push_str("  # raven: var injected_value\n");
+        code.push_str("  target += injected_value;\n");
+        code.push_str("  # raven: func injected_fun\n");
+        code.push_str("  target += injected_fun;\n");
+        code.push_str("  target += should_report;\n}\n");
+
+        let findings = diagnostics_for(&code);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].message, "should_report is not defined");
+        assert_eq!(
+            findings[0].range,
+            Range::new(Position::new(503, 12), Position::new(503, 25))
+        );
+    }
+
+    #[test]
+    fn stan_declaration_suppression_uses_private_name_and_keeps_lsp_data_empty() {
+        let code = "# raven: var injected\nmodel { target += injected; }\n";
+        let uri = Url::parse("untitled:stan-private-suppression-test").unwrap();
+        let mut state = WorldState::new();
+        state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("Stan snapshot");
+        let diagnostic = Diagnostic {
+            range: Range::new(Position::new(1, 18), Position::new(1, 26)),
+            message: "wording deliberately unrelated to the identifier".to_string(),
+            ..Default::default()
+        };
+
+        assert!(stan_semantic_diagnostic_is_suppressed(
+            &diagnostic,
+            "injected",
+            &snapshot.directive_meta
+        ));
+        assert!(!stan_semantic_diagnostic_is_suppressed(
+            &diagnostic,
+            "different_name",
+            &snapshot.directive_meta
+        ));
+
+        let outward = diagnostics_for("model { target += visible_missing; }\n");
+        assert_eq!(outward.len(), 1, "{outward:#?}");
+        assert_eq!(outward[0].message, "visible_missing is not defined");
+        assert_eq!(outward[0].data, None);
+    }
+
+    #[test]
+    fn stan_combined_syntax_and_semantic_findings_are_globally_ordered() {
+        let code = "model {\n  target += earlier_semantic;\n  target += ;\n}\n";
+        let findings = diagnostics_for(code);
+        assert_eq!(findings.len(), 2, "{findings:#?}");
+        assert_eq!(findings[0].range.start.line, 1);
+        assert_eq!(findings[0].message, "earlier_semantic is not defined");
+        assert_eq!(findings[1].range.start.line, 2);
+        assert_eq!(
+            findings[1].code,
+            Some(NumberOrString::String("syntax-error".to_string()))
+        );
+        assert!(findings.windows(2).all(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn stan_distinguishes_variable_references_from_call_and_distribution_names() {
         let code = "parameters { real x; } model { x ~ not_a_distribution(unknown); }\n";
-        assert!(diagnostics_for(code).is_empty());
+        let findings = diagnostics_for(code);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].message, "unknown is not defined");
+        assert_eq!(
+            findings[0].code,
+            Some(NumberOrString::String("undefined-variable".to_string()))
+        );
     }
 
     #[test]
@@ -1257,17 +1446,29 @@ impl DiagnosticsSnapshot {
         let text = doc.analysis_text();
 
         // Native non-R diagnostics need only the language-correct tree, its aligned
-        // analysis text, cancellation, and the master diagnostics switch.
+        // analysis text, cancellation, and the master diagnostics switch. Stan
+        // additionally reuses local declaration/suppression directives; those
+        // never enter the R graph or scope pipeline.
         // Construct the same snapshot type with inert R-specific fields so no
         // R metadata, scope, graph, package, or lint analyzer can consume a
         // foreign tree. This also keeps the syntax-only path cheap for large
         // models without introducing a second snapshot architecture.
         if doc.file_type != FileType::R {
             let file_type = doc.file_type;
+            let directive_meta = if file_type == FileType::Stan {
+                let raw_text = doc.text();
+                let eligibility_view = crate::stan::directive_eligibility_view(&raw_text);
+                crate::cross_file::directive::parse_directives_with_same_line_scanner(
+                    &eligibility_view,
+                    crate::stan::same_line_suppression_comment,
+                )
+            } else {
+                Default::default()
+            };
             return Some(DiagnosticsSnapshot {
                 tree,
                 text,
-                directive_meta: Default::default(),
+                directive_meta,
                 cross_file_config: state.cross_file_config.clone(),
                 lint_config: Default::default(),
                 indentation_producer_policy: None,
@@ -1627,12 +1828,52 @@ pub(crate) fn diagnostics_from_snapshot(
     // untitled model buffers carry their type only through `languageId`.
     match snapshot.file_type {
         FileType::Stan => {
-            return collect_stan_syntax_errors(
+            let mut diagnostics = collect_stan_syntax_errors(
                 snapshot.tree.root_node(),
                 &snapshot.text,
                 cancel,
                 snapshot.cross_file_config.max_syntax_diagnostics_per_file,
-            );
+            )?;
+            if let Some(severity) = snapshot.cross_file_config.undefined_variable_severity {
+                let semantic = crate::stan_diagnostics::collect_undefined_variables(
+                    snapshot.tree.root_node(),
+                    &snapshot.text,
+                    severity,
+                    cancel,
+                    |diagnostic, name| {
+                        !stan_semantic_diagnostic_is_suppressed(
+                            diagnostic,
+                            name,
+                            &snapshot.directive_meta,
+                        )
+                    },
+                )?;
+                diagnostics.extend(semantic);
+            }
+            // Syntax and semantic collectors are independently ordered. The
+            // combined editor/CLI stream must still be globally source-ordered
+            // and exact-deduplicated. `sort_by_key` is stable, preserving
+            // collector precedence for diagnostics at the same range.
+            diagnostics.sort_by_key(|diagnostic| {
+                (
+                    diagnostic.range.start.line,
+                    diagnostic.range.start.character,
+                    diagnostic.range.end.line,
+                    diagnostic.range.end.character,
+                )
+            });
+            let mut unique = Vec::with_capacity(diagnostics.len());
+            for diagnostic in diagnostics {
+                let duplicate = unique
+                    .iter()
+                    .rev()
+                    .take_while(|existing: &&Diagnostic| existing.range == diagnostic.range)
+                    .any(|existing| *existing == diagnostic);
+                if !duplicate {
+                    unique.push(diagnostic);
+                }
+            }
+            return Some(unique);
         }
         FileType::Jags => {
             return collect_jags_syntax_errors(
@@ -1940,6 +2181,34 @@ pub(crate) fn diagnostics_from_snapshot(
     }
 
     Some(diagnostics)
+}
+
+/// Whether a local Raven directive suppresses a Stan semantic finding.
+///
+/// Stan never enters R's scope/cross-file pipeline, but the same local
+/// suppression and declaration syntax remains useful for values injected by a
+/// host program. Declaration directives take effect on the following line,
+/// matching their R timeline semantics. Syntax diagnostics stay
+/// non-suppressible and never call this helper.
+fn stan_semantic_diagnostic_is_suppressed(
+    diagnostic: &Diagnostic,
+    name: &str,
+    metadata: &crate::cross_file::CrossFileMetadata,
+) -> bool {
+    let line = diagnostic.range.start.line;
+    if crate::cross_file::directive::is_line_ignored_for_code(
+        metadata,
+        line,
+        Some(crate::diagnostic_code::UNDEFINED_VARIABLE),
+    ) {
+        return true;
+    }
+
+    metadata
+        .declared_variables
+        .iter()
+        .chain(&metadata.declared_functions)
+        .any(|declared| declared.line < line && declared.name == name)
 }
 
 /// Maximum valid character value for LSP positions.
@@ -72083,6 +72352,22 @@ mod file_type_tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn diagnostic_range_is_in_bounds(content: &str, range: &Range) -> bool {
+        let lines: Vec<_> = content.split('\n').collect();
+        let Some(start_line) = lines.get(range.start.line as usize) else {
+            return false;
+        };
+        let Some(end_line) = lines.get(range.end.line as usize) else {
+            return false;
+        };
+        let start_line = start_line.strip_suffix('\r').unwrap_or(start_line);
+        let end_line = end_line.strip_suffix('\r').unwrap_or(end_line);
+        range.start.line <= range.end.line
+            && range.start.character <= utf16_len(start_line)
+            && range.end.character <= utf16_len(end_line)
+            && (range.start.line != range.end.line || range.start.character <= range.end.character)
+    }
+
     // **Validates: Requirements 1.1, 2.1, 10.1**
     // Property 1: File type detection is consistent with extension
 
@@ -72177,30 +72462,21 @@ mod file_type_tests {
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = diagnostics(&state, &uri, &DiagCancelToken::never());
-            let lines: Vec<&str> = content.lines().collect();
             for diagnostic in result {
                 prop_assert_eq!(
                     diagnostic.code,
                     Some(NumberOrString::String(crate::diagnostic_code::SYNTAX_ERROR.to_string()))
                 );
-                let line = lines
-                    .get(diagnostic.range.start.line as usize)
-                    .copied()
-                    .unwrap_or("");
-                let width = utf16_len(line);
-                prop_assert!(diagnostic.range.start.character <= width);
-                if diagnostic.range.end.line == diagnostic.range.start.line {
-                    prop_assert!(diagnostic.range.end.character <= width);
-                }
+                prop_assert!(diagnostic_range_is_in_bounds(&content, &diagnostic.range));
             }
         }
 
         // **Validates: Requirements 2.1, 2.2**
-        // Property 3: arbitrary Stan input produces syntax-only diagnostics
-        // with source-valid ranges. Semantic diagnostics must never leak from
-        // the R analyzer.
+        // Property 3: arbitrary Stan input produces only native Stan syntax or
+        // variable-resolution diagnostics with source-valid ranges. R-only
+        // analyzer codes must never leak.
         #[test]
-        fn prop_stan_diagnostics_are_syntax_only_and_in_bounds(
+        fn prop_stan_diagnostics_are_native_and_in_bounds(
             content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}"
         ) {
             let uri_str = "file:///test/model.stan";
@@ -72210,19 +72486,18 @@ mod file_type_tests {
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = diagnostics(&state, &uri, &DiagCancelToken::never());
-            let lines: Vec<&str> = content.lines().collect();
             for diagnostic in result {
-                prop_assert_eq!(
-                    diagnostic.code,
-                    Some(NumberOrString::String(crate::diagnostic_code::SYNTAX_ERROR.to_string()))
+                prop_assert!(
+                    diagnostic.code
+                        == Some(NumberOrString::String(
+                            crate::diagnostic_code::SYNTAX_ERROR.to_string()
+                        ))
+                        || diagnostic.code
+                            == Some(NumberOrString::String(
+                                crate::diagnostic_code::UNDEFINED_VARIABLE.to_string()
+                            ))
                 );
-                let line = lines
-                    .get(diagnostic.range.start.line as usize)
-                    .copied()
-                    .unwrap_or("");
-                let width = utf16_len(line);
-                prop_assert!(diagnostic.range.start.character <= width);
-                prop_assert!(diagnostic.range.end.character <= width);
+                prop_assert!(diagnostic_range_is_in_bounds(&content, &diagnostic.range));
             }
         }
 

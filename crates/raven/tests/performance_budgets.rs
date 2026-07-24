@@ -288,6 +288,17 @@ fn analyze_stan(code: &str) -> usize {
     diagnostics(&state, &uri, &DiagCancelToken::never()).len()
 }
 
+fn generate_stan_semantic_errors_of_size(target_bytes: usize) -> String {
+    let mut content = String::from("model {\n");
+    let mut index = 0usize;
+    while content.len() + 40 < target_bytes {
+        writeln!(content, "  target += missing_{index};").unwrap();
+        index += 1;
+    }
+    content.push_str("}\n");
+    content
+}
+
 #[test]
 fn budget_stan_parse_and_diagnostics_100kb_valid() {
     let code = generate_stan_code_of_size(100 * 1024, false);
@@ -303,6 +314,18 @@ fn budget_stan_parse_and_diagnostics_100kb_malformed_is_capped() {
     assert_eq!(first_count, 500, "Stan syntax findings must honor the cap");
     let elapsed = median_of_3(|| assert_eq!(analyze_stan(&code), 500));
     assert_within_budget("stan_parse_and_diagnostics_100kb_malformed", elapsed, 250);
+}
+
+#[test]
+fn budget_stan_parse_and_semantic_diagnostics_100kb_is_capped() {
+    let code = generate_stan_semantic_errors_of_size(100 * 1024);
+    let first_count = analyze_stan(&code);
+    assert_eq!(
+        first_count, 500,
+        "Stan semantic findings must honor their fixed cap"
+    );
+    let elapsed = median_of_3(|| assert_eq!(analyze_stan(&code), 500));
+    assert_within_budget("stan_parse_and_semantic_diagnostics_100kb", elapsed, 250);
 }
 
 #[test]
