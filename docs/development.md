@@ -1277,6 +1277,20 @@ runtime. CI runs the oracle after `npm ci`. Rust integration tests assert that
 Raven stays silent for both valid groups and reports bounded, stable, UTF-16-
 valid syntax findings for every invalid case.
 
+Stan and JAGS dispatch through the same native-syntax collector limit from the
+diagnostics snapshot. `maxSyntaxDiagnosticsPerFile = 0` maps to unlimited;
+every finite value retains at most that many unique candidates in an ordered
+vector while the traversal continues to check cancellation. The observable
+result removes exact duplicates before applying stable source-order truncation.
+Do not move this limit onto the combined diagnostics vector: it intentionally excludes R
+syntax, semantic, lint, package, and cross-file findings. The manual release
+evidence harness reuses an already-parsed 100 KB tree to isolate collection and
+reports serialized LSP payload bytes:
+
+```sh
+cargo test --release -p raven --lib benchmark_foreign_syntax_diagnostic_caps -- --ignored --nocapture
+```
+
 Stan completion and hover share `crates/raven/src/stan_builtins_generated.rs`, generated from compiler metadata exposed by the exact-pinned `stanc3` development dependency in `editors/vscode/package.json`. The npm package version (currently 2.39.1) and its exported compiler version (currently 2.39.0) are validated and recorded separately. Raven bundles the generated Rust data; it does not load `stanc3`, start a compiler subprocess, or use the network at runtime. Hover retains every callable name and at most 12 representative signatures per name, plus the full overload count. The generator also adds `_lupdf` / `_lupmf` aliases from their normalized compiler signatures, restores higher-order and embedded-Laplace callables omitted from the flat signature dump, and maintains the mapping from sampling-statement distribution names to canonical density or mass functions.
 
 After changing the `stanc3` pin or the generator, regenerate and check the catalog from the repository root:
@@ -1340,9 +1354,9 @@ defect lines and bounded finding counts for all 75 curated syntax-invalid
 cases, without copying their source text. The integration test requires exact
 ID-set equality between that manifest and the corpus and exercises every case
 through all three extensions. Separate malformed-input and release tests cover
-mid-traversal cancellation, UTF-16 positions, sort-before-dedup-before-cap
-ordering for the 100-finding limit, edited-tree reuse, and 100 KB diagnostic
-latency.
+mid-traversal cancellation, UTF-16 positions, exact-dedup-before-stable-order-
+before-cap behavior for the shared configurable limit, edited-tree reuse, and
+100 KB diagnostic latency.
 
 Strict JAGS-dialect diagnostics claim `.jags`, `.bugs`, and `.bug`
 (case-insensitively), plus untitled buffers explicitly identified by the client

@@ -82,6 +82,7 @@ export interface RavenInitializationOptions {
     };
     diagnostics?: {
         enabled?: boolean;
+        maxSyntaxDiagnosticsPerFile?: number;
         undefinedVariableSeverity?: SeverityLevel;
         undefinedVariableInCallArguments?: boolean;
         undefinedVariableInBracketIndices?: boolean;
@@ -323,6 +324,7 @@ export function getInitializationOptions(
     }
 
     const diagnosticsEnabled = config.get<boolean>('diagnostics.enabled', true);
+    const maxSyntaxDiagnosticsPerFile = config.get<number>('diagnostics.maxSyntaxDiagnosticsPerFile', 500);
     const undefinedVariableSeverity = getExplicitSetting<SeverityLevel>(config, 'diagnostics.undefinedVariableSeverity');
     const undefinedVariableInCallArguments = getExplicitSetting<boolean>(config, 'diagnostics.undefinedVariableInCallArguments');
     const undefinedVariableInBracketIndices = getExplicitSetting<boolean>(config, 'diagnostics.undefinedVariableInBracketIndices');
@@ -332,6 +334,7 @@ export function getInitializationOptions(
 
     options.diagnostics = {
         enabled: diagnosticsEnabled,
+        maxSyntaxDiagnosticsPerFile,
     };
     if (undefinedVariableSeverity !== undefined) {
         options.diagnostics.undefinedVariableSeverity = undefinedVariableSeverity;

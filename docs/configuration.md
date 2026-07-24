@@ -81,6 +81,7 @@ Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rprofi
 | Setting | Default | Description |
 |---|---|---|
 | `raven.diagnostics.enabled` | `true` | Master switch for all diagnostics |
+| `raven.diagnostics.maxSyntaxDiagnosticsPerFile` | `500` | Maximum native Tree-sitter syntax findings retained per Stan or JAGS/BUGS file after exact deduplication and stable source ordering. `0` means unlimited. Does not cap R diagnostics. Portable as `[diagnostics] maxSyntaxDiagnosticsPerFile = 500` in `raven.toml`; the editor and `raven check` use the same value. |
 
 ## Cross-File Settings
 

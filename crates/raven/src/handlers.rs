@@ -79,6 +79,35 @@ mod stan_syntax_diagnostic_tests {
             .expect("not cancelled")
     }
 
+    fn diagnostics_for_language_with_cap(
+        language_id: &str,
+        code: &str,
+        cap: usize,
+    ) -> Vec<Diagnostic> {
+        let uri = Url::parse(&format!("untitled:{language_id}-syntax-cap-test")).unwrap();
+        let mut state = WorldState::new();
+        state.cross_file_config.max_syntax_diagnostics_per_file = cap;
+        state.open_document_with_language_id(uri.clone(), code, Some(1), Some(language_id));
+        diagnostics(&state, &uri, &DiagCancelToken::never())
+    }
+
+    fn malformed_jags(lines: usize) -> String {
+        let mut code = String::from("model {\n");
+        for index in 0..lines {
+            code.push_str(&format!("  x{index} <- * 1\n"));
+        }
+        code.push_str("}\n");
+        code
+    }
+
+    fn malformed_stan(lines: usize) -> String {
+        let mut code = String::new();
+        for index in 0..lines {
+            code.push_str(&format!("model {{ print({index}); target += ; }}\n"));
+        }
+        code
+    }
+
     #[test]
     fn valid_stan_has_no_diagnostics() {
         let code = r#"functions {
@@ -171,6 +200,115 @@ generated quantities { real z = twice(mu); }
     }
 
     #[test]
+    fn shared_cap_applies_to_stan_and_jags_and_zero_is_unlimited() {
+        let fixtures = [("stan", malformed_stan(725)), ("jags", malformed_jags(725))];
+        for (language, code) in fixtures {
+            let unlimited = diagnostics_for_language_with_cap(language, &code, 0);
+            assert!(
+                unlimited.len() > 700,
+                "fixture must exceed the shared default for {language}: got {} unique findings",
+                unlimited.len()
+            );
+            let below_default = diagnostics_for_language_with_cap(language, &code, 137);
+            let above_default = diagnostics_for_language_with_cap(language, &code, 700);
+            assert_eq!(below_default, unlimited[..137]);
+            assert_eq!(above_default, unlimited[..700]);
+        }
+    }
+
+    #[test]
+    fn finite_cap_keeps_utf16_boundary_in_stable_source_order() {
+        let code = "model {\n  /* 😀 */ x <- * 1\n  /* 💥 */ y <- * 1\n  z <- * 1\n}\n";
+        let unlimited = diagnostics_for_language_with_cap("jags", code, 0);
+        assert_eq!(unlimited.len(), 3, "fixture drifted: {unlimited:?}");
+        let capped = diagnostics_for_language_with_cap("jags", code, 2);
+        assert_eq!(capped, unlimited[..2]);
+        assert_eq!(capped[0].range.start.line, 1);
+        assert_eq!(capped[0].range.start.character, 16);
+        assert_eq!(capped[1].range.start.line, 2);
+        assert_eq!(capped[1].range.start.character, 16);
+    }
+
+    #[test]
+    fn native_syntax_cap_does_not_truncate_r_diagnostics() {
+        let code = ")\n)\n)\n";
+        let findings = diagnostics_for_language_with_cap("r", code, 1);
+        assert!(
+            findings.len() > 1,
+            "the foreign-language cap must not affect R diagnostics: {findings:?}"
+        );
+    }
+
+    /// Manual release-mode evidence harness for issue #727. It reuses the
+    /// parsed tree so the timing isolates collection/order/deduplication, then
+    /// records the exact serialized LSP diagnostic payload size.
+    #[test]
+    #[ignore = "manual diagnostic-cap benchmark; run in release mode with --nocapture"]
+    fn benchmark_foreign_syntax_diagnostic_caps() {
+        use std::time::{Duration, Instant};
+
+        let mut jags = String::from("model {\n");
+        while jags.len() + 18 < 100 * 1024 {
+            jags.push_str("  theta <- * 1\n");
+        }
+        jags.push_str("}\n");
+
+        let mut stan = String::new();
+        let mut index = 0usize;
+        while stan.len() + 40 < 100 * 1024 {
+            stan.push_str(&format!("model {{ print({index}); target += ; }}\n"));
+            index += 1;
+        }
+
+        let stan_tree = crate::stan::parse(&stan).unwrap();
+        let jags_tree = crate::jags::parse_with_old_tree(&jags, None).unwrap();
+        let fixtures = [
+            (ForeignSyntaxLanguage::Stan, stan, stan_tree),
+            (ForeignSyntaxLanguage::Jags, jags, jags_tree),
+        ];
+
+        println!("language,cap,median_collector_us,diagnostics,lsp_json_bytes");
+        for (language, code, tree) in fixtures {
+            for cap in [100usize, 500, 1_000, 0] {
+                let collect = || {
+                    collect_foreign_syntax_errors_with_cancel_check(
+                        tree.root_node(),
+                        &code,
+                        language,
+                        cap,
+                        || false,
+                    )
+                    .unwrap()
+                };
+                let diagnostics = collect();
+                let diagnostic_count = diagnostics.len();
+                let payload_bytes = serde_json::to_vec(&diagnostics).unwrap().len();
+                drop(diagnostics);
+                let mut samples = [Duration::ZERO; 9];
+                for sample in &mut samples {
+                    let start = Instant::now();
+                    let diagnostics = std::hint::black_box(collect());
+                    *sample = start.elapsed();
+                    assert_eq!(diagnostics.len(), diagnostic_count);
+                }
+                samples.sort();
+                println!(
+                    "{},{},{},{},{}",
+                    language.label(),
+                    if cap == 0 {
+                        "unlimited".to_string()
+                    } else {
+                        cap.to_string()
+                    },
+                    samples[4].as_micros(),
+                    diagnostic_count,
+                    payload_bytes,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn jags_deduplicates_before_applying_the_unique_diagnostic_cap() {
         let duplicate = foreign_syntax_diagnostic(
             ForeignSyntaxLanguage::Jags,
@@ -184,7 +322,7 @@ generated quantities { real z = twice(mu); }
             )
         }));
 
-        finalize_foreign_syntax_diagnostics(&mut recovery_candidates, ForeignSyntaxLanguage::Jags);
+        finalize_foreign_syntax_diagnostics(&mut recovery_candidates, Some(100));
 
         assert_eq!(recovery_candidates.len(), 100);
         assert_eq!(recovery_candidates[0].range.start.line, 0);
@@ -217,17 +355,12 @@ generated quantities { real z = twice(mu); }
         ));
 
         let mut reference = candidates.clone();
-        finalize_foreign_syntax_diagnostics(&mut reference, ForeignSyntaxLanguage::Jags);
+        finalize_foreign_syntax_diagnostics(&mut reference, Some(100));
         let mut bounded = Vec::new();
         for diagnostic in candidates {
-            retain_foreign_syntax_diagnostic(
-                &mut bounded,
-                ForeignSyntaxLanguage::Jags,
-                diagnostic,
-                true,
-            );
+            retain_foreign_syntax_diagnostic(&mut bounded, diagnostic, Some(100));
         }
-        finalize_foreign_syntax_diagnostics(&mut bounded, ForeignSyntaxLanguage::Jags);
+        finalize_foreign_syntax_diagnostics(&mut bounded, Some(100));
 
         assert_eq!(bounded, reference);
         assert_eq!(bounded.len(), 100);
@@ -260,7 +393,7 @@ generated quantities { real z = twice(mu); }
             code,
             ForeignSyntaxLanguage::Jags,
             || false,
-            true,
+            Some(100),
         )
         .unwrap();
         let reference = collect_foreign_syntax_errors_with_cancel_check_and_retention(
@@ -268,7 +401,7 @@ generated quantities { real z = twice(mu); }
             code,
             ForeignSyntaxLanguage::Jags,
             || false,
-            false,
+            None,
         )
         .unwrap();
 
@@ -290,17 +423,18 @@ generated quantities { real z = twice(mu); }
             &code,
             ForeignSyntaxLanguage::Jags,
             || false,
-            true,
+            Some(100),
         )
         .unwrap();
-        let reference = collect_foreign_syntax_errors_with_cancel_check_and_retention(
+        let mut reference = collect_foreign_syntax_errors_with_cancel_check_and_retention(
             tree.root_node(),
             &code,
             ForeignSyntaxLanguage::Jags,
             || false,
-            false,
+            None,
         )
         .unwrap();
+        reference.truncate(100);
 
         assert_eq!(bounded, reference);
         assert_eq!(bounded.len(), 100);
@@ -308,9 +442,9 @@ generated quantities { real z = twice(mu); }
 
     #[test]
     fn jags_large_traversal_cancels_mid_collection_without_partial_results() {
-        let mut code = String::from("model {\n  first <- * 1\n");
+        let mut code = String::from("model {\n");
         for index in 0..2_000 {
-            code.push_str(&format!("  x{index} <- {index}\n"));
+            code.push_str(&format!("  x{index} <- * {index}\n"));
         }
         code.push_str("}\n");
         let tree = crate::jags::parse_with_old_tree(&code, None).expect("large JAGS tree");
@@ -319,6 +453,7 @@ generated quantities { real z = twice(mu); }
             tree.root_node(),
             &code,
             ForeignSyntaxLanguage::Jags,
+            5,
             || {
                 checks += 1;
                 checks >= 37
@@ -331,7 +466,7 @@ generated quantities { real z = twice(mu); }
         );
         assert_eq!(
             checks, 37,
-            "one bounded callback check is made per visited node"
+            "collection must keep traversing and checking cancellation after the cap saturates"
         );
     }
 
@@ -1492,10 +1627,20 @@ pub(crate) fn diagnostics_from_snapshot(
     // untitled model buffers carry their type only through `languageId`.
     match snapshot.file_type {
         FileType::Stan => {
-            return collect_stan_syntax_errors(snapshot.tree.root_node(), &snapshot.text, cancel);
+            return collect_stan_syntax_errors(
+                snapshot.tree.root_node(),
+                &snapshot.text,
+                cancel,
+                snapshot.cross_file_config.max_syntax_diagnostics_per_file,
+            );
         }
         FileType::Jags => {
-            return collect_jags_syntax_errors(snapshot.tree.root_node(), &snapshot.text, cancel);
+            return collect_jags_syntax_errors(
+                snapshot.tree.root_node(),
+                &snapshot.text,
+                cancel,
+                snapshot.cross_file_config.max_syntax_diagnostics_per_file,
+            );
         }
         FileType::R => {}
     }
@@ -10747,13 +10892,6 @@ impl ForeignSyntaxLanguage {
             Self::Stan => "Stan",
         }
     }
-
-    fn diagnostic_cap(self) -> usize {
-        match self {
-            Self::Jags => 100,
-            Self::Stan => usize::MAX,
-        }
-    }
 }
 
 fn foreign_syntax_diagnostic(language: ForeignSyntaxLanguage, range: Range) -> Diagnostic {
@@ -10785,47 +10923,43 @@ fn foreign_diagnostic_order(left: &Diagnostic, right: &Diagnostic) -> std::cmp::
 }
 
 /// Retain exactly the diagnostics that a final stable sort, exact deduplication,
-/// and truncation would keep, without letting a malformed JAGS file allocate a
-/// candidate vector proportional to its syntax-error count.
+/// and truncation would keep, without letting a malformed Stan/JAGS file
+/// allocate a candidate vector proportional to its syntax-error count.
 ///
 /// Traversal still visits every node so cancellation remains responsive after
-/// the retained set reaches its cap. Stan's unbounded collector keeps its
-/// existing append-only behavior.
+/// the retained set reaches its cap. `None` is the explicit unlimited mode.
 fn retain_foreign_syntax_diagnostic(
     diagnostics: &mut Vec<Diagnostic>,
-    language: ForeignSyntaxLanguage,
     diagnostic: Diagnostic,
-    bounded: bool,
+    retention_limit: Option<usize>,
 ) {
-    if !bounded {
+    let Some(cap) = retention_limit else {
         diagnostics.push(diagnostic);
+        return;
+    };
+
+    let first_equal = diagnostics
+        .partition_point(|existing| foreign_diagnostic_order(existing, &diagnostic).is_lt());
+    let after_equal = diagnostics
+        .partition_point(|existing| !foreign_diagnostic_order(existing, &diagnostic).is_gt());
+    if diagnostics[first_equal..after_equal].contains(&diagnostic) {
         return;
     }
 
-    let cap = language.diagnostic_cap();
-    if cap == usize::MAX {
-        diagnostics.push(diagnostic);
-        return;
-    }
-
-    match diagnostics.binary_search_by(|existing| foreign_diagnostic_order(existing, &diagnostic)) {
-        Ok(_) => {}
-        Err(index) if index < cap => {
-            diagnostics.insert(index, diagnostic);
-            diagnostics.truncate(cap);
-        }
-        Err(_) => {}
+    // Insert after equal source-order keys so ties retain traversal order, as
+    // a stable full sort would. Exact duplicates were removed above.
+    if after_equal < cap {
+        diagnostics.insert(after_equal, diagnostic);
+        diagnostics.truncate(cap);
     }
 }
 
 fn error_node_starts_after_retained_diagnostic_window(
     node: Node,
     diagnostics: &[Diagnostic],
-    language: ForeignSyntaxLanguage,
-    bounded: bool,
+    retention_limit: Option<usize>,
 ) -> bool {
-    bounded
-        && diagnostics.len() == language.diagnostic_cap()
+    retention_limit.is_some_and(|cap| diagnostics.len() == cap)
         && diagnostics.last().is_some_and(|last| {
             // Tree-sitter's source-order invariant places an ERROR node and
             // all of its descendants at or after that node's start point.
@@ -10874,6 +11008,7 @@ fn collect_foreign_syntax_errors_with_cancel_check(
     root: Node,
     text: &str,
     language: ForeignSyntaxLanguage,
+    max_diagnostics: usize,
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Option<Vec<Diagnostic>> {
     collect_foreign_syntax_errors_with_cancel_check_and_retention(
@@ -10881,7 +11016,7 @@ fn collect_foreign_syntax_errors_with_cancel_check(
         text,
         language,
         &mut is_cancelled,
-        true,
+        (max_diagnostics != 0).then_some(max_diagnostics),
     )
 }
 
@@ -10890,7 +11025,7 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
     text: &str,
     language: ForeignSyntaxLanguage,
     mut is_cancelled: impl FnMut() -> bool,
-    bounded: bool,
+    retention_limit: Option<usize>,
 ) -> Option<Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
 
@@ -10904,9 +11039,8 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
             {
                 retain_foreign_syntax_diagnostic(
                     &mut diagnostics,
-                    language,
                     foreign_syntax_diagnostic(language, range),
-                    bounded,
+                    retention_limit,
                 );
             }
         }
@@ -10937,9 +11071,8 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
             );
             retain_foreign_syntax_diagnostic(
                 &mut diagnostics,
-                language,
                 foreign_syntax_diagnostic(language, visible_anchor_range(text, row, col)),
-                bounded,
+                retention_limit,
             );
             continue;
         }
@@ -10948,17 +11081,15 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
             if error_node_starts_after_retained_diagnostic_window(
                 node,
                 &diagnostics,
-                language,
-                bounded,
+                retention_limit,
             ) {
                 continue;
             }
             let range = clamp_foreign_diagnostic_range(text, minimize_error_range(node, text));
             retain_foreign_syntax_diagnostic(
                 &mut diagnostics,
-                language,
                 foreign_syntax_diagnostic(language, range),
-                bounded,
+                retention_limit,
             );
             // The range helper inspected nested MISSING nodes. Do not recurse:
             // nested recovery errors describe the same outer parse failure.
@@ -10981,7 +11112,6 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
             };
             retain_foreign_syntax_diagnostic(
                 &mut diagnostics,
-                language,
                 Diagnostic {
                     range: visible_anchor_range(text, row, col),
                     severity: Some(DiagnosticSeverity::ERROR),
@@ -10991,7 +11121,7 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
                     message,
                     ..Default::default()
                 },
-                bounded,
+                retention_limit,
             );
             continue;
         }
@@ -11001,17 +11131,30 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
         stack.extend(children.into_iter().rev());
     }
 
-    finalize_foreign_syntax_diagnostics(&mut diagnostics, language);
+    finalize_foreign_syntax_diagnostics(&mut diagnostics, retention_limit);
     Some(diagnostics)
 }
 
 fn finalize_foreign_syntax_diagnostics(
     diagnostics: &mut Vec<Diagnostic>,
-    language: ForeignSyntaxLanguage,
+    retention_limit: Option<usize>,
 ) {
     diagnostics.sort_by(foreign_diagnostic_order);
-    diagnostics.dedup_by(|left, right| left.range == right.range && left.message == right.message);
-    diagnostics.truncate(language.diagnostic_cap());
+    let mut deduplicated = Vec::with_capacity(diagnostics.len());
+    for diagnostic in diagnostics.drain(..) {
+        let is_duplicate = deduplicated
+            .iter()
+            .rev()
+            .take_while(|existing| foreign_diagnostic_order(existing, &diagnostic).is_eq())
+            .any(|existing| existing == &diagnostic);
+        if !is_duplicate {
+            deduplicated.push(diagnostic);
+        }
+    }
+    *diagnostics = deduplicated;
+    if let Some(cap) = retention_limit {
+        diagnostics.truncate(cap);
+    }
 }
 
 fn collect_foreign_syntax_errors(
@@ -11019,24 +11162,41 @@ fn collect_foreign_syntax_errors(
     text: &str,
     cancel: &DiagCancelToken,
     language: ForeignSyntaxLanguage,
+    max_diagnostics: usize,
 ) -> Option<Vec<Diagnostic>> {
-    collect_foreign_syntax_errors_with_cancel_check(root, text, language, || cancel.is_cancelled())
+    collect_foreign_syntax_errors_with_cancel_check(root, text, language, max_diagnostics, || {
+        cancel.is_cancelled()
+    })
 }
 
 fn collect_stan_syntax_errors(
     root: Node,
     text: &str,
     cancel: &DiagCancelToken,
+    max_diagnostics: usize,
 ) -> Option<Vec<Diagnostic>> {
-    collect_foreign_syntax_errors(root, text, cancel, ForeignSyntaxLanguage::Stan)
+    collect_foreign_syntax_errors(
+        root,
+        text,
+        cancel,
+        ForeignSyntaxLanguage::Stan,
+        max_diagnostics,
+    )
 }
 
 fn collect_jags_syntax_errors(
     root: Node,
     text: &str,
     cancel: &DiagCancelToken,
+    max_diagnostics: usize,
 ) -> Option<Vec<Diagnostic>> {
-    collect_foreign_syntax_errors(root, text, cancel, ForeignSyntaxLanguage::Jags)
+    collect_foreign_syntax_errors(
+        root,
+        text,
+        cancel,
+        ForeignSyntaxLanguage::Jags,
+        max_diagnostics,
+    )
 }
 
 /// Make a zero-width parser insertion visible without extending beyond the

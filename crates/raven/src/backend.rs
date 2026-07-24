@@ -320,7 +320,8 @@ fn normalize_document_indent_unit(unit: u32) -> u32 {
 ///
 /// Supported top-level keys read:
 /// - `crossFile`: core cross-file behavior and diagnostic severities.
-/// - `diagnostics.enabled` and `diagnostics.undefinedVariableSeverity`: diagnostics master switch and undefined variable diagnostic severity.
+/// - `diagnostics`: diagnostics master switch, native Stan/JAGS syntax
+///   diagnostic limit, and R diagnostic settings.
 /// - `packages`: package-related settings (`enabled`, `additionalLibraryPaths`, `rPath`,
 ///   `missingPackageSeverity`, `watchLibraryPaths`, `watchDebounceMs`).
 ///
@@ -540,6 +541,14 @@ pub(crate) fn parse_cross_file_config(
         if let Some(v) = diag.get("enabled").and_then(|v| v.as_bool()) {
             config.diagnostics_enabled = v;
         }
+        // Parse diagnostics.maxSyntaxDiagnosticsPerFile. Zero deliberately
+        // means unlimited; unlike cache sizes, it must not be clamped upward.
+        if let Some(v) = diag
+            .get("maxSyntaxDiagnosticsPerFile")
+            .and_then(|v| v.as_u64())
+        {
+            config.max_syntax_diagnostics_per_file = usize::try_from(v).unwrap_or(usize::MAX);
+        }
         // Parse diagnostics.undefinedVariableSeverity
         if let Some(sev) = diag
             .get("undefinedVariableSeverity")
@@ -648,6 +657,10 @@ pub(crate) fn parse_cross_file_config(
         config.revalidation_debounce_ms
     );
     log::info!("  diagnostics_enabled: {}", config.diagnostics_enabled);
+    log::info!(
+        "  max_syntax_diagnostics_per_file: {}",
+        config.max_syntax_diagnostics_per_file
+    );
     log::info!(
         "  hoist_globals_in_functions: {}",
         config.hoist_globals_in_functions
@@ -31101,6 +31114,28 @@ mod tests {
         }
 
         #[test]
+        fn parse_cross_file_config_reads_shared_syntax_diagnostic_cap() {
+            let default_config = crate::backend::parse_cross_file_config(&json!({
+                "diagnostics": {}
+            }))
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                default_config.max_syntax_diagnostics_per_file,
+                crate::cross_file::config::DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE
+            );
+
+            for cap in [0, 17, 901, usize::MAX] {
+                let config = crate::backend::parse_cross_file_config(&json!({
+                    "diagnostics": { "maxSyntaxDiagnosticsPerFile": cap }
+                }))
+                .unwrap()
+                .unwrap();
+                assert_eq!(config.max_syntax_diagnostics_per_file, cap);
+            }
+        }
+
+        #[test]
         fn parse_cross_file_config_rprofile_prelude_defaults_on_and_reads_explicit() {
             // Default-on: a client that omits `packages.rprofilePrelude` still
             // gets the `.Rprofile` prelude — `CrossFileConfig::default()` has
@@ -51630,7 +51665,7 @@ lineLength = 200
         };
 
         let tmp = TempDir::new().unwrap();
-        let invalid = "model {\n  x <- * 1\n}\n";
+        let invalid = "model {\n  a <- * 1\n  b <- * 1\n  c <- * 1\n  d <- * 1\n  e <- * 1\n}\n";
         let path = tmp.path().join("model.jags");
         fs::write(&path, invalid).unwrap();
         let uri = Url::from_file_path(&path).unwrap();
@@ -51646,6 +51681,7 @@ lineLength = 200
                     initialization_options: Some(serde_json::json!({
                         "diagnosticUris": [uri.to_string()],
                         "crossFile": { "indexWorkspace": false },
+                        "diagnostics": { "maxSyntaxDiagnosticsPerFile": 3 },
                         "packages": { "enabled": false }
                     })),
                     ..Default::default()
@@ -51680,7 +51716,7 @@ lineLength = 200
         let v1: PublishDiagnosticsParams =
             serde_json::from_value(v1.params().unwrap().clone()).unwrap();
         assert_eq!(v1.uri, uri);
-        assert!(!v1.diagnostics.is_empty());
+        assert_eq!(v1.diagnostics.len(), 3);
         assert!(v1.diagnostics.iter().all(|finding| {
             finding.code
                 == Some(tower_lsp::lsp_types::NumberOrString::String(
@@ -51736,6 +51772,188 @@ lineLength = 200
         assert!(entry.artifacts.exported_interface.is_empty());
         assert!(entry.loaded_packages.is_empty());
         assert!(entry.data_packages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn syntax_diagnostic_cap_configuration_force_republishes_stan_and_jags() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Duration;
+
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::Request;
+        use tower_lsp::lsp_types::{
+            DidChangeConfigurationParams, DidOpenTextDocumentParams, InitializeParams,
+            PublishDiagnosticsParams, TextDocumentItem, Url, WorkspaceFolder,
+        };
+        use tower_lsp::{ClientSocket, LanguageServer};
+
+        async fn next_publish_batch(
+            socket: &mut ClientSocket,
+            expected_uris: &HashSet<Url>,
+        ) -> HashMap<Url, PublishDiagnosticsParams> {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut published = HashMap::new();
+                while published.len() < expected_uris.len() {
+                    let message = futures_util::StreamExt::next(socket)
+                        .await
+                        .expect("client socket remains open");
+                    if message.method() != "textDocument/publishDiagnostics" {
+                        continue;
+                    }
+                    let params: PublishDiagnosticsParams =
+                        serde_json::from_value(message.params().unwrap().clone()).unwrap();
+                    if expected_uris.contains(&params.uri) {
+                        published.insert(params.uri.clone(), params);
+                    }
+                }
+                published
+            })
+            .await
+            .expect("both Stan and JAGS diagnostics must republish")
+        }
+
+        fn assert_batch(
+            published: &HashMap<Url, PublishDiagnosticsParams>,
+            expected_uris: &HashSet<Url>,
+            expected_count: usize,
+        ) {
+            assert_eq!(published.len(), expected_uris.len());
+            for uri in expected_uris {
+                let params = &published[uri];
+                assert_eq!(
+                    params.diagnostics.len(),
+                    expected_count,
+                    "unexpected syntax diagnostic count for {uri}"
+                );
+                assert!(params.diagnostics.iter().all(|finding| {
+                    finding.code
+                        == Some(tower_lsp::lsp_types::NumberOrString::String(
+                            "syntax-error".to_string(),
+                        ))
+                }));
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let mut stan = String::new();
+        let mut jags = String::from("model {\n");
+        for index in 0..520 {
+            stan.push_str(&format!("model {{ print({index}); target += ; }}\n"));
+            jags.push_str(&format!("  x{index} <- * 1\n"));
+        }
+        jags.push_str("}\n");
+
+        let stan_uri = Url::from_file_path(tmp.path().join("invalid.stan")).unwrap();
+        let jags_uri = Url::from_file_path(tmp.path().join("invalid.jags")).unwrap();
+        fs::write(stan_uri.to_file_path().unwrap(), &stan).unwrap();
+        fs::write(jags_uri.to_file_path().unwrap(), &jags).unwrap();
+        let expected_uris = HashSet::from([stan_uri.clone(), jags_uri.clone()]);
+
+        let (mut service, mut socket) = tower_lsp::LspService::new(Backend::new);
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Url::from_directory_path(tmp.path()).unwrap(),
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(serde_json::json!({
+                        "diagnosticUris": expected_uris
+                            .iter()
+                            .map(Url::to_string)
+                            .collect::<Vec<_>>(),
+                        "crossFile": {
+                            "indexWorkspace": false,
+                            "revalidationDebounceMs": 60_000
+                        },
+                        "packages": { "enabled": false }
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize)
+            .await
+            .unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+        let backend = service.inner();
+        backend.state.write().await.workspace_scan_complete = true;
+
+        for (uri, language_id, text) in [
+            (&stan_uri, "stan", stan.as_str()),
+            (&jags_uri, "jags", jags.as_str()),
+        ] {
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: language_id.into(),
+                        version: 1,
+                        text: text.into(),
+                    },
+                })
+                .await;
+        }
+        let publish_initial = async {
+            for uri in [&stan_uri, &jags_uri] {
+                backend.publish_diagnostics(uri).await;
+            }
+        };
+        let ((), initial) = tokio::join!(
+            publish_initial,
+            next_publish_batch(&mut socket, &expected_uris)
+        );
+        assert_batch(&initial, &expected_uris, 500);
+
+        let apply_cap = backend.did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({
+                "crossFile": {
+                    "indexWorkspace": false,
+                    "revalidationDebounceMs": 60_000
+                },
+                "diagnostics": { "maxSyntaxDiagnosticsPerFile": 7 },
+                "packages": { "enabled": false }
+            }),
+        });
+        let ((), capped) = tokio::join!(apply_cap, next_publish_batch(&mut socket, &expected_uris));
+        assert_batch(&capped, &expected_uris, 7);
+
+        let reset_cap = backend.did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({
+                "crossFile": {
+                    "indexWorkspace": false,
+                    "revalidationDebounceMs": 60_000
+                },
+                "packages": { "enabled": false }
+            }),
+        });
+        let ((), reset) = tokio::join!(reset_cap, next_publish_batch(&mut socket, &expected_uris));
+        assert_batch(&reset, &expected_uris, 500);
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.cross_file_config.max_syntax_diagnostics_per_file,
+            crate::cross_file::config::DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE
+        );
+        assert!(
+            expected_uris.iter().all(|uri| {
+                state
+                    .get_document(uri)
+                    .is_some_and(|document| document.version == Some(1))
+            }),
+            "all three publish batches must occur without an edit; the latter two require the force-republish gate"
+        );
+        assert!(
+            expected_uris
+                .iter()
+                .all(|uri| { state.diagnostics_gate.force_republish_count_for_test(uri) == 0 })
+        );
     }
 
     #[tokio::test]

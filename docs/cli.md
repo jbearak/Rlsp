@@ -57,9 +57,12 @@ The workspace is indexed, except for paths matched by `[workspace].exclude`, so 
 JAGS and Stan checking is syntax-only. It does not run JAGS or `stanc`, validate
 model identifiers, dimensions, types, or distribution signatures, resolve
 Stan `#include` targets, or apply R semantic, lint, package, or cross-file
-analysis to model source. JAGS syntax findings are capped at 100 per file. The
-three JAGS suffixes select strict JAGS-dialect validation, not general OpenBUGS,
-WinBUGS, MultiBUGS, or NIMBLE compatibility.
+analysis to model source. Stan and JAGS share the `[diagnostics]`
+`maxSyntaxDiagnosticsPerFile` `raven.toml` setting (default `500`,
+`0` for unlimited); it is applied after exact deduplication and stable source
+ordering in `text`, `json`, and `sarif` output. The three JAGS suffixes select
+strict JAGS-dialect validation, not general OpenBUGS, WinBUGS, MultiBUGS, or
+NIMBLE compatibility.
 
 `raven.toml` can exclude generated or vendored trees from discovery:
 

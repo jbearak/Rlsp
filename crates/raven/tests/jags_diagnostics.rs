@@ -46,7 +46,7 @@ fn analyze(state: &mut WorldState, uri: &Url, source: &str, language_id: &str) -
 
 fn assert_syntax_only_in_bounds(name: &str, source: &str, findings: &[Diagnostic]) {
     let mut unique = HashSet::new();
-    assert!(findings.len() <= 100, "{name} exceeded the diagnostic cap");
+    assert!(findings.len() <= 500, "{name} exceeded the diagnostic cap");
     for finding in findings {
         assert_eq!(finding.severity, Some(DiagnosticSeverity::ERROR), "{name}");
         assert_eq!(
@@ -324,15 +324,15 @@ fn leading_and_trailing_whitespace_are_not_root_coverage_errors() {
 }
 
 #[test]
-fn malformed_jags_diagnostics_are_capped_at_one_hundred() {
+fn malformed_jags_diagnostics_use_the_shared_default_cap() {
     let mut source = String::from("model {\n");
-    for index in 0..150 {
+    for index in 0..550 {
         source.push_str(&format!("  x{index} <- * 1\n"));
     }
     source.push_str("}\n");
     let uri = Url::parse("untitled:jags-diagnostic-cap").unwrap();
     let findings = analyze(&mut WorldState::new(), &uri, &source, "jags");
-    assert_eq!(findings.len(), 100, "cap fixture drifted: {findings:#?}");
+    assert_eq!(findings.len(), 500, "cap fixture drifted: {findings:#?}");
 }
 
 #[test]
@@ -385,5 +385,139 @@ fn raven_check_bug_text_json_and_sarif_outputs_fail_with_syntax_error() {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+#[test]
+fn raven_check_applies_one_project_cap_to_stan_and_jags_in_every_format() {
+    use std::collections::BTreeMap;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let mut jags = String::from("model {\n");
+    let mut stan = String::new();
+    for index in 0..8 {
+        jags.push_str(&format!("  x{index} <- * 1\n"));
+        stan.push_str(&format!("model {{ print({index}); target += ; }}\n"));
+    }
+    jags.push_str("}\n");
+    std::fs::write(workspace.path().join("invalid.jags"), jags).unwrap();
+    std::fs::write(workspace.path().join("invalid.stan"), stan).unwrap();
+    std::fs::write(
+        workspace.path().join("raven.toml"),
+        "[diagnostics]\nmaxSyntaxDiagnosticsPerFile = 3\n",
+    )
+    .unwrap();
+    let expected_paths = ["invalid.jags", "invalid.stan"];
+
+    for format in ["text", "json", "sarif"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_raven"))
+            .args(["check", "--workspace"])
+            .arg(workspace.path())
+            .args(["--format", format, "--quiet", "--no-color"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{format}: {output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let mut counts = BTreeMap::<String, usize>::new();
+        match format {
+            "text" => {
+                for line in stdout
+                    .lines()
+                    .filter(|line| line.ends_with("[syntax-error]"))
+                {
+                    let path = expected_paths
+                        .iter()
+                        .find(|path| line.starts_with(&format!("{path}:")))
+                        .unwrap_or_else(|| panic!("unexpected text finding: {line}"));
+                    *counts.entry((*path).to_string()).or_default() += 1;
+                }
+            }
+            "json" => {
+                let findings = serde_json::from_str::<serde_json::Value>(&stdout).unwrap();
+                for finding in findings.as_array().unwrap() {
+                    assert_eq!(finding["diagnostic"]["code"], "syntax-error");
+                    let path = finding["path"].as_str().unwrap();
+                    *counts.entry(path.to_string()).or_default() += 1;
+                }
+            }
+            "sarif" => {
+                let report = serde_json::from_str::<serde_json::Value>(&stdout).unwrap();
+                for result in report["runs"][0]["results"].as_array().unwrap() {
+                    assert_eq!(result["ruleId"], "syntax-error");
+                    let path =
+                        result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                            .as_str()
+                            .unwrap();
+                    *counts.entry(path.to_string()).or_default() += 1;
+                }
+            }
+            _ => unreachable!(),
+        }
+        let observed_paths: Vec<_> = counts.keys().map(String::as_str).collect();
+        assert_eq!(
+            observed_paths, expected_paths,
+            "{format} emitted findings for an unexpected path: {stdout}"
+        );
+        assert_eq!(counts.values().sum::<usize>(), 6);
+        for path in expected_paths {
+            assert_eq!(
+                counts.get(path),
+                Some(&3),
+                "{format} must retain three findings for {path}: {stdout}"
+            );
+        }
+    }
+
+    let run_json_with_cap = |configured_cap: usize| {
+        std::fs::write(
+            workspace.path().join("raven.toml"),
+            format!("[diagnostics]\nmaxSyntaxDiagnosticsPerFile = {configured_cap}\n"),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_raven"))
+            .args(["check", "--workspace"])
+            .arg(workspace.path())
+            .args(["--format", "json", "--quiet", "--no-color"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let findings = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+        let mut counts = BTreeMap::<String, usize>::new();
+        for finding in findings.as_array().unwrap() {
+            assert_eq!(finding["diagnostic"]["code"], "syntax-error");
+            let path = finding["path"].as_str().unwrap();
+            *counts.entry(path.to_string()).or_default() += 1;
+        }
+        counts
+    };
+
+    let unlimited = run_json_with_cap(0);
+    for path in expected_paths {
+        assert!(
+            unlimited.get(path).is_some_and(|count| *count > 2),
+            "unlimited baseline must exercise truncation for {path}: {unlimited:?}"
+        );
+    }
+
+    let high_cap = 20;
+    assert!(
+        unlimited.values().all(|count| *count < high_cap),
+        "fixture baseline must remain below the verified high cap: {unlimited:?}"
+    );
+    assert_eq!(run_json_with_cap(high_cap), unlimited);
+
+    let low_cap = 2;
+    let low = run_json_with_cap(low_cap);
+    let expected_low_total: usize = expected_paths
+        .iter()
+        .map(|path| unlimited[*path].min(low_cap))
+        .sum();
+    assert_eq!(low.values().sum::<usize>(), expected_low_total);
+    for path in expected_paths {
+        assert_eq!(
+            low.get(path).copied().unwrap_or(0),
+            unlimited[path].min(low_cap),
+            "configured cap {low_cap} must apply independently to {path}"
+        );
     }
 }

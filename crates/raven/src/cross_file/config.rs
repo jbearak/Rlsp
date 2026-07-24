@@ -9,6 +9,10 @@ use tower_lsp::lsp_types::DiagnosticSeverity;
 
 use super::path_resolve::CaseMismatchRegime;
 
+/// Default maximum number of native Stan/JAGS syntax diagnostics retained for
+/// one file. A configured value of `0` disables the limit.
+pub const DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE: usize = 500;
+
 /// Severity policy for the `source-path-case-mismatch` diagnostic (issue #530;
 /// extended to backward directives in #535). Distinct from the plain
 /// `Option<DiagnosticSeverity>` other categories use because the default
@@ -75,6 +79,10 @@ pub struct CrossFileConfig {
     /// Master switch for all diagnostics
     /// When false, all diagnostics are suppressed regardless of individual severity settings
     pub diagnostics_enabled: bool,
+    /// Maximum native Tree-sitter syntax diagnostics retained for one Stan or
+    /// JAGS file after exact deduplication and source ordering. `0` is
+    /// unlimited. This does not cap R diagnostics.
+    pub max_syntax_diagnostics_per_file: usize,
     /// Maximum depth for backward directive traversal
     pub max_backward_depth: usize,
     /// Maximum depth for forward source() traversal
@@ -244,6 +252,7 @@ impl Default for CrossFileConfig {
     fn default() -> Self {
         Self {
             diagnostics_enabled: true,
+            max_syntax_diagnostics_per_file: DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE,
             max_backward_depth: 10,
             max_forward_depth: 10,
             max_chain_depth: 64,
@@ -316,6 +325,10 @@ mod tests {
         assert_eq!(config.max_revalidations_per_trigger, 10);
         assert_eq!(config.revalidation_debounce_ms, 200);
         assert_eq!(config.edited_file_debounce_ms, 50);
+        assert_eq!(
+            config.max_syntax_diagnostics_per_file,
+            DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE
+        );
         assert_eq!(
             config.undefined_variable_severity,
             Some(DiagnosticSeverity::WARNING)
