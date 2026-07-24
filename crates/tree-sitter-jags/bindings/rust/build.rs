@@ -10,4 +10,10 @@ fn main() {
 
     config.compile("tree-sitter-jags");
     println!("cargo:rerun-if-changed={}", parser_path.display());
+    for header in ["alloc.h", "array.h", "parser.h"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            src_dir.join("tree_sitter").join(header).display()
+        );
+    }
 }

@@ -33,17 +33,17 @@ cargo +nightly-2026-07-22 fuzz run --sanitizer address parser \
   -max_total_time=600 -max_len=4096 -seed=424242 \
   -rss_limit_mb=2048 -timeout=5 -print_final_stats=1 -verbosity=0
 
-mkdir -p evidence-corpus/incremental-asan-20260723
+mkdir -p evidence-corpus/incremental-asan-20260724-review
 cargo +nightly-2026-07-22 fuzz run --sanitizer address incremental_edits \
-  evidence-corpus/incremental-asan-20260723 seeds/incremental_edits -- \
+  evidence-corpus/incremental-asan-20260724-review seeds/incremental_edits -- \
   -max_total_time=600 -max_len=4096 -seed=424242 \
   -rss_limit_mb=2048 -timeout=5 -print_final_stats=1 -verbosity=0
 ```
 
 `evidence.json` records the resulting execution totals, peak RSS, output
 corpus hashes, and empty defect lists. It binds each result to the current
-grammar, generated parser, fuzz target, fuzz lockfile, and committed seed
-content. Check the record without running a campaign:
+grammar, generated parser, fuzz target, fuzz manifest and lockfile, and
+committed seed content. Check the record without running a campaign:
 
 ```sh
 python3 verify_evidence.py
@@ -58,15 +58,21 @@ The committed seed bindings are:
 | Target | Seed files | Bytes | Content-multiset SHA-256 |
 |---|---:|---:|---|
 | `parser` | 4 | 181 | `f36547265c8af99b20cf322950b64ee02a5e4182f0743667106061eaac268777` |
-| `incremental_edits` | 3 | 92 | `7258ff0bf41dea7863cd1d4c303d9794d1b1caedb5affc30dfcf8b4821cab088` |
+| `incremental_edits` | 3 | 101 | `9218b1c37d5928a62529c2a5abe8780bef247f440eef335d04ffe1905d00f200` |
+
+Incremental inputs use the target wire format
+`[base_index, start, delete_len, replacement...]`. Each committed seed replaces
+one complete selected base with its named loop, relation, or Unicode source, so
+the edit boundaries cannot split a UTF-8 code point.
 
 ## Current evidence
 
-Both 600-second AddressSanitizer campaigns completed successfully on
-2026-07-23 with no sanitizer finding, timeout, crash artifact, or parser
+The parser campaign completed on 2026-07-23 and the incremental-edit campaign
+completed on 2026-07-24. Both 600-second AddressSanitizer campaigns completed
+successfully with no sanitizer finding, timeout, crash artifact, or parser
 defect.
 
 | Target | Executions | Average/s | New units | Peak RSS | Output corpus | Output-corpus SHA-256 |
 |---|---:|---:|---:|---:|---|---|
 | `parser` | 8,879,519 | 14,774 | 381 | 532 MiB | 77 files / 2,378 bytes | `e02c8aa78bbc488007a17db1df92a9ca996ea43fc5eebbd46bcb5659f64671c3` |
-| `incremental_edits` | 4,338,332 | 7,218 | 451 | 615 MiB | 118 files / 9,506 bytes | `c3b0c621c11c550d87bd78c4586adf2d3849aa44b3da6020710c86659b583079` |
+| `incremental_edits` | 3,102,972 | 5,163 | 498 | 572 MiB | 106 files / 9,636 bytes | `2078c3537217c2e35fb46eb6352ddc0772a809b9bebe05756a61a51741198c0e` |

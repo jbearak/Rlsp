@@ -42,6 +42,7 @@ def verify_campaign(name: str, campaign: dict[str, Any], failures: list[str]) ->
         "grammar_js_sha256": CRATE_DIR / "grammar.js",
         "parser_c_sha256": CRATE_DIR / "src" / "parser.c",
         "fuzz_target_sha256": FUZZ_DIR / campaign["fuzz_target"],
+        "fuzz_manifest_sha256": FUZZ_DIR / "Cargo.toml",
         "fuzz_lock_sha256": FUZZ_DIR / "Cargo.lock",
     }
     for field, path in source_paths.items():
@@ -74,8 +75,7 @@ def verify_campaign(name: str, campaign: dict[str, Any], failures: list[str]) ->
     )
 
 
-def main() -> int:
-    evidence = json.loads(EVIDENCE_PATH.read_text(encoding="utf-8"))
+def verify(evidence: dict[str, Any]) -> list[str]:
     failures: list[str] = []
     require(evidence.get("schema_version") == 1, "unsupported evidence schema", failures)
 
@@ -110,6 +110,13 @@ def main() -> int:
     for name in ("parser", "incremental_edits"):
         if name in campaigns:
             verify_campaign(name, campaigns[name], failures)
+
+    return failures
+
+
+def main() -> int:
+    evidence = json.loads(EVIDENCE_PATH.read_text(encoding="utf-8"))
+    failures = verify(evidence)
 
     if failures:
         for failure in failures:

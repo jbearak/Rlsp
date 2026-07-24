@@ -8,7 +8,7 @@
     "generate": "tree-sitter generate",
     "check:generated": "tree-sitter generate && git diff --exit-code -- src",
     "check:oracle": "python3 oracle/generate_quality_corpus.py --check && python3 oracle/jags_oracle.py --verify-results && cd oracle && python3 -m unittest -v test_jags_oracle.py",
-    "check:evidence": "python3 fuzz/verify_evidence.py",
+    "check:evidence": "python3 fuzz/verify_evidence.py && cd fuzz && python3 -m unittest -v test_verify_evidence.py",
     "test": "tree-sitter test"
   },
   "devDependencies": {
