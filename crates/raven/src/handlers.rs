@@ -211,32 +211,321 @@ generated quantities { real z = twice(mu); }
     }
 
     #[tokio::test]
-    async fn jags_hover_preserves_prior_inert_behavior() {
+    async fn jags_hover_uses_distribution_and_callable_catalog_roles() {
         let uri = Url::parse("file:///model.jags").unwrap();
         let mut state = WorldState::new();
         state.open_document_with_language_id(
             uri.clone(),
-            "mean <- function(x) x\nmean(1)\n",
+            "model { y ~ dnorm(0, 1); z <- dnorm(y, 0, 1) }\n",
             Some(1),
             Some("jags"),
         );
-        assert!(hover(&state, &uri, Position::new(1, 1)).await.is_none());
+        let distribution = hover(&state, &uri, Position::new(0, 13))
+            .await
+            .expect("distribution hover");
+        let HoverContents::Markup(distribution) = distribution.contents else {
+            panic!("expected Markdown hover")
+        };
+        assert!(distribution.value.contains("distribution — `dnorm`"));
+        assert!(distribution.value.contains("dnorm(parameter1, parameter2)"));
+
+        let callable = hover(&state, &uri, Position::new(0, 34))
+            .await
+            .expect("callable hover");
+        let HoverContents::Markup(callable) = callable.contents else {
+            panic!("expected Markdown hover")
+        };
+        assert!(callable.value.contains("callable — `dnorm`"));
+        assert!(
+            callable
+                .value
+                .contains("dnorm(argument1, argument2, argument3)")
+        );
     }
 
     #[test]
-    fn jags_signature_help_preserves_r_compatible_parser_path() {
+    fn jags_signature_help_is_catalog_driven_and_unknown_calls_are_silent() {
         let uri = Url::parse("file:///model.jags").unwrap();
         let mut state = WorldState::new();
         state.open_document_with_language_id(
             uri.clone(),
-            "helper <- function(x, y) x\nhelper(1, 2)\n",
+            "model { y ~ dnorm(0, sqrt(2)); unknown(1, 2) }\n",
             Some(1),
             Some("jags"),
         );
-        assert!(
-            prepare_signature_help(&state, &uri, Position::new(1, 10)).is_some(),
-            "JAGS signature help historically follows the R-compatible tree path"
+        let ctx = prepare_signature_help(&state, &uri, Position::new(0, 28))
+            .expect("JAGS catalog signature");
+        assert_eq!(ctx.active_parameter, Some(1));
+        let SignatureResolution::Ready(info) = ctx.resolution else {
+            panic!("JAGS must not use package/R resolution")
+        };
+        assert_eq!(info.label, "dnorm(parameter1, parameter2)");
+        assert!(prepare_signature_help(&state, &uri, Position::new(0, 43)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod jags_catalog_editor_tests {
+    use super::*;
+
+    fn marked(source: &str) -> (String, Position) {
+        let marker = source.find('|').expect("one cursor marker");
+        assert_eq!(source[marker + 1..].matches('|').count(), 0);
+        let prefix = &source[..marker];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_prefix = prefix.rsplit_once('\n').map_or(prefix, |(_, tail)| tail);
+        let position = Position::new(line, crate::utf16::utf16_len(line_prefix));
+        let mut text = source.to_string();
+        text.remove(marker);
+        (text, position)
+    }
+
+    fn state_with_jags(text: &str) -> (WorldState, Url) {
+        let uri = Url::parse("file:///catalog-test.jags").unwrap();
+        let mut state = WorldState::new();
+        state.cross_file_config.packages_enabled = true;
+        state.cross_file_config.packages_r_path =
+            Some(std::path::PathBuf::from("/definitely/not/an/R/binary"));
+        state.open_document_with_language_id(uri.clone(), text, Some(1), Some("jags"));
+        (state, uri)
+    }
+
+    fn completion_items(text: &str) -> Vec<CompletionItem> {
+        let (state, uri) = state_with_jags(text);
+        let Some(CompletionResponse::Array(items)) = completion(
+            &state,
+            &uri,
+            Position::new(text.lines().count() as u32, 0),
+            None,
+        ) else {
+            panic!("JAGS completion response")
+        };
+        items
+    }
+
+    async fn hover_value(marked_source: &str) -> Option<(String, Range)> {
+        let (text, position) = marked(marked_source);
+        let (state, uri) = state_with_jags(&text);
+        let hover = hover(&state, &uri, position).await?;
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("Markdown hover")
+        };
+        Some((markup.value, hover.range.expect("hover range")))
+    }
+
+    fn signature(marked_source: &str) -> Option<(SignatureInformation, u32)> {
+        let (text, position) = marked(marked_source);
+        let (state, uri) = state_with_jags(&text);
+        let context = prepare_signature_help(&state, &uri, position)?;
+        let active = context.active_parameter?;
+        let SignatureResolution::Ready(info) = context.resolution else {
+            panic!("JAGS signature help must stay on its synchronous static path")
+        };
+        Some((info, active))
+    }
+
+    #[test]
+    fn every_catalog_name_completes_exactly_once() {
+        let items = completion_items("");
+        let mut expected = std::collections::BTreeSet::new();
+        expected.extend(crate::jags_builtins::JAGS_KEYWORDS.iter().copied());
+        expected.extend(crate::jags_builtins::JAGS_CONTEXTUAL_SYNTAX.iter().copied());
+        expected.extend(
+            crate::jags_builtins::JAGS_CALLABLES
+                .iter()
+                .map(|entry| entry.name),
         );
+        expected.extend(
+            crate::jags_builtins::JAGS_DISTRIBUTIONS
+                .iter()
+                .map(|entry| entry.name),
+        );
+
+        for name in expected {
+            assert_eq!(
+                items.iter().filter(|item| item.label == name).count(),
+                1,
+                "completion multiplicity for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_classification_modules_and_local_shadowing_are_bounded() {
+        let items = completion_items("model { dnorm ~ dbern(0.5) }");
+        let dnorm = items.iter().find(|item| item.label == "dnorm").unwrap();
+        assert_eq!(dnorm.kind, Some(CompletionItemKind::FIELD));
+        assert_eq!(items.iter().filter(|item| item.label == "dnorm").count(), 1);
+
+        let labels: HashSet<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        for present in ["var", "model", "T", "I", "pow", "dbinom", "logdensity.norm"] {
+            assert!(labels.contains(present), "missing {present}");
+        }
+        for absent in [
+            "if",
+            "else",
+            "library",
+            "TRUE",
+            "mexp",
+            "dscaled.gamma",
+            "dordered.logit",
+        ] {
+            assert!(!labels.contains(absent), "unexpected {absent}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hover_selects_distribution_after_tilde_and_callable_elsewhere() {
+        let (distribution, _) = hover_value("model { y ~ dn|orm(0, 1) }").await.unwrap();
+        assert!(distribution.contains("distribution — `dnorm`"));
+        assert!(distribution.contains("dnorm(parameter1, parameter2)"));
+
+        let (callable, _) = hover_value("model { z <- dn|orm(y, 0, 1) }").await.unwrap();
+        assert!(callable.contains("callable — `dnorm`"));
+        assert!(callable.contains("dnorm(argument1, argument2, argument3)"));
+
+        let (alias, _) = hover_value("model { y ~ dbin|om(0.5, 10) }").await.unwrap();
+        assert!(alias.contains("alias of `dbin`"));
+
+        let (comment_separated, _) = hover_value("model { x <- sq|rt /* gap */ (1) }")
+            .await
+            .unwrap();
+        assert!(comment_separated.contains("sqrt(x)"));
+    }
+
+    #[tokio::test]
+    async fn hover_is_silent_for_non_calls_comments_unknown_and_wrong_roles() {
+        for source in [
+            "model { dn|orm <- 1 }",
+            "# dn|orm(0, 1)",
+            "/* dn|orm(0, 1) */",
+            "\"dn|orm(0, 1)\"",
+            "model { unk|nown(1) }",
+            "model { x <- db|ern(0.5) }",
+            "model { y ~ me|xp(1) }",
+            "model { sq|rt + (1) }",
+            "model { sq|rt <- (1) }",
+            "model { sq|rt; (1) }",
+            "model { sq|rt 1 (2) }",
+        ] {
+            assert!(hover_value(source).await.is_none(), "{source}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hover_ranges_use_utf16_with_crlf_and_astral_prefixes() {
+        let (_, range) = hover_value("😀\r\nmodel { y ~ dn|orm(0, 1) }")
+            .await
+            .unwrap();
+        assert_eq!(
+            range,
+            Range::new(Position::new(1, 12), Position::new(1, 17))
+        );
+    }
+
+    #[test]
+    fn signature_help_handles_roles_nested_calls_indexes_and_trailing_arguments() {
+        let (distribution, active) = signature("model { y ~ dnorm(0, |) }").unwrap();
+        assert_eq!(distribution.label, "dnorm(parameter1, parameter2)");
+        assert_eq!(active, 1);
+
+        let (callable, active) = signature("model { x <- dnorm(y, 0, |) }").unwrap();
+        assert_eq!(callable.label, "dnorm(argument1, argument2, argument3)");
+        assert_eq!(active, 2);
+
+        let (outer, active) = signature("model { x <- dnorm(values[1, 2], sqrt(2), |) }").unwrap();
+        assert_eq!(outer.label, "dnorm(argument1, argument2, argument3)");
+        assert_eq!(active, 2);
+
+        let (inner, active) = signature("model { x <- dnorm(values[1, 2], sqrt(2|), 3) }").unwrap();
+        assert_eq!(inner.label, "sqrt(x)");
+        assert_eq!(active, 0);
+
+        let (_, active) = signature("model { x <- dnorm(y, 0, 1, |) }").unwrap();
+        assert_eq!(active, 2);
+
+        let (_, active) = signature("model { x <- sum(1, 2, 3, |) }").unwrap();
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn signature_help_handles_multiline_comments_empty_variadic_and_unicode() {
+        let (info, active) = signature("😀 sum(\n  1, /* comma, */\n  |\n)").unwrap();
+        assert_eq!(info.label, "sum(value, ...)");
+        assert_eq!(active, 1);
+        assert_eq!(info.parameters.as_ref().unwrap().len(), 2);
+
+        let (empty, active) = signature("sum(|)").unwrap();
+        assert_eq!(empty.label, "sum(value, ...)");
+        assert_eq!(active, 0);
+
+        let (comment_separated, active) = signature("sqrt /* gap */ (1|)").unwrap();
+        assert_eq!(comment_separated.label, "sqrt(x)");
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn signature_help_is_silent_for_unknown_optional_and_distribution_only_calls() {
+        for source in [
+            "unknown(|)",
+            "mexp(|)",
+            "dbern(|)",
+            "dnorm(1, # comm|ent\n  2)",
+            "dnorm(1, /* comm|ent */ 2)",
+            "dnorm(\"quoted |noise\", 1)",
+            "dnorm('quoted |noise', 1)",
+            "sqrt + (1|)",
+            "sqrt <- (1|)",
+            "sqrt = (1|)",
+            "sqrt; (1|)",
+            "sqrt 1 (2|)",
+        ] {
+            assert!(signature(source).is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn goto_plain_catalog_named_data_uses_first_occurrence_fallback() {
+        let text = "acos\ndbern\nT\nI\nmodel {\n  x <- acos\n  y <- dbern\n  z <- T\n  w <- I\n}";
+        let (state, uri) = state_with_jags(text);
+        for (name, expected_line) in [("acos", 0), ("dbern", 1), ("T", 2), ("I", 3)] {
+            let occurrence = collect_jags_identifier_occurrences(text)
+                .into_iter()
+                .filter(|occurrence| occurrence.name == name)
+                .nth(1)
+                .unwrap();
+            let response = goto_definition(
+                &state,
+                &uri,
+                Position::new(occurrence.line, occurrence.start_col),
+            )
+            .unwrap_or_else(|| panic!("plain {name} should navigate"));
+            let GotoDefinitionResponse::Scalar(location) = response else {
+                panic!("plain {name} should have one definition")
+            };
+            assert_eq!(location.range.start.line, expected_line, "{name}");
+        }
+    }
+
+    #[test]
+    fn goto_actual_catalog_calls_and_syntax_remain_inert() {
+        for source in [
+            "model { x <- ac|os(1) }",
+            "model { x ~ db|ern(0.5) }",
+            "model { x ~ dnorm(0, 1) |T(0,) }",
+            "mo|del { x <- 1 }",
+            "da|ta { x <- 1 }",
+            "model { fo|r (i in 1:N) { x[i] <- 1 } }",
+            "model { for (i i|n 1:N) { x[i] <- 1 } }",
+            "va|r x",
+        ] {
+            let (text, position) = marked(source);
+            let (state, uri) = state_with_jags(&text);
+            assert!(
+                goto_definition(&state, &uri, position).is_none(),
+                "syntax/catalog call navigated: {source}"
+            );
+        }
     }
 }
 
@@ -20124,6 +20413,72 @@ fn stan_builtin_hover(text: &str, position: Position) -> Option<Hover> {
     ))
 }
 
+fn jags_provider_label(module: &str) -> String {
+    if module == "compiler" {
+        "the JAGS compiler".to_string()
+    } else {
+        format!("the automatically loaded `{module}` module")
+    }
+}
+
+fn jags_builtin_hover(text: &str, position: Position) -> Option<Hover> {
+    let site = crate::jags::call_site_at_position(text, position)?;
+    let (kind, signature, module, canonical_name) = if site.after_tilde {
+        let distribution = crate::jags_builtins::distribution(&site.name)?;
+        (
+            "distribution",
+            distribution.signature(),
+            distribution.module,
+            distribution.canonical_name,
+        )
+    } else {
+        let callable = crate::jags_builtins::callable(&site.name)?;
+        (
+            "callable",
+            callable.signature(),
+            callable.module,
+            callable.canonical_name,
+        )
+    };
+
+    let mut value = format!(
+        "**JAGS {} {} — `{}`**\n\n```jags\n{}\n```\n\nProvided by {}.",
+        crate::jags_builtins::JAGS_VERSION,
+        kind,
+        site.name,
+        signature,
+        jags_provider_label(module),
+    );
+    if canonical_name != site.name {
+        value.push_str(&format!(" This name is an alias of `{canonical_name}`."));
+    }
+    if site.after_tilde {
+        value
+            .push_str(" The parameters shown exclude the stochastic node on the left side of `~`.");
+    }
+    value.push_str(&format!(
+        "\n\n[Catalog provenance: JAGS {} source]({})",
+        crate::jags_builtins::JAGS_VERSION,
+        crate::jags_builtins::JAGS_SOURCE_URL,
+    ));
+
+    Some(markdown_hover(value, site.range))
+}
+
+fn is_jags_builtin_occurrence(text: &str, position: Position) -> bool {
+    if crate::jags::syntax_site_at_position(text, position) {
+        return true;
+    }
+    let Some(site) = crate::jags::call_site_at_position(text, position) else {
+        return false;
+    };
+    if site.after_tilde {
+        crate::jags_builtins::distribution(&site.name).is_some()
+    } else {
+        crate::jags_builtins::callable(&site.name).is_some()
+    }
+}
+
 fn collect_stan_references(
     occurrences: &[StanIdentifierOccurrence],
     name: &str,
@@ -20388,45 +20743,76 @@ fn jags_completion(text: &str, uri: &Url) -> CompletionResponse {
     let mut items = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
-    // Add JAGS keywords
-    for kw in crate::jags_builtins::JAGS_KEYWORDS {
-        items.push(CompletionItem {
-            label: kw.to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, kw)),
-            ..Default::default()
-        });
-        seen_names.insert(kw.to_string());
-    }
-
-    // Add JAGS distributions
-    for dist in crate::jags_builtins::JAGS_DISTRIBUTIONS {
-        if !seen_names.contains(*dist) {
-            items.push(CompletionItem {
-                label: dist.to_string(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, dist)),
-                ..Default::default()
-            });
-            seen_names.insert(dist.to_string());
-        }
-    }
-
-    // Add JAGS functions
-    for func in crate::jags_builtins::JAGS_FUNCTIONS {
-        if !seen_names.contains(*func) {
-            items.push(CompletionItem {
-                label: func.to_string(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, func)),
-                ..Default::default()
-            });
-            seen_names.insert(func.to_string());
-        }
-    }
-
-    // Add file-local symbols
+    // File-local symbols sort before static language entries and retain the
+    // one-item-per-label contract when they share a built-in name.
     collect_jags_document_completions(text, uri, &mut items, &mut seen_names);
+
+    for kw in crate::jags_builtins::JAGS_KEYWORDS {
+        if seen_names.insert((*kw).to_string()) {
+            items.push(CompletionItem {
+                label: kw.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some("JAGS syntax".to_string()),
+                sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, kw)),
+                ..Default::default()
+            });
+        }
+    }
+
+    // `T` and `I` are contextual truncation/censoring syntax, not ordinary
+    // functions and not reserved words in every position.
+    for contextual in crate::jags_builtins::JAGS_CONTEXTUAL_SYNTAX {
+        if seen_names.insert((*contextual).to_string()) {
+            items.push(CompletionItem {
+                label: contextual.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some("JAGS contextual bound syntax".to_string()),
+                sort_text: Some(format!("{}{}", SORT_PREFIX_KEYWORD, contextual)),
+                ..Default::default()
+            });
+        }
+    }
+
+    for callable in crate::jags_builtins::JAGS_CALLABLES {
+        if seen_names.insert(callable.name.to_string()) {
+            let also_distribution = crate::jags_builtins::distribution(callable.name).is_some();
+            items.push(CompletionItem {
+                label: callable.name.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some(if also_distribution {
+                    format!(
+                        "JAGS {} callable and distribution ({})",
+                        crate::jags_builtins::JAGS_VERSION,
+                        callable.module
+                    )
+                } else {
+                    format!(
+                        "JAGS {} callable ({})",
+                        crate::jags_builtins::JAGS_VERSION,
+                        callable.module
+                    )
+                }),
+                sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, callable.name)),
+                ..Default::default()
+            });
+        }
+    }
+
+    for distribution in crate::jags_builtins::JAGS_DISTRIBUTIONS {
+        if seen_names.insert(distribution.name.to_string()) {
+            items.push(CompletionItem {
+                label: distribution.name.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some(format!(
+                    "JAGS {} distribution ({})",
+                    crate::jags_builtins::JAGS_VERSION,
+                    distribution.module
+                )),
+                sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, distribution.name)),
+                ..Default::default()
+            });
+        }
+    }
 
     CompletionResponse::Array(items)
 }
@@ -22352,6 +22738,9 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     if doc.file_type == FileType::Stan {
         return stan_builtin_hover(&doc.text(), position);
     }
+    if doc.file_type == FileType::Jags {
+        return jags_builtin_hover(&doc.text(), position);
+    }
     if doc.file_type != FileType::R {
         return None;
     }
@@ -23183,6 +23572,83 @@ pub struct SignatureHelpContext {
     resolution: SignatureResolution,
 }
 
+fn jags_signature_information(
+    name: &str,
+    signature: String,
+    parameters: &[&str],
+    variadic: bool,
+    module: &str,
+    kind: &str,
+) -> SignatureInformation {
+    let mut parameter_labels = parameters.to_vec();
+    if variadic {
+        parameter_labels.push("...");
+    }
+    SignatureInformation {
+        label: signature,
+        documentation: Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!(
+                "JAGS {} {kind} `{name}`, provided by {}.",
+                crate::jags_builtins::JAGS_VERSION,
+                jags_provider_label(module),
+            ),
+        })),
+        parameters: Some(
+            parameter_labels
+                .into_iter()
+                .map(|label| ParameterInformation {
+                    label: ParameterLabel::Simple(label.to_string()),
+                    documentation: None,
+                })
+                .collect(),
+        ),
+        active_parameter: None,
+    }
+}
+
+fn prepare_jags_signature_help(text: &str, position: Position) -> Option<SignatureHelpContext> {
+    let call = crate::jags::active_call_at_position(text, position)?;
+    let (signature, parameters, variadic) = if call.after_tilde {
+        let distribution = crate::jags_builtins::distribution(&call.name)?;
+        (
+            jags_signature_information(
+                distribution.name,
+                distribution.signature(),
+                distribution.parameters,
+                distribution.variadic,
+                distribution.module,
+                "distribution",
+            ),
+            distribution.parameters,
+            distribution.variadic,
+        )
+    } else {
+        let callable = crate::jags_builtins::callable(&call.name)?;
+        (
+            jags_signature_information(
+                callable.name,
+                callable.signature(),
+                callable.parameters,
+                callable.variadic,
+                callable.module,
+                "callable",
+            ),
+            callable.parameters,
+            callable.variadic,
+        )
+    };
+    let parameter_count = parameters.len() as u32 + u32::from(variadic);
+    let active_parameter = parameter_count
+        .checked_sub(1)
+        .map(|last_parameter| call.active_parameter.min(last_parameter));
+
+    Some(SignatureHelpContext {
+        active_parameter,
+        resolution: SignatureResolution::Ready(signature),
+    })
+}
+
 /// Synchronous phase of signature help: extracts call context, resolves scope,
 /// and determines whether async work is needed.
 ///
@@ -23196,6 +23662,9 @@ pub fn prepare_signature_help(
     let doc = state.get_document(uri)?;
     if doc.file_type == FileType::Stan {
         return None;
+    }
+    if doc.file_type == FileType::Jags {
+        return prepare_jags_signature_help(&doc.text(), position);
     }
     // Rmd/Quarto: signature help is first-class inside R chunk bodies, but a
     // prose position maps to a blank masked line. The call-node search below
@@ -23763,18 +24232,18 @@ pub fn goto_definition_with_cancel(
         let occurrences = collect_jags_identifier_occurrences(&text);
         let target = stan_identifier_at_position(&occurrences, position)?;
 
+        // Syntax and catalog calls have no file-local definition. The same
+        // spelling in a plain identifier position may be a valid data input,
+        // so only the occurrence's lexical role is excluded.
+        if is_jags_builtin_occurrence(&text, position) {
+            return None;
+        }
+
         // Try definition candidates first, then fall back to first occurrence
         // (covers data inputs and constants that have no assignment in the JAGS file).
-        // Skip the fallback for builtins/keywords — they have no user definition.
-        let is_builtin = crate::jags_builtins::JAGS_KEYWORDS.contains(&target.name.as_str())
-            || crate::jags_builtins::JAGS_DISTRIBUTIONS.contains(&target.name.as_str())
-            || crate::jags_builtins::JAGS_FUNCTIONS.contains(&target.name.as_str());
         let location = find_jags_definition(&text, &target.name, position)
             .map(|def| (def.line, def.start_col, def.end_col))
             .or_else(|| {
-                if is_builtin {
-                    return None;
-                }
                 occurrences
                     .iter()
                     .find(|o| o.name == target.name)
@@ -71152,11 +71621,26 @@ mod file_type_tests {
                 for kw in crate::jags_builtins::JAGS_KEYWORDS {
                     assert!(labels.contains(*kw), "JAGS completions missing keyword '{}'", kw);
                 }
-                for dist in crate::jags_builtins::JAGS_DISTRIBUTIONS {
-                    assert!(labels.contains(*dist), "JAGS completions missing distribution '{}'", dist);
+                for contextual in crate::jags_builtins::JAGS_CONTEXTUAL_SYNTAX {
+                    assert!(
+                        labels.contains(*contextual),
+                        "JAGS completions missing contextual syntax '{}'",
+                        contextual
+                    );
                 }
-                for func in crate::jags_builtins::JAGS_FUNCTIONS {
-                    assert!(labels.contains(*func), "JAGS completions missing function '{}'", func);
+                for dist in crate::jags_builtins::JAGS_DISTRIBUTIONS {
+                    assert!(
+                        labels.contains(dist.name),
+                        "JAGS completions missing distribution '{}'",
+                        dist.name
+                    );
+                }
+                for func in crate::jags_builtins::JAGS_CALLABLES {
+                    assert!(
+                        labels.contains(func.name),
+                        "JAGS completions missing function '{}'",
+                        func.name
+                    );
                 }
             } else {
                 panic!("Expected Some(CompletionResponse::Array) for JAGS file");

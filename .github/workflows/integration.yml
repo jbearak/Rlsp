@@ -384,6 +384,9 @@ jobs:
       - name: Check Stan builtin catalog is up to date
         run: bun editors/vscode/scripts/generate-stan-builtins.mjs --check
 
+      - name: Check JAGS builtin catalog is up to date
+        run: bun editors/vscode/scripts/generate-jags-builtins.mjs --check
+
       - name: Validate Stan diagnostic fixtures with stanc3
         run: node editors/vscode/scripts/check-stan-diagnostics-fixtures.mjs
 

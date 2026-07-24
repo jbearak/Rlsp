@@ -34,6 +34,7 @@ pub mod handlers;
 pub mod help;
 pub mod import_pkg;
 pub mod indentation;
+pub mod jags;
 pub mod jags_builtins;
 pub mod libpath_watcher;
 pub mod linting;

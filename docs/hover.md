@@ -1,6 +1,6 @@
 # Hover
 
-Hovering over an identifier shows what the symbol is and, when available, its signature or documentation. R hover uses the same position-aware, cross-file scope model as [completions](completion.md), [diagnostics](diagnostics.md), and [go-to-definition](go-to-definition.md), so the package attributed at the cursor matches what's in scope under Raven's static model — namely, packages brought in via `library()` / `require()` (or via `loadNamespace()`, which Raven treats as an attach signal even though R itself only loads the namespace), plus namespace qualifiers and declared symbols. Stan has a separate compiler-catalog hover described below.
+Hovering over an identifier shows what the symbol is and, when available, its signature or documentation. R hover uses the same position-aware, cross-file scope model as [completions](completion.md), [diagnostics](diagnostics.md), and [go-to-definition](go-to-definition.md), so the package attributed at the cursor matches what's in scope under Raven's static model — namely, packages brought in via `library()` / `require()` (or via `loadNamespace()`, which Raven treats as an attach signal even though R itself only loads the namespace), plus namespace qualifiers and declared symbols. JAGS and Stan use separate static catalog paths described below.
 
 ## What You See
 
@@ -18,6 +18,14 @@ Hovering over an identifier shows what the symbol is and, when available, its si
 | Built-in or otherwise unresolved symbol | R help text, if R has a topic for it |
 
 Hover returns nothing for symbols R doesn't recognize and that aren't in scope, and for structural labels it cannot resolve (see step 2 below).
+
+## JAGS Hover
+
+In `.jags` and `.bugs` files, hovering a known JAGS 4.3.2 call shows its signature, providing component, alias relationship when applicable, and the pinned catalog provenance. Raven recognizes only call sites; plain identifiers, comments, quoted noise in incomplete buffers, unknown names, and optional-module names remain silent.
+
+Role selection follows JAGS syntax. Immediately after `~`, the distribution entry wins and its signature lists only distribution parameters; the stochastic node is on the left side of the relation. Elsewhere, the ordinary callable entry wins. This matters for names such as `dnorm`, which JAGS exposes in both roles with different arities. A distribution-only name such as `dbern` does not receive ordinary-call hover.
+
+JAGS signature help uses the same catalog and lexical call context. It tracks nested calls, indexing, multiline arguments, trailing arguments, comments, and UTF-16 cursor positions without consulting the temporary R parse tree or starting R/JAGS subprocesses.
 
 ## Stan Hover
 
