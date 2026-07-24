@@ -22,6 +22,21 @@ SOFTWARE.
 
 ---
 
+Raven's JAGS 4.3.2 built-in catalog records clean-room factual interoperability
+metadata (names, roles, aliases, arities, and automatically loaded module
+ownership) independently verified against the official JAGS 4.3.2 source
+release:
+
+https://downloads.sourceforge.net/project/mcmc-jags/JAGS/4.x/Source/JAGS-4.3.2.tar.gz
+SHA-256: 871f556af403a7c2ce6a0f02f15cf85a572763e093d26658ebac55c4ab472fc8
+
+JAGS is GPL-2.0-only. Raven does not copy or bundle JAGS implementation code,
+source structure, manual prose, tables, examples, or comments, and does not
+link or load JAGS at runtime for this feature. The reference above is retained
+for provenance and reproducibility.
+
+---
+
 Raven uses tree-sitter-stan (https://github.com/WardBrian/tree-sitter-stan),
 pinned at revision 86544507c3600d5c4719d98ada477123fee81983, to parse Stan
 source for syntax diagnostics and as an implementation-structure reference for

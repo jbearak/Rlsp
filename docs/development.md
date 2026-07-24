@@ -1288,6 +1288,17 @@ bun editors/vscode/scripts/generate-stan-builtins.mjs --check
 
 Keep the package pin, `EXPECTED_STANC_PACKAGE_VERSION`, `DOCS_VERSION`, generated version constants, `docs/hover.md`, and the stanc3 attribution in `README.md` and `NOTICE` aligned. CI runs the check after `npm ci`; `#[rustfmt::skip]` on the large generated arrays makes the generator output independent of the host Rust toolchain while the surrounding hand-written module remains subject to the normal formatting gate.
 
+JAGS completion, hover, signature help, and built-in go-to-definition exclusion share `crates/raven/src/jags_builtins_generated.rs`. Its input is the checked-in factual manifest `editors/vscode/scripts/jags-builtins-4.3.2.tsv`, pinned to the official JAGS 4.3.2 SourceForge tarball and SHA-256 recorded in that file. The manifest contains independently verified names, aliases, arities, roles, and automatically loaded module ownership only. It deliberately contains no JAGS implementation code, source structure, manual prose, tables, examples, or comments. JAGS is GPL-2.0-only; Raven's catalog is a clean-room factual interoperability artifact, not copied JAGS expression. This is a maintainer provenance boundary, not legal advice.
+
+Regenerate and validate the catalog from the repository root without network access or an installed JAGS runtime:
+
+```sh
+bun editors/vscode/scripts/generate-jags-builtins.mjs
+bun editors/vscode/scripts/generate-jags-builtins.mjs --check
+```
+
+The generator validates the exact version, source URL/hash, default `basemod`/`bugs` boundary, schema, ASCII sort order, uniqueness, syntax classification, and module ownership before producing Rust. Keep the manifest header, generated constants, `docs/completion.md`, `docs/hover.md`, `README.md`, and `NOTICE` aligned. Runtime editor assistance uses the linear scanner in `crates/raven/src/jags.rs`; it never consults R scope/help/package machinery and never starts JAGS, R, or a network request.
+
 ### In-tree JAGS grammar
 
 `crates/tree-sitter-jags/` is a clean-room Tree-sitter grammar targeting JAGS
