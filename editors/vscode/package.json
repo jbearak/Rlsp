@@ -768,7 +768,15 @@
           ".JAGS",
           ".bugs",
           ".Bugs",
-          ".BUGS"
+          ".BUGS",
+          ".bug",
+          ".buG",
+          ".bUg",
+          ".bUG",
+          ".Bug",
+          ".BuG",
+          ".BUg",
+          ".BUG"
         ],
         "configuration": "./jags-language-configuration.json"
       },

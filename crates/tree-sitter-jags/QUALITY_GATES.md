@@ -102,5 +102,6 @@ the complete input; a BOM yields a root beginning at byte 3 and is classified
 as rejected. This is a documented core-normalization boundary, not an
 unexplained grammar allowlist.
 
-The grammar claims `.jags` only. `.bugs` is used by several related languages;
-no OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility is claimed.
+Raven applies this grammar to `.jags`, `.bugs`, and `.bug`, case-insensitively,
+as strict JAGS 4.3.2 input. Those suffixes are also used by related languages;
+no general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility is claimed.

@@ -54,7 +54,7 @@ The maximum number of results is configurable via `raven.symbols.workspaceMaxRes
 
 ## JAGS and Stan
 
-For `.stan`, `.jags`, and `.bugs` files, Find References returns all occurrences of the identifier across every open or indexed file of the same language. As with R, this is a flat name match — there is no dependency graph; results are collected by name across all Stan (or JAGS) files in the workspace.
+For `.stan`, `.jags`, `.bugs`, and `.bug` files, Find References returns all occurrences of the identifier across every open or indexed file of the same language. The JAGS extensions are matched case-insensitively and select strict JAGS behavior, not general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility. As with R, this is a flat name match — there is no dependency graph; results are collected by name across all Stan (or JAGS) files in the workspace.
 
 ## Go-to-Definition
 

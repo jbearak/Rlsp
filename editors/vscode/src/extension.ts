@@ -306,7 +306,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
             // server for live reconfiguration.
             fileEvents: [
                 vscode.workspace.createFileSystemWatcher(
-                    '**/*.{r,R,rmd,Rmd,RMD,rmarkdown,Rmarkdown,RMARKDOWN,qmd,Qmd,QMD,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}',
+                    '**/*.{r,R,rmd,Rmd,RMD,rmarkdown,Rmarkdown,RMARKDOWN,qmd,Qmd,QMD,jags,Jags,JAGS,bugs,Bugs,BUGS,bug,buG,bUg,bUG,Bug,BuG,BUg,BUG,stan,Stan,STAN}',
                 ),
                 vscode.workspace.createFileSystemWatcher('**/raven.toml'),
                 vscode.workspace.createFileSystemWatcher('**/.lintr'),

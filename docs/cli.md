@@ -40,7 +40,7 @@ raven check [OPTIONS] [PATHS...]
 
 Diagnostics reported (subject to configured severities — see [diagnostics.md](diagnostics.md)):
 
-- R syntax errors and semantic checks (e.g. assignment-in-condition, mixed logical operators), plus syntax-only diagnostics for standalone `.jags`, `.bugs`, and `.stan` programs.
+- R syntax errors and semantic checks (e.g. assignment-in-condition, mixed logical operators), plus syntax-only diagnostics for standalone `.jags`, `.bugs`, `.bug`, and `.stan` programs.
 - The native style lints (when enabled via `raven.toml` / `.lintr`).
 - Cross-file diagnostics: missing sourced files, circular dependencies, exceeded max source-chain depth, redundant directives, out-of-scope usage, and case-only path mismatches (in `source()` calls, forward directives, and backward `# raven: sourced-by`-style directives). On a case-sensitive CI filesystem a case-only mismatch (e.g. `source("scripts/templates.r")` for an on-disk `templates.R`) is a **warning**, so it exceeds the default `--max-severity info` and fails the build — surfacing a portability bug that, for a forward `source()`, would also break it at runtime on Linux. See [Diagnostics → Source path case mismatch](diagnostics.md#source-path-case-mismatch).
 - Static `{box}` and `{import}` selective-import scope, missing-module, package, and authoritative missing-export diagnostics use the same analysis as the language server.
@@ -51,13 +51,15 @@ Diagnostics reported (subject to configured severities — see [diagnostics.md](
 
 The workspace is indexed, except for paths matched by `[workspace].exclude`, so cross-file resolution is accurate for included files. The workspace root is `--workspace DIR`, defaulting to the current directory. `PATHS` only filter **which files have their diagnostics reported**:
 
-- With no `PATHS`, every included R file and standalone `.jags`, `.bugs`, or `.stan` program in the workspace is reported.
-- With `PATHS`, explicit files are reported as named, while directories are walked recursively for included R files and standalone `.jags`, `.bugs`, or `.stan` programs. Extension matching is case-insensitive. Singular `.bug` is not supported ([#724](https://github.com/jbearak/raven/issues/724)); `.stanfunctions` files are excluded because they are include fragments rather than standalone programs. Indexing still covers the included workspace, so a reported R file's `source()` targets resolve even when they aren't named.
+- With no `PATHS`, every included R file and standalone `.jags`, `.bugs`, `.bug`, or `.stan` program in the workspace is reported.
+- With `PATHS`, explicit files are reported as named, while directories are walked recursively for included R files and standalone `.jags`, `.bugs`, `.bug`, or `.stan` programs. Extension matching is case-insensitive. `.stanfunctions` files are excluded because they are include fragments rather than standalone programs. Indexing still covers the included workspace, so a reported R file's `source()` targets resolve even when they aren't named.
 
 JAGS and Stan checking is syntax-only. It does not run JAGS or `stanc`, validate
 model identifiers, dimensions, types, or distribution signatures, resolve
 Stan `#include` targets, or apply R semantic, lint, package, or cross-file
-analysis to model source. JAGS syntax findings are capped at 100 per file.
+analysis to model source. JAGS syntax findings are capped at 100 per file. The
+three JAGS suffixes select strict JAGS-dialect validation, not general OpenBUGS,
+WinBUGS, MultiBUGS, or NIMBLE compatibility.
 
 `raven.toml` can exclude generated or vendored trees from discovery:
 

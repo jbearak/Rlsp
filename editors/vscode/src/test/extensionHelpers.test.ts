@@ -172,12 +172,14 @@ suite('Extension Helpers', () => {
 
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/script.R')), true);
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/model.BUGS')), true);
+        assert.strictEqual(isRDocument(makeFileDocument('/tmp/model.BUG')), true);
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/model.StAn')), true);
         // `.Rmd` and `.qmd` register under the dedicated `rmd` / `quarto`
         // languages and are not LSP-tracked.
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/report.Rmd')), false);
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/report.qmd')), false);
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/notes.txt')), false);
+        assert.strictEqual(isRDocument(makeFileDocument('/tmp/model.bugx')), false);
     });
 
     test('isIndentUnitDocument accepts untitled chunk-capable documents', () => {
@@ -209,6 +211,7 @@ suite('Extension Helpers', () => {
 
         assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/script.R')), true);
         assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/model.BUGS')), true);
+        assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/model.BUG')), true);
         assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/model.StAn')), true);
         assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/report.Rmd')), true);
         assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/report.rmarkdown')), true);

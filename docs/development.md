@@ -1332,24 +1332,24 @@ release-performance commands are documented in the crate README. CI checks
 generation, oracle-manifest, and parser-evidence drift, the Tree-sitter corpus, Rust tests,
 rustdoc, and release performance without installing JAGS. Raven's diagnostic
 integration imports both committed manifests directly and asserts the complete
-mapping through `.jags` and `.bugs` independently: all 460 accepted programs are
+mapping through `.jags`, `.bugs`, and `.bug` independently: all 460 accepted programs are
 silent and all 346 rejected programs produce at least one stable, in-bounds
 syntax finding. The independently maintained
 `crates/raven/tests/fixtures/jags/invalid_expectations.json` manifest pins exact
 defect lines and bounded finding counts for all 75 curated syntax-invalid
 cases, without copying their source text. The integration test requires exact
 ID-set equality between that manifest and the corpus and exercises every case
-through both extensions. Separate malformed-input and release tests cover
+through all three extensions. Separate malformed-input and release tests cover
 mid-traversal cancellation, UTF-16 positions, sort-before-dedup-before-cap
 ordering for the 100-finding limit, edited-tree reuse, and 100 KB diagnostic
 latency.
 
-Strict JAGS-dialect diagnostics claim `.jags` and `.bugs`
+Strict JAGS-dialect diagnostics claim `.jags`, `.bugs`, and `.bug`
 (case-insensitively), plus untitled buffers explicitly identified by the client
-as JAGS. Both suffixes share `FileType::Jags` and must follow identical parser,
-diagnostic, lifecycle, CLI, and editor-assistance routes. Singular `.bug` is an
-explicit non-goal tracked by [#724](https://github.com/jbearak/raven/issues/724);
-do not broaden extension matching accidentally. Disk reads use the shared
+as JAGS. All three suffixes share `FileType::Jags` and must follow identical
+parser, diagnostic, lifecycle, CLI, and editor-assistance routes. They do not
+claim general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility. Do not
+broaden extension matching beyond these suffixes accidentally. Disk reads use the shared
 BOM-aware decoder, while raw in-memory text remains byte-preserving so
 diagnostic ranges stay correct.
 

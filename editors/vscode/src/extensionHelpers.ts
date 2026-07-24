@@ -12,6 +12,7 @@ const R_DOCUMENT_EXTENSIONS = new Set([
     '.r',
     '.jags',
     '.bugs',
+    '.bug',
     '.stan',
 ]);
 

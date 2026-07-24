@@ -377,13 +377,13 @@ generated quantities { real z = twice(mu); }
 
     #[tokio::test]
     async fn jags_hover_uses_distribution_and_callable_catalog_roles() {
-        let uri = Url::parse("file:///model.jags").unwrap();
+        let uri = Url::parse("file:///model.BUG").unwrap();
         let mut state = WorldState::new();
         state.open_document_with_language_id(
             uri.clone(),
             "model { y ~ dnorm(0, 1); z <- dnorm(y, 0, 1) }\n",
             Some(1),
-            Some("jags"),
+            Some("plaintext"),
         );
         let distribution = hover(&state, &uri, Position::new(0, 13))
             .await
@@ -410,13 +410,13 @@ generated quantities { real z = twice(mu); }
 
     #[test]
     fn jags_signature_help_is_catalog_driven_and_unknown_calls_are_silent() {
-        let uri = Url::parse("file:///model.jags").unwrap();
+        let uri = Url::parse("file:///model.Bug").unwrap();
         let mut state = WorldState::new();
         state.open_document_with_language_id(
             uri.clone(),
             "model { y ~ dnorm(0, sqrt(2)); unknown(1, 2) }\n",
             Some(1),
-            Some("jags"),
+            Some("plaintext"),
         );
         let ctx = prepare_signature_help(&state, &uri, Position::new(0, 28))
             .expect("JAGS catalog signature");
@@ -71936,7 +71936,10 @@ mod file_type_tests {
                 Just("Jags"),
                 Just("bugs"),
                 Just("BUGS"),
-                Just("Bugs")
+                Just("Bugs"),
+                Just("bug"),
+                Just("BUG"),
+                Just("Bug")
             ]
         ) {
             let uri_str = format!("file:///path/to/{}.{}", prefix, ext);
@@ -71994,7 +71997,14 @@ mod file_type_tests {
         #[test]
         fn prop_jags_diagnostics_are_syntax_only_and_in_bounds(
             content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}",
-            extension in prop_oneof![Just("jags"), Just("JAGS"), Just("bugs"), Just("BUGS")]
+            extension in prop_oneof![
+                Just("jags"),
+                Just("JAGS"),
+                Just("bugs"),
+                Just("BUGS"),
+                Just("bug"),
+                Just("BUG")
+            ]
         ) {
             let uri = Url::parse(&format!("file:///test/model.{extension}")).unwrap();
             let mut state = crate::state::WorldState::new();
@@ -72074,7 +72084,7 @@ mod file_type_tests {
         #[test]
         fn prop_jags_completions_exclude_r_items(
             content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}",
-            ext in prop_oneof![Just("jags"), Just("bugs")]
+            ext in prop_oneof![Just("jags"), Just("bugs"), Just("bug")]
         ) {
             let r_reserved = ["function", "library", "require", "next", "repeat",
                               "while", "TRUE", "FALSE", "NULL", "NA", "Inf", "NaN"];
@@ -72102,7 +72112,7 @@ mod file_type_tests {
         #[test]
         fn prop_jags_completions_include_all_builtins(
             content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}",
-            ext in prop_oneof![Just("jags"), Just("bugs")]
+            ext in prop_oneof![Just("jags"), Just("bugs"), Just("bug")]
         ) {
             let uri_str = format!("file:///test/model.{}", ext);
             let uri = Url::parse(&uri_str).unwrap();
@@ -72273,6 +72283,7 @@ mod file_type_tests {
         let r_uri = Url::parse("file:///test/script.R").unwrap();
         let jags_uri = Url::parse("file:///test/model.jags").unwrap();
         let bugs_uri = Url::parse("file:///test/model.bugs").unwrap();
+        let bug_uri = Url::parse("file:///test/model.bug").unwrap();
         state.open_document_with_language_id(
             r_uri.clone(),
             "shared <- 1\nshared\n",
@@ -72291,20 +72302,29 @@ mod file_type_tests {
             Some(1),
             Some("jags"),
         );
+        state.open_document_with_language_id(
+            bug_uri.clone(),
+            "model { shared <- shared + 2 }\n",
+            Some(1),
+            Some("plaintext"),
+        );
 
         let r_locations = references(&state, &r_uri, Position::new(0, 2)).unwrap();
         assert!(r_locations.iter().all(|location| location.uri == r_uri));
 
         let jags_locations = references(&state, &jags_uri, Position::new(0, 10)).unwrap();
-        assert!(
-            jags_locations
-                .iter()
-                .all(|location| location.uri == jags_uri || location.uri == bugs_uri)
-        );
+        assert!(jags_locations.iter().all(|location| {
+            location.uri == jags_uri || location.uri == bugs_uri || location.uri == bug_uri
+        }));
         assert!(
             jags_locations
                 .iter()
                 .any(|location| location.uri == bugs_uri)
+        );
+        assert!(
+            jags_locations
+                .iter()
+                .any(|location| location.uri == bug_uri)
         );
         assert!(jags_locations.iter().all(|location| location.uri != r_uri));
     }
@@ -72594,7 +72614,7 @@ mod block_detector_integration_tests {
     #[test]
     fn test_jags_native_outline_emits_every_same_line_relation_with_exact_ranges() {
         let code = "model { x <- 1; y ~ dnorm(0,1) }\n";
-        for extension in ["jags", "bugs"] {
+        for extension in ["jags", "bugs", "bug"] {
             let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
             let symbols = nested_symbols(&state, &uri);
             assert_symbol_tree_contract(&symbols, None);
@@ -72628,7 +72648,7 @@ mod block_detector_integration_tests {
     #[test]
     fn test_jags_clean_comparison_rhs_uses_only_native_relation_symbols() {
         let code = "model { x <- a <= b; y <- c == d; z <- e != f }\n";
-        for extension in ["jags", "bugs"] {
+        for extension in ["jags", "bugs", "bug"] {
             let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
             assert!(
                 !state
@@ -72658,7 +72678,7 @@ mod block_detector_integration_tests {
     #[test]
     fn test_jags_malformed_recovery_does_not_promote_comparison_operands() {
         let code = "*\nmodel { x <- a <= b; y <- c == d; z <- e != f }\n";
-        for extension in ["jags", "bugs"] {
+        for extension in ["jags", "bugs", "bug"] {
             let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
             assert!(
                 state
@@ -72688,7 +72708,7 @@ mod block_detector_integration_tests {
     #[test]
     fn test_jags_recovered_same_line_relation_ranges_are_exact_and_non_overlapping() {
         let code = "x <- 1; y ~ dnorm(0, 1)\nmodel {\n  broken <-\n}\n";
-        for extension in ["jags", "bugs"] {
+        for extension in ["jags", "bugs", "bug"] {
             let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
             let document = state.get_document(&uri).unwrap();
             let tree = document.tree.as_ref().unwrap();
@@ -72714,7 +72734,7 @@ mod block_detector_integration_tests {
     #[test]
     fn test_jags_native_outline_ignores_block_and_hash_comment_relations() {
         let code = "model {\n  /* ghost <- 1\n     hidden ~ dnorm(0, 1) */\n  before <- 1; /* same_line <- 2 */ after ~ dnorm(0, 1)\n  # hash_only <- 3\n  tail <- 4\n}\n";
-        for extension in ["jags", "bugs"] {
+        for extension in ["jags", "bugs", "bug"] {
             let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
             let symbols = nested_symbols(&state, &uri);
             assert_symbol_tree_contract(&symbols, None);
@@ -72752,7 +72772,7 @@ mod block_detector_integration_tests {
     fn test_jags_native_outline_relations_nest_under_loops_with_utf16_selections() {
         let code =
             "model {\n  for (i in 1:N) {\n    /* 💥 */ x[i] <- 1; y[i] ~ dnorm(0, 1)\n  }\n}\n";
-        for extension in ["jags", "bugs"] {
+        for extension in ["jags", "bugs", "bug"] {
             let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
             let symbols = nested_symbols(&state, &uri);
             assert_symbol_tree_contract(&symbols, None);

@@ -63,7 +63,7 @@ Any LSP client that supports stdio transport:
 raven --stdio
 ```
 
-Configure your editor's LSP client to run this command for `.R`, `.r`, `.Rmd`, `.qmd`, `.jags`, `.bugs`, and `.stan` files.
+Configure your editor's LSP client to run this command for `.R`, `.r`, `.Rmd`, `.qmd`, `.jags`, `.bugs`, `.bug`, and `.stan` files. JAGS extensions are matched case-insensitively and receive strict JAGS-dialect behavior; this does not claim general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility.
 
 ## Agent Integration
 
@@ -138,7 +138,7 @@ All editor integrations honor `raven.toml` at the project root automatically. Se
 ## Troubleshooting
 
 - **Server not found**: Ensure `raven` is on your PATH, or specify the full path to the binary.
-- **No diagnostics**: Check that files have `.R` or `.r` extension. JAGS/Stan files have diagnostics suppressed by design.
+- **No diagnostics**: Check that R files have `.R` or `.r`, JAGS files have `.jags`, `.bugs`, or `.bug`, and Stan files have `.stan`. Model-file matching is case-insensitive; JAGS and Stan receive syntax-only diagnostics.
 - **Stale package completions**: Run **Raven: Refresh package cache** from the command palette, or restart the server.
 - **Package watcher issues on Linux**: Raven watches `.libPaths()` recursively (~10–20 watches per installed package). On systems with the legacy 8192 inotify limit, the watcher can fail silently. Raise the limit: `sudo sysctl fs.inotify.max_user_watches=524288` (persist via `/etc/sysctl.conf`).
 - **Cross-file features not working**: Ensure the workspace root is set correctly (Raven uses it for `source()` path resolution). Open the folder containing your R project, not a parent directory.

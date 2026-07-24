@@ -11,7 +11,10 @@ pub enum FileType {
 pub fn file_type_from_uri(uri: &Url) -> FileType {
     let path = uri.path();
     let lower_path = path.to_ascii_lowercase();
-    if lower_path.ends_with(".jags") || lower_path.ends_with(".bugs") {
+    if lower_path.ends_with(".jags")
+        || lower_path.ends_with(".bugs")
+        || lower_path.ends_with(".bug")
+    {
         FileType::Jags
     } else if lower_path.ends_with(".stan") {
         FileType::Stan
@@ -71,12 +74,17 @@ mod tests {
     }
 
     #[test]
-    fn singular_bug_is_not_a_jags_extension() {
-        let uri = Url::parse("file:///tmp/model.bug").unwrap();
-        assert_eq!(file_type_from_uri(&uri), FileType::R);
-        assert_eq!(
-            file_type_from_language_id_or_uri(Some("plaintext"), &uri),
-            FileType::R
-        );
+    fn singular_bug_is_a_case_insensitive_jags_extension() {
+        for extension in ["bug", "Bug", "BUG"] {
+            let uri = Url::parse(&format!("file:///tmp/model.{extension}")).unwrap();
+            assert_eq!(file_type_from_uri(&uri), FileType::Jags);
+            assert_eq!(
+                file_type_from_language_id_or_uri(Some("plaintext"), &uri),
+                FileType::Jags
+            );
+        }
+
+        let near_miss = Url::parse("file:///tmp/model.bugx").unwrap();
+        assert_eq!(file_type_from_uri(&near_miss), FileType::R);
     }
 }

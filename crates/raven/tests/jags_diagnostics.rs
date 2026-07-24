@@ -95,7 +95,7 @@ fn all_committed_oracle_outcomes_map_to_raven_diagnostics() {
     assert_eq!(quality.cases.len(), 683, "quality corpus count drifted");
     assert_eq!(matrix.probes.len(), 123, "syntax matrix count drifted");
 
-    for extension in ["jags", "bugs"] {
+    for extension in ["jags", "bugs", "bug"] {
         let uri = Url::parse(&format!("file:///tmp/jags-oracle.{extension}")).unwrap();
         let mut state = WorldState::new();
         let mut accepted = 0usize;
@@ -195,7 +195,7 @@ fn curated_invalid_cases_hit_only_their_declared_defect_lines() {
         "expectations must have exactly one key for every curated invalid ID"
     );
 
-    for extension in ["jags", "bugs"] {
+    for extension in ["jags", "bugs", "bug"] {
         let uri = Url::parse(&format!("file:///tmp/curated-invalid.{extension}")).unwrap();
         let mut state = WorldState::new();
         for (id, case) in &invalid_cases {
@@ -237,12 +237,14 @@ fn curated_invalid_cases_hit_only_their_declared_defect_lines() {
 }
 
 #[test]
-fn bugs_mixed_case_and_untitled_jags_are_strict() {
+fn jags_extensions_mixed_case_and_untitled_jags_are_strict() {
     let invalid = "model { x <- * 1 }\n";
     let mut state = WorldState::new();
     for uri in [
         Url::parse("file:///tmp/model.bugs").unwrap(),
         Url::parse("file:///tmp/model.BUGS").unwrap(),
+        Url::parse("file:///tmp/model.bug").unwrap(),
+        Url::parse("file:///tmp/model.BUG").unwrap(),
     ] {
         assert!(!analyze(&mut state, &uri, invalid, "jags").is_empty());
     }
@@ -312,6 +314,7 @@ fn leading_and_trailing_whitespace_are_not_root_coverage_errors() {
     for uri in [
         Url::parse("file:///tmp/whitespace.jags").unwrap(),
         Url::parse("file:///tmp/whitespace.bugs").unwrap(),
+        Url::parse("file:///tmp/whitespace.bug").unwrap(),
     ] {
         assert!(
             analyze(&mut state, &uri, source, "jags").is_empty(),
@@ -333,13 +336,9 @@ fn malformed_jags_diagnostics_are_capped_at_one_hundred() {
 }
 
 #[test]
-fn raven_check_bugs_text_json_and_sarif_outputs_fail_with_syntax_error() {
+fn raven_check_bug_text_json_and_sarif_outputs_fail_with_syntax_error() {
     let workspace = tempfile::TempDir::new().unwrap();
-    std::fs::write(
-        workspace.path().join("invalid.BUGS"),
-        "model { x <- * 1 }\n",
-    )
-    .unwrap();
+    std::fs::write(workspace.path().join("invalid.BUG"), "model { x <- * 1 }\n").unwrap();
 
     for format in ["text", "json", "sarif"] {
         let output = Command::new(env!("CARGO_BIN_EXE_raven"))
@@ -347,7 +346,7 @@ fn raven_check_bugs_text_json_and_sarif_outputs_fail_with_syntax_error() {
             .arg(workspace.path())
             .args(["--no-config", "--format", format, "--quiet", "--no-color"])
             .output()
-            .expect("run raven check for a BUGS syntax error");
+            .expect("run raven check for a singular BUG syntax error");
         assert_eq!(
             output.status.code(),
             Some(1),
@@ -358,7 +357,7 @@ fn raven_check_bugs_text_json_and_sarif_outputs_fail_with_syntax_error() {
 
         match format {
             "text" => {
-                assert!(stdout.contains("invalid.BUGS"), "{stdout}");
+                assert!(stdout.contains("invalid.BUG"), "{stdout}");
                 assert!(stdout.contains("error:"), "{stdout}");
                 assert!(
                     stdout.contains("JAGS code could not be parsed here"),
@@ -369,7 +368,7 @@ fn raven_check_bugs_text_json_and_sarif_outputs_fail_with_syntax_error() {
             "json" => {
                 let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
                 let finding = &value.as_array().unwrap()[0];
-                assert_eq!(finding["path"], "invalid.BUGS");
+                assert_eq!(finding["path"], "invalid.BUG");
                 assert_eq!(finding["diagnostic"]["code"], "syntax-error");
                 assert_eq!(finding["diagnostic"]["severity"], 1);
             }
@@ -381,7 +380,7 @@ fn raven_check_bugs_text_json_and_sarif_outputs_fail_with_syntax_error() {
                 assert_eq!(result["level"], "error");
                 assert_eq!(
                     result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-                    "invalid.BUGS"
+                    "invalid.BUG"
                 );
             }
             _ => unreachable!(),

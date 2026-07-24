@@ -14,7 +14,7 @@ Go-to-definition (Cmd-click, Ctrl-click on Windows/Linux, or F12) navigates to w
 | Static relative module spec inside `box::use(./module)` | The resolved file module or package-style `__init__.r` / `__init__.R` |
 | Exported member of a box namespace alias, or an attached/renamed box binding | The original local-module definition, including through named, renamed, and wildcard re-exports; installed-package members remain non-navigable |
 | Literal `.R`/`.r` source or selected/renamed local member in a static `import::` call | The exact script file or original top-level definition |
-| Identifier in `.stan`, `.jags`, or `.bugs` files | The most recent definition at or before the cursor (or the first definition if the cursor precedes all of them) — see [JAGS and Stan](#jags-and-stan) for the per-language details |
+| Identifier in `.stan`, `.jags`, `.bugs`, or `.bug` files | The most recent definition at or before the cursor (or the first definition if the cursor precedes all of them) — see [JAGS and Stan](#jags-and-stan) for the per-language details |
 
 ## Position-Aware Resolution
 
@@ -115,7 +115,7 @@ Go-to-definition works inside R code chunks of `.Rmd` and `.qmd` documents. Rave
 
 ## JAGS and Stan
 
-For `.stan`, `.jags`, and `.bugs` files, Raven provides best-effort go-to-definition within the current file:
+For `.stan`, `.jags`, `.bugs`, and `.bug` files, Raven provides best-effort go-to-definition within the current file. The JAGS extensions are case-insensitive and select strict JAGS behavior, not general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility:
 
 - **Stan** — jumps to the most recent declaration of a variable or function at or before the cursor (or the first declaration if none precede it).
 - **JAGS** — jumps to the most recent assignment at or before the cursor (or the first assignment if none precedes it), or falls back to the first occurrence when the symbol is a data input or constant with no assignment in the file. Occurrences acting as built-in syntax or catalog calls are excluded from that fallback; the same spelling in a plain data-variable position remains navigable.

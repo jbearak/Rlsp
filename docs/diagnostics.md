@@ -94,7 +94,7 @@ The `Mismatched brackets` message also covers wrong-closer typos where the user 
 
 ### JAGS and Stan Parse Errors
 
-Raven reports syntax errors in `.jags`, `.bugs`, and `.stan` files, both in the
+Raven reports syntax errors in `.jags`, `.bugs`, `.bug`, and `.stan` files, both in the
 editor and from `raven check`. Untitled buffers whose language ID is `jags` are
 checked as JAGS too. This is deliberately syntax-only: Raven does not resolve model
 identifiers, validate dimensions or distribution signatures, type-check Stan,
@@ -108,9 +108,9 @@ cover parser `ERROR` and required `MISSING` nodes, are emitted in stable source
 order without duplicate recovery cascades, and are capped at 100 per document.
 The grammar and diagnostic corpus are checked against 806 committed outcomes
 from the public JAGS 4.3.2 command-line parse phase. Raven applies this strict
-JAGS dialect to both `.jags` and `.bugs`, case-insensitively. The singular
-`.bug` extension is not supported; [#724](https://github.com/jbearak/raven/issues/724)
-tracks that explicit non-goal separately.
+JAGS dialect to `.jags`, `.bugs`, and `.bug`, case-insensitively. Treating those
+suffixes as JAGS does not claim general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE
+compatibility.
 
 Full-line, recognized Raven directives are geometry-preserving Raven
 extensions and do not create Stan parse errors. Stan's own `#include` remains
@@ -441,7 +441,7 @@ When a parent file changes (e.g., a `library()` call is added or removed), Raven
 
 R semantic, lint, package, and cross-file diagnostics are suppressed for JAGS
 and Stan because Raven cannot statically determine what is in scope in those
-languages. Standalone `.jags`, `.bugs`, and `.stan` programs still receive the
+languages. Standalone `.jags`, `.bugs`, `.bug`, and `.stan` programs still receive the
 syntax-only diagnostics described above.
 
 ## R Markdown and Quarto

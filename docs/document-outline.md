@@ -333,7 +333,7 @@ Raven recognizes top-level block structures in JAGS and Stan files and displays 
 
 ### JAGS Blocks
 
-JAGS files (`.jags`, `.bugs`) support two block types:
+JAGS files (`.jags`, `.bugs`, `.bug`, case-insensitively) support two block types. These suffixes select strict JAGS behavior and do not imply general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility:
 
 | Block | Outline Name |
 |-------|--------------|
@@ -540,7 +540,7 @@ model <- fit_model(processed_data)
 
 ### Outline view is empty
 
-1. Verify the file extension is `.R`, `.Rmd`, `.qmd`, `.jags`, `.bugs`, or `.stan`
+1. Verify the file extension is `.R`, `.Rmd`, `.qmd`, `.jags`, `.bugs`, `.bug`, or `.stan`
 2. Check that Raven is running (status bar shows "Raven")
 3. Reload VS Code: **Ctrl+Shift+P** → "Developer: Reload Window"
 

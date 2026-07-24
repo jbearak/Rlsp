@@ -148,7 +148,7 @@ Inside `.Rmd` / `.qmd` documents, completions work inside R chunk bodies: local 
 
 ## JAGS and Stan
 
-For `.stan`, `.jags`, and `.bugs` files, Raven offers completions tailored to each language:
+For `.stan`, `.jags`, `.bugs`, and `.bug` files, Raven offers completions tailored to each language. JAGS suffixes are matched case-insensitively and mean strict JAGS dialect, not general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility:
 
 | Language | What's offered |
 |---|---|
