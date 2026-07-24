@@ -83,14 +83,14 @@ used seed 424242, `max_len=4096`, `timeout=5`, `rss_limit_mb=2048`,
 
 | Target | Executions | Average/s | New units | Peak RSS | Output corpus |
 |---|---:|---:|---:|---:|---|
-| Arbitrary parser input | 8,879,519 | 14,774 | 381 | 532 MiB | 77 files / 2,378 bytes |
-| Clean-base incremental edit | 4,338,332 | 7,218 | 451 | 615 MiB | 118 files / 9,506 bytes |
+| Arbitrary parser input | 8,339,912 | 13,876 | 432 | 551 MiB | 75 files / 2,264 bytes |
+| Clean-base incremental edit | 3,102,972 | 5,163 | 498 | 572 MiB | 106 files / 9,636 bytes |
 
 Both exited successfully with no sanitizer finding, timeout, or other defect.
 The parser seed set is 4 files / 181 bytes with content-multiset SHA-256
 `f36547265c8af99b20cf322950b64ee02a5e4182f0743667106061eaac268777`;
-the incremental seed set is 3 files / 92 bytes with SHA-256
-`7258ff0bf41dea7863cd1d4c303d9794d1b1caedb5affc30dfcf8b4821cab088`.
+the incremental seed set is 3 files / 101 bytes with SHA-256
+`9218b1c37d5928a62529c2a5abe8780bef247f440eef335d04ffe1905d00f200`.
 Exact commands, output-corpus hashes, source bindings, and the offline verifier
 are in `fuzz/README.md` and `fuzz/evidence.json`.
 

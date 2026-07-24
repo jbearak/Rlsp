@@ -27,9 +27,9 @@ five-second per-input timeout, 2,048 MiB RSS ceiling, final statistics, and a
 600-second campaign duration.
 
 ```sh
-mkdir -p evidence-corpus/parser-asan-20260723
+mkdir -p evidence-corpus/parser-asan-20260724-review
 cargo +nightly-2026-07-22 fuzz run --sanitizer address parser \
-  evidence-corpus/parser-asan-20260723 seeds/parser -- \
+  evidence-corpus/parser-asan-20260724-review seeds/parser -- \
   -max_total_time=600 -max_len=4096 -seed=424242 \
   -rss_limit_mb=2048 -timeout=5 -print_final_stats=1 -verbosity=0
 
@@ -67,12 +67,10 @@ the edit boundaries cannot split a UTF-8 code point.
 
 ## Current evidence
 
-The parser campaign completed on 2026-07-23 and the incremental-edit campaign
-completed on 2026-07-24. Both 600-second AddressSanitizer campaigns completed
-successfully with no sanitizer finding, timeout, crash artifact, or parser
-defect.
+Both 600-second AddressSanitizer campaigns completed on 2026-07-24 with no
+sanitizer finding, timeout, crash artifact, or parser defect.
 
 | Target | Executions | Average/s | New units | Peak RSS | Output corpus | Output-corpus SHA-256 |
 |---|---:|---:|---:|---:|---|---|
-| `parser` | 8,879,519 | 14,774 | 381 | 532 MiB | 77 files / 2,378 bytes | `e02c8aa78bbc488007a17db1df92a9ca996ea43fc5eebbd46bcb5659f64671c3` |
+| `parser` | 8,339,912 | 13,876 | 432 | 551 MiB | 75 files / 2,264 bytes | `67b518c6f95d770dbb8cdf9a295460be28aa79a381df0aeb98fa874634794260` |
 | `incremental_edits` | 3,102,972 | 5,163 | 498 | 572 MiB | 106 files / 9,636 bytes | `2078c3537217c2e35fb46eb6352ddc0772a809b9bebe05756a61a51741198c0e` |
