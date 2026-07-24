@@ -63,7 +63,7 @@ Any LSP client that supports stdio transport:
 raven --stdio
 ```
 
-Configure your editor's LSP client to run this command for `.R`, `.r`, `.Rmd`, `.qmd`, `.jags`, `.bugs`, `.bug`, and `.stan` files. JAGS extensions are matched case-insensitively and receive strict JAGS-dialect behavior; this does not claim general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility.
+Configure your editor's LSP client to run this command for `.R`, `.r`, `.Rmd`, `.qmd`, `.jags`, `.bugs`, `.bug`, and `.stan` files. Raven classifies JAGS extensions case-insensitively and applies strict JAGS-dialect behavior; this does not claim general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility. Some editors apply case-sensitive file filters before launching Raven, so configure case-insensitive matching when available or enumerate the case variants your project uses.
 
 ## Agent Integration
 

@@ -90,7 +90,7 @@ VS Code doesn't bundle grammars for JAGS or Stan, so Raven ships its own TextMat
 
 ### JAGS
 
-Registered for `.jags`, `.Jags`, `.JAGS`, `.bugs`, `.Bugs`, `.BUGS`, `.bug`, `.Bug`, and `.BUG`. These suffixes select the JAGS grammar; they do not imply general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility. The grammar recognizes:
+Registered for `.jags`, `.Jags`, `.JAGS`, `.bugs`, `.Bugs`, `.BUGS`, and all eight case variants of `.bug`. These suffixes select the JAGS grammar; they do not imply general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE compatibility. The grammar recognizes:
 
 - **Comments** — `#` to end of line.
 - **Strings** — double-quoted, with `\\`-style escapes.

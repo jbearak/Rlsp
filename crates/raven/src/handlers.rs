@@ -71938,8 +71938,13 @@ mod file_type_tests {
                 Just("BUGS"),
                 Just("Bugs"),
                 Just("bug"),
-                Just("BUG"),
-                Just("Bug")
+                Just("buG"),
+                Just("bUg"),
+                Just("bUG"),
+                Just("Bug"),
+                Just("BuG"),
+                Just("BUg"),
+                Just("BUG")
             ]
         ) {
             let uri_str = format!("file:///path/to/{}.{}", prefix, ext);

@@ -51755,6 +51755,7 @@ lineLength = 200
             (tmp.path().join("lower.bugs"), "jags"),
             (tmp.path().join("upper.BUGS"), "jags"),
             (tmp.path().join("lower.bug"), "plaintext"),
+            (tmp.path().join("mixed.BuG"), "plaintext"),
             (tmp.path().join("upper.BUG"), "plaintext"),
         ];
         for (path, _) in &cases {
