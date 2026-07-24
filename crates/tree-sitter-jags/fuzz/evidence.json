@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "recorded_date": "2026-07-23",
+  "scope": "Raven's generated tree-sitter JAGS parser",
+  "toolchain": {
+    "rustup_toolchain": "nightly-2026-07-22",
+    "rustc": "rustc 1.99.0-nightly (0e29c21d9 2026-07-21)",
+    "cargo_fuzz": "cargo-fuzz 0.13.2",
+    "libfuzzer_sys": "0.4.13",
+    "sanitizer": "address",
+    "target": "aarch64-apple-darwin",
+    "build_std": true
+  },
+  "libfuzzer_options": {
+    "max_total_time_seconds": 600,
+    "max_len": 4096,
+    "seed": 424242,
+    "rss_limit_mib": 2048,
+    "timeout_seconds": 5,
+    "print_final_stats": 1,
+    "verbosity": 0
+  },
+  "campaigns": {
+    "parser": {
+      "fuzz_target": "fuzz_targets/parser.rs",
+      "seed_corpus": "seeds/parser",
+      "output_corpus": "evidence-corpus/parser-asan-20260723",
+      "grammar_js_sha256": "ded6d239241de74f30eeec9aa5bd47c4b798ef4871806c2d69338d154eeeef2d",
+      "parser_c_sha256": "e6937e44539dc02f25232e4b4254a500636c0855ceebfb2099087b1609927e3b",
+      "fuzz_target_sha256": "9054d13898ec0d367ef667795686684f02585eb7bca83f08f633bdc44a4081b0",
+      "fuzz_lock_sha256": "7705c1264f9078b8bde80d3607b003ec458b34dbc55e0cfc29fb6633ce0ed56a",
+      "seed_file_count": 4,
+      "seed_total_bytes": 181,
+      "seed_content_multiset_sha256": "f36547265c8af99b20cf322950b64ee02a5e4182f0743667106061eaac268777",
+      "executions": 8879519,
+      "average_executions_per_second": 14774,
+      "new_units": 381,
+      "slowest_unit_time_seconds": 0,
+      "peak_rss_mib": 532,
+      "output_corpus_file_count": 77,
+      "output_corpus_total_bytes": 2378,
+      "output_corpus_content_multiset_sha256": "e02c8aa78bbc488007a17db1df92a9ca996ea43fc5eebbd46bcb5659f64671c3",
+      "exit_status": 0,
+      "defects": []
+    },
+    "incremental_edits": {
+      "fuzz_target": "fuzz_targets/incremental.rs",
+      "seed_corpus": "seeds/incremental_edits",
+      "output_corpus": "evidence-corpus/incremental-asan-20260723",
+      "grammar_js_sha256": "ded6d239241de74f30eeec9aa5bd47c4b798ef4871806c2d69338d154eeeef2d",
+      "parser_c_sha256": "e6937e44539dc02f25232e4b4254a500636c0855ceebfb2099087b1609927e3b",
+      "fuzz_target_sha256": "8bc11afb5c38b6ff2a20704319c28b72233879e3d20f0bc5b16082eb97b1db9a",
+      "fuzz_lock_sha256": "7705c1264f9078b8bde80d3607b003ec458b34dbc55e0cfc29fb6633ce0ed56a",
+      "seed_file_count": 3,
+      "seed_total_bytes": 92,
+      "seed_content_multiset_sha256": "7258ff0bf41dea7863cd1d4c303d9794d1b1caedb5affc30dfcf8b4821cab088",
+      "executions": 4338332,
+      "average_executions_per_second": 7218,
+      "new_units": 451,
+      "slowest_unit_time_seconds": 0,
+      "peak_rss_mib": 615,
+      "output_corpus_file_count": 118,
+      "output_corpus_total_bytes": 9506,
+      "output_corpus_content_multiset_sha256": "c3b0c621c11c550d87bd78c4586adf2d3849aa44b3da6020710c86659b583079",
+      "exit_status": 0,
+      "defects": []
+    }
+  }
+}

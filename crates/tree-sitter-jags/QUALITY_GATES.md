@@ -8,20 +8,21 @@ after `compile`, while malformed expressions and delimiters fail during it.
 
 - 115 independently authored black-box matrix probes: 50 accepted and 65
   rejected, across 21 categories.
-- 82 syntax-valid cases from 19 authored templates, all accepted by JAGS and
-  error-free here. They currently produce 69 distinct recursive tree-shape
-  fingerprints.
-- 20 syntax-valid semantic failures from 10 authored templates, all accepted
+- 358 syntax-valid cases from 295 authored templates, all accepted by JAGS and
+  error-free here. The total includes all 276 unordered pairs of 24 meaningful
+  syntax features; each pair has a unique recursive tree shape, and the whole
+  group produces 344 distinct recursive tree-shape fingerprints.
+- 50 syntax-valid semantic failures across 10 existing semantic families, all accepted
   by JAGS during parsing, rejected during compilation, and error-free here.
-  They currently produce 17 distinct recursive tree-shape fingerprints.
-- 74 syntax-invalid cases from 35 authored defect templates, all rejected by
+  They currently produce 39 distinct recursive tree-shape fingerprints.
+- 75 syntax-invalid cases from 35 authored defect templates, all rejected by
   JAGS and classified as erroneous here (including the documented BOM root
-  coverage boundary). They currently produce 66 distinct recursive tree-shape
+  coverage boundary). They currently produce 67 distinct recursive tree-shape
   fingerprints.
-- 60 mutation cases from 10 mutation categories and 60 independently authored
-  contexts. All are rejected by JAGS and classified as erroneous here, with
-  56 distinct recursive tree-shape fingerprints.
-- 16 structurally distinct incremental-edit sequences cover relation
+- 200 mutation cases from 10 mutation categories and 20 independently authored
+  contexts per category. All are rejected by JAGS and classified as erroneous
+  here, with 176 distinct recursive tree-shape fingerprints.
+- 25 structurally distinct incremental-edit sequences cover relation
   operators, operands, calls, subsets, loops, bounds, contextual syntax,
   special operators, non-associative operators, whole expressions, program
   blocks, CRLF/Unicode comments, and EOF comments. Every node's kind, flags,
@@ -29,7 +30,7 @@ after `compile`, while malformed expressions and delimiters fail during it.
 - 1,024 generated valid-property cases and 1,024 arbitrary-UTF-8 range/panic
   cases.
 
-The committed `oracle-results.json` binds all 351 matrix and quality-corpus
+The committed `oracle-results.json` binds all 798 matrix and quality-corpus
 outcomes to the source hashes, generator hash, and oracle harness hash. Normal
 CI regenerates the corpus, verifies the input binding and outcomes offline,
 and runs the oracle harness's timeout/hash-validation unit tests. Refreshing or
@@ -73,6 +74,25 @@ and parent range containment. The incremental target starts from one of eight
 syntax-clean source families, applies a generated edit, and compares the fresh
 and reused trees recursively, including kinds, flags, fields, and byte/point
 ranges. The fuzz crate is not part of Raven's runtime dependency graph.
+
+Publication evidence uses `nightly-2026-07-22`, rustc
+`1.99.0-nightly (0e29c21d9 2026-07-21)`, cargo-fuzz 0.13.2, and
+libfuzzer-sys 0.4.13 on `aarch64-apple-darwin`. Both AddressSanitizer campaigns
+used seed 424242, `max_len=4096`, `timeout=5`, `rss_limit_mb=2048`,
+`max_total_time=600`, `print_final_stats=1`, and `verbosity=0`:
+
+| Target | Executions | Average/s | New units | Peak RSS | Output corpus |
+|---|---:|---:|---:|---:|---|
+| Arbitrary parser input | 8,879,519 | 14,774 | 381 | 532 MiB | 77 files / 2,378 bytes |
+| Clean-base incremental edit | 4,338,332 | 7,218 | 451 | 615 MiB | 118 files / 9,506 bytes |
+
+Both exited successfully with no sanitizer finding, timeout, or other defect.
+The parser seed set is 4 files / 181 bytes with content-multiset SHA-256
+`f36547265c8af99b20cf322950b64ee02a5e4182f0743667106061eaac268777`;
+the incremental seed set is 3 files / 92 bytes with SHA-256
+`7258ff0bf41dea7863cd1d4c303d9794d1b1caedb5affc30dfcf8b4821cab088`.
+Exact commands, output-corpus hashes, source bindings, and the offline verifier
+are in `fuzz/README.md` and `fuzz/evidence.json`.
 
 ## Known boundary
 

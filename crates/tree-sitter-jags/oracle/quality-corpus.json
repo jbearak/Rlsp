@@ -657,6 +657,2214 @@
       "template": "contextual keyword names"
     },
     {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-01",
+      "source": "model {\n a <- 1\n b = 2\n}\n",
+      "template": "pairwise deterministic-arrow + deterministic-equals"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-02",
+      "source": "model {\n a <- 1\n values[i] <- i\n}\n",
+      "template": "pairwise deterministic-arrow + subset-lhs"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-03",
+      "source": "model {\n a <- 1\n logit(probability[i]) <- eta[i]\n}\n",
+      "template": "pairwise deterministic-arrow + link-lhs"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-04",
+      "source": "model {\n a <- 1\n sample_a ~ distribution_a()\n}\n",
+      "template": "pairwise deterministic-arrow + stochastic-empty-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-05",
+      "source": "model {\n a <- 1\n sample_b ~ distribution_b(mu, tau)\n}\n",
+      "template": "pairwise deterministic-arrow + stochastic-two-args"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-06",
+      "source": "model {\n a <- 1\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n}\n",
+      "template": "pairwise deterministic-arrow + truncation-both"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-07",
+      "source": "model {\n a <- 1\n sample_d ~ distribution_d(0, 1) I(, upper)\n}\n",
+      "template": "pairwise deterministic-arrow + interval-omitted"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-08",
+      "source": "model {\n a <- 1\n for (i in 1:n) { loop_value[i] <- i }\n}\n",
+      "template": "pairwise deterministic-arrow + simple-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-09",
+      "source": "model {\n a <- 1\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n}\n",
+      "template": "pairwise deterministic-arrow + nested-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-10",
+      "source": "model {\n a <- 1\n power_value <- -base^2\n}\n",
+      "template": "pairwise deterministic-arrow + unary-power"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-11",
+      "source": "model {\n a <- 1\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise deterministic-arrow + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-12",
+      "source": "model {\n a <- 1\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise deterministic-arrow + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-13",
+      "source": "model {\n a <- 1\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise deterministic-arrow + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-14",
+      "source": "model {\n a <- 1\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise deterministic-arrow + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-15",
+      "source": "model {\n a <- 1\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise deterministic-arrow + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-16",
+      "source": "model {\n a <- 1\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise deterministic-arrow + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-17",
+      "source": "model {\n a <- 1\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise deterministic-arrow + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-18",
+      "source": "model {\n a <- 1\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise deterministic-arrow + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-19",
+      "source": "model {\n a <- 1\n empty_subset <- values[]\n}\n",
+      "template": "pairwise deterministic-arrow + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-20",
+      "source": "model {\n a <- 1\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise deterministic-arrow + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-21",
+      "source": "model {\n a <- 1\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise deterministic-arrow + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-22",
+      "source": "model {\n a <- 1\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise deterministic-arrow + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-23",
+      "source": "model {\n a <- 1\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise deterministic-arrow + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-24",
+      "source": "model {\n b = 2\n values[i] <- i\n}\n",
+      "template": "pairwise deterministic-equals + subset-lhs"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-25",
+      "source": "model {\n b = 2\n logit(probability[i]) <- eta[i]\n}\n",
+      "template": "pairwise deterministic-equals + link-lhs"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-26",
+      "source": "model {\n b = 2\n sample_a ~ distribution_a()\n}\n",
+      "template": "pairwise deterministic-equals + stochastic-empty-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-27",
+      "source": "model {\n b = 2\n sample_b ~ distribution_b(mu, tau)\n}\n",
+      "template": "pairwise deterministic-equals + stochastic-two-args"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-28",
+      "source": "model {\n b = 2\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n}\n",
+      "template": "pairwise deterministic-equals + truncation-both"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-29",
+      "source": "model {\n b = 2\n sample_d ~ distribution_d(0, 1) I(, upper)\n}\n",
+      "template": "pairwise deterministic-equals + interval-omitted"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-30",
+      "source": "model {\n b = 2\n for (i in 1:n) { loop_value[i] <- i }\n}\n",
+      "template": "pairwise deterministic-equals + simple-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-31",
+      "source": "model {\n b = 2\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n}\n",
+      "template": "pairwise deterministic-equals + nested-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-32",
+      "source": "model {\n b = 2\n power_value <- -base^2\n}\n",
+      "template": "pairwise deterministic-equals + unary-power"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-33",
+      "source": "model {\n b = 2\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise deterministic-equals + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-34",
+      "source": "model {\n b = 2\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise deterministic-equals + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-35",
+      "source": "model {\n b = 2\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise deterministic-equals + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-36",
+      "source": "model {\n b = 2\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise deterministic-equals + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-37",
+      "source": "model {\n b = 2\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise deterministic-equals + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-38",
+      "source": "model {\n b = 2\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise deterministic-equals + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-39",
+      "source": "model {\n b = 2\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise deterministic-equals + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-40",
+      "source": "model {\n b = 2\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise deterministic-equals + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-41",
+      "source": "model {\n b = 2\n empty_subset <- values[]\n}\n",
+      "template": "pairwise deterministic-equals + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-42",
+      "source": "model {\n b = 2\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise deterministic-equals + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-43",
+      "source": "model {\n b = 2\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise deterministic-equals + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-44",
+      "source": "model {\n b = 2\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise deterministic-equals + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-45",
+      "source": "model {\n b = 2\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise deterministic-equals + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-46",
+      "source": "model {\n values[i] <- i\n logit(probability[i]) <- eta[i]\n}\n",
+      "template": "pairwise subset-lhs + link-lhs"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-47",
+      "source": "model {\n values[i] <- i\n sample_a ~ distribution_a()\n}\n",
+      "template": "pairwise subset-lhs + stochastic-empty-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-48",
+      "source": "model {\n values[i] <- i\n sample_b ~ distribution_b(mu, tau)\n}\n",
+      "template": "pairwise subset-lhs + stochastic-two-args"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-49",
+      "source": "model {\n values[i] <- i\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n}\n",
+      "template": "pairwise subset-lhs + truncation-both"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-50",
+      "source": "model {\n values[i] <- i\n sample_d ~ distribution_d(0, 1) I(, upper)\n}\n",
+      "template": "pairwise subset-lhs + interval-omitted"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-51",
+      "source": "model {\n values[i] <- i\n for (i in 1:n) { loop_value[i] <- i }\n}\n",
+      "template": "pairwise subset-lhs + simple-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-52",
+      "source": "model {\n values[i] <- i\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n}\n",
+      "template": "pairwise subset-lhs + nested-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-53",
+      "source": "model {\n values[i] <- i\n power_value <- -base^2\n}\n",
+      "template": "pairwise subset-lhs + unary-power"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-54",
+      "source": "model {\n values[i] <- i\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise subset-lhs + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-55",
+      "source": "model {\n values[i] <- i\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise subset-lhs + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-56",
+      "source": "model {\n values[i] <- i\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise subset-lhs + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-57",
+      "source": "model {\n values[i] <- i\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise subset-lhs + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-58",
+      "source": "model {\n values[i] <- i\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise subset-lhs + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-59",
+      "source": "model {\n values[i] <- i\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise subset-lhs + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-60",
+      "source": "model {\n values[i] <- i\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise subset-lhs + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-61",
+      "source": "model {\n values[i] <- i\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise subset-lhs + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-62",
+      "source": "model {\n values[i] <- i\n empty_subset <- values[]\n}\n",
+      "template": "pairwise subset-lhs + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-63",
+      "source": "model {\n values[i] <- i\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise subset-lhs + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-64",
+      "source": "model {\n values[i] <- i\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise subset-lhs + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-65",
+      "source": "model {\n values[i] <- i\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise subset-lhs + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-66",
+      "source": "model {\n values[i] <- i\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise subset-lhs + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-67",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n sample_a ~ distribution_a()\n}\n",
+      "template": "pairwise link-lhs + stochastic-empty-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-68",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n sample_b ~ distribution_b(mu, tau)\n}\n",
+      "template": "pairwise link-lhs + stochastic-two-args"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-69",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n}\n",
+      "template": "pairwise link-lhs + truncation-both"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-70",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n sample_d ~ distribution_d(0, 1) I(, upper)\n}\n",
+      "template": "pairwise link-lhs + interval-omitted"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-71",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n for (i in 1:n) { loop_value[i] <- i }\n}\n",
+      "template": "pairwise link-lhs + simple-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-72",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n}\n",
+      "template": "pairwise link-lhs + nested-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-73",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n power_value <- -base^2\n}\n",
+      "template": "pairwise link-lhs + unary-power"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-74",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise link-lhs + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-75",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise link-lhs + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-76",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise link-lhs + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-77",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise link-lhs + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-78",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise link-lhs + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-79",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise link-lhs + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-80",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise link-lhs + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-81",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise link-lhs + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-82",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n empty_subset <- values[]\n}\n",
+      "template": "pairwise link-lhs + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-83",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise link-lhs + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-84",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise link-lhs + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-85",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise link-lhs + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-86",
+      "source": "model {\n logit(probability[i]) <- eta[i]\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise link-lhs + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-87",
+      "source": "model {\n sample_a ~ distribution_a()\n sample_b ~ distribution_b(mu, tau)\n}\n",
+      "template": "pairwise stochastic-empty-call + stochastic-two-args"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-88",
+      "source": "model {\n sample_a ~ distribution_a()\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n}\n",
+      "template": "pairwise stochastic-empty-call + truncation-both"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-89",
+      "source": "model {\n sample_a ~ distribution_a()\n sample_d ~ distribution_d(0, 1) I(, upper)\n}\n",
+      "template": "pairwise stochastic-empty-call + interval-omitted"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-90",
+      "source": "model {\n sample_a ~ distribution_a()\n for (i in 1:n) { loop_value[i] <- i }\n}\n",
+      "template": "pairwise stochastic-empty-call + simple-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-91",
+      "source": "model {\n sample_a ~ distribution_a()\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n}\n",
+      "template": "pairwise stochastic-empty-call + nested-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-92",
+      "source": "model {\n sample_a ~ distribution_a()\n power_value <- -base^2\n}\n",
+      "template": "pairwise stochastic-empty-call + unary-power"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-93",
+      "source": "model {\n sample_a ~ distribution_a()\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise stochastic-empty-call + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-94",
+      "source": "model {\n sample_a ~ distribution_a()\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise stochastic-empty-call + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-95",
+      "source": "model {\n sample_a ~ distribution_a()\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise stochastic-empty-call + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-96",
+      "source": "model {\n sample_a ~ distribution_a()\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise stochastic-empty-call + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-97",
+      "source": "model {\n sample_a ~ distribution_a()\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise stochastic-empty-call + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-98",
+      "source": "model {\n sample_a ~ distribution_a()\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise stochastic-empty-call + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-99",
+      "source": "model {\n sample_a ~ distribution_a()\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise stochastic-empty-call + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-100",
+      "source": "model {\n sample_a ~ distribution_a()\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise stochastic-empty-call + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-101",
+      "source": "model {\n sample_a ~ distribution_a()\n empty_subset <- values[]\n}\n",
+      "template": "pairwise stochastic-empty-call + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-102",
+      "source": "model {\n sample_a ~ distribution_a()\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise stochastic-empty-call + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-103",
+      "source": "model {\n sample_a ~ distribution_a()\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise stochastic-empty-call + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-104",
+      "source": "model {\n sample_a ~ distribution_a()\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise stochastic-empty-call + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-105",
+      "source": "model {\n sample_a ~ distribution_a()\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise stochastic-empty-call + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-106",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n}\n",
+      "template": "pairwise stochastic-two-args + truncation-both"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-107",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n sample_d ~ distribution_d(0, 1) I(, upper)\n}\n",
+      "template": "pairwise stochastic-two-args + interval-omitted"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-108",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n for (i in 1:n) { loop_value[i] <- i }\n}\n",
+      "template": "pairwise stochastic-two-args + simple-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-109",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n}\n",
+      "template": "pairwise stochastic-two-args + nested-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-110",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n power_value <- -base^2\n}\n",
+      "template": "pairwise stochastic-two-args + unary-power"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-111",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise stochastic-two-args + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-112",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise stochastic-two-args + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-113",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise stochastic-two-args + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-114",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise stochastic-two-args + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-115",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise stochastic-two-args + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-116",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise stochastic-two-args + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-117",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise stochastic-two-args + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-118",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise stochastic-two-args + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-119",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n empty_subset <- values[]\n}\n",
+      "template": "pairwise stochastic-two-args + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-120",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise stochastic-two-args + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-121",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise stochastic-two-args + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-122",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise stochastic-two-args + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-123",
+      "source": "model {\n sample_b ~ distribution_b(mu, tau)\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise stochastic-two-args + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-124",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n sample_d ~ distribution_d(0, 1) I(, upper)\n}\n",
+      "template": "pairwise truncation-both + interval-omitted"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-125",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n for (i in 1:n) { loop_value[i] <- i }\n}\n",
+      "template": "pairwise truncation-both + simple-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-126",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n}\n",
+      "template": "pairwise truncation-both + nested-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-127",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n power_value <- -base^2\n}\n",
+      "template": "pairwise truncation-both + unary-power"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-128",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise truncation-both + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-129",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise truncation-both + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-130",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise truncation-both + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-131",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise truncation-both + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-132",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise truncation-both + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-133",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise truncation-both + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-134",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise truncation-both + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-135",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise truncation-both + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-136",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n empty_subset <- values[]\n}\n",
+      "template": "pairwise truncation-both + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-137",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise truncation-both + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-138",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise truncation-both + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-139",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise truncation-both + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-140",
+      "source": "model {\n sample_c ~ distribution_c(0, 1) T(lower, upper)\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise truncation-both + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-141",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n for (i in 1:n) { loop_value[i] <- i }\n}\n",
+      "template": "pairwise interval-omitted + simple-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-142",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n}\n",
+      "template": "pairwise interval-omitted + nested-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-143",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n power_value <- -base^2\n}\n",
+      "template": "pairwise interval-omitted + unary-power"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-144",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise interval-omitted + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-145",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise interval-omitted + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-146",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise interval-omitted + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-147",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise interval-omitted + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-148",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise interval-omitted + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-149",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise interval-omitted + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-150",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise interval-omitted + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-151",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise interval-omitted + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-152",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n empty_subset <- values[]\n}\n",
+      "template": "pairwise interval-omitted + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-153",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise interval-omitted + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-154",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise interval-omitted + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-155",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise interval-omitted + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-156",
+      "source": "model {\n sample_d ~ distribution_d(0, 1) I(, upper)\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise interval-omitted + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-157",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n}\n",
+      "template": "pairwise simple-loop + nested-loop"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-158",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n power_value <- -base^2\n}\n",
+      "template": "pairwise simple-loop + unary-power"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-159",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise simple-loop + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-160",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise simple-loop + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-161",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise simple-loop + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-162",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise simple-loop + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-163",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise simple-loop + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-164",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise simple-loop + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-165",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise simple-loop + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-166",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise simple-loop + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-167",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n empty_subset <- values[]\n}\n",
+      "template": "pairwise simple-loop + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-168",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise simple-loop + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-169",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise simple-loop + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-170",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise simple-loop + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-171",
+      "source": "model {\n for (i in 1:n) { loop_value[i] <- i }\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise simple-loop + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-172",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n power_value <- -base^2\n}\n",
+      "template": "pairwise nested-loop + unary-power"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-173",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise nested-loop + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-174",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise nested-loop + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-175",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise nested-loop + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-176",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise nested-loop + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-177",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise nested-loop + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-178",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise nested-loop + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-179",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise nested-loop + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-180",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise nested-loop + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-181",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n empty_subset <- values[]\n}\n",
+      "template": "pairwise nested-loop + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-182",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise nested-loop + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-183",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise nested-loop + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-184",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise nested-loop + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-185",
+      "source": "model {\n for (j in 1:n) { for (k in 1:m) { matrix[j,k] <- j+k } }\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise nested-loop + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-186",
+      "source": "model {\n power_value <- -base^2\n product_value <- left * middle / right\n}\n",
+      "template": "pairwise unary-power + multiplicative"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-187",
+      "source": "model {\n power_value <- -base^2\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise unary-power + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-188",
+      "source": "model {\n power_value <- -base^2\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise unary-power + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-189",
+      "source": "model {\n power_value <- -base^2\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise unary-power + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-190",
+      "source": "model {\n power_value <- -base^2\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise unary-power + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-191",
+      "source": "model {\n power_value <- -base^2\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise unary-power + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-192",
+      "source": "model {\n power_value <- -base^2\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise unary-power + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-193",
+      "source": "model {\n power_value <- -base^2\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise unary-power + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-194",
+      "source": "model {\n power_value <- -base^2\n empty_subset <- values[]\n}\n",
+      "template": "pairwise unary-power + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-195",
+      "source": "model {\n power_value <- -base^2\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise unary-power + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-196",
+      "source": "model {\n power_value <- -base^2\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise unary-power + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-197",
+      "source": "model {\n power_value <- -base^2\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise unary-power + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-198",
+      "source": "model {\n power_value <- -base^2\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise unary-power + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-199",
+      "source": "model {\n product_value <- left * middle / right\n modulo_value <- left %% right + left %/% right\n}\n",
+      "template": "pairwise multiplicative + modulo"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-200",
+      "source": "model {\n product_value <- left * middle / right\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise multiplicative + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-201",
+      "source": "model {\n product_value <- left * middle / right\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise multiplicative + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-202",
+      "source": "model {\n product_value <- left * middle / right\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise multiplicative + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-203",
+      "source": "model {\n product_value <- left * middle / right\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise multiplicative + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-204",
+      "source": "model {\n product_value <- left * middle / right\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise multiplicative + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-205",
+      "source": "model {\n product_value <- left * middle / right\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise multiplicative + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-206",
+      "source": "model {\n product_value <- left * middle / right\n empty_subset <- values[]\n}\n",
+      "template": "pairwise multiplicative + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-207",
+      "source": "model {\n product_value <- left * middle / right\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise multiplicative + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-208",
+      "source": "model {\n product_value <- left * middle / right\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise multiplicative + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-209",
+      "source": "model {\n product_value <- left * middle / right\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise multiplicative + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-210",
+      "source": "model {\n product_value <- left * middle / right\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise multiplicative + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-211",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n comparison_value <- left <= right\n}\n",
+      "template": "pairwise modulo + comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-212",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise modulo + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-213",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise modulo + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-214",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise modulo + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-215",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise modulo + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-216",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise modulo + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-217",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n empty_subset <- values[]\n}\n",
+      "template": "pairwise modulo + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-218",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise modulo + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-219",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise modulo + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-220",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise modulo + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-221",
+      "source": "model {\n modulo_value <- left %% right + left %/% right\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise modulo + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-222",
+      "source": "model {\n comparison_value <- left <= right\n nested_comparison <- (left < right) == flag\n}\n",
+      "template": "pairwise comparison + parenthesized-comparison"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-223",
+      "source": "model {\n comparison_value <- left <= right\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise comparison + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-224",
+      "source": "model {\n comparison_value <- left <= right\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise comparison + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-225",
+      "source": "model {\n comparison_value <- left <= right\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise comparison + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-226",
+      "source": "model {\n comparison_value <- left <= right\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise comparison + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-227",
+      "source": "model {\n comparison_value <- left <= right\n empty_subset <- values[]\n}\n",
+      "template": "pairwise comparison + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-228",
+      "source": "model {\n comparison_value <- left <= right\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise comparison + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-229",
+      "source": "model {\n comparison_value <- left <= right\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise comparison + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-230",
+      "source": "model {\n comparison_value <- left <= right\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise comparison + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-231",
+      "source": "model {\n comparison_value <- left <= right\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise comparison + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-232",
+      "source": "model {\n nested_comparison <- (left < right) == flag\n logical_value <- left || middle && right\n}\n",
+      "template": "pairwise parenthesized-comparison + logical"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-233",
+      "source": "model {\n nested_comparison <- (left < right) == flag\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise parenthesized-comparison + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-234",
+      "source": "model {\n nested_comparison <- (left < right) == flag\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise parenthesized-comparison + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-235",
+      "source": "model {\n nested_comparison <- (left < right) == flag\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise parenthesized-comparison + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-236",
+      "source": "model {\n nested_comparison <- (left < right) == flag\n empty_subset <- values[]\n}\n",
+      "template": "pairwise parenthesized-comparison + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-237",
+      "source": "model {\n nested_comparison <- (left < right) == flag\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise parenthesized-comparison + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-238",
+      "source": "model {\n nested_comparison <- (left < right) == flag\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise parenthesized-comparison + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-239",
+      "source": "model {\n nested_comparison <- (left < right) == flag\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise parenthesized-comparison + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-240",
+      "source": "model {\n nested_comparison <- (left < right) == flag\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise parenthesized-comparison + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-241",
+      "source": "model {\n logical_value <- left || middle && right\n sequence_value <- start:(stop + 1)\n}\n",
+      "template": "pairwise logical + colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-242",
+      "source": "model {\n logical_value <- left || middle && right\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise logical + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-243",
+      "source": "model {\n logical_value <- left || middle && right\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise logical + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-244",
+      "source": "model {\n logical_value <- left || middle && right\n empty_subset <- values[]\n}\n",
+      "template": "pairwise logical + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-245",
+      "source": "model {\n logical_value <- left || middle && right\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise logical + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-246",
+      "source": "model {\n logical_value <- left || middle && right\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise logical + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-247",
+      "source": "model {\n logical_value <- left || middle && right\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise logical + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-248",
+      "source": "model {\n logical_value <- left || middle && right\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise logical + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-249",
+      "source": "model {\n sequence_value <- start:(stop + 1)\n special_value <- left %pairwise% right\n}\n",
+      "template": "pairwise colon + special-infix"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-250",
+      "source": "model {\n sequence_value <- start:(stop + 1)\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise colon + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-251",
+      "source": "model {\n sequence_value <- start:(stop + 1)\n empty_subset <- values[]\n}\n",
+      "template": "pairwise colon + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-252",
+      "source": "model {\n sequence_value <- start:(stop + 1)\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise colon + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-253",
+      "source": "model {\n sequence_value <- start:(stop + 1)\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise colon + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-254",
+      "source": "model {\n sequence_value <- start:(stop + 1)\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise colon + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-255",
+      "source": "model {\n sequence_value <- start:(stop + 1)\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise colon + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-256",
+      "source": "model {\n special_value <- left %pairwise% right\n call_value <- outer(inner(1), other(2, 3))\n}\n",
+      "template": "pairwise special-infix + nested-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-257",
+      "source": "model {\n special_value <- left %pairwise% right\n empty_subset <- values[]\n}\n",
+      "template": "pairwise special-infix + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-258",
+      "source": "model {\n special_value <- left %pairwise% right\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise special-infix + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-259",
+      "source": "model {\n special_value <- left %pairwise% right\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise special-infix + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-260",
+      "source": "model {\n special_value <- left %pairwise% right\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise special-infix + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-261",
+      "source": "model {\n special_value <- left %pairwise% right\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise special-infix + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-262",
+      "source": "model {\n call_value <- outer(inner(1), other(2, 3))\n empty_subset <- values[]\n}\n",
+      "template": "pairwise nested-call + empty-subset"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-263",
+      "source": "model {\n call_value <- outer(inner(1), other(2, 3))\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise nested-call + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-264",
+      "source": "model {\n call_value <- outer(inner(1), other(2, 3))\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise nested-call + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-265",
+      "source": "model {\n call_value <- outer(inner(1), other(2, 3))\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise nested-call + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-266",
+      "source": "model {\n call_value <- outer(inner(1), other(2, 3))\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise nested-call + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-267",
+      "source": "model {\n empty_subset <- values[]\n slice_value <- values[row,,column]\n}\n",
+      "template": "pairwise empty-subset + omitted-subset-dimension"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-268",
+      "source": "model {\n empty_subset <- values[]\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise empty-subset + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-269",
+      "source": "model {\n empty_subset <- values[]\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise empty-subset + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-270",
+      "source": "model {\n empty_subset <- values[]\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise empty-subset + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-271",
+      "source": "model {\n slice_value <- values[row,,column]\n contextual_value <- model(data(1), var(2))\n}\n",
+      "template": "pairwise omitted-subset-dimension + contextual-call"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-272",
+      "source": "model {\n slice_value <- values[row,,column]\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise omitted-subset-dimension + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-273",
+      "source": "model {\n slice_value <- values[row,,column]\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise omitted-subset-dimension + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-274",
+      "source": "model {\n contextual_value <- model(data(1), var(2))\n negated_value <- -(left + right)\n}\n",
+      "template": "pairwise contextual-call + unary-parenthesized"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-275",
+      "source": "model {\n contextual_value <- model(data(1), var(2))\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise contextual-call + commented-relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "pairwise-features",
+      "group": "syntax-valid",
+      "id": "syntax-valid-pairwise-features-276",
+      "source": "model {\n negated_value <- -(left + right)\n /* pairwise */ commented_value <- 1\n}\n",
+      "template": "pairwise unary-parenthesized + commented-relation"
+    },
+    {
       "compile": true,
       "expect_parse": "accepted",
       "expect_semantic_error": true,
@@ -674,6 +2882,36 @@
       "group": "semantic-invalid",
       "id": "semantic-invalid-unknown-function-02",
       "source": "model { x <- module_specific_transform(theta, 2) }\n",
+      "template": "unknown function name"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "unknown-function",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-unknown-function-03",
+      "source": "model { x <- absent_scalar_transform(alpha + beta) }\n",
+      "template": "unknown function name"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "unknown-function",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-unknown-function-04",
+      "source": "model { x <- unavailable_vector_transform(values[]) }\n",
+      "template": "unknown function name"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "unknown-function",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-unknown-function-05",
+      "source": "model { for (i in 1:n) { x[i] <- unknown_index_transform(i, n) } }\n",
       "template": "unknown function name"
     },
     {
@@ -700,6 +2938,36 @@
       "compile": true,
       "expect_parse": "accepted",
       "expect_semantic_error": true,
+      "family": "unknown-distribution",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-unknown-distribution-03",
+      "source": "model { x ~ absent_distribution() }\n",
+      "template": "unknown distribution name"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "unknown-distribution",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-unknown-distribution-04",
+      "source": "model { x[i] ~ unavailable_distribution(mu[i]) }\n",
+      "template": "unknown distribution name"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "unknown-distribution",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-unknown-distribution-05",
+      "source": "model { for (i in 1:n) { x[i] ~ unknown_vector_distribution(mu[], tau) } }\n",
+      "template": "unknown distribution name"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
       "family": "function-arity",
       "group": "semantic-invalid",
       "id": "semantic-invalid-function-arity-01",
@@ -714,6 +2982,36 @@
       "group": "semantic-invalid",
       "id": "semantic-invalid-function-arity-02",
       "source": "model { x <- sqrt(1, 2) }\n",
+      "template": "known function wrong arity"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "function-arity",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-function-arity-03",
+      "source": "model { x <- abs(1, 2) }\n",
+      "template": "known function wrong arity"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "function-arity",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-function-arity-04",
+      "source": "model { x <- sin(1, 2) }\n",
+      "template": "known function wrong arity"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "function-arity",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-function-arity-05",
+      "source": "model { x <- pow(1) }\n",
       "template": "known function wrong arity"
     },
     {
@@ -740,6 +3038,36 @@
       "compile": true,
       "expect_parse": "accepted",
       "expect_semantic_error": true,
+      "family": "distribution-arity",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-distribution-arity-03",
+      "source": "model { x ~ dbern() }\n",
+      "template": "known distribution wrong arity"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "distribution-arity",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-distribution-arity-04",
+      "source": "model { x ~ dpois() }\n",
+      "template": "known distribution wrong arity"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "distribution-arity",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-distribution-arity-05",
+      "source": "model { x ~ dbin(1) }\n",
+      "template": "known distribution wrong arity"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
       "family": "undefined-data",
       "group": "semantic-invalid",
       "id": "semantic-invalid-undefined-data-01",
@@ -754,6 +3082,36 @@
       "group": "semantic-invalid",
       "id": "semantic-invalid-undefined-data-02",
       "source": "model { x ~ dnorm(missing_mean, 1) }\n",
+      "template": "unresolved data dependency"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "undefined-data",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-undefined-data-03",
+      "source": "model { x <- f(missing_vector[]) }\n",
+      "template": "unresolved data dependency"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "undefined-data",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-undefined-data-04",
+      "source": "model { for (i in 1:n) { x[i] <- absent_matrix[i, j] } }\n",
+      "template": "unresolved data dependency"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "undefined-data",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-undefined-data-05",
+      "source": "model { x ~ dnorm(0, missing_precision) T(missing_lower, ) }\n",
       "template": "unresolved data dependency"
     },
     {
@@ -780,6 +3138,36 @@
       "compile": true,
       "expect_parse": "accepted",
       "expect_semantic_error": true,
+      "family": "direct-cycle",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-direct-cycle-03",
+      "source": "model { x <- x + 1 }\n",
+      "template": "directed cycle"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "direct-cycle",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-direct-cycle-04",
+      "source": "model { x <- y + z; y <- z; z <- x }\n",
+      "template": "directed cycle"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "direct-cycle",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-direct-cycle-05",
+      "source": "model { for (i in 1:n) { x[i] <- y[i]; y[i] <- x[i] } }\n",
+      "template": "directed cycle"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
       "family": "duplicate-node",
       "group": "semantic-invalid",
       "id": "semantic-invalid-duplicate-node-01",
@@ -794,6 +3182,36 @@
       "group": "semantic-invalid",
       "id": "semantic-invalid-duplicate-node-02",
       "source": "model { x[1] <- 1; x[1] ~ dnorm(0,1) }\n",
+      "template": "duplicate node definition"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "duplicate-node",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-duplicate-node-03",
+      "source": "model { x ~ dnorm(0,1); x <- 1 }\n",
+      "template": "duplicate node definition"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "duplicate-node",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-duplicate-node-04",
+      "source": "model { for (i in 1:n) { x[i] <- i; x[i] <- i + 1 } }\n",
+      "template": "duplicate node definition"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "duplicate-node",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-duplicate-node-05",
+      "source": "model { logit(p) <- eta; p <- 0.5 }\n",
       "template": "duplicate node definition"
     },
     {
@@ -820,6 +3238,36 @@
       "compile": true,
       "expect_parse": "accepted",
       "expect_semantic_error": true,
+      "family": "dimension-conflict",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-dimension-conflict-03",
+      "source": "var x[2]; model { x[1,1] <- 1 }\n",
+      "template": "declared dimension conflict"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "dimension-conflict",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-dimension-conflict-04",
+      "source": "var x[2,2]; model { x[1,1,1] <- 1 }\n",
+      "template": "declared dimension conflict"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "dimension-conflict",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-dimension-conflict-05",
+      "source": "var x[2,2,2]; model { x[1,1] <- 1 }\n",
+      "template": "declared dimension conflict"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
       "family": "invalid-link",
       "group": "semantic-invalid",
       "id": "semantic-invalid-invalid-link-01",
@@ -840,6 +3288,36 @@
       "compile": true,
       "expect_parse": "accepted",
       "expect_semantic_error": true,
+      "family": "invalid-link",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-invalid-link-03",
+      "source": "model { absent_link(p[]) <- eta }\n",
+      "template": "unknown link function"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "invalid-link",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-invalid-link-04",
+      "source": "model { for (i in 1:n) { unavailable_link(p[i]) <- eta[i] } }\n",
+      "template": "unknown link function"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "invalid-link",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-invalid-link-05",
+      "source": "model { unknown_link(probability[row,column]) <- eta[row,column] }\n",
+      "template": "unknown link function"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
       "family": "invalid-index",
       "group": "semantic-invalid",
       "id": "semantic-invalid-invalid-index-01",
@@ -854,6 +3332,36 @@
       "group": "semantic-invalid",
       "id": "semantic-invalid-invalid-index-02",
       "source": "model { x[-1] <- 1 }\n",
+      "template": "invalid fixed index"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "invalid-index",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-invalid-index-03",
+      "source": "model { x[0,1] <- 1 }\n",
+      "template": "invalid fixed index"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "invalid-index",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-invalid-index-04",
+      "source": "model { x[1,0] ~ dnorm(0,1) }\n",
+      "template": "invalid fixed index"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "invalid-index",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-invalid-index-05",
+      "source": "model { for (i in 1:n) { x[i,0] <- i } }\n",
       "template": "invalid fixed index"
     },
     {
@@ -1442,6 +3950,14 @@
     },
     {
       "expect_parse": "rejected",
+      "family": "identifier-shape",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-identifier-shape-04",
+      "source": "model { 2x <- 1 }\n",
+      "template": "invalid identifier token"
+    },
+    {
+      "expect_parse": "rejected",
       "family": "bom",
       "group": "syntax-invalid",
       "id": "syntax-invalid-bom-01",
@@ -1498,6 +4014,118 @@
     },
     {
       "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-07",
+      "source": "model { x outer(inner(1), other(2)) }\n",
+      "template": "deleted-relation-operator structural context 7"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-08",
+      "source": "model { x dfoo(0, 1) }\n",
+      "template": "deleted-relation-operator structural context 8"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-09",
+      "source": "model { x dfoo(0, 1) T(0, 1) }\n",
+      "template": "deleted-relation-operator structural context 9"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-10",
+      "source": "model { /* gap */ x 1 }\n",
+      "template": "deleted-relation-operator structural context 10"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-11",
+      "source": "model { before <- 1; broken 2; after <- 3 }\n",
+      "template": "deleted-relation-operator structural context 11"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-12",
+      "source": "model {\r\n x 1\r\n}\r\n",
+      "template": "deleted-relation-operator structural context 12"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-13",
+      "source": "data { n 3 } model { x <- 1 }\n",
+      "template": "deleted-relation-operator structural context 13"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-14",
+      "source": "model { logit(p[i]) eta[i] }\n",
+      "template": "deleted-relation-operator structural context 14"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-15",
+      "source": "model { values[] source[] }\n",
+      "template": "deleted-relation-operator structural context 15"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-16",
+      "source": "model { for (i in 1:n) { for (j in 1:m) { x[i,j] i+j } } }\n",
+      "template": "deleted-relation-operator structural context 16"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-17",
+      "source": "model { x 1; y = 2 }\n",
+      "template": "deleted-relation-operator structural context 17"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-18",
+      "source": "model { contextual model(data(1), var(2)) }\n",
+      "template": "deleted-relation-operator structural context 18"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-19",
+      "source": "model { sequence start:(stop + 1) }\n",
+      "template": "deleted-relation-operator structural context 19"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-20",
+      "source": "model { transformed left %custom% right }\n",
+      "template": "deleted-relation-operator structural context 20"
+    },
+    {
+      "expect_parse": "rejected",
       "family": "missing-operand",
       "group": "mutation",
       "id": "mutation-missing-operand-01",
@@ -1543,6 +4171,118 @@
       "id": "mutation-missing-operand-06",
       "source": "model { x <- a %foo% }\n",
       "template": "missing-operand structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-07",
+      "source": "model { x <- - }\n",
+      "template": "missing-operand structural context 7"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-08",
+      "source": "model { x <- base ^ }\n",
+      "template": "missing-operand structural context 8"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-09",
+      "source": "model { x <- start: }\n",
+      "template": "missing-operand structural context 9"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-10",
+      "source": "model { x <- || right }\n",
+      "template": "missing-operand structural context 10"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-11",
+      "source": "model { x <- left <= }\n",
+      "template": "missing-operand structural context 11"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-12",
+      "source": "model { x <- () }\n",
+      "template": "missing-operand structural context 12"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-13",
+      "source": "model { x <- f(1 +) }\n",
+      "template": "missing-operand structural context 13"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-14",
+      "source": "model { x <- values[i +] }\n",
+      "template": "missing-operand structural context 14"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-15",
+      "source": "model { for (i in 1:) { x[i] <- i } }\n",
+      "template": "missing-operand structural context 15"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-16",
+      "source": "data { n <- 1 + } model { x <- 1 }\n",
+      "template": "missing-operand structural context 16"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-17",
+      "source": "model { x ~ dfoo(0 +, 1) }\n",
+      "template": "missing-operand structural context 17"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-18",
+      "source": "model { x ~ dfoo(0, 1) T(lower +, upper) }\n",
+      "template": "missing-operand structural context 18"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-19",
+      "source": "model { x <- outer(inner(1) +) }\n",
+      "template": "missing-operand structural context 19"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-20",
+      "source": "model { x <- %custom% right }\n",
+      "template": "missing-operand structural context 20"
     },
     {
       "expect_parse": "rejected",
@@ -1594,6 +4334,118 @@
     },
     {
       "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-07",
+      "source": "model { x <- outer(1, 2 }\n",
+      "template": "unclosed-call structural context 7"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-08",
+      "source": "model { x <- outer(inner(1), other(2) }\n",
+      "template": "unclosed-call structural context 8"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-09",
+      "source": "model { x <- model(data(1), var(2) }\n",
+      "template": "unclosed-call structural context 9"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-10",
+      "source": "model { x ~ dfoo() T(0, 1 }\n",
+      "template": "unclosed-call structural context 10"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-11",
+      "source": "model { x ~ dfoo(0, 1) I(, upper }\n",
+      "template": "unclosed-call structural context 11"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-12",
+      "source": "model { /* call */ x <- f(1, 2 }\n",
+      "template": "unclosed-call structural context 12"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-13",
+      "source": "model {\r\n x <- f(1\r\n}\r\n",
+      "template": "unclosed-call structural context 13"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-14",
+      "source": "data { n <- f(1, 2 } model { x <- 1 }\n",
+      "template": "unclosed-call structural context 14"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-15",
+      "source": "model { for (i in outer(1, n) { x[i] <- i } }\n",
+      "template": "unclosed-call structural context 15"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-16",
+      "source": "model { logit(p[i] <- eta[i] }\n",
+      "template": "unclosed-call structural context 16"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-17",
+      "source": "model { x <- f(values[i], values[j] }\n",
+      "template": "unclosed-call structural context 17"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-18",
+      "source": "model { x <- f((a + b), -c }\n",
+      "template": "unclosed-call structural context 18"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-19",
+      "source": "model { x <- f(1 /* tail */ }\n",
+      "template": "unclosed-call structural context 19"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-20",
+      "source": "model { before <- 1; x <- f(2; after <- 3 }\n",
+      "template": "unclosed-call structural context 20"
+    },
+    {
+      "expect_parse": "rejected",
       "family": "missing-call-comma",
       "group": "mutation",
       "id": "mutation-missing-call-comma-01",
@@ -1639,6 +4491,118 @@
       "id": "mutation-missing-call-comma-06",
       "source": "model { x <- f(a[i] b[j]) }\n",
       "template": "missing-call-comma structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-07",
+      "source": "model { x <- f(1 2 3) }\n",
+      "template": "missing-call-comma structural context 7"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-08",
+      "source": "model { x <- f((a + b) c) }\n",
+      "template": "missing-call-comma structural context 8"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-09",
+      "source": "model { x <- f((-a) (b)) }\n",
+      "template": "missing-call-comma structural context 9"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-10",
+      "source": "model { x <- outer(inner(1) other(2), third(3)) }\n",
+      "template": "missing-call-comma structural context 10"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-11",
+      "source": "model { x <- model(data(1) var(2)) }\n",
+      "template": "missing-call-comma structural context 11"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-12",
+      "source": "model { x ~ dfoo(mu[i] tau[i]) }\n",
+      "template": "missing-call-comma structural context 12"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-13",
+      "source": "model { x ~ dfoo(0, 1) T(lower upper) }\n",
+      "template": "missing-call-comma structural context 13"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-14",
+      "source": "model { x ~ dfoo(0, 1) I(lower upper) }\n",
+      "template": "missing-call-comma structural context 14"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-15",
+      "source": "model { for (i in f(1 n)) { x[i] <- i } }\n",
+      "template": "missing-call-comma structural context 15"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-16",
+      "source": "model { logit(p[i,j]) <- f(alpha beta) }\n",
+      "template": "missing-call-comma structural context 16"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-17",
+      "source": "model { x <- f(values[] other[]) }\n",
+      "template": "missing-call-comma structural context 17"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-18",
+      "source": "model { x <- f(a %foo% b c) }\n",
+      "template": "missing-call-comma structural context 18"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-19",
+      "source": "model {\r\n x <- f(1\r\n 2)\r\n}\r\n",
+      "template": "missing-call-comma structural context 19"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-20",
+      "source": "model { /* comma */ x <- f(1 2) }\n",
+      "template": "missing-call-comma structural context 20"
     },
     {
       "expect_parse": "rejected",
@@ -1690,6 +4654,118 @@
     },
     {
       "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-07",
+      "source": "model { x <- values[i,j }\n",
+      "template": "unclosed-subset structural context 7"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-08",
+      "source": "model { x <- values[i,,j }\n",
+      "template": "unclosed-subset structural context 8"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-09",
+      "source": "model { x <- values[,j }\n",
+      "template": "unclosed-subset structural context 9"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-10",
+      "source": "model { x <- values[] + other[i }\n",
+      "template": "unclosed-subset structural context 10"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-11",
+      "source": "model { values[i,j <- source[i,j] }\n",
+      "template": "unclosed-subset structural context 11"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-12",
+      "source": "model { logit(p[i] <- eta[i] }\n",
+      "template": "unclosed-subset structural context 12"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-13",
+      "source": "model { x ~ dfoo(mu[i], tau[i) }\n",
+      "template": "unclosed-subset structural context 13"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-14",
+      "source": "model { for (i in values[) { x[i] <- 1 } }\n",
+      "template": "unclosed-subset structural context 14"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-15",
+      "source": "model { for (i in 1:n) { x[i <- i } }\n",
+      "template": "unclosed-subset structural context 15"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-16",
+      "source": "model { for (i in 1:n) { for (j in 1:m) { x[i,j <- i+j } } }\n",
+      "template": "unclosed-subset structural context 16"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-17",
+      "source": "var matrix[2,3; model { matrix[1,2] <- 1 }\n",
+      "template": "unclosed-subset structural context 17"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-18",
+      "source": "var cube[2,3,4; model { cube[1,2,3] <- 1 }\n",
+      "template": "unclosed-subset structural context 18"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-19",
+      "source": "data { n <- values[1 } model { x <- n }\n",
+      "template": "unclosed-subset structural context 19"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-20",
+      "source": "model {\r\n x <- values[i\r\n}\r\n",
+      "template": "unclosed-subset structural context 20"
+    },
+    {
+      "expect_parse": "rejected",
       "family": "missing-loop-in",
       "group": "mutation",
       "id": "mutation-missing-loop-in-01",
@@ -1735,6 +4811,118 @@
       "id": "mutation-missing-loop-in-06",
       "source": "model { for (i a:b) { x[i] ~ dfoo(1) } }\n",
       "template": "missing-loop-in structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-07",
+      "source": "model { for (i 1:n) { x[i] <- f(i) } }\n",
+      "template": "missing-loop-in structural context 7"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-08",
+      "source": "model { for (row rows) { x[row] <- row } }\n",
+      "template": "missing-loop-in structural context 8"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-09",
+      "source": "model { for (column 1:m) { x[column] ~ dfoo(mu[column]) } }\n",
+      "template": "missing-loop-in structural context 9"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-10",
+      "source": "model { for (i values[]) { x[i] <- 1 } }\n",
+      "template": "missing-loop-in structural context 10"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-11",
+      "source": "model { for (i (1:n)) { x[i] <- i } }\n",
+      "template": "missing-loop-in structural context 11"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-12",
+      "source": "model { for (i start:(stop + 1)) { x[i] <- i } }\n",
+      "template": "missing-loop-in structural context 12"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-13",
+      "source": "model { for (i f(a, b)) { x[i] <- i } }\n",
+      "template": "missing-loop-in structural context 13"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-14",
+      "source": "model { for (i a %sequence% b) { x[i] <- i } }\n",
+      "template": "missing-loop-in structural context 14"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-15",
+      "source": "model { for (i 1:n) { for (j 1:m) { x[i,j] <- 1 } } }\n",
+      "template": "missing-loop-in structural context 15"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-16",
+      "source": "model { for (i 1:n) { logit(p[i]) <- eta[i] } }\n",
+      "template": "missing-loop-in structural context 16"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-17",
+      "source": "model { for (for 1:n) { x[for] <- for } }\n",
+      "template": "missing-loop-in structural context 17"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-18",
+      "source": "model { /* header */ for (i 1:n) { x[i] <- i } }\n",
+      "template": "missing-loop-in structural context 18"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-19",
+      "source": "model {\r\n for (i 1:n) { x[i] <- i }\r\n}\r\n",
+      "template": "missing-loop-in structural context 19"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-20",
+      "source": "data { n <- 3 } model { for (i 1:n) { x[i] <- i } }\n",
+      "template": "missing-loop-in structural context 20"
     },
     {
       "expect_parse": "rejected",
@@ -1786,6 +4974,118 @@
     },
     {
       "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-07",
+      "source": "model { for (i in 1:n) x[i] <- f(i) }\n",
+      "template": "unbraced-loop structural context 7"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-08",
+      "source": "model { for (row in rows) x[row] ~ dfoo(mu[row]) }\n",
+      "template": "unbraced-loop structural context 8"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-09",
+      "source": "model { for (i in values[]) x[i] = i }\n",
+      "template": "unbraced-loop structural context 9"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-10",
+      "source": "model { for (i in start:(stop + 1)) x[i] <- i }\n",
+      "template": "unbraced-loop structural context 10"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-11",
+      "source": "model { for (i in 1:n) logit(p[i]) <- eta[i] }\n",
+      "template": "unbraced-loop structural context 11"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-12",
+      "source": "model { for (i in 1:n) /* body */ x[i] <- i }\n",
+      "template": "unbraced-loop structural context 12"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-13",
+      "source": "model { before <- 1; for (i in 1:n) x[i] <- i }\n",
+      "template": "unbraced-loop structural context 13"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-14",
+      "source": "model { for (i in 1:n) x[i] <- i; after <- 2 }\n",
+      "template": "unbraced-loop structural context 14"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-15",
+      "source": "model { for (i in 1:n) for (j in 1:m) x[i,j] <- i+j }\n",
+      "template": "unbraced-loop structural context 15"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-16",
+      "source": "model { for (for in 1:n) model[for] <- for }\n",
+      "template": "unbraced-loop structural context 16"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-17",
+      "source": "model {\r\n for (i in 1:n) x[i] <- i\r\n}\r\n",
+      "template": "unbraced-loop structural context 17"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-18",
+      "source": "data { n <- 3 } model { for (i in 1:n) x[i] <- i }\n",
+      "template": "unbraced-loop structural context 18"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-19",
+      "source": "model { for (i in f(1, n)) x[i] <- outer(i) }\n",
+      "template": "unbraced-loop structural context 19"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-20",
+      "source": "model { for (i in a %sequence% b) x[i] <- i }\n",
+      "template": "unbraced-loop structural context 20"
+    },
+    {
+      "expect_parse": "rejected",
       "family": "r-string",
       "group": "mutation",
       "id": "mutation-r-string-01",
@@ -1831,6 +5131,118 @@
       "id": "mutation-r-string-06",
       "source": "model { for (i in \"abc\") { x[i] <- 1 } }\n",
       "template": "r-string structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-07",
+      "source": "model { x <- \"\" }\n",
+      "template": "r-string structural context 7"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-08",
+      "source": "model { x <- 'single quoted value' }\n",
+      "template": "r-string structural context 8"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-09",
+      "source": "model { x <- f(\"argument\") }\n",
+      "template": "r-string structural context 9"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-10",
+      "source": "model { x <- f(1, 'argument') }\n",
+      "template": "r-string structural context 10"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-11",
+      "source": "model { x ~ dfoo('parameter', 1) }\n",
+      "template": "r-string structural context 11"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-12",
+      "source": "model { logit(p[\"row\"]) <- eta }\n",
+      "template": "r-string structural context 12"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-13",
+      "source": "model { x <- values['row', i] }\n",
+      "template": "r-string structural context 13"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-14",
+      "source": "model { x <- \"a\" + \"b\" }\n",
+      "template": "r-string structural context 14"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-15",
+      "source": "model { x <- (\"group\") }\n",
+      "template": "r-string structural context 15"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-16",
+      "source": "model { before <- 1; x <- \"text\"; after <- 2 }\n",
+      "template": "r-string structural context 16"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-17",
+      "source": "model { /* string */ x <- \"text\" }\n",
+      "template": "r-string structural context 17"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-18",
+      "source": "model {\r\n x <- \"text\"\r\n}\r\n",
+      "template": "r-string structural context 18"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-19",
+      "source": "data { label <- 'name' } model { x <- 1 }\n",
+      "template": "r-string structural context 19"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-20",
+      "source": "model { for (i in values[]) { x[i] <- \"text\" } }\n",
+      "template": "r-string structural context 20"
     },
     {
       "expect_parse": "rejected",
@@ -1882,6 +5294,118 @@
     },
     {
       "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-07",
+      "source": "model { x <- inner() }\n",
+      "template": "empty-call structural context 7"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-08",
+      "source": "model { x <- f() * g(1) }\n",
+      "template": "empty-call structural context 8"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-09",
+      "source": "model { x <- f() %custom% right }\n",
+      "template": "empty-call structural context 9"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-10",
+      "source": "model { x <- (f()) }\n",
+      "template": "empty-call structural context 10"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-11",
+      "source": "model { x <- f(g()) }\n",
+      "template": "empty-call structural context 11"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-12",
+      "source": "model { x <- outer(1, inner()) }\n",
+      "template": "empty-call structural context 12"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-13",
+      "source": "model { x <- values[f()] }\n",
+      "template": "empty-call structural context 13"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-14",
+      "source": "model { logit(p[f()]) <- eta }\n",
+      "template": "empty-call structural context 14"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-15",
+      "source": "model { for (i in outer(f())) { x[i] <- i } }\n",
+      "template": "empty-call structural context 15"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-16",
+      "source": "model { before <- 1; x <- f(); after <- 2 }\n",
+      "template": "empty-call structural context 16"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-17",
+      "source": "model { /* empty */ x <- f() }\n",
+      "template": "empty-call structural context 17"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-18",
+      "source": "model {\r\n x <- f()\r\n}\r\n",
+      "template": "empty-call structural context 18"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-19",
+      "source": "data { n <- outer(f()) } model { x <- n }\n",
+      "template": "empty-call structural context 19"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-20",
+      "source": "model { x <- data() + var() }\n",
+      "template": "empty-call structural context 20"
+    },
+    {
+      "expect_parse": "rejected",
       "family": "bare-distribution",
       "group": "mutation",
       "id": "mutation-bare-distribution-01",
@@ -1927,24 +5451,136 @@
       "id": "mutation-bare-distribution-06",
       "source": "model { x ~ dfoo; y <- 1 }\n",
       "template": "bare-distribution structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-07",
+      "source": "model { x ~ dnorm }\n",
+      "template": "bare-distribution structural context 7"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-08",
+      "source": "model { x[row,column] ~ dfoo }\n",
+      "template": "bare-distribution structural context 8"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-09",
+      "source": "model { x ~ dfoo I(,upper) }\n",
+      "template": "bare-distribution structural context 9"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-10",
+      "source": "model { x ~ dfoo T(lower,) }\n",
+      "template": "bare-distribution structural context 10"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-11",
+      "source": "model { for (row in rows) { x[row] ~ dfoo } }\n",
+      "template": "bare-distribution structural context 11"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-12",
+      "source": "model { for (i in 1:n) { for (j in 1:m) { x[i,j] ~ dfoo } } }\n",
+      "template": "bare-distribution structural context 12"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-13",
+      "source": "model { before <- 1; x ~ dfoo; after <- 2 }\n",
+      "template": "bare-distribution structural context 13"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-14",
+      "source": "model { /* bare */ x ~ dfoo }\n",
+      "template": "bare-distribution structural context 14"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-15",
+      "source": "model {\r\n x ~ dfoo\r\n}\r\n",
+      "template": "bare-distribution structural context 15"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-16",
+      "source": "model { x ~ data }\n",
+      "template": "bare-distribution structural context 16"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-17",
+      "source": "model { x ~ var }\n",
+      "template": "bare-distribution structural context 17"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-18",
+      "source": "model { x ~ dfoo; y ~ dbar(1) }\n",
+      "template": "bare-distribution structural context 18"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-19",
+      "source": "model { x ~ dfoo T(0,1); y <- f(1) }\n",
+      "template": "bare-distribution structural context 19"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-20",
+      "source": "model { x[] ~ dfoo }\n",
+      "template": "bare-distribution structural context 20"
     }
   ],
   "counts": {
     "mutation": {
-      "authored_templates": 60,
-      "total": 60
+      "authored_templates": 200,
+      "total": 200
     },
     "semantic-invalid": {
       "authored_templates": 10,
-      "total": 20
+      "total": 50
     },
     "syntax-invalid": {
       "authored_templates": 35,
-      "total": 74
+      "total": 75
     },
     "syntax-valid": {
-      "authored_templates": 19,
-      "total": 82
+      "authored_templates": 295,
+      "total": 358
     }
   },
   "schema_version": 1

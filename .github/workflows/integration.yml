@@ -55,6 +55,7 @@ jobs:
           npm ci
           npm run check:generated
           npm run check:oracle
+          npm run check:evidence
           npm test
 
   # ── Clippy lint gate (required check) ──────────────────────────────────

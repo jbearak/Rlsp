@@ -70,6 +70,7 @@ fn oracle_outcomes() -> BTreeMap<String, (bool, bool)> {
         .as_array()
         .expect("oracle result records")
         .iter()
+        .filter(|record| record["group"].as_str() != Some("syntax-matrix"))
         .map(|record| {
             (
                 record["id"].as_str().expect("result id").to_owned(),
@@ -139,15 +140,17 @@ fn committed_oracle_corpus_matches_grammar_with_honest_counts() {
     let cases = quality_cases();
     let outcomes = oracle_outcomes();
     let expected_counts = BTreeMap::from([
-        ("mutation", (60, 60)),
-        ("semantic-invalid", (20, 10)),
-        ("syntax-invalid", (74, 35)),
-        ("syntax-valid", (82, 19)),
+        ("mutation", (200, 200)),
+        ("semantic-invalid", (50, 10)),
+        ("syntax-invalid", (75, 35)),
+        ("syntax-valid", (358, 295)),
     ]);
     let mut parser = parser();
     let mut observed_counts: BTreeMap<&str, usize> = BTreeMap::new();
     let mut authored_templates: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let mut structural_shapes: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    let mut pairwise_shapes = BTreeSet::new();
+    let mut mutation_family_counts: BTreeMap<&str, usize> = BTreeMap::new();
 
     for case in &cases {
         *observed_counts.entry(&case.group).or_default() += 1;
@@ -179,10 +182,21 @@ fn committed_oracle_corpus_matches_grammar_with_honest_counts() {
                 case.id
             );
         }
+        let shape = structural_shape(&tree);
         structural_shapes
             .entry(&case.group)
             .or_default()
-            .insert(structural_shape(&tree));
+            .insert(shape.clone());
+        if case.family == "pairwise-features" {
+            assert!(
+                pairwise_shapes.insert(shape),
+                "{} duplicates a pairwise structural fingerprint",
+                case.id
+            );
+        }
+        if case.group == "mutation" {
+            *mutation_family_counts.entry(&case.family).or_default() += 1;
+        }
         assert_recursive_ranges(tree.root_node(), case.source.len());
 
         if !expected_clean {
@@ -201,6 +215,18 @@ fn committed_oracle_corpus_matches_grammar_with_honest_counts() {
             );
         }
     }
+
+    assert_eq!(
+        outcomes.len(),
+        cases.len(),
+        "oracle result completeness drift"
+    );
+    assert_eq!(pairwise_shapes.len(), 276, "pairwise feature matrix drift");
+    assert_eq!(mutation_family_counts.len(), 10);
+    assert!(
+        mutation_family_counts.values().all(|count| *count == 20),
+        "mutation context floor drift: {mutation_family_counts:?}"
+    );
 
     for (group, (total, templates)) in expected_counts {
         assert_eq!(observed_counts[group], total, "{group} total drift");
@@ -221,7 +247,7 @@ fn committed_oracle_corpus_matches_grammar_with_honest_counts() {
         ("mutation", structural_shapes["mutation"].len()),
     ]);
     eprintln!("unique recursive structural fingerprints: {shape_counts:?}");
-    assert!(shape_counts["syntax-valid"] >= 55, "{shape_counts:?}");
+    assert!(shape_counts["syntax-valid"] >= 276, "{shape_counts:?}");
     assert!(shape_counts["semantic-invalid"] >= 12, "{shape_counts:?}");
     assert!(shape_counts["syntax-invalid"] >= 45, "{shape_counts:?}");
     assert!(shape_counts["mutation"] >= 45, "{shape_counts:?}");
@@ -497,7 +523,7 @@ type EditSequence<'a> = (&'a str, &'a str, &'a [EditStep<'a>]);
 
 #[test]
 fn structurally_diverse_incremental_families_match_fresh_ranges() {
-    let sequences: [EditSequence<'_>; 16] = [
+    let sequences: [EditSequence<'_>; 25] = [
         (
             "relation-operator",
             "model { x <- 1 }\n",
@@ -586,6 +612,54 @@ fn structurally_diverse_incremental_families_match_fresh_ranges() {
             "line-comment-eof",
             "model { x <- 1 }\n# tail\n",
             &[("# tail\n", "# tail", false), ("# tail", "# tail\n", true)],
+        ),
+        (
+            "stochastic-operator",
+            "model { x ~ dfoo(0, 1) }\n",
+            &[(" ~ ", " ", false), ("x dfoo", "x ~ dfoo", true)],
+        ),
+        (
+            "distribution-call-delimiters",
+            "model { x ~ dfoo() }\n",
+            &[("()", "", false), ("dfoo ", "dfoo() ", true)],
+        ),
+        (
+            "bounds-keyword",
+            "model { x ~ dfoo(0, 1) T(0, 1) }\n",
+            &[("T(0", "Q(0", false), ("Q(0", "T(0", true)],
+        ),
+        (
+            "declaration-comma",
+            "var x[2], y[3]; model { x[1] <- y[1] }\n",
+            &[("], y", "] y", false), ("] y", "], y", true)],
+        ),
+        (
+            "declaration-dimension-closer",
+            "var x[2]; model { x[1] <- 1 }\n",
+            &[("];", ";", false), ("2;", "2];", true)],
+        ),
+        (
+            "link-call-closer",
+            "model { logit(p[i]) <- eta[i] }\n",
+            &[(") <-", " <-", false), ("p[i] <-", "p[i]) <-", true)],
+        ),
+        (
+            "unary-operator",
+            "model { x <- -(a + b) }\n",
+            &[("-(a + b)", "(a + b)", true), ("(a + b)", "-(a + b)", true)],
+        ),
+        (
+            "block-comment-closer",
+            "model { /* note */ x <- 1 }\n",
+            &[("*/", "", false), ("note  x", "note */ x", true)],
+        ),
+        (
+            "nested-loop-outer-closer",
+            "model { for (i in 1:n) { for (j in 1:m) { x[i,j] <- i+j } } }\n",
+            &[
+                ("i+j } } }", "i+j } }", false),
+                ("i+j } }", "i+j } } }", true),
+            ],
         ),
     ];
 
