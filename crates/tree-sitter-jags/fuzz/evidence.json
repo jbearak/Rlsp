@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "recorded_date": "2026-07-24",
+  "scope": "Raven's generated tree-sitter JAGS parser",
+  "toolchain": {
+    "rustup_toolchain": "nightly-2026-07-22",
+    "rustc": "rustc 1.99.0-nightly (0e29c21d9 2026-07-21)",
+    "cargo_fuzz": "cargo-fuzz 0.13.2",
+    "libfuzzer_sys": "0.4.13",
+    "sanitizer": "address",
+    "target": "aarch64-apple-darwin",
+    "build_std": true
+  },
+  "libfuzzer_options": {
+    "max_total_time_seconds": 600,
+    "max_len": 4096,
+    "seed": 424242,
+    "rss_limit_mib": 2048,
+    "timeout_seconds": 5,
+    "print_final_stats": 1,
+    "verbosity": 0
+  },
+  "campaigns": {
+    "parser": {
+      "fuzz_target": "fuzz_targets/parser.rs",
+      "seed_corpus": "seeds/parser",
+      "output_corpus": "evidence-corpus/parser-asan-20260724-review",
+      "grammar_js_sha256": "93cebd511cb9609be569f71adae95c9f4b4ca310a1d6a244fe332de20cd7abf5",
+      "parser_c_sha256": "4dcfeaf7f555277e1e56d44ab8fbf132e23d5a4af7c3c27a8b7bd4c871ce1bcb",
+      "fuzz_target_sha256": "9054d13898ec0d367ef667795686684f02585eb7bca83f08f633bdc44a4081b0",
+      "fuzz_manifest_sha256": "f0c17c708cf325f789168aa4a9c712db9fbd13fe1ea6f9d4b7ff54555b03ea3a",
+      "fuzz_lock_sha256": "7705c1264f9078b8bde80d3607b003ec458b34dbc55e0cfc29fb6633ce0ed56a",
+      "seed_file_count": 4,
+      "seed_total_bytes": 181,
+      "seed_content_multiset_sha256": "f36547265c8af99b20cf322950b64ee02a5e4182f0743667106061eaac268777",
+      "executions": 8339912,
+      "average_executions_per_second": 13876,
+      "new_units": 432,
+      "slowest_unit_time_seconds": 0,
+      "peak_rss_mib": 551,
+      "output_corpus_file_count": 75,
+      "output_corpus_total_bytes": 2264,
+      "output_corpus_content_multiset_sha256": "67b518c6f95d770dbb8cdf9a295460be28aa79a381df0aeb98fa874634794260",
+      "exit_status": 0,
+      "defects": []
+    },
+    "incremental_edits": {
+      "fuzz_target": "fuzz_targets/incremental.rs",
+      "seed_corpus": "seeds/incremental_edits",
+      "output_corpus": "evidence-corpus/incremental-asan-20260724-review",
+      "grammar_js_sha256": "93cebd511cb9609be569f71adae95c9f4b4ca310a1d6a244fe332de20cd7abf5",
+      "parser_c_sha256": "4dcfeaf7f555277e1e56d44ab8fbf132e23d5a4af7c3c27a8b7bd4c871ce1bcb",
+      "fuzz_target_sha256": "8bc11afb5c38b6ff2a20704319c28b72233879e3d20f0bc5b16082eb97b1db9a",
+      "fuzz_manifest_sha256": "f0c17c708cf325f789168aa4a9c712db9fbd13fe1ea6f9d4b7ff54555b03ea3a",
+      "fuzz_lock_sha256": "7705c1264f9078b8bde80d3607b003ec458b34dbc55e0cfc29fb6633ce0ed56a",
+      "seed_file_count": 3,
+      "seed_total_bytes": 101,
+      "seed_content_multiset_sha256": "9218b1c37d5928a62529c2a5abe8780bef247f440eef335d04ffe1905d00f200",
+      "executions": 3102972,
+      "average_executions_per_second": 5163,
+      "new_units": 498,
+      "slowest_unit_time_seconds": 0,
+      "peak_rss_mib": 572,
+      "output_corpus_file_count": 106,
+      "output_corpus_total_bytes": 9636,
+      "output_corpus_content_multiset_sha256": "2078c3537217c2e35fb46eb6352ddc0772a809b9bebe05756a61a51741198c0e",
+      "exit_status": 0,
+      "defects": []
+    }
+  }
+}

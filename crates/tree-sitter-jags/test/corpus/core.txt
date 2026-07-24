@@ -1,0 +1,187 @@
+==================
+Stochastic relation and call
+==================
+
+model { x ~ dnorm(0, 1) }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (stochastic_relation
+        lhs: (identifier)
+        distribution: (call
+          function: (identifier)
+          arguments: (call_arguments
+            argument: (number)
+            argument: (number)))))))
+
+==================
+Ordered blocks, loop, and subset
+==================
+
+var x[3]; data { n <- 3 } model { for (i in 1:n) { x[i] <- f(i) } }
+
+---
+
+(program
+  (variable_declaration
+    (declared_variable
+      name: (identifier)
+      dimensions: (dimensions
+        dimension: (number))))
+  (data_block
+    body: (block_statement
+      (deterministic_relation
+        lhs: (identifier)
+        rhs: (number))))
+  (model_block
+    body: (block_statement
+      (for_statement
+        variable: (identifier)
+        sequence: (binary_operator
+          lhs: (number)
+          rhs: (identifier))
+        body: (block_statement
+          (deterministic_relation
+            lhs: (subset
+              function: (identifier)
+              arguments: (subset_arguments
+                argument: (identifier)))
+            rhs: (call
+              function: (identifier)
+              arguments: (call_arguments
+                argument: (identifier)))))))))
+
+==================
+Link relation and precedence
+==================
+
+model { logit(p[i]) <- alpha + beta * x[i] }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (deterministic_relation
+        lhs: (link_call
+          function: (identifier)
+          arguments: (call_arguments
+            argument: (subset
+              function: (identifier)
+              arguments: (subset_arguments
+                argument: (identifier)))))
+        rhs: (binary_operator
+          lhs: (identifier)
+          rhs: (binary_operator
+            lhs: (identifier)
+            rhs: (subset
+              function: (identifier)
+              arguments: (subset_arguments
+                argument: (identifier)))))))))
+
+==================
+Open truncation bound
+==================
+
+model { x ~ dnorm(0, 1) T(0,) }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (stochastic_relation
+        lhs: (identifier)
+        distribution: (call
+          function: (identifier)
+          arguments: (call_arguments
+            argument: (number)
+            argument: (number)))
+        bounds: (bounds_clause
+          lower: (number))))))
+
+==================
+Recovery: missing operand
+==================
+
+model { x <- * 1 }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (deterministic_relation
+        lhs: (identifier)
+        (ERROR)
+        rhs: (number)))))
+
+==================
+Recovery: missing call comma
+==================
+
+model { x <- f(1 2) }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (deterministic_relation
+        lhs: (identifier)
+        rhs: (call
+          function: (identifier)
+          arguments: (call_arguments
+            argument: (number)
+            (ERROR
+              (number))))))))
+
+==================
+Recovery: chained comparison
+==================
+
+model { x <- a < b < c }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (deterministic_relation
+        lhs: (identifier)
+        rhs: (binary_operator
+          lhs: (identifier)
+          (ERROR
+            (identifier))
+          rhs: (identifier))))))
+
+==================
+Recovery: semicolon after loop
+==================
+
+model { for (i in 1:2) { x[i] <- i }; y <- 1 }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (for_statement
+        variable: (identifier)
+        sequence: (binary_operator
+          lhs: (number)
+          rhs: (number))
+        body: (block_statement
+          (deterministic_relation
+            lhs: (subset
+              function: (identifier)
+              arguments: (subset_arguments
+                argument: (identifier)))
+            rhs: (identifier))))
+      (ERROR)
+      (deterministic_relation
+        lhs: (identifier)
+        rhs: (number)))))

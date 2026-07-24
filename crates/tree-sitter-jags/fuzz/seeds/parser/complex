@@ -1,0 +1,1 @@
+var x[3]; data { n <- 3 } model { for (i in 1:n) { logit(x[i]) <- alpha + beta %foo% i } }

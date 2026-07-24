@@ -1,0 +1,756 @@
+{
+  "oracle": {
+    "version": "4.3.2",
+    "source_url": "https://downloads.sourceforge.net/project/mcmc-jags/JAGS/4.x/Source/JAGS-4.3.2.tar.gz",
+    "source_sha256": "871f556af403a7c2ce6a0f02f15cf85a572763e093d26658ebac55c4ab472fc8",
+    "installed_wrapper_sha256": "8a2b5265d2a15136d74ea78c9c7365d3ed43e02c4987263f6290d8d5a7f972d8",
+    "installed_terminal_sha256": "982b72c690b734096ddb4bdccf55e5a312349ea51b50baa6eb277614bbf27a1e"
+  },
+  "probes": [
+    {
+      "name": "valid-minimal",
+      "category": "control",
+      "source": "model { x ~ dnorm(0, 1) }\n",
+      "expect_parse": "accepted",
+      "compile": true,
+      "expect_semantic_error": false
+    },
+    {
+      "name": "semantic-unknown-distribution",
+      "category": "control",
+      "source": "model { x ~ dnotinstalled(0) }\n",
+      "expect_parse": "accepted",
+      "compile": true,
+      "expect_semantic_error": true
+    },
+    {
+      "name": "semantic-unknown-function",
+      "category": "control",
+      "source": "model { x <- definitely_unknown(1) }\n",
+      "expect_parse": "accepted",
+      "compile": true,
+      "expect_semantic_error": true
+    },
+    {
+      "name": "syntax-missing-operand",
+      "category": "control",
+      "source": "model { x <- * 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "syntax-missing-brace",
+      "category": "control",
+      "source": "model { x ~ dnorm(0, 1)\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "empty-model",
+      "category": "program",
+      "source": "model {}\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "data-then-model",
+      "category": "program",
+      "source": "data { a <- 1 } model { x ~ dnorm(a, 1) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "var-then-model",
+      "category": "program",
+      "source": "var x, y[2]; model { x ~ dnorm(0, 1) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "bare-relation",
+      "category": "program",
+      "source": "x <- 1\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "two-model-blocks",
+      "category": "program",
+      "source": "model {} model {}\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "deterministic-left-arrow",
+      "category": "relation",
+      "source": "model { x <- 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "deterministic-equals",
+      "category": "relation",
+      "source": "model { x = 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "stochastic",
+      "category": "relation",
+      "source": "model { x ~ mystery_distribution(theta) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "link-left-hand-side",
+      "category": "relation",
+      "source": "model { logit(p[i]) <- alpha + beta * x[i] }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "truncate-lower-open-upper",
+      "category": "relation",
+      "source": "model { x ~ dnorm(0, 1) T(0,) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "censor-open-lower-upper",
+      "category": "relation",
+      "source": "model { x ~ dnorm(0, 1) I(, 10) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "for-loop-range",
+      "category": "statement",
+      "source": "model { for (i in 1:N) { x[i] ~ dnorm(mu[i], tau) } }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "for-loop-single-relation",
+      "category": "statement",
+      "source": "model { for (i in 1:N) x[i] <- i }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "nested-calls",
+      "category": "expression",
+      "source": "model { x <- outer(inner(1), another(2, 3)) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "subset-empty-first-index",
+      "category": "expression",
+      "source": "model { x <- matrix_value[, i] }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "subset-empty-second-index",
+      "category": "expression",
+      "source": "model { x <- matrix_value[i, ] }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "operator-precedence",
+      "category": "expression",
+      "source": "model { x <- -a + b * c / d ^ e }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "logical-and-comparison",
+      "category": "expression",
+      "source": "model { x <- (a < b) && (c != d) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "numeric-forms",
+      "category": "token",
+      "source": "model { a <- .5; b <- 1.; c <- 2e-3; d <- 4E+2 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "dotted-identifiers",
+      "category": "token",
+      "source": "model { alpha.beta <- prior.value }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "hash-comment",
+      "category": "comment",
+      "source": "model { # comment\n x <- 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "slash-comment",
+      "category": "comment",
+      "source": "model { // comment\n x <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "block-comment",
+      "category": "comment",
+      "source": "model { /* comment */ x <- 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "semicolon-separated",
+      "category": "separator",
+      "source": "model { x <- 1; y <- 2; }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "newline-separated",
+      "category": "separator",
+      "source": "model {\n x <- 1\n y <- 2\n}\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "r-function-definition",
+      "category": "r-contrast",
+      "source": "model { f <- function(x) x + 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "r-if-statement",
+      "category": "r-contrast",
+      "source": "model { if (x) y <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "r-while-statement",
+      "category": "r-contrast",
+      "source": "model { while (x) y <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "r-string-literal",
+      "category": "r-contrast",
+      "source": "model { x <- \"text\" }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "r-named-argument",
+      "category": "r-contrast",
+      "source": "model { x <- f(value = 1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "r-dollar-access",
+      "category": "r-contrast",
+      "source": "model { x <- data$value }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "r-namespace",
+      "category": "r-contrast",
+      "source": "model { x <- pkg::fun(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "r-right-assignment",
+      "category": "r-contrast",
+      "source": "model { 1 -> x }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "r-pipe",
+      "category": "r-contrast",
+      "source": "model { x <- value |> f() }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "stan-declaration",
+      "category": "stan-contrast",
+      "source": "model { real x; }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "stan-target-add",
+      "category": "stan-contrast",
+      "source": "model { target += normal_lpdf(x | 0, 1); }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "stan-data-declaration",
+      "category": "stan-contrast",
+      "source": "data { real x; } model {}\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "unclosed-call",
+      "category": "invalid",
+      "source": "model { x <- f(1, 2 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "unclosed-subset",
+      "category": "invalid",
+      "source": "model { x <- values[i }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "missing-relation-operator",
+      "category": "invalid",
+      "source": "model { x dnorm(0, 1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "missing-loop-in",
+      "category": "invalid",
+      "source": "model { for (i 1:N) { x[i] <- i } }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "crlf",
+      "category": "encoding",
+      "source": "model {\r\n  x <- 1\r\n}\r\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "utf8-comment",
+      "category": "encoding",
+      "source": "model { # lambda λ and comet 💥\n x <- 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "utf8-bom",
+      "category": "encoding",
+      "encoding": "utf-8-bom",
+      "source": "model { x <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "empty-data",
+      "category": "program-detail",
+      "source": "data {} model { x <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "model-then-data",
+      "category": "program-detail",
+      "source": "model { x <- 1 } data { y <- 2 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "var-after-data",
+      "category": "program-detail",
+      "source": "data { a <- 1 } var x; model { x <- a }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "var-without-semicolon",
+      "category": "declaration",
+      "source": "var x model { x <- 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "var-multidimensional",
+      "category": "declaration",
+      "source": "var x[2, 3], y[N]; model { x[1, 1] <- y[1] }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "underscore-identifier",
+      "category": "identifier-detail",
+      "source": "model { alpha_beta <- 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "leading-dot-identifier",
+      "category": "identifier-detail",
+      "source": "model { .alpha <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "leading-underscore-identifier",
+      "category": "identifier-detail",
+      "source": "model { _alpha <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "unicode-identifier",
+      "category": "identifier-detail",
+      "source": "model { λ <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "double-dot-identifier",
+      "category": "identifier-detail",
+      "source": "model { alpha..beta <- 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "backtick-identifier",
+      "category": "identifier-detail",
+      "source": "model { `alpha beta` <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "hex-number",
+      "category": "number-detail",
+      "source": "model { x <- 0x10 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "incomplete-exponent",
+      "category": "number-detail",
+      "source": "model { x <- 1e }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "double-star-power",
+      "category": "operator-detail",
+      "source": "model { x <- a ** b }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "single-logical-operators",
+      "category": "operator-detail",
+      "source": "model { x <- (a < b) & (c < d) | e }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "modulo-percent",
+      "category": "operator-detail",
+      "source": "model { x <- a % b }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "r-modulo-double-percent",
+      "category": "operator-detail",
+      "source": "model { x <- a %% b }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "integer-division",
+      "category": "operator-detail",
+      "source": "model { x <- a %/% b }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "unary-not",
+      "category": "operator-detail",
+      "source": "model { x <- !flag }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "empty-call-arguments",
+      "category": "argument-detail",
+      "source": "model { x <- f() }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "missing-call-argument",
+      "category": "argument-detail",
+      "source": "model { x <- f(, 1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "trailing-call-comma",
+      "category": "argument-detail",
+      "source": "model { x <- f(1,) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "empty-subset",
+      "category": "argument-detail",
+      "source": "model { x <- values[] }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "parenthesized-call-target",
+      "category": "argument-detail",
+      "source": "model { x <- (f)(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "nested-for",
+      "category": "statement-detail",
+      "source": "model { for (i in 1:N) { for (j in 1:M) { x[i,j] <- i + j } } }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "lowercase-truncation",
+      "category": "relation-detail",
+      "source": "model { x ~ dnorm(0, 1) t(0, 1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "truncation-after-deterministic",
+      "category": "relation-detail",
+      "source": "model { x <- f(1) T(0, 1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "distribution-without-call",
+      "category": "relation-detail",
+      "source": "model { x ~ distribution_name }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "case-sensitive-model",
+      "category": "program-detail",
+      "source": "MODEL { x <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "empty-distribution-call",
+      "category": "differential-boundary",
+      "source": "model { x ~ dfoo() }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "matrix-product-special-operator",
+      "category": "differential-boundary",
+      "source": "model { x <- a %*% b }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "membership-special-operator",
+      "category": "differential-boundary",
+      "source": "model { x <- a %in% b }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "unknown-special-operator",
+      "category": "differential-boundary",
+      "source": "model { x <- a %foo% b }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "chained-special-operators",
+      "category": "differential-boundary",
+      "source": "model { x <- a %foo% b %bar% c }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "reserved-model-as-name",
+      "category": "differential-boundary",
+      "source": "model { model <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-data-as-name",
+      "category": "differential-boundary",
+      "source": "model { data <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-var-as-name",
+      "category": "differential-boundary",
+      "source": "model { var <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-in-as-name",
+      "category": "differential-boundary",
+      "source": "model { in <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "contextual-for-as-name",
+      "category": "differential-boundary",
+      "source": "model { for <- 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "contextual-for-in-expression",
+      "category": "differential-boundary",
+      "source": "model { x <- for + 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "reserved-for-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- for(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-in-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- in(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "contextual-T-as-bare-identifier",
+      "category": "differential-boundary",
+      "source": "model { x <- T }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "reserved-T-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- T(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-T-as-distribution",
+      "category": "differential-boundary",
+      "source": "model { x ~ T(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-T-as-link",
+      "category": "differential-boundary",
+      "source": "model { T(p) <- eta }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "contextual-I-as-bare-identifier",
+      "category": "differential-boundary",
+      "source": "model { x <- I }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "reserved-I-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- I(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-I-as-distribution",
+      "category": "differential-boundary",
+      "source": "model { x ~ I(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-I-as-link",
+      "category": "differential-boundary",
+      "source": "model { I(p) <- eta }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "contextual-model-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- model(1) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "contextual-data-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- data(1) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "contextual-var-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- var(1) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "chained-subset-lhs",
+      "category": "differential-boundary",
+      "source": "model { x[i][j] <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "chained-subset-rhs",
+      "category": "differential-boundary",
+      "source": "model { x <- a[i][j] }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "call-result-subset",
+      "category": "differential-boundary",
+      "source": "model { x <- f(i)[j] }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "parenthesized-result-subset",
+      "category": "differential-boundary",
+      "source": "model { x <- (a)[i] }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "chained-less-than",
+      "category": "differential-boundary",
+      "source": "model { x <- a < b < c }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "chained-less-equal",
+      "category": "differential-boundary",
+      "source": "model { x <- a <= b <= c }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "chained-equality",
+      "category": "differential-boundary",
+      "source": "model { x <- a == b == c }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "chained-mixed-comparison",
+      "category": "differential-boundary",
+      "source": "model { x <- a < b == c }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "parenthesized-left-comparison",
+      "category": "differential-boundary",
+      "source": "model { x <- (a < b) < c }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "parenthesized-right-comparison",
+      "category": "differential-boundary",
+      "source": "model { x <- a < (b < c) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "chained-colon",
+      "category": "differential-boundary",
+      "source": "model { x <- 1:2:3 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "parenthesized-left-colon",
+      "category": "differential-boundary",
+      "source": "model { x <- (1:2):3 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "parenthesized-right-colon",
+      "category": "differential-boundary",
+      "source": "model { x <- 1:(2:3) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "semicolon-after-for-body",
+      "category": "differential-boundary",
+      "source": "model { for (i in 1:3) { x[i] <- i }; y <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "link-two-arguments",
+      "category": "differential-boundary",
+      "source": "model { logit(p, q) <- x }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "link-number-argument",
+      "category": "differential-boundary",
+      "source": "model { logit(1) <- x }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "link-expression-argument",
+      "category": "differential-boundary",
+      "source": "model { logit(p + q) <- x }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "link-call-argument",
+      "category": "differential-boundary",
+      "source": "model { logit(f(p)) <- x }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "link-subset-argument",
+      "category": "differential-boundary",
+      "source": "model { logit(p[i,j]) <- x }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "eof-line-comment-no-newline",
+      "category": "differential-boundary",
+      "source": "model { x <- 1 }\n# tail",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "eof-line-comment-with-newline",
+      "category": "differential-boundary",
+      "source": "model { x <- 1 }\n# tail\n",
+      "expect_parse": "accepted"
+    }
+  ]
+}

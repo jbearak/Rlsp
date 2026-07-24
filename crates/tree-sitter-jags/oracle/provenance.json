@@ -1,0 +1,27 @@
+{
+  "target": {
+    "name": "JAGS",
+    "version": "4.3.2",
+    "public_interface": "jags command-line program",
+    "license_reported_by_homebrew": "GPL-2.0-only"
+  },
+  "official_release": {
+    "url": "https://downloads.sourceforge.net/project/mcmc-jags/JAGS/4.x/Source/JAGS-4.3.2.tar.gz",
+    "sha256": "871f556af403a7c2ce6a0f02f15cf85a572763e093d26658ebac55c4ab472fc8",
+    "verification": "downloaded without unpacking or inspecting and hashed locally"
+  },
+  "homebrew_installation": {
+    "formula_tap_revision": "d1d7548116bdc1a6b243e20d0287c8419a847387",
+    "formula_source_sha256": "027545373f7b7ab55d28231eabb2b7757cd8bca2c3af9d6d66acfde93fdfd1c7",
+    "wrapper_path": "/opt/homebrew/bin/jags",
+    "wrapper_sha256": "8a2b5265d2a15136d74ea78c9c7365d3ed43e02c4987263f6290d8d5a7f972d8",
+    "terminal_path": "/opt/homebrew/Cellar/jags/4.3.2/libexec/jags-terminal",
+    "terminal_sha256": "982b72c690b734096ddb4bdccf55e5a312349ea51b50baa6eb277614bbf27a1e"
+  },
+  "clean_room_boundary": {
+    "inspected_jags_source": false,
+    "inspected_jags_parser": false,
+    "copied_jags_manual_prose": false,
+    "observations": "independently authored inputs and public command-line outputs only"
+  }
+}

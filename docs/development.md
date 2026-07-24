@@ -1299,6 +1299,35 @@ bun editors/vscode/scripts/generate-jags-builtins.mjs --check
 
 The generator validates the exact version, source URL/hash, default `basemod`/`bugs` boundary, schema, ASCII sort order, uniqueness, syntax classification, and module ownership before producing Rust. Keep the manifest header, generated constants, `docs/completion.md`, `docs/hover.md`, `README.md`, and `NOTICE` aligned. Runtime editor assistance uses the linear scanner in `crates/raven/src/jags.rs`; it never consults R scope/help/package machinery and never starts JAGS, R, or a network request.
 
+### In-tree JAGS grammar
+
+`crates/tree-sitter-jags/` is a clean-room Tree-sitter grammar targeting JAGS
+4.3.2. It is intentionally an independent workspace crate: adding or changing
+it does not route Raven documents through the grammar. Runtime integration is
+a separate change with its own document-lifecycle and diagnostics review.
+
+The syntax authority is the public JAGS command-line parse phase, captured by
+the independently authored matrix and harness under `oracle/`. Do not inspect
+or copy JAGS's GPL-2-only parser source or manual prose when maintaining the
+grammar. Tree-sitter R and Stan are pinned MIT implementation references; the
+production mapping and complete quality evidence live in
+`PRODUCTION_MAPPING.md` and `QUALITY_GATES.md` inside the crate.
+
+Generated parser artifacts and an 806-outcome oracle manifest are checked in.
+The manifest binds the deterministic matrix and quality corpus to their exact
+sources, generator, harness, and pinned JAGS executable hashes. After editing
+`grammar.js`, an oracle input, the generator, or the harness, run `npm ci`,
+`npm run generate`, `npm run check:generated`, `npm run check:oracle`, `npm run
+check:evidence`, and `npm test` from the crate directory, followed by `cargo test -p
+tree-sitter-jags` from the repository root. The ignored live-oracle and
+release-performance commands are documented in the crate README. CI checks
+generation, oracle-manifest, and parser-evidence drift, the Tree-sitter corpus, Rust tests,
+rustdoc, and release performance without installing JAGS.
+
+The grammar claims `.jags` only. Treat `.bugs` as ambiguous until a separate
+representative compatibility corpus proves that strict JAGS diagnostics would
+not create false positives for other BUGS-family implementations.
+
 ### Quarto process lifecycle
 
 The VS Code extension's Quarto implementation lives under

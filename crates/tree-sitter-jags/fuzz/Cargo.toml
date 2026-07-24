@@ -1,0 +1,30 @@
+[package]
+name = "tree-sitter-jags-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tree-sitter = "=0.26.9"
+tree-sitter-jags = { path = ".." }
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "incremental_edits"
+path = "fuzz_targets/incremental.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
