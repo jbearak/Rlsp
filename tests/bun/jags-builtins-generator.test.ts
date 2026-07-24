@@ -110,6 +110,16 @@ test("JAGS generator rejects alias arity drift", () => {
   expectRejected(manifest, /Alias acos arity 2 does not match canonical arccos arity 1/);
 });
 
+test("JAGS generator rejects parameter-label override arity drift", () => {
+  const manifest = mutateEntry(sourceManifest, "callable", "dim", (fields) => {
+    fields[4] = "2";
+  });
+  expectRejected(
+    manifest,
+    /Parameter-label override for dim has 1 labels but manifest arity is 2/,
+  );
+});
+
 test("JAGS generator rejects alias module drift", () => {
   const manifest = mutateEntry(sourceManifest, "callable", "acos", (fields) => {
     fields[1] = "basemod";

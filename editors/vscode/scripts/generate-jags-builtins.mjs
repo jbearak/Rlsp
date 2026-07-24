@@ -250,7 +250,15 @@ function parameterLabels(entry) {
     ["rep", ["value", "times"]],
   ]);
   const labels = exact.get(entry.name);
-  if (labels) return labels;
+  if (labels) {
+    if (entry.arity !== -1 && labels.length !== entry.arity) {
+      throw new Error(
+        `Parameter-label override for ${entry.name} has ${labels.length} labels ` +
+          `but manifest arity is ${entry.arity}`,
+      );
+    }
+    return labels;
+  }
 
   const unary = new Set([
     "abs",
@@ -331,7 +339,7 @@ function renderGeneratedSource() {
     `pub const JAGS_VERSION: &str = ${rustString(version)};`,
     `pub const JAGS_SOURCE_URL: &str = ${rustString(sourceUrl)};`,
     `pub const JAGS_SOURCE_SHA256: &str = ${rustString(sourceSha256)};`,
-    "pub static JAGS_AUTOMATIC_MODULES: &[&str] = &[\"basemod\", \"bugs\"];",
+    `pub static JAGS_AUTOMATIC_MODULES: &[&str] = &[${EXPECTED_MODULES.map(rustString).join(", ")}];`,
     `pub static JAGS_KEYWORDS: &[&str] = &[${keywords.map((entry) => rustString(entry.name)).join(", ")}];`,
     `pub static JAGS_CONTEXTUAL_SYNTAX: &[&str] = &[${contextual.map((entry) => rustString(entry.name)).join(", ")}];`,
     "",
