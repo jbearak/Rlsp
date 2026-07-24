@@ -161,6 +161,16 @@ pub fn is_stan_file(p: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("stan"))
 }
 
+/// True for standalone `.jags` and `.bugs` programs, matched
+/// case-insensitively. Singular `.bug` is not a supported model extension.
+pub fn is_jags_file(p: &Path) -> bool {
+    p.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("jags") || extension.eq_ignore_ascii_case("bugs")
+        })
+}
+
 /// True for chunk-bearing document extensions (`.Rmd` / `.Rmarkdown` / `.qmd`),
 /// matched case-insensitively so the CLI walk agrees with the canonical
 /// [`crate::chunks::classify_chunk_document`] (which lowercases the whole
@@ -205,19 +215,19 @@ pub fn collect_r_file_paths_with_exclusions(
     crate::state::collect_files_matching_with_exclusions(dir, out, is_r_file, exclusions);
 }
 
-/// Recursively collect both R sources (`.R` / `.r`) and chunk-bearing documents
-/// (`.Rmd` / `.Rmarkdown` / `.qmd`, case-insensitive) under `dir`. Same
+/// Recursively collect R sources, chunk-bearing documents, and standalone JAGS
+/// or Stan models under `dir` (all extension checks are case-insensitive). Same
 /// directory walk as [`collect_r_file_paths`] — symlinked directories are
 /// followed with canonical-path cycle detection and non-source directories
-/// pruned — but the predicate also matches chunk files so their R chunks are
-/// diagnosed (issue #343).
+/// pruned. Chunk documents are included so their R chunks are diagnosed (issue
+/// #343); singular `.bug` and Stan include fragments are not standalone targets.
 ///
 /// Used by `raven check`'s report walk (empty `PATHS` or an explicit
 /// directory). Results are unsorted; callers that need deterministic order
 /// sort afterwards.
 pub fn collect_check_target_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     crate::state::collect_files_matching(dir, out, |p| {
-        is_r_file(p) || is_chunk_file(p) || is_stan_file(p)
+        is_r_file(p) || is_chunk_file(p) || is_jags_file(p) || is_stan_file(p)
     });
 }
 
@@ -229,7 +239,7 @@ pub fn collect_check_target_paths_with_exclusions(
     crate::state::collect_files_matching_with_exclusions(
         dir,
         out,
-        |p| is_r_file(p) || is_chunk_file(p) || is_stan_file(p),
+        |p| is_r_file(p) || is_chunk_file(p) || is_jags_file(p) || is_stan_file(p),
         exclusions,
     );
 }
@@ -631,6 +641,11 @@ mod tests {
         assert!(is_stan_file(Path::new("a.stan")));
         assert!(is_stan_file(Path::new("a.StAn")));
         assert!(!is_stan_file(Path::new("a.stanfunctions")));
+        assert!(is_jags_file(Path::new("a.jags")));
+        assert!(is_jags_file(Path::new("a.JaGs")));
+        assert!(is_jags_file(Path::new("a.bugs")));
+        assert!(is_jags_file(Path::new("a.BuGs")));
+        assert!(!is_jags_file(Path::new("a.bug")));
     }
 
     #[test]
@@ -668,6 +683,11 @@ mod tests {
         fs::write(tmp.path().join("g.RMARKDOWN"), "prose\n").unwrap();
         fs::write(tmp.path().join("model.stan"), "model {}\n").unwrap();
         fs::write(tmp.path().join("mixed.StAn"), "model {}\n").unwrap();
+        fs::write(tmp.path().join("model.jags"), "model { x <- 1 }\n").unwrap();
+        fs::write(tmp.path().join("mixed.JAGS"), "model { x <- 1 }\n").unwrap();
+        fs::write(tmp.path().join("legacy.bugs"), "model { x <- * 1 }\n").unwrap();
+        fs::write(tmp.path().join("mixed.BUGS"), "model { x <- 1 }\n").unwrap();
+        fs::write(tmp.path().join("unsupported.bug"), "model { x <- * 1 }\n").unwrap();
         fs::write(tmp.path().join("helper.stanfunctions"), "functions {}\n").unwrap();
         fs::write(tmp.path().join("f.txt"), "not source\n").unwrap();
         fs::create_dir(tmp.path().join(".git")).unwrap();
@@ -677,13 +697,17 @@ mod tests {
         collect_check_target_paths(tmp.path(), &mut out);
         // a.R + sub/b.r + c.Rmd + d.Rmarkdown + e.qmd + .Rmarkdown + f.QMD +
         // g.RMARKDOWN; .txt skipped; .git pruned.
-        assert_eq!(out.len(), 10, "got {out:?}");
+        assert_eq!(out.len(), 14, "got {out:?}");
         assert!(
             out.iter()
-                .all(|p| is_r_file(p) || is_chunk_file(p) || is_stan_file(p))
+                .all(|p| is_r_file(p) || is_chunk_file(p) || is_jags_file(p) || is_stan_file(p))
         );
         assert!(out.iter().any(|p| is_chunk_file(p)));
         assert_eq!(out.iter().filter(|p| is_stan_file(p)).count(), 2);
+        assert_eq!(out.iter().filter(|p| is_jags_file(p)).count(), 4);
+        assert!(out.iter().any(|path| path.ends_with("legacy.bugs")));
+        assert!(out.iter().any(|path| path.ends_with("mixed.BUGS")));
+        assert!(!out.iter().any(|path| path.ends_with("unsupported.bug")));
     }
 
     #[cfg(unix)]

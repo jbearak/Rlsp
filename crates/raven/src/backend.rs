@@ -6340,6 +6340,7 @@ async fn replay_open_documents_after_workspace_index_apply(
                 let metadata = extract_enriched_live_metadata(
                     &state,
                     &uri,
+                    record.document().file_type,
                     record.document().chunk_kind,
                     &record.document().analysis_text(),
                 );
@@ -9784,18 +9785,23 @@ fn collect_backward_parent_content_with(
 fn extract_enriched_live_metadata(
     state: &WorldState,
     uri: &Url,
+    file_type: crate::file_type::FileType,
     chunk_kind: crate::chunks::ChunkKind,
     analysis_text: &str,
 ) -> crate::cross_file::CrossFileMetadata {
-    extract_enriched_live_metadata_with_contexts(state, uri, chunk_kind, analysis_text).0
+    extract_enriched_live_metadata_with_contexts(state, uri, file_type, chunk_kind, analysis_text).0
 }
 
 fn extract_enriched_live_metadata_with_contexts(
     state: &WorldState,
     uri: &Url,
+    file_type: crate::file_type::FileType,
     chunk_kind: crate::chunks::ChunkKind,
     analysis_text: &str,
 ) -> (crate::cross_file::CrossFileMetadata, Vec<Url>) {
+    if file_type != crate::file_type::FileType::R {
+        return (crate::cross_file::CrossFileMetadata::default(), Vec::new());
+    }
     let mut meta =
         crate::cross_file::extract_metadata_from_analysis_for_kind(chunk_kind, analysis_text);
     let workspace_root = state.workspace_folders.first().cloned();
@@ -10136,7 +10142,7 @@ fn derive_open_edit_fallback(
     captured: CapturedOpenEditFallback,
 ) -> (crate::cross_file::CrossFileMetadata, PreparedOpenCommitPlan) {
     let mut local_metadata = captured.precomputed_metadata.unwrap_or_else(|| {
-        if captured.file_type == crate::file_type::FileType::Stan {
+        if captured.file_type != crate::file_type::FileType::R {
             return crate::cross_file::CrossFileMetadata::default();
         }
         let mut metadata = crate::cross_file::extract_metadata_from_analysis_for_kind(
@@ -10564,6 +10570,7 @@ async fn commit_detached_live_package_open_edit(
             let (metadata, attempted_contexts) = extract_enriched_live_metadata_with_contexts(
                 &state,
                 uri,
+                document.file_type,
                 document.chunk_kind,
                 &text,
             );
@@ -11270,7 +11277,7 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
             captured.chunk_kind,
         );
         let mut metadata = document.cross_file_metadata();
-        if document.file_type != crate::file_type::FileType::Stan {
+        if document.file_type == crate::file_type::FileType::R {
             crate::cross_file::resolve_system_file_sources(
                 &mut metadata,
                 captured.system_file_workspace_name.as_deref(),
@@ -11309,9 +11316,9 @@ fn derive_open_close_analysis(mut captured: CapturedOpenCloseAnalysis) -> Derive
     for root in &captured.roots {
         if let Some(metadata) = root.metadata.as_ref() {
             let mut semantic = metadata.as_ref().clone();
-            let is_stan =
-                crate::file_type::file_type_from_uri(&root.uri) == crate::file_type::FileType::Stan;
-            if !is_stan {
+            let is_r =
+                crate::file_type::file_type_from_uri(&root.uri) == crate::file_type::FileType::R;
+            if is_r {
                 if root
                     .owner_uri
                     .as_ref()
@@ -11818,9 +11825,9 @@ fn derive_open_install_analysis(
             })
         })
     };
-    let is_stan = captured.document.file_type == crate::file_type::FileType::Stan;
+    let is_r = captured.document.file_type == crate::file_type::FileType::R;
     let mut metadata = captured.document.cross_file_metadata();
-    if !local_only && !is_stan {
+    if !local_only && is_r {
         crate::cross_file::enrich_metadata_with_inherited_wd(
             &mut metadata,
             &captured.uri,
@@ -11835,9 +11842,7 @@ fn derive_open_install_analysis(
             &captured.library_paths,
         );
     }
-    let selected_shiny_entry = if is_stan {
-        None
-    } else {
+    let selected_shiny_entry = if is_r {
         crate::cross_file::enrich_selective_import_resolutions(
             &mut metadata,
             &captured.uri,
@@ -11849,6 +11854,8 @@ fn derive_open_install_analysis(
             captured.workspace_root.as_ref(),
             &captured.exclusions,
         )
+    } else {
+        None
     };
 
     let mut prerequisites = OpenInstallPrerequisites {
@@ -11857,7 +11864,7 @@ fn derive_open_install_analysis(
         max_backward_depth: captured.max_backward_depth,
         ..OpenInstallPrerequisites::default()
     };
-    if captured.on_demand_enabled && !local_only && !is_stan {
+    if captured.on_demand_enabled && !local_only && is_r {
         let opened_support_file = metadata
             .shiny_application
             .as_ref()
@@ -12257,16 +12264,16 @@ fn derive_open_metadata_reenrichment(
         })
     };
 
-    let is_stan = captured.file_type == crate::file_type::FileType::Stan;
-    let mut metadata = if is_stan {
-        crate::cross_file::CrossFileMetadata::default()
-    } else {
+    let is_r = captured.file_type == crate::file_type::FileType::R;
+    let mut metadata = if is_r {
         crate::cross_file::extract_metadata_from_analysis_for_kind(
             captured.chunk_kind,
             &captured.analysis_text,
         )
+    } else {
+        crate::cross_file::CrossFileMetadata::default()
     };
-    if !is_stan {
+    if is_r {
         crate::cross_file::enrich_metadata_with_inherited_wd(
             &mut metadata,
             &captured.uri,
@@ -13326,17 +13333,17 @@ async fn resync_file_from_disk(
     // bodies only (#343), then parse ONCE and derive both metadata and
     // artifacts from the same tree.
     let file_type = crate::file_type::file_type_from_uri(uri);
-    let stan_document = (file_type == crate::file_type::FileType::Stan)
+    let non_r_document = (file_type != crate::file_type::FileType::R)
         .then(|| crate::state::Document::new_with_uri(&content, None, uri));
-    let analysis = stan_document.as_ref().map_or_else(
+    let analysis = non_r_document.as_ref().map_or_else(
         || crate::cross_file::analysis_text_for_kind(effective_chunk_kind, &content).into_owned(),
         crate::state::Document::analysis_text,
     );
-    let tree = stan_document.as_ref().map_or_else(
+    let tree = non_r_document.as_ref().map_or_else(
         || crate::parser_pool::with_parser(|parser| parser.parse(&analysis, None)),
         |document| document.tree.clone(),
     );
-    let mut cross_file_meta = stan_document.as_ref().map_or_else(
+    let mut cross_file_meta = non_r_document.as_ref().map_or_else(
         || {
             crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
                 effective_chunk_kind,
@@ -13371,7 +13378,7 @@ async fn resync_file_from_disk(
         let ws = state.package_state.workspace();
         let ws_name = ws.map(|w| w.name.as_str());
         let ws_root = ws.map(|w| w.root.as_path());
-        if stan_document.is_none() {
+        if non_r_document.is_none() {
             crate::cross_file::resolve_system_file_sources(
                 &mut cross_file_meta,
                 ws_name,
@@ -13382,7 +13389,7 @@ async fn resync_file_from_disk(
 
         let workspace_root = state.workspace_folders.first().cloned();
         let consumed_context_uris = std::cell::RefCell::new(Vec::new());
-        if stan_document.is_none() {
+        if non_r_document.is_none() {
             crate::cross_file::enrich_metadata_with_inherited_wd(
                 &mut cross_file_meta,
                 uri,
@@ -13403,7 +13410,7 @@ async fn resync_file_from_disk(
         )
     };
 
-    if stan_document.is_none() {
+    if non_r_document.is_none() {
         crate::cross_file::enrich_selective_import_resolutions(
             &mut cross_file_meta,
             uri,
@@ -13521,7 +13528,7 @@ async fn resync_file_from_disk(
 
     // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression
     // for declared symbols)
-    let artifacts = std::sync::Arc::new(stan_document.as_ref().map_or_else(
+    let artifacts = std::sync::Arc::new(non_r_document.as_ref().map_or_else(
         || match tree.as_ref() {
             Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                 uri,
@@ -13534,11 +13541,11 @@ async fn resync_file_from_disk(
         |document| document.cross_file_artifacts(uri, &cross_file_meta),
     ));
     let new_interface_hash = artifacts.interface_hash;
-    let loaded_packages = stan_document.as_ref().map_or_else(
+    let loaded_packages = non_r_document.as_ref().map_or_else(
         || extract_loaded_packages_from_metadata(&cross_file_meta),
         |document| document.loaded_packages.clone(),
     );
-    let data_packages = stan_document.as_ref().map_or_else(
+    let data_packages = non_r_document.as_ref().map_or_else(
         || crate::state::extract_data_packages(&tree, &analysis),
         |document| document.data_packages.clone(),
     );
@@ -18606,6 +18613,7 @@ impl LanguageServer for Backend {
                         extract_enriched_live_metadata_with_contexts(
                             &state,
                             &uri,
+                            document.file_type,
                             document.chunk_kind,
                             &analysis_text,
                         );
@@ -18743,6 +18751,7 @@ impl LanguageServer for Backend {
                 let (meta, mut attempted_contexts) = extract_enriched_live_metadata_with_contexts(
                     &state,
                     &uri,
+                    document.file_type,
                     document.chunk_kind,
                     &text,
                 );
@@ -19918,7 +19927,7 @@ impl LanguageServer for Backend {
                 }
             };
 
-            if doc.file_type == crate::file_type::FileType::Stan {
+            if doc.file_type != crate::file_type::FileType::R {
                 log::trace!("on_type_formatting: unsupported document type: {}", uri);
                 return Ok(None);
             }
@@ -21791,18 +21800,18 @@ impl Backend {
             let state = self.state.read().await;
             state.chunk_kind_for_closed_file(file_uri)
         };
-        let stan_document = (crate::file_type::file_type_from_uri(file_uri)
-            == crate::file_type::FileType::Stan)
+        let non_r_document = (crate::file_type::file_type_from_uri(file_uri)
+            != crate::file_type::FileType::R)
             .then(|| crate::state::Document::new_with_uri(&content, None, file_uri));
-        let analysis_text = stan_document.as_ref().map_or_else(
+        let analysis_text = non_r_document.as_ref().map_or_else(
             || crate::cross_file::analysis_text_for_kind(chunk_kind, &content).into_owned(),
             crate::state::Document::analysis_text,
         );
-        let tree = stan_document.as_ref().map_or_else(
+        let tree = non_r_document.as_ref().map_or_else(
             || crate::parser_pool::with_parser(|parser| parser.parse(&analysis_text, None)),
             |document| document.tree.clone(),
         );
-        let mut cross_file_meta = stan_document.as_ref().map_or_else(
+        let mut cross_file_meta = non_r_document.as_ref().map_or_else(
             || {
                 crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
                     chunk_kind,
@@ -21830,7 +21839,7 @@ impl Backend {
             let packages_enabled = state.cross_file_config.packages_enabled;
             let consumed_context_uris = std::cell::RefCell::new(Vec::new());
 
-            if stan_document.is_none() {
+            if non_r_document.is_none() {
                 crate::cross_file::enrich_metadata_with_inherited_wd(
                     &mut cross_file_meta,
                     file_uri,
@@ -21888,7 +21897,7 @@ impl Backend {
 
         // Persist local selective-module identities off-lock after inherited-WD
         // enrichment and with the captured workspace fallback context.
-        if stan_document.is_none() {
+        if non_r_document.is_none() {
             crate::cross_file::enrich_selective_import_resolutions(
                 &mut cross_file_meta,
                 file_uri,
@@ -21910,7 +21919,7 @@ impl Backend {
                 &exclusions,
             );
         }
-        let artifacts = std::sync::Arc::new(stan_document.as_ref().map_or_else(
+        let artifacts = std::sync::Arc::new(non_r_document.as_ref().map_or_else(
             || match tree.as_ref() {
                 Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                     file_uri,
@@ -21926,11 +21935,11 @@ impl Backend {
         let snapshot =
             crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
 
-        let loaded_packages = stan_document.as_ref().map_or_else(
+        let loaded_packages = non_r_document.as_ref().map_or_else(
             || extract_loaded_packages_from_metadata(&cross_file_meta),
             |document| document.loaded_packages.clone(),
         );
-        let data_packages = stan_document.as_ref().map_or_else(
+        let data_packages = non_r_document.as_ref().map_or_else(
             || crate::state::extract_data_packages(&tree, &analysis_text),
             |document| document.data_packages.clone(),
         );
@@ -22341,18 +22350,18 @@ impl Backend {
             let state = self.state.read().await;
             state.chunk_kind_for_closed_file(file_uri)
         };
-        let stan_document = (crate::file_type::file_type_from_uri(file_uri)
-            == crate::file_type::FileType::Stan)
+        let non_r_document = (crate::file_type::file_type_from_uri(file_uri)
+            != crate::file_type::FileType::R)
             .then(|| crate::state::Document::new_with_uri(&content, None, file_uri));
-        let analysis_text = stan_document.as_ref().map_or_else(
+        let analysis_text = non_r_document.as_ref().map_or_else(
             || crate::cross_file::analysis_text_for_kind(chunk_kind, &content).into_owned(),
             crate::state::Document::analysis_text,
         );
-        let tree = stan_document.as_ref().map_or_else(
+        let tree = non_r_document.as_ref().map_or_else(
             || crate::parser_pool::with_parser(|parser| parser.parse(&analysis_text, None)),
             |document| document.tree.clone(),
         );
-        let mut cross_file_meta = stan_document.as_ref().map_or_else(
+        let mut cross_file_meta = non_r_document.as_ref().map_or_else(
             || {
                 crate::cross_file::extract_metadata_with_tree_from_analysis_for_kind(
                     chunk_kind,
@@ -22362,7 +22371,7 @@ impl Backend {
             },
             crate::state::Document::cross_file_metadata,
         );
-        if stan_document.is_none()
+        if non_r_document.is_none()
             && cross_file_meta.working_directory.is_none()
             && cross_file_meta.inherited_working_directory.is_none()
         {
@@ -22442,7 +22451,7 @@ impl Backend {
 
         // Persist local selective-module identities off-lock after inherited-WD
         // enrichment and with the captured workspace fallback context.
-        if stan_document.is_none() {
+        if non_r_document.is_none() {
             crate::cross_file::enrich_selective_import_resolutions(
                 &mut cross_file_meta,
                 file_uri,
@@ -22464,7 +22473,7 @@ impl Backend {
                 &exclusions,
             );
         }
-        let artifacts = std::sync::Arc::new(stan_document.as_ref().map_or_else(
+        let artifacts = std::sync::Arc::new(non_r_document.as_ref().map_or_else(
             || match tree.as_ref() {
                 Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                     file_uri,
@@ -22477,11 +22486,11 @@ impl Backend {
             |document| document.cross_file_artifacts(file_uri, &cross_file_meta),
         ));
 
-        let loaded_packages = stan_document.as_ref().map_or_else(
+        let loaded_packages = non_r_document.as_ref().map_or_else(
             || extract_loaded_packages_from_metadata(&cross_file_meta),
             |document| document.loaded_packages.clone(),
         );
-        let data_packages = stan_document.as_ref().map_or_else(
+        let data_packages = non_r_document.as_ref().map_or_else(
             || crate::state::extract_data_packages(&tree, &analysis_text),
             |document| document.data_packages.clone(),
         );
@@ -23383,11 +23392,14 @@ pub(crate) async fn publish_diagnostics_inner(
         // Rmd/Quarto documents flow through too (issue #343): the snapshot
         // carries the masked analysis text + tree, so `diagnostics_from_snapshot`
         // sees only real R chunk-body content. Stan follows its syntax-only
-        // collector; JAGS remains suppressed.
+        // collector; JAGS dispatches strict syntax for both `.jags` and
+        // `.bugs` through their shared language identity.
         Some(snap)
             if matches!(
                 snap.file_type,
-                crate::file_type::FileType::R | crate::file_type::FileType::Stan
+                crate::file_type::FileType::R
+                    | crate::file_type::FileType::Jags
+                    | crate::file_type::FileType::Stan
             ) =>
         {
             handlers::diagnostics_from_snapshot(&snap, uri, &handlers::DiagCancelToken::never())
@@ -28986,6 +28998,113 @@ mod tests {
             assert!(
                 fresh.diagnostics.iter().all(|d| d.range.start.line >= 2),
                 "only reopened Stan text may publish: {:?}",
+                fresh.diagnostics
+            );
+        }
+
+        /// JAGS syntax diagnostics participate in the same epoch-gated direct
+        /// publish path. Reopening at the same version must reject work from
+        /// the retired lifecycle and leave the new lifecycle publishable.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stale_jags_direct_worker_cannot_publish_into_reopened_lifecycle() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("reopen-race.jags");
+            let old_text = "model { x <- * 1 }\n";
+            let new_text = "\n\nmodel {\n  x <- * 2\n}\n";
+            std::fs::write(&path, old_text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "jags".into(),
+                        version: 1,
+                        text: old_text.into(),
+                    },
+                })
+                .await;
+
+            let pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_test_pause
+                .arm(uri.clone());
+            let worker = {
+                let state_arc = backend.state.clone();
+                let client = backend.client.clone();
+                let task_uri = uri.clone();
+                tokio::spawn(async move {
+                    super::super::publish_diagnostics_inner(&state_arc, &client, &task_uri).await;
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), pause.wait_arrived())
+                .await
+                .expect("old JAGS worker must reach the pre-commit pause");
+
+            backend
+                .did_close(DidCloseTextDocumentParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                })
+                .await;
+            let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("JAGS close must clear diagnostics")
+                .expect("client socket remains open");
+            let cleared: PublishDiagnosticsParams =
+                serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
+            assert_eq!(cleared.uri, uri);
+            assert!(cleared.diagnostics.is_empty());
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "jags".into(),
+                        version: 1,
+                        text: new_text.into(),
+                    },
+                })
+                .await;
+
+            pause.release();
+            worker.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err(),
+                "the retired JAGS worker must not publish after close+reopen"
+            );
+
+            backend.publish_diagnostics(&uri).await;
+            let fresh = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("reopened JAGS lifecycle must publish at the same version")
+                .expect("client socket remains open");
+            let fresh: PublishDiagnosticsParams =
+                serde_json::from_value(fresh.params().unwrap().clone()).unwrap();
+            assert_eq!(fresh.uri, uri);
+            assert!(!fresh.diagnostics.is_empty());
+            assert!(
+                fresh.diagnostics.iter().all(|d| d.range.start.line >= 2),
+                "only reopened JAGS text may publish: {:?}",
                 fresh.diagnostics
             );
         }
@@ -51499,6 +51618,262 @@ lineLength = 200
     }
 
     #[tokio::test]
+    async fn jags_lsp_open_change_clear_and_close_lifecycle() {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::Request;
+        use tower_lsp::lsp_types::{
+            DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+            PublishDiagnosticsParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+            TextDocumentItem, VersionedTextDocumentIdentifier,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let invalid = "model {\n  x <- * 1\n}\n";
+        let path = tmp.path().join("model.jags");
+        fs::write(&path, invalid).unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: Url::from_directory_path(tmp.path()).unwrap(),
+                        name: "t".into(),
+                    }]),
+                    initialization_options: Some(serde_json::json!({
+                        "diagnosticUris": [uri.to_string()],
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false }
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+        let backend = svc.inner();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+        }
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "jags".into(),
+                    version: 1,
+                    text: invalid.into(),
+                },
+            })
+            .await;
+
+        backend.publish_diagnostics(&uri).await;
+        let v1 = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("JAGS v1 diagnostics must publish")
+            .expect("client socket remains open");
+        let v1: PublishDiagnosticsParams =
+            serde_json::from_value(v1.params().unwrap().clone()).unwrap();
+        assert_eq!(v1.uri, uri);
+        assert!(!v1.diagnostics.is_empty());
+        assert!(v1.diagnostics.iter().all(|finding| {
+            finding.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "syntax-error".to_string(),
+                ))
+        }));
+
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "model {\n  x <- 1\n}\n".to_string(),
+                }],
+            })
+            .await;
+        backend.publish_diagnostics(&uri).await;
+        let v2 = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("JAGS v2 clear must publish")
+            .expect("client socket remains open");
+        let v2: PublishDiagnosticsParams =
+            serde_json::from_value(v2.params().unwrap().clone()).unwrap();
+        assert!(v2.diagnostics.is_empty());
+
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            })
+            .await;
+        let close = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("JAGS close must publish an empty clear")
+            .expect("client socket remains open");
+        let close: PublishDiagnosticsParams =
+            serde_json::from_value(close.params().unwrap().clone()).unwrap();
+        assert_eq!(close.uri, uri);
+        assert!(close.diagnostics.is_empty());
+
+        let state = backend.state.read().await;
+        assert!(state.get_document(&uri).is_none());
+        assert!(state.diagnostics_gate.current_epoch(&uri).is_none());
+        let entry = state
+            .workspace_index
+            .get(&uri)
+            .expect("close must install the disk-backed JAGS entry");
+        assert_eq!(entry.tree.as_ref().unwrap().root_node().kind(), "program");
+        assert!(entry.metadata.sources.is_empty());
+        assert!(entry.artifacts.exported_interface.is_empty());
+        assert!(entry.loaded_packages.is_empty());
+        assert!(entry.data_packages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bugs_files_publish_and_clear_for_lower_and_uppercase_extensions() {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::Request;
+        use tower_lsp::lsp_types::{
+            DidChangeTextDocumentParams, DidOpenTextDocumentParams, PublishDiagnosticsParams,
+            TextDocumentContentChangeEvent, TextDocumentItem, VersionedTextDocumentIdentifier,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let invalid = "model { x <- * 1 }\n";
+        let paths = [tmp.path().join("lower.bugs"), tmp.path().join("upper.BUGS")];
+        for path in &paths {
+            fs::write(path, invalid).unwrap();
+        }
+        let uris = paths
+            .iter()
+            .map(|path| Url::from_file_path(path).unwrap())
+            .collect::<Vec<_>>();
+        let unsupported_path = tmp.path().join("unsupported.bug");
+        let r_valid_jags_invalid = "x <- function(y) y\n";
+        fs::write(&unsupported_path, r_valid_jags_invalid).unwrap();
+        let unsupported_uri = Url::from_file_path(&unsupported_path).unwrap();
+        let mut diagnostic_uris = uris.iter().map(Url::to_string).collect::<Vec<_>>();
+        diagnostic_uris.push(unsupported_uri.to_string());
+
+        let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    initialization_options: Some(serde_json::json!({
+                        "diagnosticUris": diagnostic_uris,
+                        "crossFile": { "indexWorkspace": false },
+                        "packages": { "enabled": false }
+                    })),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+        let backend = svc.inner();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+        }
+
+        for (version, uri) in uris.iter().enumerate() {
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "jags".into(),
+                        version: version as i32 + 1,
+                        text: invalid.into(),
+                    },
+                })
+                .await;
+            backend.publish_diagnostics(uri).await;
+            let published = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("BUGS diagnostics must publish")
+                .expect("client socket remains open");
+            let published: PublishDiagnosticsParams =
+                serde_json::from_value(published.params().unwrap().clone()).unwrap();
+            assert_eq!(published.uri, *uri);
+            assert!(
+                !published.diagnostics.is_empty(),
+                "BUGS files must receive strict JAGS diagnostics"
+            );
+            assert!(published.diagnostics.iter().all(|diagnostic| {
+                diagnostic.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "syntax-error".to_string(),
+                    ))
+            }));
+
+            backend
+                .did_change(DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version: version as i32 + 2,
+                    },
+                    content_changes: vec![TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: "model { x <- 1 }\n".to_string(),
+                    }],
+                })
+                .await;
+            backend.publish_diagnostics(uri).await;
+            let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("BUGS diagnostic clear must publish")
+                .expect("client socket remains open");
+            let cleared: PublishDiagnosticsParams =
+                serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
+            assert_eq!(cleared.uri, *uri);
+            assert!(cleared.diagnostics.is_empty());
+        }
+
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: unsupported_uri.clone(),
+                    language_id: "plaintext".into(),
+                    version: 1,
+                    text: r_valid_jags_invalid.into(),
+                },
+            })
+            .await;
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.get_document(&unsupported_uri).unwrap().file_type,
+                crate::file_type::FileType::R,
+                "singular .bug must not opt into the JAGS parser"
+            );
+        }
+        backend.publish_diagnostics(&unsupported_uri).await;
+        let unsupported = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("unsupported .bug clear must publish")
+            .expect("client socket remains open");
+        let unsupported: PublishDiagnosticsParams =
+            serde_json::from_value(unsupported.params().unwrap().clone()).unwrap();
+        assert_eq!(unsupported.uri, unsupported_uri);
+        assert!(unsupported.diagnostics.is_empty());
+    }
+
+    #[tokio::test]
     async fn untitled_stan_uses_language_id_and_r_only_handlers_are_inert() {
         use tower_lsp::lsp_types::{
             DidOpenTextDocumentParams, DocumentOnTypeFormattingParams, FormattingOptions,
@@ -57176,7 +57551,9 @@ infixContinuationStyle = "aligned"
             crate::handlers::DiagnosticsSnapshot::build(state, uri).expect("snapshot must build");
         if matches!(
             snapshot.file_type,
-            crate::file_type::FileType::R | crate::file_type::FileType::Stan
+            crate::file_type::FileType::R
+                | crate::file_type::FileType::Jags
+                | crate::file_type::FileType::Stan
         ) {
             crate::handlers::diagnostics_from_snapshot(
                 &snapshot,

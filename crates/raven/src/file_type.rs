@@ -69,4 +69,14 @@ mod tests {
             FileType::Stan
         );
     }
+
+    #[test]
+    fn singular_bug_is_not_a_jags_extension() {
+        let uri = Url::parse("file:///tmp/model.bug").unwrap();
+        assert_eq!(file_type_from_uri(&uri), FileType::R);
+        assert_eq!(
+            file_type_from_language_id_or_uri(Some("plaintext"), &uri),
+            FileType::R
+        );
+    }
 }

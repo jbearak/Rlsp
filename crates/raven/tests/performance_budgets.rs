@@ -205,6 +205,7 @@ fn assert_within_budget_message_includes_details() {
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 use tree_sitter::Parser;
 use url::Url;
 
@@ -309,6 +310,71 @@ fn budget_stan_parse_and_diagnostics_100kb_malformed_is_bounded() {
 #[test]
 fn stan_document_constructor_uses_the_stan_grammar() {
     let document = Document::new_with_file_type("model {}\n", None, FileType::Stan);
+    assert_eq!(document.tree.unwrap().root_node().kind(), "program");
+}
+
+fn generate_jags_code_of_size(target_bytes: usize, malformed: bool) -> String {
+    let mut content = String::from("model {\n");
+    let statement = if malformed {
+        "  theta <- * 1\n"
+    } else {
+        "  theta <- 1 + 2\n"
+    };
+    while content.len() + statement.len() + 2 < target_bytes {
+        content.push_str(statement);
+    }
+    content.push_str("}\n");
+    content
+}
+
+fn analyze_jags(code: &str) -> usize {
+    let uri = Url::parse("untitled:jags-performance-budget").unwrap();
+    let mut state = WorldState::new();
+    state.open_document_with_language_id(uri.clone(), code, Some(1), Some("jags"));
+    diagnostics(&state, &uri, &DiagCancelToken::never()).len()
+}
+
+#[test]
+fn budget_jags_parse_and_diagnostics_100kb_valid() {
+    let code = generate_jags_code_of_size(100 * 1024, false);
+    let _ = analyze_jags(&code);
+    let elapsed = median_of_3(|| assert_eq!(analyze_jags(&code), 0));
+    assert_within_budget("jags_parse_and_diagnostics_100kb_valid", elapsed, 250);
+}
+
+#[test]
+fn budget_jags_parse_and_diagnostics_100kb_malformed_is_capped() {
+    let code = generate_jags_code_of_size(100 * 1024, true);
+    let first_count = analyze_jags(&code);
+    assert_eq!(first_count, 100, "JAGS syntax findings must honor the cap");
+    let elapsed = median_of_3(|| assert_eq!(analyze_jags(&code), 100));
+    assert_within_budget("jags_parse_and_diagnostics_100kb_malformed", elapsed, 250);
+}
+
+#[test]
+fn budget_jags_incremental_one_line_edit_100kb() {
+    let code = generate_jags_code_of_size(100 * 1024, false);
+    let target_line = (code.lines().count() / 2) as u32;
+    let mut document = Document::new_with_file_type(&code, None, FileType::Jags);
+    let mut replacement = "3";
+    let elapsed = median_of_3(|| {
+        document.apply_change(TextDocumentContentChangeEvent {
+            range: Some(Range::new(
+                Position::new(target_line, 15),
+                Position::new(target_line, 16),
+            )),
+            range_length: None,
+            text: replacement.to_string(),
+        });
+        replacement = if replacement == "3" { "2" } else { "3" };
+    });
+    assert_eq!(document.tree.unwrap().root_node().kind(), "program");
+    assert_within_budget("jags_incremental_one_line_edit_100kb", elapsed, 50);
+}
+
+#[test]
+fn jags_document_constructor_uses_the_jags_grammar() {
+    let document = Document::new_with_file_type("model {}\n", None, FileType::Jags);
     assert_eq!(document.tree.unwrap().root_node().kind(), "program");
 }
 

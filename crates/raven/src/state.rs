@@ -181,7 +181,9 @@ pub struct DocumentIndentOptions {
 }
 
 use tower_lsp::lsp_types::Url;
+use tree_sitter::InputEdit;
 use tree_sitter::Parser;
+use tree_sitter::Point;
 use tree_sitter::Tree;
 
 use crate::chunks::{ChunkKind, classify_chunk_document, classify_chunk_document_for};
@@ -262,6 +264,21 @@ pub struct Document {
     pub revision: u64,
 }
 
+fn point_after_insert(start: Point, inserted: &str) -> Point {
+    match inserted.rfind('\n') {
+        Some(last_newline) => Point::new(
+            start.row + inserted.bytes().filter(|byte| *byte == b'\n').count(),
+            inserted.len() - last_newline - 1,
+        ),
+        None => Point::new(start.row, start.column + inserted.len()),
+    }
+}
+
+fn rope_end_point(contents: &Rope) -> Point {
+    let row = contents.len_lines().saturating_sub(1);
+    Point::new(row, contents.line(row).len_bytes())
+}
+
 impl Document {
     #[cfg(test)]
     pub fn new(text: &str, version: Option<i32>) -> Self {
@@ -306,8 +323,8 @@ impl Document {
         chunk_kind: ChunkKind,
     ) -> Self {
         let contents = Rope::from_str(text);
-        // Mask Rmd/Quarto bodies so the R parser only sees real R code; plain R
-        // JAGS keeps raw text; Stan masks recognized Raven directives. Routed through the shared
+        // Mask Rmd/Quarto bodies so the R parser only sees real R code. JAGS
+        // keeps raw text; Stan masks recognized Raven directives. Routed through the shared
         // `masked_analysis_text` chokepoint so this and the open-document authority can
         // never derive divergent analysis views.
         let masked_text = analysis_mask(chunk_kind, file_type, text);
@@ -315,15 +332,15 @@ impl Document {
         let tree = parse_document_text(analysis_text, file_type);
         // Extract from the SAME text the tree was parsed from, so `library()`
         // calls inside chunks are found and prose mentions are not.
-        let loaded_packages = if file_type == FileType::Stan {
-            Vec::new()
-        } else {
+        let loaded_packages = if file_type == FileType::R {
             extract_loaded_packages(&tree, analysis_text)
-        };
-        let data_packages = if file_type == FileType::Stan {
-            Vec::new()
         } else {
+            Vec::new()
+        };
+        let data_packages = if file_type == FileType::R {
             extract_data_packages(&tree, analysis_text)
+        } else {
+            Vec::new()
         };
         Self {
             contents,
@@ -359,6 +376,13 @@ impl Document {
         changes: impl IntoIterator<Item = TextDocumentContentChangeEvent>,
     ) {
         let mut applied = 0_u64;
+        // JAGS analysis text is always the raw text, so its stored tree can be
+        // edited with the exact sequential LSP changes before one final parse.
+        // Rmd masking and Stan directive masking make that unsafe for those
+        // languages; R and Stan retain their existing full-reparse path.
+        let mut incremental_jags_tree = (self.file_type == FileType::Jags)
+            .then(|| self.tree.clone())
+            .flatten();
 
         for change in changes {
             // Always apply the edit to the RAW contents exactly as before — LSP
@@ -379,10 +403,47 @@ impl Document {
                 let start_idx = self.contents.line_to_char(start_line) + start_char;
                 let end_idx = self.contents.line_to_char(end_line) + end_char;
 
+                let edit = incremental_jags_tree.as_ref().map(|_| {
+                    let start_byte = self.contents.char_to_byte(start_idx);
+                    let old_end_byte = self.contents.char_to_byte(end_idx);
+                    let start_column = start_line_text
+                        .chars()
+                        .take(start_char)
+                        .map(char::len_utf8)
+                        .sum();
+                    let old_end_column = end_line_text
+                        .chars()
+                        .take(end_char)
+                        .map(char::len_utf8)
+                        .sum();
+                    let start_position = Point::new(start_line, start_column);
+                    InputEdit {
+                        start_byte,
+                        old_end_byte,
+                        new_end_byte: start_byte + change.text.len(),
+                        start_position,
+                        old_end_position: Point::new(end_line, old_end_column),
+                        new_end_position: point_after_insert(start_position, &change.text),
+                    }
+                });
+
                 self.contents.remove(start_idx..end_idx);
                 self.contents.insert(start_idx, &change.text);
+                if let (Some(tree), Some(edit)) = (incremental_jags_tree.as_mut(), edit.as_ref()) {
+                    tree.edit(edit);
+                }
             } else {
                 // Full document sync
+                if let Some(tree) = incremental_jags_tree.as_mut() {
+                    tree.edit(&InputEdit {
+                        start_byte: 0,
+                        old_end_byte: self.contents.len_bytes(),
+                        new_end_byte: change.text.len(),
+                        start_position: Point::new(0, 0),
+                        old_end_position: rope_end_point(&self.contents),
+                        new_end_position: point_after_insert(Point::new(0, 0), &change.text),
+                    });
+                }
                 self.contents = Rope::from_str(&change.text);
             }
 
@@ -398,26 +459,27 @@ impl Document {
         let raw_text = self.contents.to_string();
         // Re-derive the analysis text and parse the tree from it.
         //
-        // For Rmd documents we re-mask the FULL new raw text and parse from
-        // scratch (no incremental tree-sitter edit). The previous tree's byte
-        // offsets reference the OLD masked text, whereas the LSP edit ranges
-        // are computed against the raw text — feeding the latter into an
-        // incremental `Tree::edit` would corrupt the former. A full reparse per
-        // change is acceptable: tree-sitter is fast, and incremental masking is
-        // a future optimization. (Plain R already reparses from scratch here,
-        // so this is not a regression for the common case.)
+        // R and Stan retain a full final-text parse. In particular, the
+        // previous Rmd tree's byte offsets reference OLD masked text whereas
+        // LSP edit ranges address raw text, so applying those edits to that
+        // tree would corrupt it. JAGS has no mask: the edited prior tree above
+        // is safe to reuse for this one final parse.
         self.masked_text = analysis_mask(self.chunk_kind, self.file_type, &raw_text);
         // `Some(masked)` for Rmd or directive-bearing Stan, `None` when the
         // analysis text equals raw source.
         let analysis_text = self.masked_text.as_deref().unwrap_or(&raw_text);
 
-        self.tree = parse_document_text(analysis_text, self.file_type);
-        if self.file_type == FileType::Stan {
-            self.loaded_packages.clear();
-            self.data_packages.clear();
-        } else {
+        self.tree = parse_document_text_with_old_tree(
+            analysis_text,
+            self.file_type,
+            incremental_jags_tree.as_ref(),
+        );
+        if self.file_type == FileType::R {
             self.loaded_packages = extract_loaded_packages(&self.tree, analysis_text);
             self.data_packages = extract_data_packages(&self.tree, analysis_text);
+        } else {
+            self.loaded_packages.clear();
+            self.data_packages.clear();
         }
     }
 
@@ -441,11 +503,10 @@ impl Document {
         }
     }
 
-    /// Derive R cross-file metadata only for languages whose existing parser
-    /// contract is R-based. Stan owns a different grammar and deliberately
-    /// contributes no R scope, packages, sources, or directives.
+    /// Derive R cross-file metadata only for R documents. Native JAGS and Stan
+    /// trees deliberately contribute no R scope, packages, sources, or directives.
     pub(crate) fn cross_file_metadata(&self) -> crate::cross_file::CrossFileMetadata {
-        if self.file_type == FileType::Stan {
+        if self.file_type != FileType::R {
             crate::cross_file::CrossFileMetadata::default()
         } else {
             crate::cross_file::extract_metadata_from_analysis_for_kind(
@@ -456,14 +517,14 @@ impl Document {
     }
 
     /// Compute metadata-dependent R scope artifacts, or an inert artifact set
-    /// for Stan. This is the shared language boundary for open and closed
+    /// for non-R languages. This is the shared language boundary for open and closed
     /// document authorities.
     pub(crate) fn cross_file_artifacts(
         &self,
         uri: &Url,
         metadata: &crate::cross_file::CrossFileMetadata,
     ) -> crate::cross_file::scope::ScopeArtifacts {
-        if self.file_type == FileType::Stan {
+        if self.file_type != FileType::R {
             return crate::cross_file::scope::ScopeArtifacts::default();
         }
         let analysis_text = self.analysis_text();
@@ -708,7 +769,8 @@ fn parse_r_text(text: &str) -> Option<Tree> {
 fn analysis_mask(chunk_kind: ChunkKind, file_type: FileType, text: &str) -> Option<String> {
     match file_type {
         FileType::Stan => crate::stan::mask_raven_directives(text),
-        FileType::R | FileType::Jags => crate::cross_file::masked_analysis_text(chunk_kind, text),
+        FileType::Jags => None,
+        FileType::R => crate::cross_file::masked_analysis_text(chunk_kind, text),
     }
 }
 
@@ -717,16 +779,33 @@ thread_local! {
     /// Per-test-thread parse counter used to pin the single-parse batch-edit
     /// contract without introducing synchronization into production builds.
     static DOCUMENT_PARSE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Counts final JAGS parses that received an edited prior tree.
+    static JAGS_INCREMENTAL_PARSE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Parse `text` (the already-prepared analysis text) into a
 /// tree-sitter tree appropriate for `file_type`.
 fn parse_document_text(text: &str, file_type: FileType) -> Option<Tree> {
+    parse_document_text_with_old_tree(text, file_type, None)
+}
+
+fn parse_document_text_with_old_tree(
+    text: &str,
+    file_type: FileType,
+    old_tree: Option<&Tree>,
+) -> Option<Tree> {
     #[cfg(test)]
     DOCUMENT_PARSE_COUNT.with(|count| count.set(count.get().wrapping_add(1)));
 
     match file_type {
-        FileType::R | FileType::Jags => parse_r_text(text),
+        FileType::R => parse_r_text(text),
+        FileType::Jags => {
+            #[cfg(test)]
+            if old_tree.is_some() {
+                JAGS_INCREMENTAL_PARSE_COUNT.with(|count| count.set(count.get().wrapping_add(1)));
+            }
+            crate::jags::parse_with_old_tree(text, old_tree)
+        }
         FileType::Stan => crate::stan::parse(text),
     }
 }
@@ -8268,13 +8347,13 @@ impl WorldState {
         uri: &Url,
         content: &str,
     ) -> crate::cross_file::CrossFileMetadata {
-        if file_type_from_uri(uri) == FileType::Stan {
-            crate::cross_file::CrossFileMetadata::default()
-        } else {
+        if file_type_from_uri(uri) == FileType::R {
             crate::cross_file::extract_metadata_for_kind(
                 self.chunk_kind_for_closed_file(uri),
                 content,
             )
+        } else {
+            crate::cross_file::CrossFileMetadata::default()
         }
     }
 
@@ -11516,7 +11595,7 @@ pub(crate) fn prepare_system_file_analysis(
         let content = content.clone();
         let document = Document::new_with_uri(&content, None, &uri);
         let mut metadata = document.cross_file_metadata();
-        if document.file_type != FileType::Stan {
+        if document.file_type == FileType::R {
             crate::cross_file::resolve_system_file_source_entries(
                 &mut metadata.sources,
                 basis.routing.workspace_name.as_deref(),
@@ -12023,9 +12102,7 @@ pub(crate) fn derive_workspace_dependency_graph(
             );
         }
         let analysis = entry.contents.to_string();
-        entry.artifacts = Arc::new(if file_type_from_uri(uri) == FileType::Stan {
-            crate::cross_file::scope::ScopeArtifacts::default()
-        } else {
+        entry.artifacts = Arc::new(if file_type_from_uri(uri) == FileType::R {
             match entry.tree.as_ref() {
                 Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                     uri,
@@ -12035,6 +12112,8 @@ pub(crate) fn derive_workspace_dependency_graph(
                 ),
                 None => crate::cross_file::scope::ScopeArtifacts::default(),
             }
+        } else {
+            crate::cross_file::scope::ScopeArtifacts::default()
         });
     }
     for (uri, metadata) in &mut open_metadata {
@@ -12617,9 +12696,7 @@ pub fn scan_workspace_with_exclusions(
             workspace_root.as_ref(),
         );
         let analysis = entry.contents.to_string();
-        entry.artifacts = Arc::new(if file_type_from_uri(uri) == FileType::Stan {
-            crate::cross_file::scope::ScopeArtifacts::default()
-        } else {
+        entry.artifacts = Arc::new(if file_type_from_uri(uri) == FileType::R {
             match entry.tree.as_ref() {
                 Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
                     uri,
@@ -12629,6 +12706,8 @@ pub fn scan_workspace_with_exclusions(
                 ),
                 None => crate::cross_file::scope::ScopeArtifacts::default(),
             }
+        } else {
+            crate::cross_file::scope::ScopeArtifacts::default()
         });
     }
 
@@ -14835,6 +14914,106 @@ tarchetypes::tar_render(nested, "nested.Rmd")
                 "diagnostics must reuse the stored Stan tree"
             )
         });
+    }
+
+    #[test]
+    fn jags_document_uses_native_tree_and_keeps_r_analysis_inert() {
+        let uri = Url::parse("file:///workspace/model.jags").unwrap();
+        let source = "model { library(fake) <- 1; x ~ dunknown(y) }\n";
+        let document = Document::new_with_uri(source, Some(1), &uri);
+
+        assert_eq!(document.file_type, FileType::Jags);
+        assert_eq!(
+            document.tree.as_ref().unwrap().root_node().kind(),
+            "program"
+        );
+        assert!(document.loaded_packages.is_empty());
+        assert!(document.data_packages.is_empty());
+        let metadata = document.cross_file_metadata();
+        assert!(metadata.sources.is_empty());
+        assert!(metadata.box_imports.is_empty());
+        assert!(metadata.import_calls.is_empty());
+        let artifacts = document.cross_file_artifacts(&uri, &metadata);
+        assert!(artifacts.exported_interface.is_empty());
+        assert!(artifacts.timeline.is_empty());
+    }
+
+    #[test]
+    fn jags_batch_reparse_matches_fresh_tree_and_diagnostics_reuse_it() {
+        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
+        JAGS_INCREMENTAL_PARSE_COUNT.with(|count| count.set(0));
+        let mut document =
+            Document::new_with_file_type("model { x <- 1 }\n", Some(1), FileType::Jags);
+        DOCUMENT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
+        let changed = "model { x <- * 1 }\n";
+        document.apply_changes([TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: changed.to_string(),
+        }]);
+        DOCUMENT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+        JAGS_INCREMENTAL_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+        let fresh = Document::new_with_file_type(changed, Some(2), FileType::Jags);
+        assert_eq!(
+            document.tree.as_ref().unwrap().root_node().to_sexp(),
+            fresh.tree.as_ref().unwrap().root_node().to_sexp()
+        );
+
+        let uri = Url::parse("untitled:jags-parse-count").unwrap();
+        let mut state = WorldState::new();
+        state.open_document_with_language_id(uri.clone(), changed, Some(2), Some("jags"));
+        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
+        let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &uri).unwrap();
+        let findings = crate::handlers::diagnostics_from_snapshot(
+            &snapshot,
+            &uri,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .unwrap();
+        assert!(!findings.is_empty());
+        DOCUMENT_PARSE_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "diagnostics must reuse the stored JAGS tree"
+            )
+        });
+    }
+
+    #[test]
+    fn jags_incremental_utf16_batch_uses_one_edited_old_tree_and_matches_fresh_parse() {
+        let original = "model {\n  /* 💥 */ x <- 1\n}\n";
+        let expected = "model {\n  /* 💥 */ y <- 2\n}\n";
+        let mut document = Document::new_with_file_type(original, Some(1), FileType::Jags);
+        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
+        JAGS_INCREMENTAL_PARSE_COUNT.with(|count| count.set(0));
+
+        document.apply_changes([
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 11), Position::new(1, 12))),
+                range_length: None,
+                text: "y".to_string(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(1, 16), Position::new(1, 17))),
+                range_length: None,
+                text: "2".to_string(),
+            },
+        ]);
+
+        assert_eq!(document.text(), expected);
+        DOCUMENT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+        JAGS_INCREMENTAL_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+        let fresh = Document::new_with_file_type(expected, Some(2), FileType::Jags);
+        assert_eq!(
+            document.tree.as_ref().unwrap().root_node().to_sexp(),
+            fresh.tree.as_ref().unwrap().root_node().to_sexp()
+        );
+        assert_eq!(
+            document.tree.as_ref().unwrap().root_node().range(),
+            fresh.tree.as_ref().unwrap().root_node().range()
+        );
     }
 
     #[test]

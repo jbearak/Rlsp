@@ -454,7 +454,7 @@ impl OpenDocumentStore {
     pub fn insert(&mut self, uri: Url, document: Document) -> Option<Document> {
         let replaced = self.records.get(&uri).map(|record| record.document.clone());
         let mut metadata = document.cross_file_metadata();
-        if document.file_type != crate::file_type::FileType::Stan {
+        if document.file_type == crate::file_type::FileType::R {
             crate::cross_file::enrich_box_import_resolutions(&mut metadata, &uri);
         }
         self.install(uri, document, Arc::new(metadata), None);

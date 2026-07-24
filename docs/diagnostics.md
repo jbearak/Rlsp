@@ -92,14 +92,25 @@ Raven surfaces parse errors from the tree-sitter R grammar whenever the document
 
 The `Mismatched brackets` message also covers wrong-closer typos where the user typed an unexpected closer immediately after an unclosed opener (e.g. `f(}` produces a single `` Mismatched brackets: `(` opened here; close with `)` not `}`. `` diagnostic rather than two separate ones).
 
-### Stan Parse Errors
+### JAGS and Stan Parse Errors
 
-Raven also reports syntax errors in `.stan` files, both in the editor and from
-`raven check`. This is deliberately syntax-only: Raven does not type-check Stan,
-resolve includes, validate identifiers or distribution signatures, or run the
-Stan compiler. Syntactically well-formed but semantically invalid code
-therefore remains silent. Stan findings use the same non-suppressible
-`syntax-error` code and obey only the master `raven.diagnostics.enabled` switch.
+Raven reports syntax errors in `.jags`, `.bugs`, and `.stan` files, both in the
+editor and from `raven check`. Untitled buffers whose language ID is `jags` are
+checked as JAGS too. This is deliberately syntax-only: Raven does not resolve model
+identifiers, validate dimensions or distribution signatures, type-check Stan,
+or run JAGS, `stanc`, R, or any network process. Syntactically well-formed but
+semantically invalid code therefore remains silent. Findings use the same
+non-suppressible `syntax-error` code and obey only the master
+`raven.diagnostics.enabled` switch.
+
+JAGS findings come from Raven's in-tree clean-room Tree-sitter grammar. They
+cover parser `ERROR` and required `MISSING` nodes, are emitted in stable source
+order without duplicate recovery cascades, and are capped at 100 per document.
+The grammar and diagnostic corpus are checked against 806 committed outcomes
+from the public JAGS 4.3.2 command-line parse phase. Raven applies this strict
+JAGS dialect to both `.jags` and `.bugs`, case-insensitively. The singular
+`.bug` extension is not supported; [#724](https://github.com/jbearak/raven/issues/724)
+tracks that explicit non-goal separately.
 
 Full-line, recognized Raven directives are geometry-preserving Raven
 extensions and do not create Stan parse errors. Stan's own `#include` remains
@@ -428,7 +439,10 @@ When a parent file changes (e.g., a `library()` call is added or removed), Raven
 
 ## JAGS and Stan
 
-Diagnostics are suppressed for JAGS (`.jags`, `.bugs`) and Stan (`.stan`) files because Raven cannot statically determine what is in scope in these languages.
+R semantic, lint, package, and cross-file diagnostics are suppressed for JAGS
+and Stan because Raven cannot statically determine what is in scope in those
+languages. Standalone `.jags`, `.bugs`, and `.stan` programs still receive the
+syntax-only diagnostics described above.
 
 ## R Markdown and Quarto
 
