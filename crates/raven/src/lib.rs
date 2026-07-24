@@ -11,6 +11,7 @@ pub mod cross_file;
 pub mod parser_pool;
 pub mod reserved_words;
 mod stan;
+pub(crate) mod stan_diagnostics;
 pub mod state;
 // test_utils is available in test builds and when the `test-support` feature is enabled.
 // This allows benchmarks and integration tests to import directly instead of #[path] hacks.

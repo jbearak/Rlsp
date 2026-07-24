@@ -62,24 +62,56 @@ function compile(entry) {
 const valid = readGroup("valid");
 const generated = readGroup("generated");
 const syntaxOnly = readGroup("syntax_only");
+const semanticScope = readGroup("semantic_scope");
+const semanticScopeValid = readGroup("semantic_scope_valid");
 const invalid = readGroup("invalid");
 const includes = readGroup("includes");
 
-if (valid.length !== 58 || syntaxOnly.length !== 18 || invalid.length !== 41) {
+// Single-defect name-resolution cases consumed by Raven's native semantic
+// integration test. The stanc3 oracle must continue to classify these as
+// semantic (not syntax) failures and name the same missing identifier.
+const undeclaredVariableCases = new Map([
+  ["unknown-variable", "unknown_value"],
+  ["invalid-bound-reference", "missing_bound"],
+]);
+
+if (
+  valid.length !== 58
+  || syntaxOnly.length !== 18
+  || semanticScope.length !== 9
+  || semanticScopeValid.length !== 13
+  || invalid.length !== 41
+) {
   throw new Error(
-    `Unexpected curated fixture counts: valid=${valid.length}, syntax_only=${syntaxOnly.length}, invalid=${invalid.length}`,
+    `Unexpected curated fixture counts: valid=${valid.length}, syntax_only=${syntaxOnly.length}, semantic_scope=${semanticScope.length}, semantic_scope_valid=${semanticScopeValid.length}, invalid=${invalid.length}`,
   );
 }
+
 if (JSON.stringify(generated) !== JSON.stringify(expectedGenerated())) {
   throw new Error(
     "generated.json drifted; regenerate it from generatedModel() with its fixed 0..127 seed",
   );
 }
 
-for (const entry of [...valid, ...generated, ...includes]) {
+for (const entry of [...valid, ...generated, ...includes, ...semanticScopeValid]) {
   const result = compile(entry);
   if (result.errors !== undefined) {
     throw new Error(`${entry.name} must compile:\n${result.errors.join("\n")}`);
+  }
+}
+
+for (const entry of semanticScope) {
+  const result = compile(entry);
+  if (result.errors === undefined) {
+    throw new Error(`${entry.name} must fail semantic name resolution`);
+  }
+  if (result.errors.some((message) => message.includes("Syntax error"))) {
+    throw new Error(`${entry.name} is not syntax-valid:\n${result.errors.join("\n")}`);
+  }
+  if (!result.errors.some((message) => message.includes(entry.missing))) {
+    throw new Error(
+      `${entry.name} no longer identifies ${entry.missing}:\n${result.errors.join("\n")}`,
+    );
   }
 }
 
@@ -90,6 +122,21 @@ for (const entry of syntaxOnly) {
   }
   if (result.errors.some((message) => message.includes("Syntax error"))) {
     throw new Error(`${entry.name} is not syntax-only:\n${result.errors.join("\n")}`);
+  }
+  const expectedMissingName = undeclaredVariableCases.get(entry.name);
+  if (
+    expectedMissingName !== undefined
+    && !result.errors.some((message) => message.includes(expectedMissingName))
+  ) {
+    throw new Error(
+      `${entry.name} no longer identifies ${expectedMissingName}:\n${result.errors.join("\n")}`,
+    );
+  }
+}
+
+for (const name of undeclaredVariableCases.keys()) {
+  if (!syntaxOnly.some((entry) => entry.name === name)) {
+    throw new Error(`Missing semantic oracle fixture ${name}`);
   }
 }
 
@@ -104,5 +151,5 @@ for (const entry of invalid) {
 }
 
 console.log(
-  `Stan fixture oracle passed: ${valid.length + generated.length + includes.length} valid, ${syntaxOnly.length} semantic/type-invalid, ${invalid.length} syntax-invalid`,
+  `Stan fixture oracle passed: ${valid.length + generated.length + includes.length + semanticScopeValid.length} valid, ${syntaxOnly.length + semanticScope.length} semantic/type-invalid, ${invalid.length} syntax-invalid`,
 );

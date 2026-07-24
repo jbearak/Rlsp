@@ -96,10 +96,11 @@ The `Mismatched brackets` message also covers wrong-closer typos where the user 
 
 Raven reports syntax errors in `.jags`, `.bugs`, `.bug`, and `.stan` files, both in the
 editor and from `raven check`. Untitled buffers whose language ID is `jags` are
-checked as JAGS too. This is deliberately syntax-only: Raven does not resolve model
-identifiers, validate dimensions or distribution signatures, type-check Stan,
-or run JAGS, `stanc`, R, or any network process. Syntactically well-formed but
-semantically invalid code therefore remains silent. Findings use the same
+checked as JAGS too. JAGS checking is deliberately syntax-only. Stan also gets
+the conservative undeclared-variable pass described below. Raven does not
+validate dimensions or distribution signatures, type-check Stan, or run JAGS,
+`stanc`, R, or any network process. Other syntactically well-formed semantic
+errors therefore remain silent. Findings use the same
 non-suppressible `syntax-error` code and obey only the master
 `raven.diagnostics.enabled` switch.
 
@@ -125,6 +126,70 @@ extensions and do not create Stan parse errors. Stan's own `#include` remains
 part of the Stan grammar; unknown `#` lines are diagnosed. Raven does not check
 whether an include target exists. `.stanfunctions` helper files are not checked
 as standalone Stan programs.
+
+A recognized trailing `# raven: ignore` / `# @lsp-ignore` marker is masked from
+the Stan parser while the code before it remains intact. This masking never
+hides a real syntax defect in that code, and syntax findings themselves remain
+non-suppressible. For Stan syntax and semantic diagnostic collection,
+marker-shaped text inside a string, `//` comment, or `/* ... */` comment never
+acts as diagnostic metadata or suppression, including when the string or block
+comment spans lines.
+
+### Stan Undeclared Variables
+
+For a structurally complete Stan program, Raven reports clear undeclared
+variable references with the existing `undefined-variable` code and configured
+`raven.diagnostics.undefinedVariableSeverity` (warning by default). The native
+pass models declaration order; data → transformed data → parameters →
+transformed parameters → model → generated quantities visibility; function
+parameters and locals; statement-block locals; and `for` loop variables. It
+checks references in dimensions, constraints, initializers, and statements.
+Function and distribution names are a separate namespace, so calls, sampling
+distributions, prototypes, and a user function passed as a higher-order
+argument are not mistaken for variables.
+
+Raven deliberately does **not** diagnose whether a called function or sampling
+distribution exists; that requires compiler overload/type resolution. A name
+used as a higher-order *value* is a variable expression, however, so an unknown
+value such as `reduce_sum(missing_fun, ...)` is diagnosed.
+
+Declaration order follows the pinned compiler: shared type dimensions and
+constraints are resolved before any declarator name; the current local name is
+visible in its own initializer; and comma declarators become visible from left
+to right, so `real a = 1, b = a` is clean while `real a = b, b = 1` reports
+`b`. Branch, loop, `while`, nested-block, and `profile` locals are visible only
+inside their lexical statement scope.
+
+The completeness boundary is syntactic: the `program` root must contain at
+least one direct real `functions`, `data`, `transformed data`, `parameters`,
+`transformed parameters`, `model`, or `generated quantities` block. A file with
+no such block receives syntax diagnostics only. This keeps standalone assembler
+fragments quiet, including files organized by comments such as `//--- data` or
+`//--- model`, because other fragments may supply their declarations. Missing
+one optional block does *not* suppress the pass: `model { target += from_r; }`
+still reports `from_r` because data supplied by R must be declared in Stan.
+
+Raven never descends into `ERROR` or `MISSING` recovery subtrees for semantic
+roles. If recovery could have hidden a declaration, unresolved references
+visible through that lexical scope fail closed, while sound independent scopes
+and blocks continue. If any `#include` occurs anywhere in a file, Raven
+suppresses all Stan undeclared-variable findings for that file—whether the
+include appears before a program block, after one, or inside a nested lexical
+scope. An include can insert declarations, and Raven deliberately does not
+implement preprocessing or include resolution.
+
+Local `# raven: var` / `# raven: func` declarations and `# raven: ignore` /
+`# raven: ignore-next` suppressions apply to Stan undeclared-variable findings
+in both the editor and CLI. This is a narrow host-integration escape hatch; it
+does not put Stan in R's scope/cross-file pipeline. A value supplied by R still
+reports unless it is declared in Stan or explicitly covered by one of these
+directives. Stan syntax findings remain non-suppressible.
+
+Stan semantic findings have a fixed, source-ordered limit of 500 exact unique
+diagnostics per file. This bound is separate from
+`maxSyntaxDiagnosticsPerFile`; changing the syntax setting cannot change Stan
+undeclared-variable output. Traversal continues after saturation so cancellation
+remains responsive.
 
 ### Undefined Variables
 
@@ -448,9 +513,10 @@ When a parent file changes (e.g., a `library()` call is added or removed), Raven
 ## JAGS and Stan
 
 R semantic, lint, package, and cross-file diagnostics are suppressed for JAGS
-and Stan because Raven cannot statically determine what is in scope in those
-languages. Standalone `.jags`, `.bugs`, `.bug`, and `.stan` programs still receive the
-syntax-only diagnostics described above.
+and Stan. Standalone `.jags`, `.bugs`, and `.bug` programs receive syntax-only
+diagnostics. Standalone `.stan` programs receive syntax diagnostics plus the
+conservative, fragment-aware undeclared-variable analysis described above; they
+do not enter R's scope, package, lint, or cross-file pipelines.
 
 ## R Markdown and Quarto
 

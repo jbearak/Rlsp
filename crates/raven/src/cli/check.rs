@@ -110,7 +110,7 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
 
 pub fn print_help() {
     println!(
-        "raven check {} — R diagnostics and model syntax checks for CI
+        "raven check {} — R and model diagnostics for CI
 
 Usage: raven check [OPTIONS] [PATHS...]
 
@@ -121,7 +121,8 @@ given): syntax errors, semantic checks, style lints, cross-file diagnostics
 missing-package warnings, and undefined-variable diagnostics. For .Rmd /
 .Rmarkdown / .qmd the R code inside chunks is analyzed; prose and non-R chunks
 are ignored. JAGS `.jags` / `.bugs` / `.bug` and Stan `.stan` programs receive
-syntax-only checks.
+native syntax checks; complete Stan programs also receive conservative
+undeclared-variable checks.
 Honors raven.toml / .lintr.
 
 Options:
@@ -3291,7 +3292,7 @@ infixContinuationStyle = "indented"
     }
 
     #[test]
-    fn check_discovers_stan_and_reports_only_syntax_errors() {
+    fn check_discovers_stan_and_reports_syntax_and_undefined_variables() {
         let tmp = TempDir::new().unwrap();
         let invalid = tmp.path().join("invalid.stan");
         let valid = tmp.path().join("valid.StAn");
@@ -3312,12 +3313,21 @@ infixContinuationStyle = "indented"
         let args = base_args(tmp.path());
         let findings = collect_diagnostics_blocking(&args);
         assert!(!findings.is_empty());
-        assert!(findings.iter().all(|(path, diagnostic)| {
+        assert_eq!(findings.len(), 2, "{findings:#?}");
+        assert!(findings.iter().any(|(path, diagnostic)| {
             path.ends_with("invalid.stan")
                 && diagnostic.code
                     == Some(tower_lsp::lsp_types::NumberOrString::String(
                         "syntax-error".to_string(),
                     ))
+        }));
+        assert!(findings.iter().any(|(path, diagnostic)| {
+            path.ends_with("semantic.stan")
+                && diagnostic.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "undefined-variable".to_string(),
+                    ))
+                && diagnostic.message == "unknown_value is not defined"
         }));
         assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
     }

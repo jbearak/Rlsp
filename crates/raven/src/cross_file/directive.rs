@@ -519,9 +519,9 @@ fn patterns() -> &'static DirectivePatterns {
 /// Stan analysis uses this to geometry-mask Raven's comment directives before
 /// handing the document to the Stan grammar. Keeping the decision here, beside
 /// the parser's compiled patterns, prevents the mask from growing a second,
-/// drifting directive vocabulary. Same-line suppression markers are accepted
-/// only when the whole source line is a comment; trailing markers on code are
-/// therefore never hidden from the Stan parser.
+/// drifting directive vocabulary. Trailing same-line suppression markers are
+/// recognized separately by [`is_recognized_same_line_suppression`] so a
+/// Stan mask can preserve the code prefix while hiding only Raven metadata.
 pub(crate) fn is_recognized_full_line_directive(line: &str, in_header: bool) -> bool {
     let line = line.strip_prefix('\u{feff}').unwrap_or(line);
     if !line.trim_start().starts_with('#') {
@@ -534,9 +534,8 @@ pub(crate) fn is_recognized_full_line_directive(line: &str, in_header: bool) -> 
             || patterns.working_dir.is_match(line)
             || patterns.standalone.is_match(line)))
         || patterns.forward.is_match(line)
-        || patterns.ignore.is_match(line)
+        || is_recognized_same_line_suppression(line.trim_start())
         || patterns.ignore_next.is_match(line)
-        || patterns.raven_ignore.is_match(line)
         || patterns.raven_ignore_next.is_match(line)
         || patterns.raven_ignore_start.is_match(line)
         || patterns.raven_ignore_end.is_match(line)
@@ -544,6 +543,25 @@ pub(crate) fn is_recognized_full_line_directive(line: &str, in_header: bool) -> 
         || patterns.declare_var.is_match(line)
         || patterns.declare_func.is_match(line)
         || patterns.nse.is_match(line)
+}
+
+/// Whether `comment` is exactly a recognized same-line ignore/expect marker.
+///
+/// The caller supplies a slice beginning at the candidate `#`. Requiring the
+/// regex match to start there prevents a preceding, unrelated hash comment
+/// from borrowing a later Raven marker on the same line. String/comment
+/// scanning remains language-specific: R uses
+/// [`comment_region_outside_strings`], while Stan treats apostrophes as
+/// transpose operators and therefore performs its own scan.
+pub(crate) fn is_recognized_same_line_suppression(comment: &str) -> bool {
+    let patterns = patterns();
+    [
+        patterns.ignore.find(comment),
+        patterns.raven_ignore.find(comment),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|matched| matched.start() == 0 && matched.end() == comment.len())
 }
 
 /// Parse directives from file content.
@@ -556,6 +574,21 @@ pub(crate) fn is_recognized_full_line_directive(line: &str, in_header: bool) -> 
 ///
 /// Forward, declaration, and ignore directives are recognized anywhere in the file.
 pub fn parse_directives(content: &str) -> CrossFileMetadata {
+    parse_directives_with_same_line_scanner(content, comment_region_outside_strings)
+}
+
+/// Parse directives with a language-specific same-line comment scanner.
+///
+/// R's public parser uses its single-/double-quoted-string scanner unchanged.
+/// Stan supplies a scanner that understands apostrophe transpose and returns
+/// the actual Raven marker suffix after any earlier hash construct.
+pub(crate) fn parse_directives_with_same_line_scanner<F>(
+    content: &str,
+    same_line_comment: F,
+) -> CrossFileMetadata
+where
+    F: Copy + for<'a> Fn(&'a str) -> Option<&'a str>,
+{
     log::trace!("Starting directive parsing");
     let patterns = patterns();
     let mut meta = CrossFileMetadata::default();
@@ -724,11 +757,11 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         // Full-file: ignore directives. Each captures an optional flavor
         // (`ignore`|`expect`, group 1) and `[code]` selector (group 2) that
         // narrows what it suppresses. The same-line form is not start-anchored,
-        // so it is matched only against the comment region (the substring from
-        // the first `#` outside any string literal) — otherwise a marker that
-        // lives inside an *open* multi-line string would wrongly suppress.
-        if let Some(caps) = comment_region_outside_strings(line)
-            .and_then(|comment| patterns.ignore.captures(comment))
+        // so it is matched only against the language-specific scanner's actual
+        // comment/marker region — otherwise marker-shaped string contents could
+        // wrongly suppress.
+        if let Some(caps) =
+            same_line_comment(line).and_then(|comment| patterns.ignore.captures(comment))
         {
             log::trace!("  Parsed @lsp-ignore/expect directive at line {}", line_num);
             let flavor = parse_flavor(caps.get(1).map(|m| m.as_str()));
@@ -840,8 +873,8 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
 
         // Same-line form (not start-anchored); see `patterns.ignore` above for
         // why this is gated on the comment region rather than the raw line.
-        if let Some(caps) = comment_region_outside_strings(line)
-            .and_then(|comment| patterns.raven_ignore.captures(comment))
+        if let Some(caps) =
+            same_line_comment(line).and_then(|comment| patterns.raven_ignore.captures(comment))
         {
             log::trace!(
                 "  Parsed `# raven: ignore/expect` directive at line {}",
