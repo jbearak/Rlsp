@@ -7,12 +7,30 @@ change Raven's runtime parser routing, diagnostics, CLI, or editor behavior.
 The normative evidence is the public-command-line matrix under `oracle/`.
 Tree-sitter R and Stan are implementation references, not syntax authorities.
 
-Generate pinned parser artifacts from this directory:
+Install the pinned CLI, verify generated artifacts, and run the exact-shape
+Tree-sitter corpus from this directory:
 
 ```sh
-npm install
-npm run generate
+npm ci
+npm run check:generated
+npm test
 ```
+
+Run the Rust correctness, live-oracle, and release performance gates from the
+repository root:
+
+```sh
+cargo test -p tree-sitter-jags
+cargo test -p tree-sitter-jags --test quality_gates \
+  generated_corpora_and_mutations_match_real_jags -- --ignored
+cargo test --release -p tree-sitter-jags --test performance -- --ignored
+```
+
+The live oracle requires `/opt/homebrew/bin/jags` or `JAGS_BIN` to identify
+itself as JAGS 4.3.2. It uses only the public command-line interface.
 
 The grammar intentionally claims only `.jags`. The `.bugs` suffix is shared by
 multiple related languages; strict compatibility is not established here.
+
+See `QUALITY_GATES.md` for quantitative evidence and limitations and
+`PRODUCTION_MAPPING.md` for the clean-room rule mapping.

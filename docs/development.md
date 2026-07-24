@@ -1288,6 +1288,31 @@ bun editors/vscode/scripts/generate-stan-builtins.mjs --check
 
 Keep the package pin, `EXPECTED_STANC_PACKAGE_VERSION`, `DOCS_VERSION`, generated version constants, `docs/hover.md`, and the stanc3 attribution in `README.md` and `NOTICE` aligned. CI runs the check after `npm ci`; `#[rustfmt::skip]` on the large generated arrays makes the generator output independent of the host Rust toolchain while the surrounding hand-written module remains subject to the normal formatting gate.
 
+### In-tree JAGS grammar
+
+`crates/tree-sitter-jags/` is a clean-room Tree-sitter grammar targeting JAGS
+4.3.2. It is intentionally an independent workspace crate: adding or changing
+it does not route Raven documents through the grammar. Runtime integration is
+a separate change with its own document-lifecycle and diagnostics review.
+
+The syntax authority is the public JAGS command-line parse phase, captured by
+the independently authored matrix and harness under `oracle/`. Do not inspect
+or copy JAGS's GPL-2-only parser source or manual prose when maintaining the
+grammar. Tree-sitter R and Stan are pinned MIT implementation references; the
+production mapping and complete quality evidence live in
+`PRODUCTION_MAPPING.md` and `QUALITY_GATES.md` inside the crate.
+
+Generated parser artifacts are checked in. After editing `grammar.js`, run
+`npm ci`, `npm run generate`, `npm run check:generated`, and `npm test` from
+the crate directory, followed by `cargo test -p tree-sitter-jags` from the
+repository root. The ignored live-oracle and release-performance commands are
+documented in the crate README. CI checks generation drift, the Tree-sitter
+corpus, Rust tests, rustdoc, and release performance without installing JAGS.
+
+The grammar claims `.jags` only. Treat `.bugs` as ambiguous until a separate
+representative compatibility corpus proves that strict JAGS diagnostics would
+not create false positives for other BUGS-family implementations.
+
 ### Quarto process lifecycle
 
 The VS Code extension's Quarto implementation lives under

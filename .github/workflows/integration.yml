@@ -41,8 +41,20 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Setup Node.js for grammar generation
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: crates/tree-sitter-jags/package-lock.json
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Check generated JAGS parser and Tree-sitter corpus
+        working-directory: crates/tree-sitter-jags
+        run: |
+          npm ci
+          npm run check:generated
+          npm test
 
   # ── Clippy lint gate (required check) ──────────────────────────────────
   # Denies ALL clippy/rustc warnings (`-D warnings`) across every target so
@@ -103,6 +115,8 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc -p raven --no-deps --document-private-items
       - name: Check rustdoc (deny warnings, test-support)
         run: RUSTDOCFLAGS="-D warnings" cargo doc -p raven --no-deps --document-private-items --features test-support
+      - name: Check JAGS grammar rustdoc (deny warnings)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p tree-sitter-jags --no-deps --document-private-items
 
 
   # Build only the release artifacts that genuinely need optimization: the LSP
@@ -169,6 +183,9 @@ jobs:
           PERF_BIN=$(grep -oE 'target/release/deps/performance_budgets-[a-f0-9]+' /tmp/perf-build.txt | head -1)
           echo "PERF_BIN=$PERF_BIN"
           cp "$PERF_BIN" target/raven-perf-test
+
+      - name: Run JAGS grammar performance budgets
+        run: cargo test --release -p tree-sitter-jags --test performance -- --ignored
 
       - name: Upload LSP binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -250,6 +267,9 @@ jobs:
 
       - name: Run cargo tests (debug)
         run: cargo test -p raven --features test-support
+
+      - name: Run JAGS grammar tests (debug)
+        run: cargo test -p tree-sitter-jags
 
   # ── Time-budget regression tests (required check) ──────────────────────
   # Runs the release-compiled performance_budgets binary from the build job.
