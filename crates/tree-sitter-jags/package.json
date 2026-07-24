@@ -1,0 +1,15 @@
+{
+  "name": "@raven/tree-sitter-jags",
+  "private": true,
+  "version": "0.19.0",
+  "description": "Clean-room JAGS 4.3.2 grammar for tree-sitter",
+  "license": "GPL-3.0",
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "check:generated": "tree-sitter generate && git diff --exit-code -- src",
+    "test": "tree-sitter test"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "0.26.11"
+  }
+}

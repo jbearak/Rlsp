@@ -1,0 +1,30 @@
+{
+  "grammars": [
+    {
+      "name": "jags",
+      "camelcase": "JAGS",
+      "scope": "source.jags",
+      "path": ".",
+      "file-types": ["jags"]
+    }
+  ],
+  "metadata": {
+    "version": "0.19.0",
+    "license": "GPL-3.0",
+    "description": "Clean-room JAGS 4.3.2 grammar",
+    "authors": [
+      {
+        "name": "Raven contributors"
+      }
+    ]
+  },
+  "bindings": {
+    "c": true,
+    "go": false,
+    "node": false,
+    "python": false,
+    "rust": true,
+    "swift": false,
+    "zig": false
+  }
+}
