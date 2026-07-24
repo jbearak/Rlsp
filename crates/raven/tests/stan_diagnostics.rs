@@ -203,3 +203,17 @@ fn stan_syntax_ranges_are_exact_across_utf16_line_endings_and_eof() {
         );
     }
 }
+
+#[test]
+fn malformed_stan_diagnostics_use_the_shared_default_cap() {
+    let mut code = String::new();
+    for index in 0..550 {
+        code.push_str(&format!("model {{ print({index}); target += ; }}\n"));
+    }
+    let fixture = Fixture {
+        name: "default-diagnostic-cap".to_string(),
+        code,
+    };
+    let (_, _, findings) = analyze(&fixture);
+    assert_eq!(findings.len(), 500, "cap fixture drifted: {findings:#?}");
+}

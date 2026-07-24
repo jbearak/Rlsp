@@ -46,7 +46,7 @@ fn analyze(state: &mut WorldState, uri: &Url, source: &str, language_id: &str) -
 
 fn assert_syntax_only_in_bounds(name: &str, source: &str, findings: &[Diagnostic]) {
     let mut unique = HashSet::new();
-    assert!(findings.len() <= 100, "{name} exceeded the diagnostic cap");
+    assert!(findings.len() <= 500, "{name} exceeded the diagnostic cap");
     for finding in findings {
         assert_eq!(finding.severity, Some(DiagnosticSeverity::ERROR), "{name}");
         assert_eq!(
@@ -324,15 +324,15 @@ fn leading_and_trailing_whitespace_are_not_root_coverage_errors() {
 }
 
 #[test]
-fn malformed_jags_diagnostics_are_capped_at_one_hundred() {
+fn malformed_jags_diagnostics_use_the_shared_default_cap() {
     let mut source = String::from("model {\n");
-    for index in 0..150 {
+    for index in 0..550 {
         source.push_str(&format!("  x{index} <- * 1\n"));
     }
     source.push_str("}\n");
     let uri = Url::parse("untitled:jags-diagnostic-cap").unwrap();
     let findings = analyze(&mut WorldState::new(), &uri, &source, "jags");
-    assert_eq!(findings.len(), 100, "cap fixture drifted: {findings:#?}");
+    assert_eq!(findings.len(), 500, "cap fixture drifted: {findings:#?}");
 }
 
 #[test]
@@ -385,5 +385,75 @@ fn raven_check_bug_text_json_and_sarif_outputs_fail_with_syntax_error() {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+#[test]
+fn raven_check_applies_one_project_cap_to_stan_and_jags_in_every_format() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let mut jags = String::from("model {\n");
+    let mut stan = String::new();
+    for index in 0..8 {
+        jags.push_str(&format!("  x{index} <- * 1\n"));
+        stan.push_str(&format!("model {{ print({index}); target += ; }}\n"));
+    }
+    jags.push_str("}\n");
+    std::fs::write(workspace.path().join("invalid.jags"), jags).unwrap();
+    std::fs::write(workspace.path().join("invalid.stan"), stan).unwrap();
+    std::fs::write(
+        workspace.path().join("raven.toml"),
+        "[diagnostics]\nmaxSyntaxDiagnosticsPerFile = 3\n",
+    )
+    .unwrap();
+
+    for format in ["text", "json", "sarif"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_raven"))
+            .args(["check", "--workspace"])
+            .arg(workspace.path())
+            .args(["--format", format, "--quiet", "--no-color"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{format}: {output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let count = match format {
+            "text" => stdout.matches("[syntax-error]").count(),
+            "json" => serde_json::from_str::<serde_json::Value>(&stdout)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            "sarif" => {
+                serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["runs"][0]["results"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            count, 6,
+            "{format} must retain three findings per file: {stdout}"
+        );
+    }
+
+    for (configured_cap, expected_total) in [(0, 24), (20, 24), (2, 4)] {
+        std::fs::write(
+            workspace.path().join("raven.toml"),
+            format!("[diagnostics]\nmaxSyntaxDiagnosticsPerFile = {configured_cap}\n"),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_raven"))
+            .args(["check", "--workspace"])
+            .arg(workspace.path())
+            .args(["--format", "json", "--quiet", "--no-color"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let findings = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+        assert_eq!(
+            findings.as_array().unwrap().len(),
+            expected_total,
+            "configured cap {configured_cap}: {findings:#?}"
+        );
     }
 }

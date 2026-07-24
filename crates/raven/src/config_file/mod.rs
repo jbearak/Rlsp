@@ -214,6 +214,30 @@ mod tests {
         state
     }
 
+    #[test]
+    fn syntax_diagnostic_cap_layers_project_over_client_and_resets_to_default() {
+        let mut state = WorldState::new();
+        state.raw_client_settings = json!({
+            "diagnostics": { "maxSyntaxDiagnosticsPerFile": 40 }
+        });
+        state.raw_project_settings = Some(json!({
+            "diagnostics": { "maxSyntaxDiagnosticsPerFile": 12 }
+        }));
+        recompute_parsed_configs(&mut state);
+        assert_eq!(state.cross_file_config.max_syntax_diagnostics_per_file, 12);
+
+        state.raw_project_settings = None;
+        recompute_parsed_configs(&mut state);
+        assert_eq!(state.cross_file_config.max_syntax_diagnostics_per_file, 40);
+
+        state.raw_client_settings = json!({});
+        recompute_parsed_configs(&mut state);
+        assert_eq!(
+            state.cross_file_config.max_syntax_diagnostics_per_file,
+            crate::cross_file::config::DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE
+        );
+    }
+
     /// The per-URI resolved-config cache serves repeated lookups, evicts a
     /// closed document, and is cleared by `recompute_parsed_configs`, so no
     /// stale value survives either lifecycle transition.

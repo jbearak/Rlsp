@@ -105,6 +105,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.cache.workspaceIndexMaxEntries', jsonPath: ['crossFile', 'cache', 'workspaceIndexMaxEntries'], type: 'number' },
     // Diagnostics settings
     { vsCodeKey: 'diagnostics.enabled', jsonPath: ['diagnostics', 'enabled'], type: 'boolean', defaultWhenUnconfigured: true },
+    { vsCodeKey: 'diagnostics.maxSyntaxDiagnosticsPerFile', jsonPath: ['diagnostics', 'maxSyntaxDiagnosticsPerFile'], type: 'number', defaultWhenUnconfigured: 500 },
     { vsCodeKey: 'diagnostics.undefinedVariableSeverity', jsonPath: ['diagnostics', 'undefinedVariableSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
     { vsCodeKey: 'diagnostics.undefinedVariableInCallArguments', jsonPath: ['diagnostics', 'undefinedVariableInCallArguments'], type: 'boolean' },
     { vsCodeKey: 'diagnostics.undefinedVariableInBracketIndices', jsonPath: ['diagnostics', 'undefinedVariableInBracketIndices'], type: 'boolean' },
@@ -389,6 +390,7 @@ suite('Settings Transmission Property Tests', () => {
         assert.deepStrictEqual(options, {
             diagnostics: {
                 enabled: true,
+                maxSyntaxDiagnosticsPerFile: 500,
             },
             linting: {
                 enabled: 'auto',
@@ -732,6 +734,7 @@ suite('Settings Transmission Unit Tests', () => {
     test('diagnostics settings transmit correctly', () => {
         const configuredSettings = new Map<string, unknown>([
             ['diagnostics.enabled', false],
+            ['diagnostics.maxSyntaxDiagnosticsPerFile', 17],
             ['diagnostics.undefinedVariableSeverity', 'error'],
             ['diagnostics.undefinedVariableInCallArguments', false],
             ['diagnostics.undefinedVariableInBracketIndices', false],
@@ -741,9 +744,20 @@ suite('Settings Transmission Unit Tests', () => {
         const options = getInitializationOptions(mockConfig);
 
         assert.strictEqual(options.diagnostics?.enabled, false);
+        assert.strictEqual(options.diagnostics?.maxSyntaxDiagnosticsPerFile, 17);
         assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, 'error');
         assert.strictEqual(options.diagnostics?.undefinedVariableInCallArguments, false);
         assert.strictEqual(options.diagnostics?.undefinedVariableInBracketIndices, false);
+    });
+
+    test('diagnostics syntax cap transmits zero as unlimited', () => {
+        const mockConfig = createMockConfig(new Map<string, unknown>([
+            ['diagnostics.maxSyntaxDiagnosticsPerFile', 0],
+        ]));
+
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.diagnostics?.maxSyntaxDiagnosticsPerFile, 0);
     });
 
     /**
@@ -839,7 +853,7 @@ suite('Settings Transmission Unit Tests', () => {
         // Unconfigured settings should be absent
         assert.strictEqual(options.crossFile?.maxForwardDepth, undefined);
         assert.strictEqual(options.crossFile?.assumeCallSite, undefined);
-        assert.deepStrictEqual(options.diagnostics, { enabled: true });
+        assert.deepStrictEqual(options.diagnostics, { enabled: true, maxSyntaxDiagnosticsPerFile: 500 });
         assert.strictEqual(options.packages?.rPath, undefined);
     });
 
@@ -859,7 +873,7 @@ suite('Settings Transmission Unit Tests', () => {
         const options = getInitializationOptions(mockConfig);
 
         assert.strictEqual(options.crossFile, undefined);
-        assert.deepStrictEqual(options.diagnostics, { enabled: true });
+        assert.deepStrictEqual(options.diagnostics, { enabled: true, maxSyntaxDiagnosticsPerFile: 500 });
         assert.notStrictEqual(options.packages, undefined);
         assert.strictEqual(options.packages?.enabled, true);
     });

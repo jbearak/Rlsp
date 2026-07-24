@@ -4,7 +4,7 @@
 //! They are gated behind `#[cfg(not(debug_assertions))]` because debug-mode
 //! timings are not meaningful.
 //!
-//! Run with: `cargo test --release -p raven --test performance_budgets`
+//! Run with: `cargo test --release -p raven --features test-support --test performance_budgets`
 //!
 //! CI adaptation: when the `CI` environment variable is set, thresholds are
 //! multiplied by a relaxation factor (default 3×, configurable via
@@ -262,12 +262,18 @@ fn generate_r_code_of_size(target_bytes: usize) -> String {
 }
 
 fn generate_stan_code_of_size(target_bytes: usize, malformed: bool) -> String {
+    if malformed {
+        let mut content = String::new();
+        let mut index = 0usize;
+        while content.len() + 40 < target_bytes {
+            content.push_str(&format!("model {{ print({index}); target += ; }}\n"));
+            index += 1;
+        }
+        return content;
+    }
+
     let mut content = String::from("parameters { real theta; }\nmodel {\n");
-    let statement = if malformed {
-        "  target += normal_lpdf(theta | 0, 1)\n"
-    } else {
-        "  target += normal_lpdf(theta | 0, 1);\n"
-    };
+    let statement = "  target += normal_lpdf(theta | 0, 1);\n";
     while content.len() + statement.len() + 2 < target_bytes {
         content.push_str(statement);
     }
@@ -291,19 +297,11 @@ fn budget_stan_parse_and_diagnostics_100kb_valid() {
 }
 
 #[test]
-fn budget_stan_parse_and_diagnostics_100kb_malformed_is_bounded() {
+fn budget_stan_parse_and_diagnostics_100kb_malformed_is_capped() {
     let code = generate_stan_code_of_size(100 * 1024, true);
-    let lines = code.lines().count();
     let first_count = analyze_stan(&code);
-    assert!(first_count > 0);
-    assert!(
-        first_count <= lines,
-        "malformed Stan diagnostic count must remain linearly bounded"
-    );
-    let elapsed = median_of_3(|| {
-        let count = analyze_stan(&code);
-        assert!(count <= lines);
-    });
+    assert_eq!(first_count, 500, "Stan syntax findings must honor the cap");
+    let elapsed = median_of_3(|| assert_eq!(analyze_stan(&code), 500));
     assert_within_budget("stan_parse_and_diagnostics_100kb_malformed", elapsed, 250);
 }
 
@@ -346,8 +344,8 @@ fn budget_jags_parse_and_diagnostics_100kb_valid() {
 fn budget_jags_parse_and_diagnostics_100kb_malformed_is_capped() {
     let code = generate_jags_code_of_size(100 * 1024, true);
     let first_count = analyze_jags(&code);
-    assert_eq!(first_count, 100, "JAGS syntax findings must honor the cap");
-    let elapsed = median_of_3(|| assert_eq!(analyze_jags(&code), 100));
+    assert_eq!(first_count, 500, "JAGS syntax findings must honor the cap");
+    let elapsed = median_of_3(|| assert_eq!(analyze_jags(&code), 500));
     assert_within_budget("jags_parse_and_diagnostics_100kb_malformed", elapsed, 250);
 }
 

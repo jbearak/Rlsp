@@ -103,9 +103,17 @@ semantically invalid code therefore remains silent. Findings use the same
 non-suppressible `syntax-error` code and obey only the master
 `raven.diagnostics.enabled` switch.
 
+Native Stan and JAGS syntax findings share
+`raven.diagnostics.maxSyntaxDiagnosticsPerFile` (default `500`). Raven removes
+exact duplicate recovery findings, orders the unique findings by source
+position, and then keeps the first configured number. Set it to `0` for
+unlimited findings. The finite limit bounds retained collector memory and the
+editor/CLI payload while traversal continues so cancellation remains
+responsive. It does not apply to R diagnostics.
+
 JAGS findings come from Raven's in-tree clean-room Tree-sitter grammar. They
 cover parser `ERROR` and required `MISSING` nodes, are emitted in stable source
-order without duplicate recovery cascades, and are capped at 100 per document.
+order without duplicate recovery cascades.
 The grammar and diagnostic corpus are checked against 806 committed outcomes
 from the public JAGS 4.3.2 command-line parse phase. Raven applies this strict
 JAGS dialect to `.jags`, `.bugs`, and `.bug`, case-insensitively. Treating those

@@ -28,9 +28,12 @@ function createMockConfig(
   };
 }
 
-test("initialization options keep diagnostics enabled by default", () => {
+test("initialization options keep diagnostic defaults", () => {
   const options = getInitializationOptions(createMockConfig(new Map()));
-  expect(options.diagnostics).toEqual({ enabled: true });
+  expect(options.diagnostics).toEqual({
+    enabled: true,
+    maxSyntaxDiagnosticsPerFile: 500,
+  });
 });
 
 test("initialization options forward explicitly configured settings", () => {

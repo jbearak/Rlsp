@@ -371,6 +371,16 @@ enabled = true
     }
 
     #[test]
+    fn parses_portable_syntax_diagnostic_cap() {
+        let out = load_str("[diagnostics]\nmaxSyntaxDiagnosticsPerFile = 0\n", "test").unwrap();
+        assert!(out.warnings.is_empty(), "got {:?}", out.warnings);
+        assert_eq!(
+            out.settings["diagnostics"]["maxSyntaxDiagnosticsPerFile"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[test]
     fn parses_overrides_as_array() {
         let toml = r#"
 [linting]

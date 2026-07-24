@@ -1327,6 +1327,12 @@
           "default": true,
           "description": "Enable or disable all diagnostics. When disabled, no diagnostic messages will be shown regardless of individual severity settings."
         },
+        "raven.diagnostics.maxSyntaxDiagnosticsPerFile": {
+          "type": "integer",
+          "default": 500,
+          "minimum": 0,
+          "description": "Maximum native Tree-sitter syntax diagnostics retained per Stan or JAGS/BUGS file after exact deduplication and source ordering. Set to 0 for unlimited. This setting does not cap R diagnostics."
+        },
         "raven.diagnostics.undefinedVariableSeverity": {
           "type": "string",
           "enum": [
