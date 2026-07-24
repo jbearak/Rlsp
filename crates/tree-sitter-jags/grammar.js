@@ -13,10 +13,11 @@ const PREC = {
   COMPARISON: 3,
   ADD: 4,
   MULTIPLY: 5,
-  COLON: 6,
-  UNARY: 7,
-  POWER: 8,
-  POSTFIX: 9,
+  SPECIAL: 6,
+  COLON: 7,
+  UNARY: 8,
+  POWER: 9,
+  POSTFIX: 10,
 };
 
 module.exports = grammar({
@@ -29,12 +30,20 @@ module.exports = grammar({
 
   word: $ => $.identifier,
 
+  // JAGS reserves these words as bare names, but the public parser accepts
+  // model/data/var in callable positions. `for` is the inverse edge case: it
+  // is a valid bare name but not a callable name outside loop syntax.
+  reserved: {
+    bare: _ => ['model', 'data', 'var', 'in'],
+    ordinary: _ => ['model', 'data', 'var', 'for', 'in'],
+  },
+
   rules: {
-    program: $ => seq(
+    program: $ => optional(seq(
       optional($.variable_declaration),
       optional($.data_block),
       $.model_block,
-    ),
+    )),
 
     variable_declaration: $ => seq(
       'var',
@@ -43,7 +52,7 @@ module.exports = grammar({
     ),
 
     declared_variable: $ => seq(
-      field('name', $.identifier),
+      field('name', $._bare_identifier),
       optional(field('dimensions', $.dimensions)),
     ),
 
@@ -83,15 +92,15 @@ module.exports = grammar({
     ),
 
     _deterministic_lhs: $ => choice(
-      $.identifier,
+      $._bare_identifier,
       $.subset,
-      alias($.call, $.link_call),
+      $.link_call,
     ),
 
     stochastic_relation: $ => seq(
-      field('lhs', choice($.identifier, $.subset)),
+      field('lhs', choice($._bare_identifier, $.subset)),
       '~',
-      field('distribution', $.call),
+      field('distribution', alias($._distribution_call, $.call)),
       optional(field('bounds', $.bounds_clause)),
       optional(';'),
     ),
@@ -108,18 +117,28 @@ module.exports = grammar({
     for_statement: $ => seq(
       'for',
       '(',
-      field('variable', $.identifier),
+      field('variable', $._bare_identifier),
       'in',
       field('sequence', $._expression),
       ')',
       field('body', $.block_statement),
-      optional(';'),
     ),
 
     call: $ => prec.left(PREC.POSTFIX, seq(
-      field('function', $.identifier),
+      field('function', $._callable_identifier),
       field('arguments', $.call_arguments),
     )),
+
+    _distribution_call: $ => prec.left(PREC.POSTFIX, seq(
+      field('function', $._callable_identifier),
+      field('arguments', alias($._distribution_call_arguments, $.call_arguments)),
+    )),
+
+    _distribution_call_arguments: $ => seq(
+      '(',
+      optional(commaSep1(field('argument', $._expression))),
+      ')',
+    ),
 
     call_arguments: $ => seq(
       '(',
@@ -128,9 +147,20 @@ module.exports = grammar({
     ),
 
     subset: $ => prec.left(PREC.POSTFIX, seq(
-      field('function', choice($.identifier, $.subset)),
+      field('function', $._bare_identifier),
       field('arguments', $.subset_arguments),
     )),
+
+    link_call: $ => prec.left(PREC.POSTFIX, seq(
+      field('function', $._callable_identifier),
+      field('arguments', alias($._link_call_arguments, $.call_arguments)),
+    )),
+
+    _link_call_arguments: $ => seq(
+      '(',
+      field('argument', choice($._bare_identifier, $.subset)),
+      ')',
+    ),
 
     subset_arguments: $ => seq(
       '[',
@@ -149,45 +179,144 @@ module.exports = grammar({
 
     unary_operator: $ => prec.right(PREC.UNARY, seq(
       field('operator', choice('+', '-')),
-      field('rhs', $._expression),
+      field('rhs', $._unary_expression),
     )),
 
-    binary_operator: $ => choice(
-      prec.left(PREC.OR, binary($, '||')),
-      prec.left(PREC.AND, binary($, '&&')),
-      prec.left(PREC.COMPARISON, binary($, choice('<', '<=', '>', '>=', '==', '!='))),
-      prec.left(PREC.ADD, binary($, choice('+', '-'))),
-      prec.left(PREC.MULTIPLY, binary($, choice('*', '/', '%%', '%/%'))),
-      prec.left(PREC.COLON, binary($, ':')),
-      prec.right(PREC.POWER, binary($, choice('^', '**'))),
-    ),
-
-    _expression: $ => choice(
+    _primary_expression: $ => choice(
       $.number,
-      $.identifier,
+      $._bare_identifier,
       $.call,
       $.subset,
       $.parenthesized_expression,
-      $.unary_operator,
-      $.binary_operator,
     ),
+
+    _power_expression: $ => choice(
+      $._primary_expression,
+      alias($._power_operator, $.binary_operator),
+    ),
+
+    _power_operator: $ => prec.right(PREC.POWER, seq(
+      field('lhs', $._primary_expression),
+      field('operator', choice('^', '**')),
+      field('rhs', $._unary_expression),
+    )),
+
+    _unary_expression: $ => choice(
+      $._power_expression,
+      $.unary_operator,
+    ),
+
+    _colon_expression: $ => choice(
+      $._unary_expression,
+      alias($._colon_operator, $.binary_operator),
+    ),
+
+    _colon_operator: $ => prec(PREC.COLON, binary($, $._unary_expression, ':')),
+
+    _special_expression: $ => choice(
+      $._colon_expression,
+      alias($._special_binary_operator, $.binary_operator),
+    ),
+
+    _special_binary_operator: $ => prec.left(PREC.SPECIAL, binary(
+      $,
+      $._special_expression,
+      $.special_operator,
+      $._colon_expression,
+    )),
+
+    _multiplicative_expression: $ => choice(
+      $._special_expression,
+      alias($._multiplicative_operator, $.binary_operator),
+    ),
+
+    _multiplicative_operator: $ => prec.left(PREC.MULTIPLY, binary(
+      $,
+      $._multiplicative_expression,
+      choice('*', '/', '%%', '%/%'),
+      $._special_expression,
+    )),
+
+    _additive_expression: $ => choice(
+      $._multiplicative_expression,
+      alias($._additive_operator, $.binary_operator),
+    ),
+
+    _additive_operator: $ => prec.left(PREC.ADD, binary(
+      $,
+      $._additive_expression,
+      choice('+', '-'),
+      $._multiplicative_expression,
+    )),
+
+    _comparison_expression: $ => choice(
+      $._additive_expression,
+      alias($._comparison_operator, $.binary_operator),
+    ),
+
+    _comparison_operator: $ => prec(PREC.COMPARISON, binary(
+      $,
+      $._additive_expression,
+      choice('<', '<=', '>', '>=', '==', '!='),
+      $._additive_expression,
+    )),
+
+    _and_expression: $ => choice(
+      $._comparison_expression,
+      alias($._and_operator, $.binary_operator),
+    ),
+
+    _and_operator: $ => prec.left(PREC.AND, binary(
+      $,
+      $._and_expression,
+      '&&',
+      $._comparison_expression,
+    )),
+
+    _or_expression: $ => choice(
+      $._and_expression,
+      alias($._or_operator, $.binary_operator),
+    ),
+
+    _or_operator: $ => prec.left(PREC.OR, binary(
+      $,
+      $._or_expression,
+      '||',
+      $._and_expression,
+    )),
+
+    _expression: $ => $._or_expression,
 
     number: _ => token(/(?:(?:[0-9]+(?:\.[0-9]*)?)|(?:\.[0-9]+))(?:[eE][+-]?[0-9]+)?/),
 
     identifier: _ => /[A-Za-z][A-Za-z0-9_.]*/,
 
+    _bare_identifier: $ => choice(
+      reserved('bare', $.identifier),
+      alias('for', $.identifier),
+    ),
+
+    _callable_identifier: $ => choice(
+      reserved('ordinary', $.identifier),
+      alias('model', $.identifier),
+      alias('data', $.identifier),
+      alias('var', $.identifier),
+    ),
+
+    special_operator: _ => token(/%[^%\s]+%/),
+
     comment: _ => token(choice(
-      /#[^\r\n]*/,
+      /#[^\r\n]*(?:\r\n|\r|\n)/,
       seq('/*', /[^*]*\*+([^/*][^*]*\*+)*/, '/'),
     )),
   },
 });
 
-function binary($, operator) {
+function binary($, lhs, operator, rhs = lhs) {
   return seq(
-    field('lhs', $._expression),
+    field('lhs', lhs),
     field('operator', operator),
-    field('rhs', $._expression),
+    field('rhs', rhs),
   );
 }
 

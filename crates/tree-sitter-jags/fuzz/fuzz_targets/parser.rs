@@ -16,8 +16,11 @@ fuzz_target!(|source: &[u8]| {
 fn assert_ranges(node: Node<'_>, source_len: usize) {
     assert!(node.start_byte() <= node.end_byte());
     assert!(node.end_byte() <= source_len);
+    assert!(node.start_position() <= node.end_position());
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        assert!(child.start_byte() >= node.start_byte());
+        assert!(child.end_byte() <= node.end_byte());
         assert_ranges(child, source_len);
     }
 }

@@ -10,13 +10,37 @@ functions and distributions pass that command and fail only after a subsequent
 The oracle therefore treats the parse-error heading as syntax rejection and
 does not interpret compilation errors as syntax errors.
 
-Run the matrix on macOS/Homebrew with:
+Regenerate the deterministic quality corpus and verify all committed evidence
+without starting JAGS:
 
 ```sh
-python3 crates/tree-sitter-jags/oracle/jags_oracle.py
+python3 crates/tree-sitter-jags/oracle/generate_quality_corpus.py --check
+python3 crates/tree-sitter-jags/oracle/jags_oracle.py --verify-results
+cd crates/tree-sitter-jags/oracle
+python3 -m unittest -v test_jags_oracle.py
 ```
 
-The manifest pins the official release URL and SHA-256 reported by Homebrew.
+`oracle-results.json` records 351 outcomes: 115 matrix probes and 236 quality
+cases. It binds the exact syntax matrix, generated corpus, corpus generator,
+oracle harness, and canonical source set by SHA-256. CI performs the offline
+checks above, so an authored source, generator, harness, outcome, or binding
+change cannot silently inherit old JAGS evidence.
+
+On the pinned macOS/Homebrew installation, compare every committed result with
+a fresh public-CLI observation or deliberately refresh the manifest with:
+
+```sh
+python3 crates/tree-sitter-jags/oracle/jags_oracle.py --verify-results-live
+python3 crates/tree-sitter-jags/oracle/jags_oracle.py --refresh-results
+```
+
+Each probe has a five-second default timeout. Before any probe runs, the
+harness checks both `/opt/homebrew/bin/jags` and the actual terminal executable
+against the hashes in `provenance.json`. `--allow-unpinned-oracle` supports an
+independently validated platform build for exploratory verification, but the
+harness refuses to refresh committed results under that override.
+
+The provenance manifest pins the official release URL and SHA-256 reported by Homebrew.
 The release archive was downloaded only to verify its digest; its contents were
 not inspected. The installed terminal executable digest is separate from the
 shell-wrapper digest.

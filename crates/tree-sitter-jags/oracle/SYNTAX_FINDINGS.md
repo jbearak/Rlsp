@@ -13,28 +13,37 @@ remain silent for semantic failures and extension-module names.
 
 ## Observed accepted forms
 
-- A `var` declaration may precede `data` and `model`; the tested `data` block
-  precedes `model`, and a non-empty `model` block is required.
+- Empty and comment-only input are accepted. If program blocks are present, a
+  `var` declaration may precede `data` and `model`; the tested `data` block
+  precedes `model`, and the `model` body is non-empty.
 - Deterministic relations use either `<-` or `=`. Stochastic relations use `~`.
 - A call may appear on the left of a deterministic relation for link syntax.
 - `T(lower, upper)` and `I(lower, upper)` follow stochastic relations; either
   tested boundary may be omitted.
 - `for (name in range) { ... }` uses a mandatory braced body in the tested
   syntax.
-- Calls with at least one argument, nested calls, arithmetic/comparison
-  operators, `&&`, `||`, `**`, `%%`, `%/%`, dotted ASCII names, underscores
-  after the first character, and omitted array indices parse.
+- Distribution calls may be empty. Other calls require at least one argument.
+  Nested calls, arithmetic/comparison operators, `&&`, `||`, `**`, `%%`,
+  `%/%`, arbitrary non-whitespace `%name%` infix operators, dotted ASCII names,
+  underscores after the first character, and omitted array indices parse.
+- Unparenthesized comparison and colon chains reject, while explicitly
+  parenthesized nesting parses.
+- `model`, `data`, and `var` are rejected as bare names but accepted as call
+  names. `for` is accepted as a bare name but rejected as a call name; `in` is
+  rejected in both positions outside its loop role.
 - Semicolons are optional between newline-separated relations.
 - `#` line comments and `/* ... */` block comments parse. CRLF and non-ASCII
-  comment text parse.
+  comment text parse. A final `#` comment must include its line terminator.
 
 ## Observed rejected forms
 
-- An empty model, multiple model blocks, a relation outside a program block,
-  and an unbraced `for` body.
+- An empty model block, multiple model blocks, a relation outside a program
+  block, an unbraced `for` body, and a semicolon after a `for` body.
 - `//` comments and a leading UTF-8 BOM.
-- Zero-argument calls, omitted call arguments, a trailing call comma, unary
-  `!`, single `&` or `|`, and bare `%`.
+- Zero-argument deterministic calls, omitted call arguments, a trailing call
+  comma, unary `!`, single `&` or `|`, and bare `%`.
+- Chained subsets, unparenthesized chained comparisons/colons, and link-call
+  left-hand sides with multiple, numeric, expression, or nested-call arguments.
 - Leading-dot, leading-underscore, backtick-quoted, and non-ASCII identifiers
   in the tested forms.
 - Tested R-only forms: function definitions, `if`, `while`, strings, named

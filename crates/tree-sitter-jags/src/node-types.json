@@ -106,6 +106,10 @@
             "named": false
           },
           {
+            "type": "special_operator",
+            "named": true
+          },
+          {
             "type": "||",
             "named": false
           }
@@ -290,7 +294,7 @@
     "fields": {
       "argument": {
         "multiple": true,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "binary_operator",
@@ -627,7 +631,7 @@
     "fields": {},
     "children": {
       "multiple": true,
-      "required": true,
+      "required": false,
       "types": [
         {
           "type": "data_block",
@@ -704,10 +708,6 @@
         "types": [
           {
             "type": "identifier",
-            "named": true
-          },
-          {
-            "type": "subset",
             "named": true
           }
         ]
@@ -954,6 +954,10 @@
   },
   {
     "type": "number",
+    "named": true
+  },
+  {
+    "type": "special_operator",
     "named": true
   },
   {

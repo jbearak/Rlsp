@@ -102,3 +102,86 @@ model { x ~ dnorm(0, 1) T(0,) }
             argument: (number)))
         bounds: (bounds_clause
           lower: (number))))))
+
+==================
+Recovery: missing operand
+==================
+
+model { x <- * 1 }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (deterministic_relation
+        lhs: (identifier)
+        (ERROR)
+        rhs: (number)))))
+
+==================
+Recovery: missing call comma
+==================
+
+model { x <- f(1 2) }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (deterministic_relation
+        lhs: (identifier)
+        rhs: (call
+          function: (identifier)
+          arguments: (call_arguments
+            argument: (number)
+            (ERROR
+              (number))))))))
+
+==================
+Recovery: chained comparison
+==================
+
+model { x <- a < b < c }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (deterministic_relation
+        lhs: (identifier)
+        rhs: (binary_operator
+          lhs: (identifier)
+          (ERROR
+            (identifier))
+          rhs: (identifier))))))
+
+==================
+Recovery: semicolon after loop
+==================
+
+model { for (i in 1:2) { x[i] <- i }; y <- 1 }
+
+---
+
+(program
+  (model_block
+    body: (block_statement
+      (for_statement
+        variable: (identifier)
+        sequence: (binary_operator
+          lhs: (number)
+          rhs: (number))
+        body: (block_statement
+          (deterministic_relation
+            lhs: (subset
+              function: (identifier)
+              arguments: (subset_arguments
+                argument: (identifier)))
+            rhs: (identifier))))
+      (ERROR)
+      (deterministic_relation
+        lhs: (identifier)
+        rhs: (number)))))

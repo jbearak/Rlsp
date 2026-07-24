@@ -1,0 +1,1951 @@
+{
+  "cases": [
+    {
+      "expect_parse": "accepted",
+      "family": "empty-program",
+      "group": "syntax-valid",
+      "id": "syntax-valid-empty-program-01",
+      "source": "",
+      "template": "empty or comment-only source"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "empty-program",
+      "group": "syntax-valid",
+      "id": "syntax-valid-empty-program-02",
+      "source": "# only\n",
+      "template": "empty or comment-only source"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "minimal-relation",
+      "group": "syntax-valid",
+      "id": "syntax-valid-minimal-relation-01",
+      "source": "model { x <- 1 }\n",
+      "template": "single deterministic relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "minimal-relation",
+      "group": "syntax-valid",
+      "id": "syntax-valid-minimal-relation-02",
+      "source": "model { x = 1 }\n",
+      "template": "single deterministic relation"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "multiple-relations",
+      "group": "syntax-valid",
+      "id": "syntax-valid-multiple-relations-01",
+      "source": "model { x <- 1\ny <- 2\nz <- x + y }\n",
+      "template": "multiple relation separators"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "multiple-relations",
+      "group": "syntax-valid",
+      "id": "syntax-valid-multiple-relations-02",
+      "source": "model { x <- 1; y <- 2; z <- x + y; }\n",
+      "template": "multiple relation separators"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "program-blocks",
+      "group": "syntax-valid",
+      "id": "syntax-valid-program-blocks-01",
+      "source": "data { n <- 3 } model { x <- n }\n",
+      "template": "ordered program blocks"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "program-blocks",
+      "group": "syntax-valid",
+      "id": "syntax-valid-program-blocks-02",
+      "source": "var x[3]; model { x[1] <- 1 }\n",
+      "template": "ordered program blocks"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "program-blocks",
+      "group": "syntax-valid",
+      "id": "syntax-valid-program-blocks-03",
+      "source": "var x[2], y[2,3]; data { n <- 2 } model { x[n] <- y[n,1] }\n",
+      "template": "ordered program blocks"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "declarations",
+      "group": "syntax-valid",
+      "id": "syntax-valid-declarations-01",
+      "source": "var scalar; model { scalar <- 1 }\n",
+      "template": "declaration dimensions"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "declarations",
+      "group": "syntax-valid",
+      "id": "syntax-valid-declarations-02",
+      "source": "var vector[3]; model { vector[1] <- 1 }\n",
+      "template": "declaration dimensions"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "declarations",
+      "group": "syntax-valid",
+      "id": "syntax-valid-declarations-03",
+      "source": "var matrix[2,3], cube[2,3,4]; model { matrix[1,2] <- cube[1,2,3] }\n",
+      "template": "declaration dimensions"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "declarations",
+      "group": "syntax-valid",
+      "id": "syntax-valid-declarations-04",
+      "source": "var dynamic[n,m+1]; model { dynamic[1,1] <- 1 }\n",
+      "template": "declaration dimensions"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "stochastic",
+      "group": "syntax-valid",
+      "id": "syntax-valid-stochastic-01",
+      "source": "model { x ~ dfoo() }\n",
+      "template": "distribution arity"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "stochastic",
+      "group": "syntax-valid",
+      "id": "syntax-valid-stochastic-02",
+      "source": "model { x ~ dfoo(theta) }\n",
+      "template": "distribution arity"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "stochastic",
+      "group": "syntax-valid",
+      "id": "syntax-valid-stochastic-03",
+      "source": "model { x ~ dfoo(mu, tau) }\n",
+      "template": "distribution arity"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "stochastic",
+      "group": "syntax-valid",
+      "id": "syntax-valid-stochastic-04",
+      "source": "model { x[i] ~ dfoo(mu[i], tau) }\n",
+      "template": "distribution arity"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "bounds",
+      "group": "syntax-valid",
+      "id": "syntax-valid-bounds-01",
+      "source": "model { x ~ dfoo(0,1) T(0,1) }\n",
+      "template": "stochastic bounds"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "bounds",
+      "group": "syntax-valid",
+      "id": "syntax-valid-bounds-02",
+      "source": "model { x ~ dfoo(0,1) T(,1) }\n",
+      "template": "stochastic bounds"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "bounds",
+      "group": "syntax-valid",
+      "id": "syntax-valid-bounds-03",
+      "source": "model { x ~ dfoo(0,1) T(0,) }\n",
+      "template": "stochastic bounds"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "bounds",
+      "group": "syntax-valid",
+      "id": "syntax-valid-bounds-04",
+      "source": "model { x ~ dfoo(0,1) T(,) }\n",
+      "template": "stochastic bounds"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "bounds",
+      "group": "syntax-valid",
+      "id": "syntax-valid-bounds-05",
+      "source": "model { x ~ dfoo(0,1) I(lower,upper) }\n",
+      "template": "stochastic bounds"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "bounds",
+      "group": "syntax-valid",
+      "id": "syntax-valid-bounds-06",
+      "source": "model { x ~ dfoo(0,1) I(,upper) }\n",
+      "template": "stochastic bounds"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "bounds",
+      "group": "syntax-valid",
+      "id": "syntax-valid-bounds-07",
+      "source": "model { x ~ dfoo(0,1) I(lower,) }\n",
+      "template": "stochastic bounds"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "loops",
+      "group": "syntax-valid",
+      "id": "syntax-valid-loops-01",
+      "source": "model { for (i in 1:n) { x[i] <- i } }\n",
+      "template": "loop nesting and sequences"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "loops",
+      "group": "syntax-valid",
+      "id": "syntax-valid-loops-02",
+      "source": "model { for (i in indexes) { x[i] ~ dfoo(mu[i]) } }\n",
+      "template": "loop nesting and sequences"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "loops",
+      "group": "syntax-valid",
+      "id": "syntax-valid-loops-03",
+      "source": "model { for (i in 1:n) { for (j in 1:m) { x[i,j] <- i+j } } }\n",
+      "template": "loop nesting and sequences"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "loops",
+      "group": "syntax-valid",
+      "id": "syntax-valid-loops-04",
+      "source": "model { for (for in 1:n) { x[for] <- for } }\n",
+      "template": "loop nesting and sequences"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "link-relations",
+      "group": "syntax-valid",
+      "id": "syntax-valid-link-relations-01",
+      "source": "model { logit(p) <- eta }\n",
+      "template": "link lhs shapes"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "link-relations",
+      "group": "syntax-valid",
+      "id": "syntax-valid-link-relations-02",
+      "source": "model { logit(p[i]) <- alpha + beta*x[i] }\n",
+      "template": "link lhs shapes"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "link-relations",
+      "group": "syntax-valid",
+      "id": "syntax-valid-link-relations-03",
+      "source": "model { cloglog(p[,j]) <- eta[j] }\n",
+      "template": "link lhs shapes"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "link-relations",
+      "group": "syntax-valid",
+      "id": "syntax-valid-link-relations-04",
+      "source": "model { model(p[]) <- eta }\n",
+      "template": "link lhs shapes"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "calls",
+      "group": "syntax-valid",
+      "id": "syntax-valid-calls-01",
+      "source": "model { x <- f(1) }\n",
+      "template": "nested nonempty calls"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "calls",
+      "group": "syntax-valid",
+      "id": "syntax-valid-calls-02",
+      "source": "model { x <- outer(inner(1), other(2,3)) }\n",
+      "template": "nested nonempty calls"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "calls",
+      "group": "syntax-valid",
+      "id": "syntax-valid-calls-03",
+      "source": "model { x <- model(data(1), var(2)) }\n",
+      "template": "nested nonempty calls"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "calls",
+      "group": "syntax-valid",
+      "id": "syntax-valid-calls-04",
+      "source": "model { x <- f(a[i], (b + c), -d) }\n",
+      "template": "nested nonempty calls"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "subsets",
+      "group": "syntax-valid",
+      "id": "syntax-valid-subsets-01",
+      "source": "model { x <- a[] }\n",
+      "template": "omitted subset dimensions"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "subsets",
+      "group": "syntax-valid",
+      "id": "syntax-valid-subsets-02",
+      "source": "model { x <- a[,] }\n",
+      "template": "omitted subset dimensions"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "subsets",
+      "group": "syntax-valid",
+      "id": "syntax-valid-subsets-03",
+      "source": "model { x <- a[i,] }\n",
+      "template": "omitted subset dimensions"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "subsets",
+      "group": "syntax-valid",
+      "id": "syntax-valid-subsets-04",
+      "source": "model { x <- a[,j] }\n",
+      "template": "omitted subset dimensions"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "subsets",
+      "group": "syntax-valid",
+      "id": "syntax-valid-subsets-05",
+      "source": "model { x <- a[i,,k] }\n",
+      "template": "omitted subset dimensions"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "subsets",
+      "group": "syntax-valid",
+      "id": "syntax-valid-subsets-06",
+      "source": "model { a[] <- x }\n",
+      "template": "omitted subset dimensions"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "arithmetic",
+      "group": "syntax-valid",
+      "id": "syntax-valid-arithmetic-01",
+      "source": "model { x <- a + b - c }\n",
+      "template": "arithmetic precedence"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "arithmetic",
+      "group": "syntax-valid",
+      "id": "syntax-valid-arithmetic-02",
+      "source": "model { x <- a * b / c }\n",
+      "template": "arithmetic precedence"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "arithmetic",
+      "group": "syntax-valid",
+      "id": "syntax-valid-arithmetic-03",
+      "source": "model { x <- a %% b + c %/% d }\n",
+      "template": "arithmetic precedence"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "arithmetic",
+      "group": "syntax-valid",
+      "id": "syntax-valid-arithmetic-04",
+      "source": "model { x <- -2^2 + 2^-3 }\n",
+      "template": "arithmetic precedence"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "arithmetic",
+      "group": "syntax-valid",
+      "id": "syntax-valid-arithmetic-05",
+      "source": "model { x <- 2^3^4 }\n",
+      "template": "arithmetic precedence"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "arithmetic",
+      "group": "syntax-valid",
+      "id": "syntax-valid-arithmetic-06",
+      "source": "model { x <- (2^3)^4 }\n",
+      "template": "arithmetic precedence"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "colon",
+      "group": "syntax-valid",
+      "id": "syntax-valid-colon-01",
+      "source": "model { x <- 1:n }\n",
+      "template": "nonassociative colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "colon",
+      "group": "syntax-valid",
+      "id": "syntax-valid-colon-02",
+      "source": "model { x <- (1:2):3 }\n",
+      "template": "nonassociative colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "colon",
+      "group": "syntax-valid",
+      "id": "syntax-valid-colon-03",
+      "source": "model { x <- 1:(2:3) }\n",
+      "template": "nonassociative colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "colon",
+      "group": "syntax-valid",
+      "id": "syntax-valid-colon-04",
+      "source": "model { x <- (1:2):(3:4) }\n",
+      "template": "nonassociative colon"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "special-infix",
+      "group": "syntax-valid",
+      "id": "syntax-valid-special-infix-01",
+      "source": "model { x <- a %*% b }\n",
+      "template": "special infix operators"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "special-infix",
+      "group": "syntax-valid",
+      "id": "syntax-valid-special-infix-02",
+      "source": "model { x <- a %in% b }\n",
+      "template": "special infix operators"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "special-infix",
+      "group": "syntax-valid",
+      "id": "syntax-valid-special-infix-03",
+      "source": "model { x <- a %custom% b }\n",
+      "template": "special infix operators"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "special-infix",
+      "group": "syntax-valid",
+      "id": "syntax-valid-special-infix-04",
+      "source": "model { x <- a %left% b %right% c }\n",
+      "template": "special infix operators"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comparisons",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comparisons-01",
+      "source": "model { x <- a < b }\n",
+      "template": "nonassociative comparisons"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comparisons",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comparisons-02",
+      "source": "model { x <- a <= b }\n",
+      "template": "nonassociative comparisons"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comparisons",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comparisons-03",
+      "source": "model { x <- a > b }\n",
+      "template": "nonassociative comparisons"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comparisons",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comparisons-04",
+      "source": "model { x <- a >= b }\n",
+      "template": "nonassociative comparisons"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comparisons",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comparisons-05",
+      "source": "model { x <- a == b }\n",
+      "template": "nonassociative comparisons"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comparisons",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comparisons-06",
+      "source": "model { x <- a != b }\n",
+      "template": "nonassociative comparisons"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comparisons",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comparisons-07",
+      "source": "model { x <- (a < b) == c }\n",
+      "template": "nonassociative comparisons"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comparisons",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comparisons-08",
+      "source": "model { x <- a < (b == c) }\n",
+      "template": "nonassociative comparisons"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "logical",
+      "group": "syntax-valid",
+      "id": "syntax-valid-logical-01",
+      "source": "model { x <- a && b && c }\n",
+      "template": "logical precedence"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "logical",
+      "group": "syntax-valid",
+      "id": "syntax-valid-logical-02",
+      "source": "model { x <- a || b || c }\n",
+      "template": "logical precedence"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "logical",
+      "group": "syntax-valid",
+      "id": "syntax-valid-logical-03",
+      "source": "model { x <- a || b && c }\n",
+      "template": "logical precedence"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "logical",
+      "group": "syntax-valid",
+      "id": "syntax-valid-logical-04",
+      "source": "model { x <- (a || b) && c }\n",
+      "template": "logical precedence"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "numbers",
+      "group": "syntax-valid",
+      "id": "syntax-valid-numbers-01",
+      "source": "model { x <- 0 }\n",
+      "template": "numeric token forms"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "numbers",
+      "group": "syntax-valid",
+      "id": "syntax-valid-numbers-02",
+      "source": "model { x <- 12. }\n",
+      "template": "numeric token forms"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "numbers",
+      "group": "syntax-valid",
+      "id": "syntax-valid-numbers-03",
+      "source": "model { x <- .25 }\n",
+      "template": "numeric token forms"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "numbers",
+      "group": "syntax-valid",
+      "id": "syntax-valid-numbers-04",
+      "source": "model { x <- 1e9 }\n",
+      "template": "numeric token forms"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "numbers",
+      "group": "syntax-valid",
+      "id": "syntax-valid-numbers-05",
+      "source": "model { x <- 2.5E-3 }\n",
+      "template": "numeric token forms"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comments",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comments-01",
+      "source": "# heading\nmodel { x <- 1 }\n",
+      "template": "comment placements"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comments",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comments-02",
+      "source": "model { /* before */ x <- 1 /* after */ }\n",
+      "template": "comment placements"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comments",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comments-03",
+      "source": "model { x <- 1 # relation\n y <- 2 }\n",
+      "template": "comment placements"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comments",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comments-04",
+      "source": "model { x <- 1 }\n# terminal\n",
+      "template": "comment placements"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "comments",
+      "group": "syntax-valid",
+      "id": "syntax-valid-comments-05",
+      "source": "/* λ 💥 */\r\nmodel {\r\n x <- 1\r\n}\r\n",
+      "template": "comment placements"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "contextual-names",
+      "group": "syntax-valid",
+      "id": "syntax-valid-contextual-names-01",
+      "source": "model { for <- 1; x <- for + 1 }\n",
+      "template": "contextual keyword names"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "contextual-names",
+      "group": "syntax-valid",
+      "id": "syntax-valid-contextual-names-02",
+      "source": "model { x <- model(1) }\n",
+      "template": "contextual keyword names"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "contextual-names",
+      "group": "syntax-valid",
+      "id": "syntax-valid-contextual-names-03",
+      "source": "model { x <- data(1) }\n",
+      "template": "contextual keyword names"
+    },
+    {
+      "expect_parse": "accepted",
+      "family": "contextual-names",
+      "group": "syntax-valid",
+      "id": "syntax-valid-contextual-names-04",
+      "source": "model { x <- var(1) }\n",
+      "template": "contextual keyword names"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "unknown-function",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-unknown-function-01",
+      "source": "model { x <- definitely_unknown_function(1) }\n",
+      "template": "unknown function name"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "unknown-function",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-unknown-function-02",
+      "source": "model { x <- module_specific_transform(theta, 2) }\n",
+      "template": "unknown function name"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "unknown-distribution",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-unknown-distribution-01",
+      "source": "model { x ~ definitely_unknown_distribution(1) }\n",
+      "template": "unknown distribution name"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "unknown-distribution",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-unknown-distribution-02",
+      "source": "model { x ~ module_specific_distribution(mu, tau) }\n",
+      "template": "unknown distribution name"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "function-arity",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-function-arity-01",
+      "source": "model { x <- log(1, 2) }\n",
+      "template": "known function wrong arity"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "function-arity",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-function-arity-02",
+      "source": "model { x <- sqrt(1, 2) }\n",
+      "template": "known function wrong arity"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "distribution-arity",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-distribution-arity-01",
+      "source": "model { x ~ dnorm(0) }\n",
+      "template": "known distribution wrong arity"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "distribution-arity",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-distribution-arity-02",
+      "source": "model { x ~ dunif(0) }\n",
+      "template": "known distribution wrong arity"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "undefined-data",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-undefined-data-01",
+      "source": "model { x <- missing_data + 1 }\n",
+      "template": "unresolved data dependency"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "undefined-data",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-undefined-data-02",
+      "source": "model { x ~ dnorm(missing_mean, 1) }\n",
+      "template": "unresolved data dependency"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "direct-cycle",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-direct-cycle-01",
+      "source": "model { x <- y; y <- x }\n",
+      "template": "directed cycle"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "direct-cycle",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-direct-cycle-02",
+      "source": "model { a <- b; b <- c; c <- a }\n",
+      "template": "directed cycle"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "duplicate-node",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-duplicate-node-01",
+      "source": "model { x <- 1; x <- 2 }\n",
+      "template": "duplicate node definition"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "duplicate-node",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-duplicate-node-02",
+      "source": "model { x[1] <- 1; x[1] ~ dnorm(0,1) }\n",
+      "template": "duplicate node definition"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "dimension-conflict",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-dimension-conflict-01",
+      "source": "var x[2]; model { x[1:3] <- 1 }\n",
+      "template": "declared dimension conflict"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "dimension-conflict",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-dimension-conflict-02",
+      "source": "var x[2,2]; model { x[1] <- 1 }\n",
+      "template": "declared dimension conflict"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "invalid-link",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-invalid-link-01",
+      "source": "model { mystery_link(p) <- eta }\n",
+      "template": "unknown link function"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "invalid-link",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-invalid-link-02",
+      "source": "model { module_link(p[i]) <- eta[i] }\n",
+      "template": "unknown link function"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "invalid-index",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-invalid-index-01",
+      "source": "model { x[0] <- 1 }\n",
+      "template": "invalid fixed index"
+    },
+    {
+      "compile": true,
+      "expect_parse": "accepted",
+      "expect_semantic_error": true,
+      "family": "invalid-index",
+      "group": "semantic-invalid",
+      "id": "semantic-invalid-invalid-index-02",
+      "source": "model { x[-1] <- 1 }\n",
+      "template": "invalid fixed index"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-model",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-empty-model-01",
+      "source": "model {}\n",
+      "template": "empty model body"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-model",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-empty-model-02",
+      "source": "model { # no relation\n}\n",
+      "template": "empty model body"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-model",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-missing-model-01",
+      "source": "data { x <- 1 }\n",
+      "template": "program without model"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-model",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-missing-model-02",
+      "source": "var x;\n",
+      "template": "program without model"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "block-order",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-block-order-01",
+      "source": "model { x <- 1 } data { y <- 2 }\n",
+      "template": "invalid block order"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "block-order",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-block-order-02",
+      "source": "data { y <- 2 } var x; model { x <- y }\n",
+      "template": "invalid block order"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "duplicate-block",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-duplicate-block-01",
+      "source": "model { x <- 1 } model { y <- 2 }\n",
+      "template": "duplicate top-level block"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "duplicate-block",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-duplicate-block-02",
+      "source": "data { x <- 1 } data { y <- 2 } model { z <- 3 }\n",
+      "template": "duplicate top-level block"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-relation",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-missing-relation-01",
+      "source": "model { x 1 }\n",
+      "template": "missing relation operator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-relation",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-missing-relation-02",
+      "source": "model { x dnorm(0,1) }\n",
+      "template": "missing relation operator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-missing-operand-01",
+      "source": "model { x <- * 1 }\n",
+      "template": "missing expression operand"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-missing-operand-02",
+      "source": "model { x <- 1 + }\n",
+      "template": "missing expression operand"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bad-relation-operator",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-bad-relation-operator-01",
+      "source": "model { x -> 1 }\n",
+      "template": "unsupported relation operator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bad-relation-operator",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-bad-relation-operator-02",
+      "source": "model { x := 1 }\n",
+      "template": "unsupported relation operator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-block",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-unclosed-block-01",
+      "source": "model { x <- 1\n",
+      "template": "unclosed program block"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-block",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-unclosed-block-02",
+      "source": "data { n <- 1 } model { x <- n\n",
+      "template": "unclosed program block"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-unclosed-call-01",
+      "source": "model { x <- f(1,2 }\n",
+      "template": "unclosed call"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-unclosed-call-02",
+      "source": "model { x ~ dfoo(0,1 }\n",
+      "template": "unclosed call"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "call-separator",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-call-separator-01",
+      "source": "model { x <- f(1 2) }\n",
+      "template": "invalid call separators"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "call-separator",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-call-separator-02",
+      "source": "model { x <- f(1,) }\n",
+      "template": "invalid call separators"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "call-separator",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-call-separator-03",
+      "source": "model { x <- f(,1) }\n",
+      "template": "invalid call separators"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-empty-call-01",
+      "source": "model { x <- f() }\n",
+      "template": "empty deterministic call"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-empty-call-02",
+      "source": "model { x <- model() }\n",
+      "template": "empty deterministic call"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-unclosed-subset-01",
+      "source": "model { x <- a[i }\n",
+      "template": "unclosed subset"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-unclosed-subset-02",
+      "source": "model { x[i,j <- 1 }\n",
+      "template": "unclosed subset"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "chained-subset",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-chained-subset-01",
+      "source": "model { x <- a[i][j] }\n",
+      "template": "chained postfix subset"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "chained-subset",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-chained-subset-02",
+      "source": "model { x[i][j] <- 1 }\n",
+      "template": "chained postfix subset"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "postfix-target",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-postfix-target-01",
+      "source": "model { x <- f(i)[j] }\n",
+      "template": "nonidentifier subset target"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "postfix-target",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-postfix-target-02",
+      "source": "model { x <- (a)[i] }\n",
+      "template": "nonidentifier subset target"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "loop-header",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-loop-header-01",
+      "source": "model { for (i 1:n) { x[i] <- 1 } }\n",
+      "template": "malformed loop header"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "loop-header",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-loop-header-02",
+      "source": "model { for i in 1:n { x[i] <- 1 } }\n",
+      "template": "malformed loop header"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "loop-body",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-loop-body-01",
+      "source": "model { for (i in 1:n) x[i] <- 1 }\n",
+      "template": "invalid loop body"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "loop-body",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-loop-body-02",
+      "source": "model { for (i in 1:n) {} }\n",
+      "template": "invalid loop body"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "loop-semicolon",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-loop-semicolon-01",
+      "source": "model { for (i in 1:n) { x[i] <- 1 }; y <- 2 }\n",
+      "template": "semicolon after loop body"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "comparison-chain",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-comparison-chain-01",
+      "source": "model { x <- a < b < c }\n",
+      "template": "unparenthesized comparison chain"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "comparison-chain",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-comparison-chain-02",
+      "source": "model { x <- a <= b == c }\n",
+      "template": "unparenthesized comparison chain"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "colon-chain",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-colon-chain-01",
+      "source": "model { x <- 1:2:3 }\n",
+      "template": "unparenthesized colon chain"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "colon-chain",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-colon-chain-02",
+      "source": "model { x <- a:b:c }\n",
+      "template": "unparenthesized colon chain"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "special-operator",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-special-operator-01",
+      "source": "model { x <- a %foo b }\n",
+      "template": "malformed special operator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "special-operator",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-special-operator-02",
+      "source": "model { x <- a %foo bar% b }\n",
+      "template": "malformed special operator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "link-arity",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-link-arity-01",
+      "source": "model { logit() <- x }\n",
+      "template": "invalid link arity"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "link-arity",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-link-arity-02",
+      "source": "model { logit(p,q) <- x }\n",
+      "template": "invalid link arity"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "link-shape",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-link-shape-01",
+      "source": "model { logit(1) <- x }\n",
+      "template": "invalid link argument shape"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "link-shape",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-link-shape-02",
+      "source": "model { logit(p+q) <- x }\n",
+      "template": "invalid link argument shape"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "link-shape",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-link-shape-03",
+      "source": "model { logit(f(p)) <- x }\n",
+      "template": "invalid link argument shape"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-bare-distribution-01",
+      "source": "model { x ~ dfoo }\n",
+      "template": "distribution without call"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-bare-distribution-02",
+      "source": "model { x ~ dfoo T(0,1) }\n",
+      "template": "distribution without call"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bad-bounds",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-bad-bounds-01",
+      "source": "model { x ~ dfoo(1) T(0) }\n",
+      "template": "malformed bounds clause"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bad-bounds",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-bad-bounds-02",
+      "source": "model { x ~ dfoo(1) T(0,1,2) }\n",
+      "template": "malformed bounds clause"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "reserved-name",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-reserved-name-01",
+      "source": "model { model <- 1 }\n",
+      "template": "reserved bare name"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "reserved-name",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-reserved-name-02",
+      "source": "model { data <- 1 }\n",
+      "template": "reserved bare name"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "reserved-name",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-reserved-name-03",
+      "source": "model { var <- 1 }\n",
+      "template": "reserved bare name"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "reserved-name",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-reserved-name-04",
+      "source": "model { in <- 1 }\n",
+      "template": "reserved bare name"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "reserved-call",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-reserved-call-01",
+      "source": "model { x <- for(1) }\n",
+      "template": "reserved callable name"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "reserved-call",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-reserved-call-02",
+      "source": "model { x <- in(1) }\n",
+      "template": "reserved callable name"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-string-01",
+      "source": "model { x <- \"text\" }\n",
+      "template": "unsupported string expression"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-string-02",
+      "source": "model { x <- 'text' }\n",
+      "template": "unsupported string expression"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-control",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-control-01",
+      "source": "model { if (x) { y <- 1 } }\n",
+      "template": "unsupported R control syntax"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-control",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-control-02",
+      "source": "model { while (x) { y <- 1 } }\n",
+      "template": "unsupported R control syntax"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-function",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-function-01",
+      "source": "model { f <- function(x) x }\n",
+      "template": "unsupported R function syntax"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-function",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-function-02",
+      "source": "model { x <- function(y) { y } }\n",
+      "template": "unsupported R function syntax"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-call-argument",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-call-argument-01",
+      "source": "model { x <- f(value=1) }\n",
+      "template": "unsupported R call arguments"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-call-argument",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-call-argument-02",
+      "source": "model { x <- f(1, ...) }\n",
+      "template": "unsupported R call arguments"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-operator",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-operator-01",
+      "source": "model { x <- a |> f() }\n",
+      "template": "unsupported R operator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-operator",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-operator-02",
+      "source": "model { x <- a $ b }\n",
+      "template": "unsupported R operator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-operator",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-r-operator-03",
+      "source": "model { x <- pkg::f(1) }\n",
+      "template": "unsupported R operator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "stan-syntax",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-stan-syntax-01",
+      "source": "model { real x; }\n",
+      "template": "unsupported Stan syntax"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "stan-syntax",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-stan-syntax-02",
+      "source": "model { target += x; }\n",
+      "template": "unsupported Stan syntax"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "line-comment-eof",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-line-comment-eof-01",
+      "source": "model { x <- 1 }\n# tail",
+      "template": "line comment without terminator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "line-comment-eof",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-line-comment-eof-02",
+      "source": "model { x <- 1 }\r\n#",
+      "template": "line comment without terminator"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "identifier-shape",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-identifier-shape-01",
+      "source": "model { _x <- 1 }\n",
+      "template": "invalid identifier token"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "identifier-shape",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-identifier-shape-02",
+      "source": "model { .x <- 1 }\n",
+      "template": "invalid identifier token"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "identifier-shape",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-identifier-shape-03",
+      "source": "model { λ <- 1 }\n",
+      "template": "invalid identifier token"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bom",
+      "group": "syntax-invalid",
+      "id": "syntax-invalid-bom-01",
+      "source": "﻿model { x <- 1 }\n",
+      "template": "leading UTF-8 BOM"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-01",
+      "source": "model { x 1 }\n",
+      "template": "deleted-relation-operator structural context 1"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-02",
+      "source": "data { n 3 } model { x <- n }\n",
+      "template": "deleted-relation-operator structural context 2"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-03",
+      "source": "model { x[i] value[i] }\n",
+      "template": "deleted-relation-operator structural context 3"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-04",
+      "source": "model { for (i in 1:n) { x[i] i } }\n",
+      "template": "deleted-relation-operator structural context 4"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-05",
+      "source": "model { link(p) eta }\n",
+      "template": "deleted-relation-operator structural context 5"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "deleted-relation-operator",
+      "group": "mutation",
+      "id": "mutation-deleted-relation-operator-06",
+      "source": "var x[2]; model { x[1] f(1) }\n",
+      "template": "deleted-relation-operator structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-01",
+      "source": "model { x <- + }\n",
+      "template": "missing-operand structural context 1"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-02",
+      "source": "model { x <- 1 * }\n",
+      "template": "missing-operand structural context 2"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-03",
+      "source": "model { x <- / y }\n",
+      "template": "missing-operand structural context 3"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-04",
+      "source": "model { x <- a && }\n",
+      "template": "missing-operand structural context 4"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-05",
+      "source": "model { x <- < b }\n",
+      "template": "missing-operand structural context 5"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-operand",
+      "group": "mutation",
+      "id": "mutation-missing-operand-06",
+      "source": "model { x <- a %foo% }\n",
+      "template": "missing-operand structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-01",
+      "source": "model { x <- f(1 }\n",
+      "template": "unclosed-call structural context 1"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-02",
+      "source": "model { x <- f(1, g(2) }\n",
+      "template": "unclosed-call structural context 2"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-03",
+      "source": "model { x ~ dfoo(0,1 }\n",
+      "template": "unclosed-call structural context 3"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-04",
+      "source": "model { link(p <- eta }\n",
+      "template": "unclosed-call structural context 4"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-05",
+      "source": "data { n <- f(1 } model { x <- n }\n",
+      "template": "unclosed-call structural context 5"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-call",
+      "group": "mutation",
+      "id": "mutation-unclosed-call-06",
+      "source": "model { for (i in f(1) { x[i] <- 1 } }\n",
+      "template": "unclosed-call structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-01",
+      "source": "model { x <- f(1 2) }\n",
+      "template": "missing-call-comma structural context 1"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-02",
+      "source": "model { x <- f(a b, c) }\n",
+      "template": "missing-call-comma structural context 2"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-03",
+      "source": "model { x ~ dfoo(0 tau) }\n",
+      "template": "missing-call-comma structural context 3"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-04",
+      "source": "model { x <- outer(inner(1) other(2)) }\n",
+      "template": "missing-call-comma structural context 4"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-05",
+      "source": "data { n <- f(1 2) } model { x <- n }\n",
+      "template": "missing-call-comma structural context 5"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-call-comma",
+      "group": "mutation",
+      "id": "mutation-missing-call-comma-06",
+      "source": "model { x <- f(a[i] b[j]) }\n",
+      "template": "missing-call-comma structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-01",
+      "source": "model { x <- a[i }\n",
+      "template": "unclosed-subset structural context 1"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-02",
+      "source": "model { x[i <- 1 }\n",
+      "template": "unclosed-subset structural context 2"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-03",
+      "source": "model { x <- a[i, }\n",
+      "template": "unclosed-subset structural context 3"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-04",
+      "source": "model { x <- a[,j }\n",
+      "template": "unclosed-subset structural context 4"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-05",
+      "source": "model { for (i in a[) { x[i] <- 1 } }\n",
+      "template": "unclosed-subset structural context 5"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unclosed-subset",
+      "group": "mutation",
+      "id": "mutation-unclosed-subset-06",
+      "source": "var x[2; model { x[1] <- 1 }\n",
+      "template": "unclosed-subset structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-01",
+      "source": "model { for (i 1:n) { x[i] <- 1 } }\n",
+      "template": "missing-loop-in structural context 1"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-02",
+      "source": "model { for (j indexes) { x[j] <- 1 } }\n",
+      "template": "missing-loop-in structural context 2"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-03",
+      "source": "model { for (k f(1)) { x[k] <- 1 } }\n",
+      "template": "missing-loop-in structural context 3"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-04",
+      "source": "model { for (i 1:n) { for (j in 1:m) { x[i,j] <- 1 } } }\n",
+      "template": "missing-loop-in structural context 4"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-05",
+      "source": "model { for (for 1:n) { x[for] <- 1 } }\n",
+      "template": "missing-loop-in structural context 5"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "missing-loop-in",
+      "group": "mutation",
+      "id": "mutation-missing-loop-in-06",
+      "source": "model { for (i a:b) { x[i] ~ dfoo(1) } }\n",
+      "template": "missing-loop-in structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-01",
+      "source": "model { for (i in 1:n) x[i] <- 1 }\n",
+      "template": "unbraced-loop structural context 1"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-02",
+      "source": "model { for (j in indexes) x[j] ~ dfoo(1) }\n",
+      "template": "unbraced-loop structural context 2"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-03",
+      "source": "model { for (i in 1:n) for (j in 1:m) { x[i,j] <- 1 } }\n",
+      "template": "unbraced-loop structural context 3"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-04",
+      "source": "model { for (i in f(1)) link(p[i]) <- eta[i] }\n",
+      "template": "unbraced-loop structural context 4"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-05",
+      "source": "model { for (i in a:b) x[i] = i }\n",
+      "template": "unbraced-loop structural context 5"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "unbraced-loop",
+      "group": "mutation",
+      "id": "mutation-unbraced-loop-06",
+      "source": "model { for (for in 1:n) x[for] <- for }\n",
+      "template": "unbraced-loop structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-01",
+      "source": "model { x <- \"text\" }\n",
+      "template": "r-string structural context 1"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-02",
+      "source": "model { x <- 'text' }\n",
+      "template": "r-string structural context 2"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-03",
+      "source": "model { x ~ dfoo(\"x\") }\n",
+      "template": "r-string structural context 3"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-04",
+      "source": "model { x[\"name\"] <- 1 }\n",
+      "template": "r-string structural context 4"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-05",
+      "source": "data { x <- \"text\" } model { y <- 1 }\n",
+      "template": "r-string structural context 5"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "r-string",
+      "group": "mutation",
+      "id": "mutation-r-string-06",
+      "source": "model { for (i in \"abc\") { x[i] <- 1 } }\n",
+      "template": "r-string structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-01",
+      "source": "model { x <- f() }\n",
+      "template": "empty-call structural context 1"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-02",
+      "source": "model { x <- model() }\n",
+      "template": "empty-call structural context 2"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-03",
+      "source": "model { x <- outer(f()) }\n",
+      "template": "empty-call structural context 3"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-04",
+      "source": "model { for (i in f()) { x[i] <- 1 } }\n",
+      "template": "empty-call structural context 4"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-05",
+      "source": "data { n <- f() } model { x <- n }\n",
+      "template": "empty-call structural context 5"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "empty-call",
+      "group": "mutation",
+      "id": "mutation-empty-call-06",
+      "source": "model { x <- f() + 1 }\n",
+      "template": "empty-call structural context 6"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-01",
+      "source": "model { x ~ dfoo }\n",
+      "template": "bare-distribution structural context 1"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-02",
+      "source": "model { x[i] ~ dfoo }\n",
+      "template": "bare-distribution structural context 2"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-03",
+      "source": "model { x ~ dfoo T(0,1) }\n",
+      "template": "bare-distribution structural context 3"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-04",
+      "source": "model { for (i in 1:n) { x[i] ~ dfoo } }\n",
+      "template": "bare-distribution structural context 4"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-05",
+      "source": "model { x ~ model }\n",
+      "template": "bare-distribution structural context 5"
+    },
+    {
+      "expect_parse": "rejected",
+      "family": "bare-distribution",
+      "group": "mutation",
+      "id": "mutation-bare-distribution-06",
+      "source": "model { x ~ dfoo; y <- 1 }\n",
+      "template": "bare-distribution structural context 6"
+    }
+  ],
+  "counts": {
+    "mutation": {
+      "authored_templates": 60,
+      "total": 60
+    },
+    "semantic-invalid": {
+      "authored_templates": 10,
+      "total": 20
+    },
+    "syntax-invalid": {
+      "authored_templates": 35,
+      "total": 74
+    },
+    "syntax-valid": {
+      "authored_templates": 19,
+      "total": 82
+    }
+  },
+  "schema_version": 1
+}

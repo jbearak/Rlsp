@@ -1302,12 +1302,16 @@ grammar. Tree-sitter R and Stan are pinned MIT implementation references; the
 production mapping and complete quality evidence live in
 `PRODUCTION_MAPPING.md` and `QUALITY_GATES.md` inside the crate.
 
-Generated parser artifacts are checked in. After editing `grammar.js`, run
-`npm ci`, `npm run generate`, `npm run check:generated`, and `npm test` from
-the crate directory, followed by `cargo test -p tree-sitter-jags` from the
-repository root. The ignored live-oracle and release-performance commands are
-documented in the crate README. CI checks generation drift, the Tree-sitter
-corpus, Rust tests, rustdoc, and release performance without installing JAGS.
+Generated parser artifacts and a 351-outcome oracle manifest are checked in.
+The manifest binds the deterministic matrix and quality corpus to their exact
+sources, generator, harness, and pinned JAGS executable hashes. After editing
+`grammar.js`, an oracle input, the generator, or the harness, run `npm ci`,
+`npm run generate`, `npm run check:generated`, `npm run check:oracle`, and
+`npm test` from the crate directory, followed by `cargo test -p
+tree-sitter-jags` from the repository root. The ignored live-oracle and
+release-performance commands are documented in the crate README. CI checks
+generation and oracle-manifest drift, the Tree-sitter corpus, Rust tests,
+rustdoc, and release performance without installing JAGS.
 
 The grammar claims `.jags` only. Treat `.bugs` as ambiguous until a separate
 representative compatibility corpus proves that strict JAGS diagnostics would

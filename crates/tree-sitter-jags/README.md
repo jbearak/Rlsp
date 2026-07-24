@@ -13,6 +13,7 @@ Tree-sitter corpus from this directory:
 ```sh
 npm ci
 npm run check:generated
+npm run check:oracle
 npm test
 ```
 
@@ -22,12 +23,14 @@ repository root:
 ```sh
 cargo test -p tree-sitter-jags
 cargo test -p tree-sitter-jags --test quality_gates \
-  generated_corpora_and_mutations_match_real_jags -- --ignored
+  all_committed_outcomes_match_live_jags -- --ignored
 cargo test --release -p tree-sitter-jags --test performance -- --ignored
 ```
 
-The live oracle requires `/opt/homebrew/bin/jags` or `JAGS_BIN` to identify
-itself as JAGS 4.3.2. It uses only the public command-line interface.
+The normal oracle check is offline: it verifies the deterministic corpus and
+the committed 351-result manifest's input and tool hashes. The live check
+requires the exact JAGS 4.3.2 wrapper and terminal hashes recorded in
+`oracle/provenance.json` and uses only the public command-line interface.
 
 The grammar intentionally claims only `.jags`. The `.bugs` suffix is shared by
 multiple related languages; strict compatibility is not established here.

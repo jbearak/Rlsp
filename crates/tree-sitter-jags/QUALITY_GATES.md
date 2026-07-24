@@ -6,57 +6,73 @@ after `compile`, while malformed expressions and delimiters fail during it.
 
 ## Deterministic corpora
 
-- 78 hand-authored black-box matrix probes: 34 accepted, 44 rejected.
-- 320 generated valid models, all accepted by JAGS and error-free here.
-- 64 syntax-valid semantic failures, all accepted by JAGS during parsing,
-  rejected during compilation, and error-free here.
-- 96 curated syntax-invalid cases across 12 defect families, all rejected by
-  JAGS and detected here with an `ERROR`/`MISSING` node intersecting the
-  recorded defect line.
-- 32 incremental sequences, including CRLF and BMP/astral comments; every
-  incremental tree equals a fresh parse through valid, incomplete, and
-  restored states.
+- 115 independently authored black-box matrix probes: 50 accepted and 65
+  rejected, across 21 categories.
+- 82 syntax-valid cases from 19 authored templates, all accepted by JAGS and
+  error-free here. They currently produce 69 distinct recursive tree-shape
+  fingerprints.
+- 20 syntax-valid semantic failures from 10 authored templates, all accepted
+  by JAGS during parsing, rejected during compilation, and error-free here.
+  They currently produce 17 distinct recursive tree-shape fingerprints.
+- 74 syntax-invalid cases from 35 authored defect templates, all rejected by
+  JAGS and classified as erroneous here (including the documented BOM root
+  coverage boundary). They currently produce 66 distinct recursive tree-shape
+  fingerprints.
+- 60 mutation cases from 10 mutation categories and 60 independently authored
+  contexts. All are rejected by JAGS and classified as erroneous here, with
+  56 distinct recursive tree-shape fingerprints.
+- 16 structurally distinct incremental-edit sequences cover relation
+  operators, operands, calls, subsets, loops, bounds, contextual syntax,
+  special operators, non-associative operators, whole expressions, program
+  blocks, CRLF/Unicode comments, and EOF comments. Every node's kind, flags,
+  byte/point range, field, and children equal a fresh parse after each edit.
 - 1,024 generated valid-property cases and 1,024 arbitrary-UTF-8 range/panic
   cases.
 
-Ten mutation categories have 20 real-JAGS-rejected cases each. Detection is
-20/20 (100%) in every category; there are no escaped cases or allowlist.
+The committed `oracle-results.json` binds all 351 matrix and quality-corpus
+outcomes to the source hashes, generator hash, and oracle harness hash. Normal
+CI regenerates the corpus, verifies the input binding and outcomes offline,
+and runs the oracle harness's timeout/hash-validation unit tests. Refreshing or
+live-verifying the results additionally requires the exact wrapper and terminal
+hashes in `provenance.json`; an explicit unpinned override cannot refresh the
+committed manifest.
+
+Recovery checks include exact issue kinds and byte/point ranges for six defect
+families, separated-fault locality, deterministic high-fault recovery, Unicode,
+CRLF, BOM, EOF, bounded tree growth, and cancellation after 256 parser progress
+callbacks. Reuse of an arbitrary already-invalid tree is tested separately for
+safe error classification and recursive range validity, because Tree-sitter
+does not promise a canonical recovery shape for that input class.
 
 ## Performance
 
-Release-mode local medians (three samples, Apple Silicon) are:
+Release-mode local medians (five samples, Apple Silicon) are:
 
 | Input | Median |
 |---|---:|
-| 1 KiB valid | 0.057 ms |
-| 10 KiB valid | 0.485 ms |
-| 100 KiB valid | 3.799 ms |
-| 100 KiB malformed | 4.390 ms |
-| 100 KiB one-byte incremental edit | 2.095 ms |
-| 1 MiB valid | 34.828 ms |
+| 1 KiB valid | 0.135 ms |
+| 10 KiB valid | 1.056 ms |
+| 100 KiB valid | 9.296 ms |
+| 100 KiB malformed | 9.804 ms |
+| 100 KiB incremental edit, early/middle/late | 2.682/2.674/2.758 ms |
+| 1 MiB valid | 84.892 ms |
 
-CI enforces 5/25/250/250/50/2000 ms respectively, with a threefold allowance
-for shared CI hardware. Cancellation of a 100,000-relation input is separately
-required to return no partial tree within 100 ms.
+CI enforces 3/8/30/40/20/300 ms respectively, without an environment-specific
+multiplier. Cancellation of a 65,536-relation input is separately required to
+return no partial tree after exactly 256 progress callbacks and within 250 ms.
 
-The generated `parser.c` is 96,457 bytes and the locally built release rlib is
-63,520 bytes. Raven does not depend on this crate in this PR, so its runtime
+The generated `parser.c` is 150,308 bytes and the locally built release rlib is
+70,464 bytes. Raven does not depend on this crate in this PR, so its runtime
 binary and extension package size are unchanged.
 
-## Fuzzing
+## Fuzz targets
 
-Two 601-second cargo-fuzz campaigns completed without crashes, timeouts, or
-artifacts:
-
-- Arbitrary parser input: 69,940,031 executions, 116,372/s average, 29 MiB
-  peak RSS.
-- Arbitrary incremental edits with fresh-tree equivalence: 62,758,643
-  executions, 104,423/s average, 28 MiB peak RSS.
-
-This host lacked a nightly sanitizer runtime, so the campaigns used cargo-fuzz
-0.13.2 coverage instrumentation with `--sanitizer none` and
-`RUSTC_BOOTSTRAP=1`. The fuzz targets remain ready for sanitizer-enabled runs
-on a nightly-equipped host.
+The separate fuzz crate retains small deterministic seed sets for arbitrary
+parser input and incremental edits. The parser target recursively checks node
+and parent range containment. The incremental target starts from one of eight
+syntax-clean source families, applies a generated edit, and compares the fresh
+and reused trees recursively, including kinds, flags, fields, and byte/point
+ranges. The fuzz crate is not part of Raven's runtime dependency graph.
 
 ## Known boundary
 

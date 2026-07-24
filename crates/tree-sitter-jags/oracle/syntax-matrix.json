@@ -481,6 +481,228 @@
       "category": "program-detail",
       "source": "MODEL { x <- 1 }\n",
       "expect_parse": "rejected"
+    },
+    {
+      "name": "empty-distribution-call",
+      "category": "differential-boundary",
+      "source": "model { x ~ dfoo() }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "matrix-product-special-operator",
+      "category": "differential-boundary",
+      "source": "model { x <- a %*% b }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "membership-special-operator",
+      "category": "differential-boundary",
+      "source": "model { x <- a %in% b }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "unknown-special-operator",
+      "category": "differential-boundary",
+      "source": "model { x <- a %foo% b }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "chained-special-operators",
+      "category": "differential-boundary",
+      "source": "model { x <- a %foo% b %bar% c }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "reserved-model-as-name",
+      "category": "differential-boundary",
+      "source": "model { model <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-data-as-name",
+      "category": "differential-boundary",
+      "source": "model { data <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-var-as-name",
+      "category": "differential-boundary",
+      "source": "model { var <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-in-as-name",
+      "category": "differential-boundary",
+      "source": "model { in <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "contextual-for-as-name",
+      "category": "differential-boundary",
+      "source": "model { for <- 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "contextual-for-in-expression",
+      "category": "differential-boundary",
+      "source": "model { x <- for + 1 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "reserved-for-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- for(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-in-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- in(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "contextual-model-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- model(1) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "contextual-data-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- data(1) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "contextual-var-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- var(1) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "chained-subset-lhs",
+      "category": "differential-boundary",
+      "source": "model { x[i][j] <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "chained-subset-rhs",
+      "category": "differential-boundary",
+      "source": "model { x <- a[i][j] }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "call-result-subset",
+      "category": "differential-boundary",
+      "source": "model { x <- f(i)[j] }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "parenthesized-result-subset",
+      "category": "differential-boundary",
+      "source": "model { x <- (a)[i] }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "chained-less-than",
+      "category": "differential-boundary",
+      "source": "model { x <- a < b < c }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "chained-less-equal",
+      "category": "differential-boundary",
+      "source": "model { x <- a <= b <= c }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "chained-equality",
+      "category": "differential-boundary",
+      "source": "model { x <- a == b == c }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "chained-mixed-comparison",
+      "category": "differential-boundary",
+      "source": "model { x <- a < b == c }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "parenthesized-left-comparison",
+      "category": "differential-boundary",
+      "source": "model { x <- (a < b) < c }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "parenthesized-right-comparison",
+      "category": "differential-boundary",
+      "source": "model { x <- a < (b < c) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "chained-colon",
+      "category": "differential-boundary",
+      "source": "model { x <- 1:2:3 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "parenthesized-left-colon",
+      "category": "differential-boundary",
+      "source": "model { x <- (1:2):3 }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "parenthesized-right-colon",
+      "category": "differential-boundary",
+      "source": "model { x <- 1:(2:3) }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "semicolon-after-for-body",
+      "category": "differential-boundary",
+      "source": "model { for (i in 1:3) { x[i] <- i }; y <- 1 }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "link-two-arguments",
+      "category": "differential-boundary",
+      "source": "model { logit(p, q) <- x }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "link-number-argument",
+      "category": "differential-boundary",
+      "source": "model { logit(1) <- x }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "link-expression-argument",
+      "category": "differential-boundary",
+      "source": "model { logit(p + q) <- x }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "link-call-argument",
+      "category": "differential-boundary",
+      "source": "model { logit(f(p)) <- x }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "link-subset-argument",
+      "category": "differential-boundary",
+      "source": "model { logit(p[i,j]) <- x }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "eof-line-comment-no-newline",
+      "category": "differential-boundary",
+      "source": "model { x <- 1 }\n# tail",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "eof-line-comment-with-newline",
+      "category": "differential-boundary",
+      "source": "model { x <- 1 }\n# tail\n",
+      "expect_parse": "accepted"
     }
   ]
 }
