@@ -300,6 +300,36 @@ model {
     }
 
     #[test]
+    fn stan_declaration_suppression_uses_private_name_and_keeps_lsp_data_empty() {
+        let code = "# raven: var injected\nmodel { target += injected; }\n";
+        let uri = Url::parse("untitled:stan-private-suppression-test").unwrap();
+        let mut state = WorldState::new();
+        state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
+        let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("Stan snapshot");
+        let diagnostic = Diagnostic {
+            range: Range::new(Position::new(1, 18), Position::new(1, 26)),
+            message: "wording deliberately unrelated to the identifier".to_string(),
+            ..Default::default()
+        };
+
+        assert!(stan_semantic_diagnostic_is_suppressed(
+            &diagnostic,
+            "injected",
+            &snapshot.directive_meta
+        ));
+        assert!(!stan_semantic_diagnostic_is_suppressed(
+            &diagnostic,
+            "different_name",
+            &snapshot.directive_meta
+        ));
+
+        let outward = diagnostics_for("model { target += visible_missing; }\n");
+        assert_eq!(outward.len(), 1, "{outward:#?}");
+        assert_eq!(outward[0].message, "visible_missing is not defined");
+        assert_eq!(outward[0].data, None);
+    }
+
+    #[test]
     fn stan_combined_syntax_and_semantic_findings_are_globally_ordered() {
         let code = "model {\n  target += earlier_semantic;\n  target += ;\n}\n";
         let findings = diagnostics_for(code);
@@ -1810,9 +1840,10 @@ pub(crate) fn diagnostics_from_snapshot(
                     &snapshot.text,
                     severity,
                     cancel,
-                    |diagnostic| {
+                    |diagnostic, name| {
                         !stan_semantic_diagnostic_is_suppressed(
                             diagnostic,
+                            name,
                             &snapshot.directive_meta,
                         )
                     },
@@ -2161,6 +2192,7 @@ pub(crate) fn diagnostics_from_snapshot(
 /// non-suppressible and never call this helper.
 fn stan_semantic_diagnostic_is_suppressed(
     diagnostic: &Diagnostic,
+    name: &str,
     metadata: &crate::cross_file::CrossFileMetadata,
 ) -> bool {
     let line = diagnostic.range.start.line;
@@ -2172,9 +2204,6 @@ fn stan_semantic_diagnostic_is_suppressed(
         return true;
     }
 
-    let Some(name) = diagnostic.message.strip_suffix(" is not defined") else {
-        return false;
-    };
     metadata
         .declared_variables
         .iter()
@@ -72323,6 +72352,22 @@ mod file_type_tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn diagnostic_range_is_in_bounds(content: &str, range: &Range) -> bool {
+        let lines: Vec<_> = content.split('\n').collect();
+        let Some(start_line) = lines.get(range.start.line as usize) else {
+            return false;
+        };
+        let Some(end_line) = lines.get(range.end.line as usize) else {
+            return false;
+        };
+        let start_line = start_line.strip_suffix('\r').unwrap_or(start_line);
+        let end_line = end_line.strip_suffix('\r').unwrap_or(end_line);
+        range.start.line <= range.end.line
+            && range.start.character <= utf16_len(start_line)
+            && range.end.character <= utf16_len(end_line)
+            && (range.start.line != range.end.line || range.start.character <= range.end.character)
+    }
+
     // **Validates: Requirements 1.1, 2.1, 10.1**
     // Property 1: File type detection is consistent with extension
 
@@ -72417,21 +72462,12 @@ mod file_type_tests {
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = diagnostics(&state, &uri, &DiagCancelToken::never());
-            let lines: Vec<&str> = content.lines().collect();
             for diagnostic in result {
                 prop_assert_eq!(
                     diagnostic.code,
                     Some(NumberOrString::String(crate::diagnostic_code::SYNTAX_ERROR.to_string()))
                 );
-                let line = lines
-                    .get(diagnostic.range.start.line as usize)
-                    .copied()
-                    .unwrap_or("");
-                let width = utf16_len(line);
-                prop_assert!(diagnostic.range.start.character <= width);
-                if diagnostic.range.end.line == diagnostic.range.start.line {
-                    prop_assert!(diagnostic.range.end.character <= width);
-                }
+                prop_assert!(diagnostic_range_is_in_bounds(&content, &diagnostic.range));
             }
         }
 
@@ -72450,7 +72486,6 @@ mod file_type_tests {
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = diagnostics(&state, &uri, &DiagCancelToken::never());
-            let lines: Vec<&str> = content.lines().collect();
             for diagnostic in result {
                 prop_assert!(
                     diagnostic.code
@@ -72462,15 +72497,7 @@ mod file_type_tests {
                                 crate::diagnostic_code::UNDEFINED_VARIABLE.to_string()
                             ))
                 );
-                let line = lines
-                    .get(diagnostic.range.start.line as usize)
-                    .copied()
-                    .unwrap_or("");
-                let width = utf16_len(line);
-                prop_assert!(diagnostic.range.start.character <= width);
-                if diagnostic.range.end.line == diagnostic.range.start.line {
-                    prop_assert!(diagnostic.range.end.character <= width);
-                }
+                prop_assert!(diagnostic_range_is_in_bounds(&content, &diagnostic.range));
             }
         }
 

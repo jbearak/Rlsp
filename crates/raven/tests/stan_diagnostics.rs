@@ -422,6 +422,10 @@ fn raven_check_stan_undefined_variable_matches_text_json_and_sarif() {
                     assert_eq!(finding["diagnostic"]["range"]["start"]["character"], start);
                     assert_eq!(finding["diagnostic"]["range"]["end"]["line"], line);
                     assert_eq!(finding["diagnostic"]["range"]["end"]["character"], end);
+                    assert!(
+                        finding["diagnostic"].get("data").is_none(),
+                        "internal Stan identifiers must not leak into CLI JSON: {finding}"
+                    );
                 }
             }
             "sarif" => {

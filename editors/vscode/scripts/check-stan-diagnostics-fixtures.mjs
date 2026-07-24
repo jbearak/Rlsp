@@ -59,6 +59,42 @@ function compile(entry) {
   return stanc(`${entry.name}.stan`, entry.code, [], entry.includes);
 }
 
+const stanIdentifierCharacter = /[A-Za-z0-9_]/;
+
+function containsIdentifier(message, identifier) {
+  if (identifier.length === 0) {
+    return false;
+  }
+  let offset = 0;
+  while (offset <= message.length - identifier.length) {
+    const index = message.indexOf(identifier, offset);
+    if (index === -1) {
+      return false;
+    }
+    const before = message[index - 1];
+    const after = message[index + identifier.length];
+    if (
+      (before === undefined || !stanIdentifierCharacter.test(before))
+      && (after === undefined || !stanIdentifierCharacter.test(after))
+    ) {
+      return true;
+    }
+    offset = index + 1;
+  }
+  return false;
+}
+
+for (const [message, identifier, expected] of [
+  ["n is not defined", "n", true],
+  ["unknown_value is not defined", "unknown_value", true],
+  ["unknown_value_2 is not defined", "unknown_value", false],
+  ["unrelated diagnostic", "n", false],
+]) {
+  if (containsIdentifier(message, identifier) !== expected) {
+    throw new Error(`Identifier-boundary matcher failed for ${identifier}: ${message}`);
+  }
+}
+
 const valid = readGroup("valid");
 const generated = readGroup("generated");
 const syntaxOnly = readGroup("syntax_only");
@@ -108,7 +144,7 @@ for (const entry of semanticScope) {
   if (result.errors.some((message) => message.includes("Syntax error"))) {
     throw new Error(`${entry.name} is not syntax-valid:\n${result.errors.join("\n")}`);
   }
-  if (!result.errors.some((message) => message.includes(entry.missing))) {
+  if (!result.errors.some((message) => containsIdentifier(message, entry.missing))) {
     throw new Error(
       `${entry.name} no longer identifies ${entry.missing}:\n${result.errors.join("\n")}`,
     );
@@ -126,7 +162,7 @@ for (const entry of syntaxOnly) {
   const expectedMissingName = undeclaredVariableCases.get(entry.name);
   if (
     expectedMissingName !== undefined
-    && !result.errors.some((message) => message.includes(expectedMissingName))
+    && !result.errors.some((message) => containsIdentifier(message, expectedMissingName))
   ) {
     throw new Error(
       `${entry.name} no longer identifies ${expectedMissingName}:\n${result.errors.join("\n")}`,

@@ -53,8 +53,9 @@ const ORDERED_VARIABLE_BLOCKS: [(&str, bool); 6] = [
 ///
 /// Returns `None` on cancellation and never exposes a partial result. Syntax
 /// diagnostics are collected separately by the caller and use their own cap.
-/// `should_retain` runs before exact deduplication and the fixed semantic cap,
-/// so suppressed or host-declared candidates never consume retained capacity.
+/// `should_retain` receives the outward diagnostic plus its private identifier
+/// and runs before exact deduplication and the fixed semantic cap, so suppressed
+/// or host-declared candidates never consume retained capacity.
 pub(crate) fn collect_undefined_variables<F>(
     root: Node<'_>,
     text: &str,
@@ -63,12 +64,10 @@ pub(crate) fn collect_undefined_variables<F>(
     should_retain: F,
 ) -> Option<Vec<Diagnostic>>
 where
-    F: Fn(&Diagnostic) -> bool,
+    F: Fn(&Diagnostic, &str) -> bool,
 {
     let mut budget = CancellationBudget::new(cancel);
-    if budget.cancelled()? {
-        return None;
-    }
+    budget.check()?;
 
     // Includes are extras and can occur below otherwise ordinary nodes, so
     // scan every child (including recovery subtrees) before semantic descent.
@@ -181,19 +180,19 @@ impl<'a> CancellationBudget<'a> {
     }
 
     /// Check immediately and then once per 64 visited nodes.
-    fn cancelled(&mut self) -> Option<bool> {
+    fn check(&mut self) -> Option<()> {
         let should_check = self.visited == 0 || self.visited & 63 == 0;
         self.visited = self.visited.saturating_add(1);
         if should_check && self.cancel.is_cancelled() {
             None
         } else {
-            Some(false)
+            Some(())
         }
     }
 }
 
 fn tree_contains_include(node: Node<'_>, budget: &mut CancellationBudget<'_>) -> Option<bool> {
-    budget.cancelled()?;
+    budget.check()?;
     if node.kind() == "preproc_include" {
         return Some(true);
     }
@@ -216,7 +215,7 @@ fn direct_program_blocks<'tree>(
     let mut blocks = Vec::new();
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
-        budget.cancelled()?;
+        budget.check()?;
         // Direct membership is intentional: never recover a block nested below
         // ERROR or arbitrary top-level text.
         if PROGRAM_BLOCKS.contains(&child.kind()) {
@@ -251,7 +250,7 @@ fn collect_function_namespace(
 
     let mut cursor = functions.walk();
     for child in functions.named_children(&mut cursor) {
-        budget.cancelled()?;
+        budget.check()?;
         if is_recovery_node(child) {
             for name in recovered_function_names(child, text) {
                 namespace.recovered_candidates.insert(name.to_string());
@@ -314,13 +313,12 @@ fn recovered_function_names<'a>(error: Node<'_>, text: &'a str) -> Vec<&'a str> 
 
 struct Analyzer<'a, F>
 where
-    F: Fn(&Diagnostic) -> bool,
+    F: Fn(&Diagnostic, &str) -> bool,
 {
     text: &'a str,
     line_starts: Vec<usize>,
     severity: DiagnosticSeverity,
-    cancel: &'a DiagCancelToken,
-    visited: usize,
+    cancellation: CancellationBudget<'a>,
     function_namespace: FunctionNamespace,
     findings: RetainedFindings,
     should_retain: F,
@@ -328,7 +326,7 @@ where
 
 impl<'a, F> Analyzer<'a, F>
 where
-    F: Fn(&Diagnostic) -> bool,
+    F: Fn(&Diagnostic, &str) -> bool,
 {
     fn new(
         text: &'a str,
@@ -343,8 +341,7 @@ where
                 .chain(text.match_indices('\n').map(|(index, _)| index + 1))
                 .collect(),
             severity,
-            cancel,
-            visited: 0,
+            cancellation: CancellationBudget::new(cancel),
             function_namespace,
             findings: RetainedFindings::default(),
             should_retain,
@@ -352,18 +349,12 @@ where
     }
 
     fn check_cancel(&mut self) -> Option<()> {
-        let should_check = self.visited == 0 || self.visited & 63 == 0;
-        self.visited = self.visited.saturating_add(1);
-        if should_check && self.cancel.is_cancelled() {
-            None
-        } else {
-            Some(())
-        }
+        self.cancellation.check()
     }
 
     fn finish(mut self) -> Option<Vec<Diagnostic>> {
         // Check after the full walk as well, including after cap saturation.
-        if self.cancel.is_cancelled() {
+        if self.cancellation.cancel.is_cancelled() {
             return None;
         }
         Some(std::mem::take(&mut self.findings).into_diagnostics())
@@ -664,7 +655,10 @@ where
             message: format!("{name} is not defined"),
             ..Default::default()
         };
-        if !(self.should_retain)(&diagnostic) {
+        // Keep the identifier as private analysis state. `Diagnostic.data` is
+        // part of Raven's public LSP and CLI JSON payload, so using it as an
+        // internal suppression carrier would change those interfaces.
+        if !(self.should_retain)(&diagnostic, name) {
             return Some(());
         }
         self.findings.retain(Finding {
@@ -767,7 +761,7 @@ mod tests {
             source,
             DiagnosticSeverity::WARNING,
             &DiagCancelToken::never(),
-            |_| true,
+            |_, _| true,
         )
         .expect("not cancelled")
     }
@@ -1013,6 +1007,10 @@ model {
         let results = findings(&source);
         assert_eq!(results.len(), MAX_STAN_SEMANTIC_DIAGNOSTICS);
         assert_eq!(results[0].message, "missing_0 is not defined");
+        assert!(
+            results.iter().all(|finding| finding.data.is_none()),
+            "internal identifier state must not leak into LSP diagnostics"
+        );
         assert_eq!(results[0].range.start, Position::new(2, 12));
         assert_eq!(results[499].message, "missing_499 is not defined");
         assert!(results.windows(2).all(|pair| {
@@ -1054,6 +1052,35 @@ model {
     }
 
     #[test]
+    fn retained_findings_displace_the_last_entry_for_a_late_earlier_candidate() {
+        let make = |start: usize| Finding {
+            start_byte: start,
+            end_byte: start + 1,
+            name: format!("n{start}"),
+            diagnostic: Diagnostic::default(),
+        };
+        let mut retained = RetainedFindings::default();
+        for start in (1..=MAX_STAN_SEMANTIC_DIAGNOSTICS).rev() {
+            retained.retain(make(start));
+        }
+
+        retained.retain(make(0));
+
+        let keys: Vec<_> = retained
+            .entries
+            .iter()
+            .map(|finding| finding.start_byte)
+            .collect();
+        assert_eq!(keys.len(), MAX_STAN_SEMANTIC_DIAGNOSTICS);
+        assert_eq!(keys[0], 0, "the late earlier candidate must be retained");
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            !keys.contains(&MAX_STAN_SEMANTIC_DIAGNOSTICS),
+            "the previous final entry must be displaced"
+        );
+    }
+
+    #[test]
     fn traversal_continues_after_saturation_and_late_cancellation_discards_results() {
         let mut source = String::from("transformed data {\n");
         for index in 0..600 {
@@ -1072,7 +1099,7 @@ model {
             DiagnosticSeverity::WARNING,
             &cancel,
             FunctionNamespace::default(),
-            |_| true,
+            |_, _| true,
         );
         let mut program_scope = Frame::default();
         analyzer
@@ -1116,7 +1143,7 @@ model {
                 source,
                 DiagnosticSeverity::WARNING,
                 &DiagCancelToken::from_token(token),
-                |_| true,
+                |_, _| true,
             )
             .is_none()
         );
