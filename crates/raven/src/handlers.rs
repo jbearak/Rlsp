@@ -21,7 +21,7 @@ use crate::cross_file::dependency::compute_inherited_working_directory;
 use crate::cross_file::{ScopedSymbol, scope};
 use crate::file_type::{FileType, file_type_from_uri};
 use crate::state::WorldState;
-use crate::utf16::utf16_column_to_byte_offset;
+use crate::utf16::{byte_offset_to_utf16_column, utf16_column_to_byte_offset};
 
 use crate::builtins;
 use crate::reserved_words::is_reserved_word;
@@ -167,6 +167,171 @@ generated quantities { real z = twice(mu); }
         assert!(
             diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::from_token(token))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn jags_deduplicates_before_applying_the_unique_diagnostic_cap() {
+        let duplicate = foreign_syntax_diagnostic(
+            ForeignSyntaxLanguage::Jags,
+            Range::new(Position::new(0, 0), Position::new(0, 1)),
+        );
+        let mut recovery_candidates = vec![duplicate; 150];
+        recovery_candidates.extend((1..=120).map(|line| {
+            foreign_syntax_diagnostic(
+                ForeignSyntaxLanguage::Jags,
+                Range::new(Position::new(line, 0), Position::new(line, 1)),
+            )
+        }));
+
+        finalize_foreign_syntax_diagnostics(&mut recovery_candidates, ForeignSyntaxLanguage::Jags);
+
+        assert_eq!(recovery_candidates.len(), 100);
+        assert_eq!(recovery_candidates[0].range.start.line, 0);
+        assert_eq!(recovery_candidates[1].range.start.line, 1);
+        assert_eq!(recovery_candidates[99].range.start.line, 99);
+    }
+
+    #[test]
+    fn jags_bounded_retention_matches_unbounded_reference_for_out_of_order_utf16_candidates() {
+        let mut candidates = Vec::new();
+        // These columns are LSP UTF-16 positions after an astral prefix. Insert
+        // them in reverse source order and interleave exact duplicates and the
+        // two messages produced by ERROR and MISSING nodes.
+        for column in (3..=132).rev() {
+            let mut diagnostic = foreign_syntax_diagnostic(
+                ForeignSyntaxLanguage::Jags,
+                Range::new(Position::new(7, column), Position::new(7, column + 1)),
+            );
+            if column % 3 == 0 {
+                diagnostic.message = "Missing ) in JAGS code".to_string();
+            }
+            candidates.push(diagnostic.clone());
+            if column % 5 == 0 {
+                candidates.push(diagnostic);
+            }
+        }
+        candidates.push(foreign_syntax_diagnostic(
+            ForeignSyntaxLanguage::Jags,
+            Range::new(Position::new(2, 4), Position::new(2, 5)),
+        ));
+
+        let mut reference = candidates.clone();
+        finalize_foreign_syntax_diagnostics(&mut reference, ForeignSyntaxLanguage::Jags);
+        let mut bounded = Vec::new();
+        for diagnostic in candidates {
+            retain_foreign_syntax_diagnostic(
+                &mut bounded,
+                ForeignSyntaxLanguage::Jags,
+                diagnostic,
+                true,
+            );
+        }
+        finalize_foreign_syntax_diagnostics(&mut bounded, ForeignSyntaxLanguage::Jags);
+
+        assert_eq!(bounded, reference);
+        assert_eq!(bounded.len(), 100);
+        assert!(bounded.iter().all(|diagnostic| {
+            diagnostic.code
+                == Some(NumberOrString::String(
+                    crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                ))
+        }));
+    }
+
+    #[test]
+    fn jags_bounded_collector_matches_unbounded_reference_for_mixed_recovery_nodes() {
+        let code = concat!(
+            "model {\n",
+            "  /* 💥 */ alpha <- * 1; beta[1 <- 2; gamma ~ dnorm(0, 1\n",
+            "  delta <-\n",
+            "}\n",
+        );
+        let tree = crate::jags::parse_with_old_tree(code, None).expect("mixed recovery tree");
+        let sexp = tree.root_node().to_sexp();
+        assert!(sexp.contains("ERROR"), "fixture must contain ERROR: {sexp}");
+        assert!(
+            sexp.contains("MISSING"),
+            "fixture must contain MISSING: {sexp}"
+        );
+
+        let bounded = collect_foreign_syntax_errors_with_cancel_check_and_retention(
+            tree.root_node(),
+            code,
+            ForeignSyntaxLanguage::Jags,
+            || false,
+            true,
+        )
+        .unwrap();
+        let reference = collect_foreign_syntax_errors_with_cancel_check_and_retention(
+            tree.root_node(),
+            code,
+            ForeignSyntaxLanguage::Jags,
+            || false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(bounded, reference);
+    }
+
+    #[test]
+    fn jags_bounded_collector_matches_unbounded_reference_for_100kb_malformed_input() {
+        let target_bytes = 100 * 1024;
+        let mut code = String::from("model {\n");
+        while code.len() + "  theta <- * 1\n".len() + 2 < target_bytes {
+            code.push_str("  theta <- * 1\n");
+        }
+        code.push_str("}\n");
+        let tree = crate::jags::parse_with_old_tree(&code, None).expect("large malformed tree");
+
+        let bounded = collect_foreign_syntax_errors_with_cancel_check_and_retention(
+            tree.root_node(),
+            &code,
+            ForeignSyntaxLanguage::Jags,
+            || false,
+            true,
+        )
+        .unwrap();
+        let reference = collect_foreign_syntax_errors_with_cancel_check_and_retention(
+            tree.root_node(),
+            &code,
+            ForeignSyntaxLanguage::Jags,
+            || false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(bounded, reference);
+        assert_eq!(bounded.len(), 100);
+    }
+
+    #[test]
+    fn jags_large_traversal_cancels_mid_collection_without_partial_results() {
+        let mut code = String::from("model {\n  first <- * 1\n");
+        for index in 0..2_000 {
+            code.push_str(&format!("  x{index} <- {index}\n"));
+        }
+        code.push_str("}\n");
+        let tree = crate::jags::parse_with_old_tree(&code, None).expect("large JAGS tree");
+        let mut checks = 0usize;
+        let result = collect_foreign_syntax_errors_with_cancel_check(
+            tree.root_node(),
+            &code,
+            ForeignSyntaxLanguage::Jags,
+            || {
+                checks += 1;
+                checks >= 37
+            },
+        );
+
+        assert!(
+            result.is_none(),
+            "cancellation must discard partial findings"
+        );
+        assert_eq!(
+            checks, 37,
+            "one bounded callback check is made per visited node"
         );
     }
 
@@ -956,13 +1121,14 @@ impl DiagnosticsSnapshot {
         // diagnostic range is a valid document coordinate.
         let text = doc.analysis_text();
 
-        // Stan diagnostics need only the language-correct tree, its aligned
+        // Native non-R diagnostics need only the language-correct tree, its aligned
         // analysis text, cancellation, and the master diagnostics switch.
         // Construct the same snapshot type with inert R-specific fields so no
         // R metadata, scope, graph, package, or lint analyzer can consume a
-        // Stan tree. This also keeps the syntax-only path cheap for large
+        // foreign tree. This also keeps the syntax-only path cheap for large
         // models without introducing a second snapshot architecture.
-        if doc.file_type == FileType::Stan {
+        if doc.file_type != FileType::R {
+            let file_type = doc.file_type;
             return Some(DiagnosticsSnapshot {
                 tree,
                 text,
@@ -983,7 +1149,7 @@ impl DiagnosticsSnapshot {
                 cycle_detection: None,
                 cycle_closing_snippet: None,
                 package_library: state.package_library.clone(),
-                file_type: FileType::Stan,
+                file_type,
                 rmd_declared_params: false,
                 parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
                 scope_contribution: Default::default(),
@@ -1323,12 +1489,14 @@ pub(crate) fn diagnostics_from_snapshot(
     }
 
     // Dispatch from the document's language identity, not the URI extension:
-    // untitled Stan buffers carry their type only through `languageId`.
+    // untitled model buffers carry their type only through `languageId`.
     match snapshot.file_type {
         FileType::Stan => {
             return collect_stan_syntax_errors(snapshot.tree.root_node(), &snapshot.text, cancel);
         }
-        FileType::Jags => return Some(Vec::new()),
+        FileType::Jags => {
+            return collect_jags_syntax_errors(snapshot.tree.root_node(), &snapshot.text, cancel);
+        }
         FileType::R => {}
     }
 
@@ -2508,13 +2676,6 @@ impl<'a> SymbolExtractor<'a> {
         // Extract R code sections (text-based, not tree-sitter)
         let section_symbols = self.extract_sections();
         symbols.extend(section_symbols);
-        symbols
-    }
-
-    /// Extract assignments and S4 symbols without comment-derived sections.
-    fn extract_ast_symbols(&self) -> Vec<RawSymbol> {
-        let mut symbols = Vec::new();
-        self.extract_ast_symbols_recursive(self.root, &mut symbols);
         symbols
     }
 
@@ -5047,9 +5208,10 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
         }
         FileType::Jags => {
             // JAGS is never an Rmd document, so `analysis_text` is the verbatim
-            // text and serves the raw-text block detector too.
+            // text and serves the recovery-oriented symbol/block detectors too.
+            // Do not run the R assignment extractor over the native JAGS tree.
             let extractor = SymbolExtractor::new(&analysis_text, tree.root_node());
-            let mut raw_symbols = extractor.extract_ast_symbols();
+            let mut raw_symbols = collect_jags_document_symbols(tree.root_node(), &analysis_text);
             raw_symbols.extend(extractor.extract_decorative_sections(ModelCommentStyle::Hash));
             raw_symbols.extend(extractor.extract_loops());
             raw_symbols.extend(BlockDetector::detect_jags(&analysis_text));
@@ -5564,12 +5726,6 @@ pub fn diagnostics_via_snapshot_profile(
 pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> Vec<Diagnostic> {
     // Master switch check - return empty if diagnostics disabled
     if !state.cross_file_config.diagnostics_enabled {
-        return Vec::new();
-    }
-
-    // JAGS keeps its historical no-diagnostics behavior. Stan has a dedicated
-    // syntax-only path inside `diagnostics_from_snapshot`.
-    if document_file_type(state, uri) == FileType::Jags {
         return Vec::new();
     }
 
@@ -10578,23 +10734,187 @@ fn collect_syntax_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnosti
     collect_syntax_errors_inner(node, text, diagnostics, &mut state);
 }
 
-/// Collect syntax-only diagnostics from a tree-sitter-stan tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForeignSyntaxLanguage {
+    Jags,
+    Stan,
+}
+
+impl ForeignSyntaxLanguage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Jags => "JAGS",
+            Self::Stan => "Stan",
+        }
+    }
+
+    fn diagnostic_cap(self) -> usize {
+        match self {
+            Self::Jags => 100,
+            Self::Stan => usize::MAX,
+        }
+    }
+}
+
+fn foreign_syntax_diagnostic(language: ForeignSyntaxLanguage, range: Range) -> Diagnostic {
+    Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String(
+            crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+        )),
+        message: format!("{} code could not be parsed here", language.label()),
+        ..Default::default()
+    }
+}
+
+fn foreign_diagnostic_order(left: &Diagnostic, right: &Diagnostic) -> std::cmp::Ordering {
+    (
+        left.range.start.line,
+        left.range.start.character,
+        left.range.end.line,
+        left.range.end.character,
+    )
+        .cmp(&(
+            right.range.start.line,
+            right.range.start.character,
+            right.range.end.line,
+            right.range.end.character,
+        ))
+        .then_with(|| left.message.cmp(&right.message))
+}
+
+/// Retain exactly the diagnostics that a final stable sort, exact deduplication,
+/// and truncation would keep, without letting a malformed JAGS file allocate a
+/// candidate vector proportional to its syntax-error count.
+///
+/// Traversal still visits every node so cancellation remains responsive after
+/// the retained set reaches its cap. Stan's unbounded collector keeps its
+/// existing append-only behavior.
+fn retain_foreign_syntax_diagnostic(
+    diagnostics: &mut Vec<Diagnostic>,
+    language: ForeignSyntaxLanguage,
+    diagnostic: Diagnostic,
+    bounded: bool,
+) {
+    if !bounded {
+        diagnostics.push(diagnostic);
+        return;
+    }
+
+    let cap = language.diagnostic_cap();
+    if cap == usize::MAX {
+        diagnostics.push(diagnostic);
+        return;
+    }
+
+    match diagnostics.binary_search_by(|existing| foreign_diagnostic_order(existing, &diagnostic)) {
+        Ok(_) => {}
+        Err(index) if index < cap => {
+            diagnostics.insert(index, diagnostic);
+            diagnostics.truncate(cap);
+        }
+        Err(_) => {}
+    }
+}
+
+fn error_node_starts_after_retained_diagnostic_window(
+    node: Node,
+    diagnostics: &[Diagnostic],
+    language: ForeignSyntaxLanguage,
+    bounded: bool,
+) -> bool {
+    bounded
+        && diagnostics.len() == language.diagnostic_cap()
+        && diagnostics.last().is_some_and(|last| {
+            // Tree-sitter's source-order invariant places an ERROR node and
+            // all of its descendants at or after that node's start point.
+            // `minimize_error_range` is lower-bounded by that ERROR row, and
+            // clamping never moves it earlier. A later-row ERROR therefore
+            // cannot displace the retained last row after
+            // sort/dedup/truncate. Comparing only rows is deliberately
+            // conservative across UTF-8 / UTF-16 columns: same-line errors
+            // always take the full path. Standalone MISSING nodes do not use
+            // this shortcut because their anchor may walk to an earlier line.
+            node.start_position().row as u32 > last.range.start.line
+        })
+}
+
+fn byte_offset_to_position(text: &str, offset: usize) -> Position {
+    let offset = offset.min(text.len());
+    let prefix = &text[..offset];
+    let row = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    Position::new(row, utf16_len(&text[line_start..offset]))
+}
+
+fn uncovered_non_whitespace_range(text: &str, start: usize, end: usize) -> Option<Range> {
+    let uncovered = &text[start..end];
+    let leading = uncovered.len() - uncovered.trim_start_matches(char::is_whitespace).len();
+    let meaningful = uncovered.trim_matches(char::is_whitespace);
+    if meaningful.is_empty() {
+        return None;
+    }
+    let meaningful_start = start + leading;
+    let meaningful_end = meaningful_start + meaningful.len();
+    Some(Range::new(
+        byte_offset_to_position(text, meaningful_start),
+        byte_offset_to_position(text, meaningful_end),
+    ))
+}
+
+/// Collect syntax-only diagnostics from a native non-R Tree-sitter tree.
 ///
 /// Recovery subtrees often contain several nested `ERROR` nodes for one typo.
 /// Raven reports only the outer node, while still letting
 /// [`minimize_error_range`] use a nested `MISSING` node as its anchor. This
 /// keeps malformed blocks visible without cascading across otherwise-valid
 /// declarations. Standalone `MISSING` nodes are reported independently.
-fn collect_stan_syntax_errors(
+fn collect_foreign_syntax_errors_with_cancel_check(
     root: Node,
     text: &str,
-    cancel: &DiagCancelToken,
+    language: ForeignSyntaxLanguage,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Option<Vec<Diagnostic>> {
+    collect_foreign_syntax_errors_with_cancel_check_and_retention(
+        root,
+        text,
+        language,
+        &mut is_cancelled,
+        true,
+    )
+}
+
+fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
+    root: Node,
+    text: &str,
+    language: ForeignSyntaxLanguage,
+    mut is_cancelled: impl FnMut() -> bool,
+    bounded: bool,
 ) -> Option<Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
+
+    // Tree-sitter consumes a leading UTF-8 BOM before invoking a grammar. JAGS
+    // rejects that byte sequence, so parser acceptance also requires complete
+    // root coverage. The same check protects against future lexer gaps at EOF.
+    if language == ForeignSyntaxLanguage::Jags {
+        for (start, end) in [(0, root.start_byte()), (root.end_byte(), text.len())] {
+            if start < end
+                && let Some(range) = uncovered_non_whitespace_range(text, start, end)
+            {
+                retain_foreign_syntax_diagnostic(
+                    &mut diagnostics,
+                    language,
+                    foreign_syntax_diagnostic(language, range),
+                    bounded,
+                );
+            }
+        }
+    }
     let mut stack = vec![root];
 
     while let Some(node) = stack.pop() {
-        if cancel.is_cancelled() {
+        if is_cancelled() {
             return None;
         }
 
@@ -10603,7 +10923,8 @@ fn collect_stan_syntax_errors(
         // `preproc_file`, while stanc3 correctly rejects the missing required
         // path as syntax. This single structural compatibility check closes
         // that known grammar gap without resolving or reading includes.
-        if node.kind() == "preproc_include"
+        if language == ForeignSyntaxLanguage::Stan
+            && node.kind() == "preproc_include"
             && let Some(file) = node.child_by_field_name("file")
             && file.start_byte() == file.end_byte()
         {
@@ -10614,29 +10935,31 @@ fn collect_stan_syntax_errors(
                 file.start_byte(),
                 text,
             );
-            diagnostics.push(Diagnostic {
-                range: visible_anchor_range(text, row, col),
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(NumberOrString::String(
-                    crate::diagnostic_code::SYNTAX_ERROR.to_string(),
-                )),
-                message: "Stan code could not be parsed here".to_string(),
-                ..Default::default()
-            });
+            retain_foreign_syntax_diagnostic(
+                &mut diagnostics,
+                language,
+                foreign_syntax_diagnostic(language, visible_anchor_range(text, row, col)),
+                bounded,
+            );
             continue;
         }
 
         if node.is_error() {
-            let range = clamp_stan_diagnostic_range(text, minimize_error_range(node, text));
-            diagnostics.push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(NumberOrString::String(
-                    crate::diagnostic_code::SYNTAX_ERROR.to_string(),
-                )),
-                message: "Stan code could not be parsed here".to_string(),
-                ..Default::default()
-            });
+            if error_node_starts_after_retained_diagnostic_window(
+                node,
+                &diagnostics,
+                language,
+                bounded,
+            ) {
+                continue;
+            }
+            let range = clamp_foreign_diagnostic_range(text, minimize_error_range(node, text));
+            retain_foreign_syntax_diagnostic(
+                &mut diagnostics,
+                language,
+                foreign_syntax_diagnostic(language, range),
+                bounded,
+            );
             // The range helper inspected nested MISSING nodes. Do not recurse:
             // nested recovery errors describe the same outer parse failure.
             continue;
@@ -10652,19 +10975,24 @@ fn collect_stan_syntax_errors(
             );
             let kind = node.kind();
             let message = if matches!(kind, ";" | "," | ")" | "]" | "}" | "in" | "else" | "while") {
-                format!("Missing {kind} in Stan code")
+                format!("Missing {kind} in {} code", language.label())
             } else {
-                "Stan code could not be parsed here".to_string()
+                format!("{} code could not be parsed here", language.label())
             };
-            diagnostics.push(Diagnostic {
-                range: visible_anchor_range(text, row, col),
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(NumberOrString::String(
-                    crate::diagnostic_code::SYNTAX_ERROR.to_string(),
-                )),
-                message,
-                ..Default::default()
-            });
+            retain_foreign_syntax_diagnostic(
+                &mut diagnostics,
+                language,
+                Diagnostic {
+                    range: visible_anchor_range(text, row, col),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: Some(NumberOrString::String(
+                        crate::diagnostic_code::SYNTAX_ERROR.to_string(),
+                    )),
+                    message,
+                    ..Default::default()
+                },
+                bounded,
+            );
             continue;
         }
 
@@ -10673,23 +11001,42 @@ fn collect_stan_syntax_errors(
         stack.extend(children.into_iter().rev());
     }
 
-    diagnostics.sort_by(|left, right| {
-        (
-            left.range.start.line,
-            left.range.start.character,
-            left.range.end.line,
-            left.range.end.character,
-        )
-            .cmp(&(
-                right.range.start.line,
-                right.range.start.character,
-                right.range.end.line,
-                right.range.end.character,
-            ))
-            .then_with(|| left.message.cmp(&right.message))
-    });
-    diagnostics.dedup_by(|left, right| left.range == right.range && left.message == right.message);
+    finalize_foreign_syntax_diagnostics(&mut diagnostics, language);
     Some(diagnostics)
+}
+
+fn finalize_foreign_syntax_diagnostics(
+    diagnostics: &mut Vec<Diagnostic>,
+    language: ForeignSyntaxLanguage,
+) {
+    diagnostics.sort_by(foreign_diagnostic_order);
+    diagnostics.dedup_by(|left, right| left.range == right.range && left.message == right.message);
+    diagnostics.truncate(language.diagnostic_cap());
+}
+
+fn collect_foreign_syntax_errors(
+    root: Node,
+    text: &str,
+    cancel: &DiagCancelToken,
+    language: ForeignSyntaxLanguage,
+) -> Option<Vec<Diagnostic>> {
+    collect_foreign_syntax_errors_with_cancel_check(root, text, language, || cancel.is_cancelled())
+}
+
+fn collect_stan_syntax_errors(
+    root: Node,
+    text: &str,
+    cancel: &DiagCancelToken,
+) -> Option<Vec<Diagnostic>> {
+    collect_foreign_syntax_errors(root, text, cancel, ForeignSyntaxLanguage::Stan)
+}
+
+fn collect_jags_syntax_errors(
+    root: Node,
+    text: &str,
+    cancel: &DiagCancelToken,
+) -> Option<Vec<Diagnostic>> {
+    collect_foreign_syntax_errors(root, text, cancel, ForeignSyntaxLanguage::Jags)
 }
 
 /// Make a zero-width parser insertion visible without extending beyond the
@@ -10710,7 +11057,7 @@ fn visible_anchor_range(text: &str, row: u32, column: u32) -> Range {
     Range::new(Position::new(row, start), Position::new(row, end))
 }
 
-fn clamp_stan_diagnostic_range(text: &str, range: Range) -> Range {
+fn clamp_foreign_diagnostic_range(text: &str, range: Range) -> Range {
     let line = text.lines().nth(range.start.line as usize).unwrap_or("");
     let width = utf16_len(line);
     let start = range.start.character.min(width);
@@ -19670,13 +20017,6 @@ fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> 
     }
 }
 
-fn document_file_type(state: &WorldState, uri: &Url) -> FileType {
-    state
-        .get_document(uri)
-        .map(|doc| doc.file_type)
-        .unwrap_or_else(|| file_type_from_uri(uri))
-}
-
 fn push_local_symbol_completion(
     items: &mut Vec<CompletionItem>,
     seen_names: &mut std::collections::HashSet<String>,
@@ -20530,8 +20870,127 @@ fn collect_jags_document_completions(
     }
 }
 
-// JAGS text-based identifier scanning (analogous to Stan's text-based approach).
-// tree-sitter-r can't parse JAGS syntax, so we bypass the AST entirely.
+/// Return the identifier defined by a JAGS relation's left-hand side.
+///
+/// Plain and subset relations define the base identifier (`x` in `x[i]`). A
+/// link relation defines the identifier inside the link call (`p` in
+/// `logit(p[i])`), not the link function name.
+fn jags_relation_identifier(lhs: Node) -> Option<Node> {
+    fn first_identifier(node: Node) -> Option<Node> {
+        if node.kind() == "identifier" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).find_map(first_identifier)
+    }
+
+    match lhs.kind() {
+        "identifier" => Some(lhs),
+        "subset" => lhs
+            .child_by_field_name("function")
+            .and_then(first_identifier),
+        "link_call" => lhs
+            .child_by_field_name("arguments")
+            .and_then(first_identifier),
+        _ => first_identifier(lhs),
+    }
+}
+
+fn jags_node_range(node: Node, text: &str) -> Range {
+    let start = node.start_position();
+    let end = node.end_position();
+    let column = |point: Point| {
+        byte_offset_to_utf16_column(text.split('\n').nth(point.row).unwrap_or(""), point.column)
+    };
+    Range::new(
+        Position::new(start.row as u32, column(start)),
+        Position::new(end.row as u32, column(end)),
+    )
+}
+
+/// Extract native deterministic and stochastic JAGS relations for the outline.
+///
+/// Relation nodes keep comments lexically opaque, preserve malformed-buffer
+/// recovery supplied by Tree-sitter, and expose every semicolon-separated
+/// relation. Raven deliberately does not send the JAGS tree through the R
+/// assignment extractor.
+fn collect_jags_document_symbols(root: Node, text: &str) -> Vec<RawSymbol> {
+    let mut symbols = Vec::new();
+
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "deterministic_relation" | "stochastic_relation"
+        ) && let Some(lhs) = node.child_by_field_name("lhs")
+            && let Some(identifier) = jags_relation_identifier(lhs)
+            && let Ok(name) = identifier.utf8_text(text.as_bytes())
+        {
+            symbols.push(RawSymbol {
+                name: name.to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: jags_node_range(node, text),
+                selection_range: jags_node_range(identifier, text),
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            });
+            continue;
+        }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+
+    // A clean native tree is authoritative. Lexical recovery exists only for
+    // malformed editor buffers where the grammar could not form a relation
+    // node (for example, a temporarily out-of-order root relation).
+    if root.has_error() {
+        let mut seen = symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.selection_range.start.line,
+                    symbol.selection_range.start.character,
+                )
+            })
+            .collect::<HashSet<_>>();
+        for relation in crate::jags::recovery_relation_identifiers(text) {
+            if is_r_only_jags_completion_name(&relation.name)
+                || !seen.insert((
+                    relation.selection_range.start.line,
+                    relation.selection_range.start.character,
+                ))
+            {
+                continue;
+            }
+            symbols.push(RawSymbol {
+                name: relation.name,
+                kind: DocumentSymbolKind::Variable,
+                range: relation.range,
+                selection_range: relation.selection_range,
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            });
+        }
+    }
+
+    symbols.sort_by_key(|symbol| {
+        (
+            symbol.range.start.line,
+            symbol.range.start.character,
+            symbol.range.end.line,
+            symbol.range.end.character,
+        )
+    });
+
+    symbols
+}
+
+// JAGS text-based identifier scanning (analogous to Stan's text-based approach)
+// remains deliberately recovery-oriented and independent of AST shape.
 
 fn is_jags_identifier_start(byte: u8) -> bool {
     byte.is_ascii_alphabetic()
@@ -24139,8 +24598,8 @@ pub fn goto_definition_with_cancel(
         if let Some(crate::file_path_intellisense::FilePathNavigationTarget::Directive {
             directive_type,
             path,
-        }) = crate::file_path_intellisense::detect_file_path_navigation_target(
-            tree, &raw_text, position,
+        }) = crate::file_path_intellisense::detect_directive_path_navigation_target(
+            &raw_text, position,
         ) && let Some(location) = crate::file_path_intellisense::file_path_definition(
             crate::file_path_intellisense::FilePathNavigationTarget::Directive {
                 directive_type,
@@ -24164,6 +24623,56 @@ pub fn goto_definition_with_cancel(
             range: Range {
                 start: Position::new(definition.line, definition.start_col),
                 end: Position::new(definition.line, definition.end_col),
+            },
+        }));
+    }
+
+    // JAGS uses recovery-oriented text navigation. Dispatch before any R AST,
+    // metadata, attachment, or source-call logic can consume its native tree.
+    if doc.file_type == FileType::Jags {
+        let raw_text = doc.text();
+        let directive_metadata = crate::cross_file::directive::parse_directives(&raw_text);
+        if let Some(crate::file_path_intellisense::FilePathNavigationTarget::Directive {
+            directive_type,
+            path,
+        }) = crate::file_path_intellisense::detect_directive_path_navigation_target(
+            &raw_text, position,
+        ) && let Some(location) = crate::file_path_intellisense::file_path_definition(
+            crate::file_path_intellisense::FilePathNavigationTarget::Directive {
+                directive_type,
+                path,
+            },
+            uri,
+            &directive_metadata,
+            state.workspace_folders.first(),
+        ) {
+            return Some(GotoDefinitionResponse::Scalar(location));
+        }
+
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let occurrences = collect_jags_identifier_occurrences(&raw_text);
+        let target = stan_identifier_at_position(&occurrences, position)?;
+
+        if is_jags_builtin_occurrence(&raw_text, position) {
+            return None;
+        }
+
+        let location = find_jags_definition(&raw_text, &target.name, position)
+            .map(|definition| (definition.line, definition.start_col, definition.end_col))
+            .or_else(|| {
+                occurrences
+                    .iter()
+                    .find(|occurrence| occurrence.name == target.name)
+                    .map(|occurrence| (occurrence.line, occurrence.start_col, occurrence.end_col))
+            })?;
+
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range: Range {
+                start: Position::new(location.0, location.1),
+                end: Position::new(location.0, location.2),
             },
         }));
     }
@@ -24223,40 +24732,6 @@ pub fn goto_definition_with_cancel(
             .or_else(|| import_module_spec_definition(&metadata, position))
     {
         return Some(GotoDefinitionResponse::Scalar(location));
-    }
-
-    if doc.file_type == FileType::Jags {
-        if cancel.is_cancelled() {
-            return None;
-        }
-        let occurrences = collect_jags_identifier_occurrences(&text);
-        let target = stan_identifier_at_position(&occurrences, position)?;
-
-        // Syntax and catalog calls have no file-local definition. The same
-        // spelling in a plain identifier position may be a valid data input,
-        // so only the occurrence's lexical role is excluded.
-        if is_jags_builtin_occurrence(&text, position) {
-            return None;
-        }
-
-        // Try definition candidates first, then fall back to first occurrence
-        // (covers data inputs and constants that have no assignment in the JAGS file).
-        let location = find_jags_definition(&text, &target.name, position)
-            .map(|def| (def.line, def.start_col, def.end_col))
-            .or_else(|| {
-                occurrences
-                    .iter()
-                    .find(|o| o.name == target.name)
-                    .map(|o| (o.line, o.start_col, o.end_col))
-            })?;
-
-        return Some(GotoDefinitionResponse::Scalar(Location {
-            uri: uri.clone(),
-            range: Range {
-                start: Position::new(location.0, location.1),
-                end: Position::new(location.0, location.2),
-            },
-        }));
     }
 
     // Continue with normal identifier-based go-to-definition.
@@ -24919,7 +25394,11 @@ fn reference_search_uris(state: &WorldState, current: &Url) -> Vec<Url> {
         .chain(state.documents.uris())
         .chain(state.workspace_index.iter().into_iter().map(|(uri, _)| uri))
     {
-        if seen.insert(uri.clone()) {
+        let file_type = state
+            .get_document(&uri)
+            .map(|document| document.file_type)
+            .unwrap_or_else(|| file_type_from_uri(&uri));
+        if file_type == FileType::R && seen.insert(uri.clone()) {
             uris.push(uri);
         }
     }
@@ -25404,6 +25883,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
             continue; // Already searched
         }
         if let Some(document) = state.documents.get(&file_uri)
+            && document.file_type == FileType::R
             && let Some(tree) = &document.tree
         {
             let file_text = document.analysis_text();
@@ -25422,7 +25902,10 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     // while `contents` is RAW — pair the tree with the masked analysis view so
     // byte offsets align (#343).
     for (file_uri, entry) in state.workspace_index.iter() {
-        if &file_uri == uri || state.documents.contains_key(&file_uri) {
+        if &file_uri == uri
+            || state.documents.contains_key(&file_uri)
+            || file_type_from_uri(&file_uri) != FileType::R
+        {
             continue; // Already searched
         }
         if let Some(tree) = &entry.tree {
@@ -71508,21 +71991,33 @@ mod file_type_tests {
             assert_eq!(file_type_from_uri(&uri), FileType::R);
         }
 
-        // **Validates: Requirements 1.1, 1.2**
-        // Property 2: JAGS files produce empty diagnostics
         #[test]
-        fn prop_jags_files_produce_empty_diagnostics(
+        fn prop_jags_diagnostics_are_syntax_only_and_in_bounds(
             content in "[a-zA-Z0-9 ~<\\-\\+\\*/\\n\\{\\}\\(\\)]{1,200}",
-            ext in prop_oneof![Just("jags"), Just("bugs")]
+            extension in prop_oneof![Just("jags"), Just("JAGS"), Just("bugs"), Just("BUGS")]
         ) {
-            let uri_str = format!("file:///test/model.{}", ext);
-            let uri = Url::parse(&uri_str).unwrap();
+            let uri = Url::parse(&format!("file:///test/model.{extension}")).unwrap();
             let mut state = crate::state::WorldState::new();
             state.workspace_scan_complete = true;
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = diagnostics(&state, &uri, &DiagCancelToken::never());
-            assert!(result.is_empty(), "JAGS file should produce no diagnostics, got {:?}", result);
+            let lines: Vec<&str> = content.lines().collect();
+            for diagnostic in result {
+                prop_assert_eq!(
+                    diagnostic.code,
+                    Some(NumberOrString::String(crate::diagnostic_code::SYNTAX_ERROR.to_string()))
+                );
+                let line = lines
+                    .get(diagnostic.range.start.line as usize)
+                    .copied()
+                    .unwrap_or("");
+                let width = utf16_len(line);
+                prop_assert!(diagnostic.range.start.character <= width);
+                if diagnostic.range.end.line == diagnostic.range.start.line {
+                    prop_assert!(diagnostic.range.end.character <= width);
+                }
+            }
         }
 
         // **Validates: Requirements 2.1, 2.2**
@@ -71771,6 +72266,49 @@ mod file_type_tests {
         }
     }
 
+    #[test]
+    fn r_and_jags_reference_searches_do_not_cross_language_boundaries() {
+        let mut state = crate::state::WorldState::new();
+        state.workspace_scan_complete = true;
+        let r_uri = Url::parse("file:///test/script.R").unwrap();
+        let jags_uri = Url::parse("file:///test/model.jags").unwrap();
+        let bugs_uri = Url::parse("file:///test/model.bugs").unwrap();
+        state.open_document_with_language_id(
+            r_uri.clone(),
+            "shared <- 1\nshared\n",
+            Some(1),
+            Some("r"),
+        );
+        state.open_document_with_language_id(
+            jags_uri.clone(),
+            "model { shared <- 1 }\n",
+            Some(1),
+            Some("jags"),
+        );
+        state.open_document_with_language_id(
+            bugs_uri.clone(),
+            "model { shared <- shared + 1 }\n",
+            Some(1),
+            Some("jags"),
+        );
+
+        let r_locations = references(&state, &r_uri, Position::new(0, 2)).unwrap();
+        assert!(r_locations.iter().all(|location| location.uri == r_uri));
+
+        let jags_locations = references(&state, &jags_uri, Position::new(0, 10)).unwrap();
+        assert!(
+            jags_locations
+                .iter()
+                .all(|location| location.uri == jags_uri || location.uri == bugs_uri)
+        );
+        assert!(
+            jags_locations
+                .iter()
+                .any(|location| location.uri == bugs_uri)
+        );
+        assert!(jags_locations.iter().all(|location| location.uri != r_uri));
+    }
+
     fn stan_completion_items(text: &str) -> Vec<CompletionItem> {
         let uri = Url::parse("file:///test/model.stan").unwrap();
         let mut state = crate::state::WorldState::new();
@@ -72007,6 +72545,17 @@ mod block_detector_integration_tests {
         }
     }
 
+    fn variable_symbols<'a>(symbols: &'a [DocumentSymbol], output: &mut Vec<&'a DocumentSymbol>) {
+        for symbol in symbols {
+            if symbol.kind == SymbolKind::FIELD {
+                output.push(symbol);
+            }
+            if let Some(children) = &symbol.children {
+                variable_symbols(children, output);
+            }
+        }
+    }
+
     fn make_state(uri_str: &str, code: &str) -> (crate::state::WorldState, Url) {
         let mut state = crate::state::WorldState::new();
         state.symbol_config.hierarchical_document_symbol_support = true;
@@ -72040,6 +72589,202 @@ mod block_detector_integration_tests {
         );
         let children = block.unwrap().children.as_ref().unwrap();
         assert!(!children.is_empty(), "model block should contain children");
+    }
+
+    #[test]
+    fn test_jags_native_outline_emits_every_same_line_relation_with_exact_ranges() {
+        let code = "model { x <- 1; y ~ dnorm(0,1) }\n";
+        for extension in ["jags", "bugs"] {
+            let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
+            let symbols = nested_symbols(&state, &uri);
+            assert_symbol_tree_contract(&symbols, None);
+            let model = symbols
+                .iter()
+                .find(|symbol| symbol.name == "model")
+                .unwrap();
+            let children = model.children.as_ref().unwrap();
+            let x = children.iter().find(|symbol| symbol.name == "x").unwrap();
+            let y = children.iter().find(|symbol| symbol.name == "y").unwrap();
+
+            assert_eq!(
+                x.range,
+                Range::new(Position::new(0, 8), Position::new(0, 15))
+            );
+            assert_eq!(
+                x.selection_range,
+                Range::new(Position::new(0, 8), Position::new(0, 9))
+            );
+            assert_eq!(
+                y.range,
+                Range::new(Position::new(0, 16), Position::new(0, 30))
+            );
+            assert_eq!(
+                y.selection_range,
+                Range::new(Position::new(0, 16), Position::new(0, 17))
+            );
+        }
+    }
+
+    #[test]
+    fn test_jags_clean_comparison_rhs_uses_only_native_relation_symbols() {
+        let code = "model { x <- a <= b; y <- c == d; z <- e != f }\n";
+        for extension in ["jags", "bugs"] {
+            let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
+            assert!(
+                !state
+                    .get_document(&uri)
+                    .unwrap()
+                    .tree
+                    .as_ref()
+                    .unwrap()
+                    .root_node()
+                    .has_error()
+            );
+            let symbols = nested_symbols(&state, &uri);
+            assert_symbol_tree_contract(&symbols, None);
+            let mut variables = Vec::new();
+            variable_symbols(&symbols, &mut variables);
+            assert_eq!(
+                variables
+                    .iter()
+                    .map(|symbol| symbol.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["x", "y", "z"],
+                ".{extension}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_jags_malformed_recovery_does_not_promote_comparison_operands() {
+        let code = "*\nmodel { x <- a <= b; y <- c == d; z <- e != f }\n";
+        for extension in ["jags", "bugs"] {
+            let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
+            assert!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .tree
+                    .as_ref()
+                    .unwrap()
+                    .root_node()
+                    .has_error()
+            );
+            let symbols = nested_symbols(&state, &uri);
+            assert_symbol_tree_contract(&symbols, None);
+            let mut variables = Vec::new();
+            variable_symbols(&symbols, &mut variables);
+            assert_eq!(
+                variables
+                    .iter()
+                    .map(|symbol| symbol.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["x", "y", "z"],
+                ".{extension}: comparison operands must not become definitions"
+            );
+        }
+    }
+
+    #[test]
+    fn test_jags_recovered_same_line_relation_ranges_are_exact_and_non_overlapping() {
+        let code = "x <- 1; y ~ dnorm(0, 1)\nmodel {\n  broken <-\n}\n";
+        for extension in ["jags", "bugs"] {
+            let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
+            let document = state.get_document(&uri).unwrap();
+            let tree = document.tree.as_ref().unwrap();
+            assert!(tree.root_node().has_error());
+            let analysis_text = document.analysis_text();
+            let symbols = collect_jags_document_symbols(tree.root_node(), &analysis_text);
+            let x = symbols.iter().find(|symbol| symbol.name == "x").unwrap();
+            let y = symbols.iter().find(|symbol| symbol.name == "y").unwrap();
+            assert_eq!(
+                x.range,
+                Range::new(Position::new(0, 0), Position::new(0, 7)),
+                ".{extension}"
+            );
+            assert_eq!(
+                y.range,
+                Range::new(Position::new(0, 8), Position::new(0, 23)),
+                ".{extension}"
+            );
+            assert!(x.range.end <= y.range.start, ".{extension}");
+        }
+    }
+
+    #[test]
+    fn test_jags_native_outline_ignores_block_and_hash_comment_relations() {
+        let code = "model {\n  /* ghost <- 1\n     hidden ~ dnorm(0, 1) */\n  before <- 1; /* same_line <- 2 */ after ~ dnorm(0, 1)\n  # hash_only <- 3\n  tail <- 4\n}\n";
+        for extension in ["jags", "bugs"] {
+            let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
+            let symbols = nested_symbols(&state, &uri);
+            assert_symbol_tree_contract(&symbols, None);
+            let model = symbols
+                .iter()
+                .find(|symbol| symbol.name == "model")
+                .unwrap();
+            let children = model.children.as_ref().unwrap();
+            let names: Vec<&str> = children.iter().map(|symbol| symbol.name.as_str()).collect();
+            assert_eq!(names, vec!["before", "after", "tail"], ".{extension}");
+
+            let before = &children[0];
+            let after = &children[1];
+            let tail = &children[2];
+            assert_eq!(
+                before.range,
+                Range::new(Position::new(3, 2), Position::new(3, 14))
+            );
+            assert_eq!(
+                before.selection_range,
+                Range::new(Position::new(3, 2), Position::new(3, 8))
+            );
+            assert_eq!(
+                after.selection_range,
+                Range::new(Position::new(3, 36), Position::new(3, 41))
+            );
+            assert_eq!(
+                tail.selection_range,
+                Range::new(Position::new(5, 2), Position::new(5, 6))
+            );
+        }
+    }
+
+    #[test]
+    fn test_jags_native_outline_relations_nest_under_loops_with_utf16_selections() {
+        let code =
+            "model {\n  for (i in 1:N) {\n    /* 💥 */ x[i] <- 1; y[i] ~ dnorm(0, 1)\n  }\n}\n";
+        for extension in ["jags", "bugs"] {
+            let (state, uri) = make_state(&format!("file:///test/model.{extension}"), code);
+            let symbols = nested_symbols(&state, &uri);
+            assert_symbol_tree_contract(&symbols, None);
+            let model = symbols
+                .iter()
+                .find(|symbol| symbol.name == "model")
+                .unwrap();
+            let loop_symbol = model
+                .children
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|symbol| symbol.name == "for (i in 1:N)")
+                .unwrap();
+            let children = loop_symbol.children.as_ref().unwrap();
+            assert_eq!(
+                children
+                    .iter()
+                    .map(|symbol| symbol.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["x", "y"],
+                ".{extension}"
+            );
+            assert_eq!(
+                children[0].selection_range,
+                Range::new(Position::new(2, 13), Position::new(2, 14))
+            );
+            assert_eq!(
+                children[1].selection_range,
+                Range::new(Position::new(2, 24), Position::new(2, 25))
+            );
+        }
     }
 
     #[test]

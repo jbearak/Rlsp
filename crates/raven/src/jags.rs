@@ -1,12 +1,24 @@
-//! Lightweight lexical support for JAGS editor assistance.
+//! JAGS parsing and lightweight lexical support for editor assistance.
 //!
-//! This scanner is deliberately narrower than a parser. It identifies ASCII
+//! The native Tree-sitter parser backs syntax diagnostics and structural
+//! editor features. The recovery-oriented scanner remains deliberately
+//! narrower than the parser: it identifies ASCII
 //! JAGS call names, comment-free delimiters, distribution context after `~`,
 //! and the active call argument. Completion, hover, and signature help can use
-//! it without consulting the temporary R parse tree or any R-specific scope,
+//! it without consulting the parse tree or any R-specific scope,
 //! package, help, subprocess, or cross-file machinery.
 
 use tower_lsp::lsp_types::{Position, Range};
+use tree_sitter::{Parser, Tree};
+
+/// Parse JAGS source while reusing an edited tree from the prior raw text.
+pub(crate) fn parse_with_old_tree(text: &str, old_tree: Option<&Tree>) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_jags::LANGUAGE.into())
+        .ok()?;
+    parser.parse(text, old_tree)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TokenKind {
@@ -19,6 +31,10 @@ enum TokenKind {
     RightBrace,
     Comma,
     Tilde,
+    LeftArrow,
+    Equals,
+    Comparison,
+    Semicolon,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +128,25 @@ fn push_punctuation(
     });
 }
 
+fn push_two_byte_punctuation(
+    tokens: &mut Vec<Token>,
+    kind: TokenKind,
+    index: &mut usize,
+    line: &mut u32,
+    column: &mut u32,
+) {
+    let start_byte = *index;
+    let start = Position::new(*line, *column);
+    advance_ascii(0, index, line, column);
+    advance_ascii(0, index, line, column);
+    tokens.push(Token {
+        kind,
+        start_byte,
+        end_byte: *index,
+        range: Range::new(start, Position::new(*line, *column)),
+    });
+}
+
 fn tokenize_until(text: &str, limit: usize) -> (Vec<Token>, LexState) {
     let bytes = text.as_bytes();
     let limit = limit.min(bytes.len());
@@ -160,6 +195,32 @@ fn tokenize_until(text: &str, limit: usize) -> (Vec<Token>, LexState) {
                     continue;
                 }
 
+                if bytes[index] == b'<' && index + 1 < limit && bytes[index + 1] == b'-' {
+                    push_two_byte_punctuation(
+                        &mut tokens,
+                        TokenKind::LeftArrow,
+                        &mut index,
+                        &mut line,
+                        &mut column,
+                    );
+                    continue;
+                }
+                if index + 1 < limit
+                    && matches!(
+                        (bytes[index], bytes[index + 1]),
+                        (b'<', b'=') | (b'>', b'=') | (b'=', b'=') | (b'!', b'=')
+                    )
+                {
+                    push_two_byte_punctuation(
+                        &mut tokens,
+                        TokenKind::Comparison,
+                        &mut index,
+                        &mut line,
+                        &mut column,
+                    );
+                    continue;
+                }
+
                 let kind = match bytes[index] {
                     b'(' => Some(TokenKind::LeftParen),
                     b')' => Some(TokenKind::RightParen),
@@ -169,6 +230,8 @@ fn tokenize_until(text: &str, limit: usize) -> (Vec<Token>, LexState) {
                     b'}' => Some(TokenKind::RightBrace),
                     b',' => Some(TokenKind::Comma),
                     b'~' => Some(TokenKind::Tilde),
+                    b'=' => Some(TokenKind::Equals),
+                    b';' => Some(TokenKind::Semicolon),
                     _ => None,
                 };
                 if let Some(kind) = kind {
@@ -470,7 +533,12 @@ pub fn active_call_at_position(text: &str, position: Position) -> Option<JagsAct
                     call.active_parameter += 1;
                 }
             }
-            TokenKind::Identifier(_) | TokenKind::Tilde => {}
+            TokenKind::Identifier(_)
+            | TokenKind::Tilde
+            | TokenKind::LeftArrow
+            | TokenKind::Equals
+            | TokenKind::Comparison
+            | TokenKind::Semicolon => {}
         }
     }
 
@@ -483,9 +551,239 @@ pub fn active_call_at_position(text: &str, position: Position) -> Option<JagsAct
         })
 }
 
+/// A relation identifier recovered lexically when the native parser cannot
+/// form a relation node around an incomplete or out-of-order buffer fragment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JagsRecoveryRelation {
+    pub(crate) name: String,
+    pub(crate) range: Range,
+    pub(crate) selection_range: Range,
+}
+
+fn position_at_byte_offset(text: &str, offset: usize) -> Position {
+    let offset = offset.min(text.len());
+    let prefix = &text[..offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    Position::new(line, text[line_start..offset].encode_utf16().count() as u32)
+}
+
+/// Scan the malformed relation's RHS to its own lexical boundary.
+///
+/// A top-level semicolon belongs to the relation. A top-level newline, closing
+/// brace, or opening brace starts another construct and does not. Comments and
+/// quoted text are opaque, and delimiters inside calls/subsets do not end the
+/// relation. `last_code_end` excludes trailing whitespace and comments.
+fn recovery_relation_end_byte(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = start;
+    let mut last_code_end = start;
+    let mut parentheses = 0usize;
+    let mut brackets = 0usize;
+    let mut state = LexState::Code;
+
+    while index < bytes.len() {
+        match state {
+            LexState::Code => {
+                let byte = bytes[index];
+                let top_level = parentheses == 0 && brackets == 0;
+                if byte == b'#' {
+                    state = LexState::LineComment;
+                    index += 1;
+                } else if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
+                    state = LexState::BlockComment;
+                    index += 2;
+                } else if byte == b'"' {
+                    state = LexState::DoubleQuoted;
+                    last_code_end = index + 1;
+                    index += 1;
+                } else if byte == b'\'' {
+                    state = LexState::SingleQuoted;
+                    last_code_end = index + 1;
+                    index += 1;
+                } else if top_level && byte == b';' {
+                    return index + 1;
+                } else if top_level && matches!(byte, b'\n' | b'{' | b'}') {
+                    return last_code_end;
+                } else {
+                    match byte {
+                        b'(' => parentheses += 1,
+                        b')' => parentheses = parentheses.saturating_sub(1),
+                        b'[' => brackets += 1,
+                        b']' => brackets = brackets.saturating_sub(1),
+                        _ => {}
+                    }
+                    if !byte.is_ascii_whitespace() {
+                        last_code_end = index + 1;
+                    }
+                    index += 1;
+                }
+            }
+            LexState::LineComment => {
+                if bytes[index] == b'\n' {
+                    if parentheses == 0 && brackets == 0 {
+                        return last_code_end;
+                    }
+                    state = LexState::Code;
+                }
+                index += 1;
+            }
+            LexState::BlockComment => {
+                if bytes[index] == b'*' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
+                    state = LexState::Code;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            LexState::DoubleQuoted | LexState::SingleQuoted => {
+                let terminator = if state == LexState::DoubleQuoted {
+                    b'"'
+                } else {
+                    b'\''
+                };
+                if bytes[index] == b'\\' && index + 1 < bytes.len() {
+                    index += 2;
+                    last_code_end = index;
+                } else {
+                    let byte = bytes[index];
+                    index += 1;
+                    last_code_end = index;
+                    if byte == terminator {
+                        state = LexState::Code;
+                    }
+                }
+            }
+        }
+    }
+
+    last_code_end
+}
+
+/// Recover plain/subset relation identifiers using the editor scanner's
+/// comment- and string-aware token stream.
+///
+/// Native relation nodes remain authoritative for valid JAGS. This narrow
+/// fallback preserves outline symbols in malformed buffers (for example, a
+/// relation temporarily preceding `model`) without ever interpreting relation
+/// text inside `#`, `/* ... */`, or quoted content.
+pub(crate) fn recovery_relation_identifiers(text: &str) -> Vec<JagsRecoveryRelation> {
+    let tokens = tokenize(text);
+    let mut relations = Vec::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        let TokenKind::Identifier(name) = &token.kind else {
+            continue;
+        };
+        let mut next = index + 1;
+        let mut lhs_end = token;
+        while tokens.get(next).is_some_and(|candidate| {
+            matches!(candidate.kind, TokenKind::LeftBracket)
+                && token_follows_with_trivia(text, lhs_end, candidate)
+        }) {
+            let mut depth = 0usize;
+            let mut closing = None;
+            while let Some(candidate) = tokens.get(next) {
+                match candidate.kind {
+                    TokenKind::LeftBracket => depth += 1,
+                    TokenKind::RightBracket => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            closing = Some(candidate);
+                            next += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                next += 1;
+            }
+            if depth != 0 {
+                continue;
+            }
+            lhs_end = closing.expect("balanced subset has a closing bracket");
+        }
+
+        if let Some(operator) = tokens.get(next).filter(|candidate| {
+            matches!(
+                candidate.kind,
+                TokenKind::LeftArrow | TokenKind::Equals | TokenKind::Tilde
+            ) && token_follows_with_trivia(text, lhs_end, candidate)
+        }) {
+            let end_byte = recovery_relation_end_byte(text, operator.end_byte);
+            relations.push(JagsRecoveryRelation {
+                name: name.clone(),
+                range: Range::new(token.range.start, position_at_byte_offset(text, end_byte)),
+                selection_range: token.range,
+            });
+        }
+    }
+
+    relations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_relations_are_comment_aware_and_keep_utf16_identifier_ranges() {
+        let code = concat!(
+            "# ghost <- 1\n",
+            "/* hidden ~ dnorm(0, 1)\n",
+            "   still_hidden = 2 */\n",
+            "\"quoted <- 3\"\n",
+            "model { /* 💥 */ x[i] <- 1; y ~ dnorm(0, 1) }\n",
+        );
+
+        assert_eq!(
+            recovery_relation_identifiers(code),
+            vec![
+                JagsRecoveryRelation {
+                    name: "x".to_string(),
+                    range: Range::new(Position::new(4, 17), Position::new(4, 27)),
+                    selection_range: Range::new(Position::new(4, 17), Position::new(4, 18)),
+                },
+                JagsRecoveryRelation {
+                    name: "y".to_string(),
+                    range: Range::new(Position::new(4, 28), Position::new(4, 43)),
+                    selection_range: Range::new(Position::new(4, 28), Position::new(4, 29)),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_relations_require_raw_trivia_adjacency_and_skip_comparisons() {
+        let code = concat!(
+            "a <= b; c >= d; e == f; g != h\n",
+            "plus + hidden <- 1\n",
+            "call() = 2; discarded + 1 = 2\n",
+            "x /* trivia */ <- 1; y[i] # line trivia\n",
+            "  ~ dnorm(0, 1)\n",
+        );
+
+        assert_eq!(
+            recovery_relation_identifiers(code),
+            vec![
+                JagsRecoveryRelation {
+                    name: "hidden".to_string(),
+                    range: Range::new(Position::new(1, 7), Position::new(1, 18)),
+                    selection_range: Range::new(Position::new(1, 7), Position::new(1, 13)),
+                },
+                JagsRecoveryRelation {
+                    name: "x".to_string(),
+                    range: Range::new(Position::new(3, 0), Position::new(3, 20)),
+                    selection_range: Range::new(Position::new(3, 0), Position::new(3, 1)),
+                },
+                JagsRecoveryRelation {
+                    name: "y".to_string(),
+                    range: Range::new(Position::new(3, 21), Position::new(4, 15)),
+                    selection_range: Range::new(Position::new(3, 21), Position::new(3, 22)),
+                },
+            ]
+        );
+    }
 
     #[test]
     fn call_sites_are_distribution_aware_and_support_dotted_names() {

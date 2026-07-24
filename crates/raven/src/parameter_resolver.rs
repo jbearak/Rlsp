@@ -541,6 +541,9 @@ pub(crate) fn get_text_and_tree(
     // 1. Open documents. Return the analysis text (masked when required) so
     //    the caller's byte-offset slices into `tree` align.
     if let Some(doc) = state.documents.get(uri) {
+        if doc.file_type != crate::file_type::FileType::R {
+            return None;
+        }
         if let Some(tree) = &doc.tree {
             return Some((doc.analysis_text(), tree.clone()));
         } else {
@@ -553,6 +556,9 @@ pub(crate) fn get_text_and_tree(
     //    indexing), while `contents` is RAW — pair the tree with the masked
     //    analysis view so byte offsets align (#343).
     if let Some(entry) = state.workspace_index.get(uri) {
+        if crate::file_type::file_type_from_uri(uri) != crate::file_type::FileType::R {
+            return None;
+        }
         if let Some(tree) = &entry.tree {
             let raw = entry.contents.to_string();
             let text = state.analysis_text_for_uri(uri, &raw).into_owned();
@@ -568,6 +574,9 @@ pub(crate) fn get_text_and_tree(
     //    rather than failing closed, and the (text, tree) pair stays aligned
     //    (raw == analysis for plain R, so this is behavior-neutral there) (#343).
     if let Some(content) = state.cross_file_file_cache.get(uri) {
+        if crate::file_type::file_type_from_uri(uri) != crate::file_type::FileType::R {
+            return None;
+        }
         let analysis = state.analysis_text_for_uri(uri, &content).into_owned();
         if let Some(tree) = crate::parser_pool::with_parser(|p| p.parse(&analysis, None)) {
             return Some((analysis, tree));
@@ -591,6 +600,9 @@ fn resolve_from_current_file(
     position: tower_lsp::lsp_types::Position,
 ) -> Option<FunctionSignature> {
     let doc = state.get_document(uri)?;
+    if doc.file_type != crate::file_type::FileType::R {
+        return None;
+    }
     let tree = doc.tree.as_ref()?;
     // Analysis text (masked for Rmd) matches `tree`'s byte offsets; equals the
     // raw text for plain R. Signature help is gated for Rmd at the entry point,

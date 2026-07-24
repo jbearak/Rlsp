@@ -1645,6 +1645,7 @@ dependencies = [
  "tower",
  "tower-lsp",
  "tree-sitter",
+ "tree-sitter-jags",
  "tree-sitter-r",
  "tree-sitter-stan",
  "url",

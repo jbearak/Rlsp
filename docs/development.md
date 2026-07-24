@@ -1297,14 +1297,22 @@ bun editors/vscode/scripts/generate-jags-builtins.mjs
 bun editors/vscode/scripts/generate-jags-builtins.mjs --check
 ```
 
-The generator validates the exact version, source URL/hash, default `basemod`/`bugs` boundary, schema, ASCII sort order, uniqueness, syntax classification, and module ownership before producing Rust. Keep the manifest header, generated constants, `docs/completion.md`, `docs/hover.md`, `README.md`, and `NOTICE` aligned. Runtime editor assistance uses the linear scanner in `crates/raven/src/jags.rs`; it never consults R scope/help/package machinery and never starts JAGS, R, or a network request.
+The generator validates the exact version, source URL/hash, default `basemod`/`bugs` boundary, schema, ASCII sort order, uniqueness, syntax classification, and module ownership before producing Rust. Keep the manifest header, generated constants, `docs/completion.md`, `docs/hover.md`, `README.md`, and `NOTICE` aligned. Runtime editor assistance combines the native parse tree with the recovery-oriented scanner in `crates/raven/src/jags.rs`; it never consults R scope/help/package machinery and never starts JAGS, R, or a network request.
 
 ### In-tree JAGS grammar
 
 `crates/tree-sitter-jags/` is a clean-room Tree-sitter grammar targeting JAGS
-4.3.2. It is intentionally an independent workspace crate: adding or changing
-it does not route Raven documents through the grammar. Runtime integration is
-a separate change with its own document-lifecycle and diagnostics review.
+4.3.2. It remains independently testable as a workspace crate and is also the
+native parser for Raven JAGS documents. `Document` retains one JAGS tree per
+text revision. Each edit in an LSP change batch is applied to the retained tree
+with Tree-sitter's byte-and-point `InputEdit`; Raven then incrementally parses
+the batch's final text once against that edited tree. Diagnostics reuse the
+stored result without reparsing. This optimization is JAGS-only: R Markdown
+masking and Stan directive masking make their raw-text edit coordinates
+incompatible with the previously masked tree. JAGS documents contribute empty
+R metadata, scope artifacts, and package sets, and every R-only async
+enrichment, filesystem, formatting, and reference-search path rejects them
+explicitly.
 
 The syntax authority is the public JAGS command-line parse phase, captured by
 the independently authored matrix and harness under `oracle/`. Do not inspect
@@ -1322,11 +1330,28 @@ check:evidence`, and `npm test` from the crate directory, followed by `cargo tes
 tree-sitter-jags` from the repository root. The ignored live-oracle and
 release-performance commands are documented in the crate README. CI checks
 generation, oracle-manifest, and parser-evidence drift, the Tree-sitter corpus, Rust tests,
-rustdoc, and release performance without installing JAGS.
+rustdoc, and release performance without installing JAGS. Raven's diagnostic
+integration imports both committed manifests directly and asserts the complete
+mapping through `.jags` and `.bugs` independently: all 460 accepted programs are
+silent and all 346 rejected programs produce at least one stable, in-bounds
+syntax finding. The independently maintained
+`crates/raven/tests/fixtures/jags/invalid_expectations.json` manifest pins exact
+defect lines and bounded finding counts for all 75 curated syntax-invalid
+cases, without copying their source text. The integration test requires exact
+ID-set equality between that manifest and the corpus and exercises every case
+through both extensions. Separate malformed-input and release tests cover
+mid-traversal cancellation, UTF-16 positions, sort-before-dedup-before-cap
+ordering for the 100-finding limit, edited-tree reuse, and 100 KB diagnostic
+latency.
 
-The grammar claims `.jags` only. Treat `.bugs` as ambiguous until a separate
-representative compatibility corpus proves that strict JAGS diagnostics would
-not create false positives for other BUGS-family implementations.
+Strict JAGS-dialect diagnostics claim `.jags` and `.bugs`
+(case-insensitively), plus untitled buffers explicitly identified by the client
+as JAGS. Both suffixes share `FileType::Jags` and must follow identical parser,
+diagnostic, lifecycle, CLI, and editor-assistance routes. Singular `.bug` is an
+explicit non-goal tracked by [#724](https://github.com/jbearak/raven/issues/724);
+do not broaden extension matching accidentally. Disk reads use the shared
+BOM-aware decoder, while raw in-memory text remains byte-preserving so
+diagnostic ranges stay correct.
 
 ### Quarto process lifecycle
 

@@ -22,15 +22,15 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Url};
 use crate::cli::shared::{
     ColorChoice, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR, OutputFormat, SeverityLevel,
     absolute_path, collect_check_target_paths_with_exclusions, encoding_diagnostic, is_chunk_file,
-    is_r_file, is_stan_file, parse_color_choice, parse_output_format, parse_severity_level, render,
-    resolve_color_from_env,
+    is_jags_file, is_r_file, is_stan_file, parse_color_choice, parse_output_format,
+    parse_severity_level, render, resolve_color_from_env,
 };
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct CheckArgs {
-    /// Files / directories to report on. Empty means "every R file in the
-    /// workspace". These filter only what is *reported*; the whole workspace is
-    /// always indexed regardless.
+    /// Files / directories to report on. Empty means every supported R or
+    /// standalone model file in the workspace. These filter only what is
+    /// *reported*; the whole workspace is always indexed regardless.
     pub paths: Vec<PathBuf>,
     /// Workspace root to index. Defaults to the current directory.
     pub workspace: Option<PathBuf>,
@@ -110,17 +110,18 @@ pub fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<CheckArgs, S
 
 pub fn print_help() {
     println!(
-        "raven check {} — full R diagnostics for CI
+        "raven check {} — R diagnostics and model syntax checks for CI
 
 Usage: raven check [OPTIONS] [PATHS...]
 
 Indexes the workspace, then reports the full diagnostic set for the requested
-files (or every R / R Markdown / Quarto file in the workspace when no PATHS are
+files (or every R / R Markdown / Quarto / JAGS / Stan file in the workspace when no PATHS are
 given): syntax errors, semantic checks, style lints, cross-file diagnostics
 (missing source files, circular dependencies, out-of-scope usage),
 missing-package warnings, and undefined-variable diagnostics. For .Rmd /
 .Rmarkdown / .qmd the R code inside chunks is analyzed; prose and non-R chunks
-are ignored.
+are ignored. JAGS `.jags` / `.bugs` and Stan `.stan` programs receive
+syntax-only checks. Singular `.bug` is not a supported model extension.
 Honors raven.toml / .lintr.
 
 Options:
@@ -196,22 +197,25 @@ fn open_disk_fallback_target(
     // the URI to classify it as Rmd and masks the prose), "r" otherwise.
     // `file_type_from_language_id("rmd")` is `None`, so the `FileType` still
     // falls back to R via the URI — only the chunk masking differs.
-    let is_stan = is_stan_file(path);
+    let is_jags = is_jags_file(path);
+    let is_non_r = is_jags || is_stan_file(path);
     let language_id = if is_chunk_file(path) {
         "rmd"
-    } else if is_stan {
+    } else if is_jags {
+        "jags"
+    } else if is_non_r {
         "stan"
     } else {
         "r"
     };
     let workspace_root = state.workspace_folders.first().cloned();
     let max_chain_depth = state.cross_file_config.max_chain_depth;
-    let mut meta = if is_stan {
+    let mut meta = if is_non_r {
         crate::cross_file::CrossFileMetadata::default()
     } else {
         crate::cross_file::extract_metadata_for_path(uri.path(), text)
     };
-    if !is_stan {
+    if !is_non_r {
         crate::cross_file::enrich_metadata_with_inherited_wd(
             &mut meta,
             uri,
@@ -381,9 +385,9 @@ fn materialize_cli_contextual_provider(
         return false;
     };
     let document = crate::state::Document::new_with_uri(&content, None, &execution.uri);
-    let is_stan = document.file_type == crate::file_type::FileType::Stan;
+    let is_r = document.file_type == crate::file_type::FileType::R;
     let mut metadata = document.cross_file_metadata();
-    if !is_stan {
+    if is_r {
         if metadata.working_directory.is_none()
             && metadata.inherited_working_directory.is_none()
             && let Some(inherited) = execution.context.inherited_working_directory.as_ref()
@@ -1814,7 +1818,7 @@ async fn collect_target_diagnostics(
 }
 
 /// Resolve which files to report diagnostics for. Empty `paths` means every R
-/// source (`.R`/`.r`) and chunk-bearing document (`.Rmd`/`.Rmarkdown`/`.qmd`)
+/// source, chunk-bearing document, and supported standalone JAGS or Stan model
 /// under the workspace root. Explicit paths are taken as-is (files) or walked
 /// (directories). The result is sorted and de-duplicated for stable output.
 /// Chunk files are collected both as explicit args and while walking a
@@ -1855,7 +1859,11 @@ fn collect_report_targets_with_exclusions(
             if abs.is_dir() {
                 collect_check_target_paths_with_exclusions(&abs, &mut out, exclusions);
             } else if abs.is_file() {
-                if is_r_file(&abs) || is_chunk_file(&abs) || is_stan_file(&abs) {
+                if is_r_file(&abs)
+                    || is_chunk_file(&abs)
+                    || is_jags_file(&abs)
+                    || is_stan_file(&abs)
+                {
                     out.push(abs);
                 }
                 // Other file types: silently ignored, matching lint's walk.
@@ -3312,6 +3320,90 @@ infixContinuationStyle = "indented"
                     ))
         }));
         assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn check_discovers_jags_and_bugs_case_insensitively_but_excludes_bug() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("invalid.JAGS"), "model { x <- * 1 }\n").unwrap();
+        fs::write(tmp.path().join("invalid.BUGS"), "model { y <- * 1 }\n").unwrap();
+        fs::write(tmp.path().join("valid.jags"), "model { x <- 1 }\n").unwrap();
+        fs::write(
+            tmp.path().join("semantic-only.bugs"),
+            "model { x <- unknown_identifier + 1 }\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("unsupported.bug"), "model { z <- * 1 }\n").unwrap();
+
+        let args = base_args(tmp.path());
+        let findings = collect_diagnostics_blocking(&args);
+        assert!(!findings.is_empty());
+        assert!(findings.iter().all(|(path, diagnostic)| {
+            (path.ends_with("invalid.JAGS") || path.ends_with("invalid.BUGS"))
+                && diagnostic.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "syntax-error".to_string(),
+                    ))
+        }));
+        assert_eq!(run_blocking(args), EXIT_LINT_FAILED);
+    }
+
+    #[test]
+    fn explicit_mixed_case_jags_uses_jags_disk_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let model = tmp.path().join("model.JaGs");
+        fs::write(&model, "model { x <- * 1 }\n").unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![model.clone()];
+        let findings = collect_diagnostics_blocking(&args);
+        assert!(!findings.is_empty());
+        let expected = model.canonicalize().unwrap();
+        assert!(
+            findings
+                .iter()
+                .all(|(path, _)| path.canonicalize().unwrap() == expected)
+        );
+    }
+
+    #[test]
+    fn explicit_mixed_case_bugs_uses_jags_disk_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let model = tmp.path().join("model.BuGs");
+        fs::write(&model, "model { x <- * 1 }\n").unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![model.clone()];
+        let findings = collect_diagnostics_blocking(&args);
+        assert!(!findings.is_empty());
+        let expected = model.canonicalize().unwrap();
+        assert!(
+            findings
+                .iter()
+                .all(|(path, _)| path.canonicalize().unwrap() == expected)
+        );
+    }
+
+    #[test]
+    fn explicit_singular_bug_is_not_a_check_target() {
+        let tmp = TempDir::new().unwrap();
+        let model = tmp.path().join("unsupported.bug");
+        fs::write(&model, "model { x <- * 1 }\n").unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![model];
+        assert!(collect_diagnostics_blocking(&args).is_empty());
+        assert_eq!(run_blocking(args), EXIT_OK);
+    }
+
+    #[test]
+    fn jags_and_bugs_disk_fallback_strip_utf8_bom() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["valid.jags", "valid.BUGS"] {
+            let mut bytes = vec![0xef, 0xbb, 0xbf];
+            bytes.extend_from_slice(b"model { x <- 1 }\n");
+            fs::write(tmp.path().join(name), bytes).unwrap();
+        }
+        let args = base_args(tmp.path());
+        assert!(collect_diagnostics_blocking(&args).is_empty());
+        assert_eq!(run_blocking(args), EXIT_OK);
     }
 
     #[test]

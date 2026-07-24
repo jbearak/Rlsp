@@ -201,6 +201,17 @@ pub fn detect_file_path_navigation_target(
         }
     }
 
+    detect_directive_path_navigation_target(content, position)
+}
+
+/// Detect only Raven directive paths, without consulting an R syntax tree.
+///
+/// Native JAGS and Stan navigation uses this entry point so their trees never
+/// enter the R-specific `source()` argument detector.
+pub fn detect_directive_path_navigation_target(
+    content: &str,
+    position: Position,
+) -> Option<FilePathNavigationTarget> {
     let (directive_type, path, _) = extract_full_directive_path(content, position)?;
     Some(FilePathNavigationTarget::Directive {
         directive_type,
