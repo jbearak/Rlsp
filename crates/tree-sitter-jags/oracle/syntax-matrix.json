@@ -561,6 +561,54 @@
       "expect_parse": "rejected"
     },
     {
+      "name": "contextual-T-as-bare-identifier",
+      "category": "differential-boundary",
+      "source": "model { x <- T }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "reserved-T-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- T(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-T-as-distribution",
+      "category": "differential-boundary",
+      "source": "model { x ~ T(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-T-as-link",
+      "category": "differential-boundary",
+      "source": "model { T(p) <- eta }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "contextual-I-as-bare-identifier",
+      "category": "differential-boundary",
+      "source": "model { x <- I }\n",
+      "expect_parse": "accepted"
+    },
+    {
+      "name": "reserved-I-as-call",
+      "category": "differential-boundary",
+      "source": "model { x <- I(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-I-as-distribution",
+      "category": "differential-boundary",
+      "source": "model { x ~ I(1) }\n",
+      "expect_parse": "rejected"
+    },
+    {
+      "name": "reserved-I-as-link",
+      "category": "differential-boundary",
+      "source": "model { I(p) <- eta }\n",
+      "expect_parse": "rejected"
+    },
+    {
       "name": "contextual-model-as-call",
       "category": "differential-boundary",
       "source": "model { x <- model(1) }\n",

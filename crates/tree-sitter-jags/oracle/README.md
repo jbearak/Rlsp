@@ -20,7 +20,7 @@ cd crates/tree-sitter-jags/oracle
 python3 -m unittest -v test_jags_oracle.py
 ```
 
-`oracle-results.json` records 798 outcomes: 115 matrix probes and 683 quality
+`oracle-results.json` records 806 outcomes: 123 matrix probes and 683 quality
 cases. It binds the exact syntax matrix, generated corpus, corpus generator,
 oracle harness, and canonical source set by SHA-256. CI performs the offline
 checks above, so an authored source, generator, harness, outcome, or binding

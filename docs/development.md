@@ -1302,7 +1302,7 @@ grammar. Tree-sitter R and Stan are pinned MIT implementation references; the
 production mapping and complete quality evidence live in
 `PRODUCTION_MAPPING.md` and `QUALITY_GATES.md` inside the crate.
 
-Generated parser artifacts and a 798-outcome oracle manifest are checked in.
+Generated parser artifacts and an 806-outcome oracle manifest are checked in.
 The manifest binds the deterministic matrix and quality corpus to their exact
 sources, generator, harness, and pinned JAGS executable hashes. After editing
 `grammar.js`, an oracle input, the generator, or the harness, run `npm ci`,

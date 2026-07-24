@@ -6,7 +6,7 @@ after `compile`, while malformed expressions and delimiters fail during it.
 
 ## Deterministic corpora
 
-- 115 independently authored black-box matrix probes: 50 accepted and 65
+- 123 independently authored black-box matrix probes: 52 accepted and 71
   rejected, across 21 categories.
 - 358 syntax-valid cases from 295 authored templates, all accepted by JAGS and
   error-free here. The total includes all 276 unordered pairs of 24 meaningful
@@ -30,7 +30,7 @@ after `compile`, while malformed expressions and delimiters fail during it.
 - 1,024 generated valid-property cases and 1,024 arbitrary-UTF-8 range/panic
   cases.
 
-The committed `oracle-results.json` binds all 798 matrix and quality-corpus
+The committed `oracle-results.json` binds all 806 matrix and quality-corpus
 outcomes to the source hashes, generator hash, and oracle harness hash. Normal
 CI regenerates the corpus, verifies the input binding and outcomes offline,
 and runs the oracle harness's timeout/hash-validation unit tests. Refreshing or

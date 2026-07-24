@@ -1386,6 +1386,24 @@
           },
           "named": true,
           "value": "identifier"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "STRING",
+            "value": "T"
+          },
+          "named": true,
+          "value": "identifier"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "STRING",
+            "value": "I"
+          },
+          "named": true,
+          "value": "identifier"
         }
       ]
     },
@@ -1476,7 +1494,11 @@
       "name": "comment"
     }
   ],
-  "conflicts": [],
+  "conflicts": [
+    [
+      "stochastic_relation"
+    ]
+  ],
   "precedences": [],
   "externals": [],
   "inline": [],
@@ -1520,6 +1542,14 @@
       {
         "type": "STRING",
         "value": "in"
+      },
+      {
+        "type": "STRING",
+        "value": "T"
+      },
+      {
+        "type": "STRING",
+        "value": "I"
       }
     ]
   }

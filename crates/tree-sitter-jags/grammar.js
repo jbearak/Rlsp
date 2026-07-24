@@ -30,12 +30,17 @@ module.exports = grammar({
 
   word: $ => $.identifier,
 
+  conflicts: $ => [
+    [$.stochastic_relation],
+  ],
+
   // JAGS reserves these words as bare names, but the public parser accepts
-  // model/data/var in callable positions. `for` is the inverse edge case: it
-  // is a valid bare name but not a callable name outside loop syntax.
+  // model/data/var in callable positions. `for`, `T`, and `I` are inverse edge
+  // cases: they are valid bare names but not callable names outside their
+  // contextual syntax.
   reserved: {
     bare: _ => ['model', 'data', 'var', 'in'],
-    ordinary: _ => ['model', 'data', 'var', 'for', 'in'],
+    ordinary: _ => ['model', 'data', 'var', 'for', 'in', 'T', 'I'],
   },
 
   rules: {
@@ -294,6 +299,8 @@ module.exports = grammar({
     _bare_identifier: $ => choice(
       reserved('bare', $.identifier),
       alias('for', $.identifier),
+      alias('T', $.identifier),
+      alias('I', $.identifier),
     ),
 
     _callable_identifier: $ => choice(

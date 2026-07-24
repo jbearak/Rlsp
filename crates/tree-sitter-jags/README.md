@@ -29,7 +29,7 @@ cargo test --release -p tree-sitter-jags --test performance -- --ignored
 ```
 
 The normal oracle check is offline: it verifies the deterministic corpus and
-the committed 798-result manifest's input and tool hashes. The live check
+the committed 806-result manifest's input and tool hashes. The live check
 requires the exact JAGS 4.3.2 wrapper and terminal hashes recorded in
 `oracle/provenance.json` and uses only the public command-line interface.
 
