@@ -1331,7 +1331,7 @@
           "type": "integer",
           "default": 500,
           "minimum": 0,
-          "description": "Maximum native Tree-sitter syntax diagnostics retained per Stan or JAGS/BUGS file after exact deduplication and source ordering. Set to 0 for unlimited. This setting does not cap R diagnostics."
+          "description": "Maximum native Tree-sitter syntax diagnostics retained per Stan or JAGS/BUGS file after exact deduplication and source ordering; set to 0 for unlimited, and note that this cap does not apply to R diagnostics."
         },
         "raven.diagnostics.undefinedVariableSeverity": {
           "type": "string",
