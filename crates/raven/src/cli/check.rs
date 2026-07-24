@@ -120,8 +120,8 @@ given): syntax errors, semantic checks, style lints, cross-file diagnostics
 (missing source files, circular dependencies, out-of-scope usage),
 missing-package warnings, and undefined-variable diagnostics. For .Rmd /
 .Rmarkdown / .qmd the R code inside chunks is analyzed; prose and non-R chunks
-are ignored. JAGS `.jags` / `.bugs` and Stan `.stan` programs receive
-syntax-only checks. Singular `.bug` is not a supported model extension.
+are ignored. JAGS `.jags` / `.bugs` / `.bug` and Stan `.stan` programs receive
+syntax-only checks.
 Honors raven.toml / .lintr.
 
 Options:
@@ -3323,23 +3323,26 @@ infixContinuationStyle = "indented"
     }
 
     #[test]
-    fn check_discovers_jags_and_bugs_case_insensitively_but_excludes_bug() {
+    fn check_discovers_all_jags_dialect_extensions_case_insensitively() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("invalid.JAGS"), "model { x <- * 1 }\n").unwrap();
         fs::write(tmp.path().join("invalid.BUGS"), "model { y <- * 1 }\n").unwrap();
+        fs::write(tmp.path().join("invalid.BUG"), "model { z <- * 1 }\n").unwrap();
         fs::write(tmp.path().join("valid.jags"), "model { x <- 1 }\n").unwrap();
         fs::write(
             tmp.path().join("semantic-only.bugs"),
             "model { x <- unknown_identifier + 1 }\n",
         )
         .unwrap();
-        fs::write(tmp.path().join("unsupported.bug"), "model { z <- * 1 }\n").unwrap();
+        fs::write(tmp.path().join("near-miss.bugx"), "model { w <- * 1 }\n").unwrap();
 
         let args = base_args(tmp.path());
         let findings = collect_diagnostics_blocking(&args);
         assert!(!findings.is_empty());
         assert!(findings.iter().all(|(path, diagnostic)| {
-            (path.ends_with("invalid.JAGS") || path.ends_with("invalid.BUGS"))
+            (path.ends_with("invalid.JAGS")
+                || path.ends_with("invalid.BUGS")
+                || path.ends_with("invalid.BUG"))
                 && diagnostic.code
                     == Some(tower_lsp::lsp_types::NumberOrString::String(
                         "syntax-error".to_string(),
@@ -3383,9 +3386,26 @@ infixContinuationStyle = "indented"
     }
 
     #[test]
-    fn explicit_singular_bug_is_not_a_check_target() {
+    fn explicit_mixed_case_bug_uses_jags_disk_fallback() {
         let tmp = TempDir::new().unwrap();
-        let model = tmp.path().join("unsupported.bug");
+        let model = tmp.path().join("model.BuG");
+        fs::write(&model, "model { x <- * 1 }\n").unwrap();
+        let mut args = base_args(tmp.path());
+        args.paths = vec![model.clone()];
+        let findings = collect_diagnostics_blocking(&args);
+        assert!(!findings.is_empty());
+        let expected = model.canonicalize().unwrap();
+        assert!(
+            findings
+                .iter()
+                .all(|(path, _)| path.canonicalize().unwrap() == expected)
+        );
+    }
+
+    #[test]
+    fn explicit_bug_near_miss_is_not_a_check_target() {
+        let tmp = TempDir::new().unwrap();
+        let model = tmp.path().join("unsupported.bugx");
         fs::write(&model, "model { x <- * 1 }\n").unwrap();
         let mut args = base_args(tmp.path());
         args.paths = vec![model];
@@ -3394,9 +3414,9 @@ infixContinuationStyle = "indented"
     }
 
     #[test]
-    fn jags_and_bugs_disk_fallback_strip_utf8_bom() {
+    fn jags_dialect_disk_fallbacks_strip_utf8_bom() {
         let tmp = TempDir::new().unwrap();
-        for name in ["valid.jags", "valid.BUGS"] {
+        for name in ["valid.jags", "valid.BUGS", "valid.BUG"] {
             let mut bytes = vec![0xef, 0xbb, 0xbf];
             bytes.extend_from_slice(b"model { x <- 1 }\n");
             fs::write(tmp.path().join(name), bytes).unwrap();

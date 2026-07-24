@@ -21,7 +21,7 @@ Hover returns nothing for symbols R doesn't recognize and that aren't in scope, 
 
 ## JAGS Hover
 
-In `.jags` and `.bugs` files, hovering a known JAGS 4.3.2 call shows its signature, providing component, alias relationship when applicable, and the pinned catalog provenance. Raven recognizes only call sites; plain identifiers, comments, quoted noise in incomplete buffers, unknown names, and optional-module names remain silent.
+In `.jags`, `.bugs`, and `.bug` files, hovering a known JAGS 4.3.2 call shows its signature, providing component, alias relationship when applicable, and the pinned catalog provenance. All three extensions are matched case-insensitively as strict JAGS, not as general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE input. Raven recognizes only call sites; plain identifiers, comments, quoted noise in incomplete buffers, unknown names, and optional-module names remain silent.
 
 Role selection follows JAGS syntax. Immediately after `~`, the distribution entry wins and its signature lists only distribution parameters; the stochastic node is on the left side of the relation. Elsewhere, the ordinary callable entry wins. This matters for names such as `dnorm`, which JAGS exposes in both roles with different arities. A distribution-only name such as `dbern` does not receive ordinary-call hover.
 

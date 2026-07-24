@@ -82,8 +82,60 @@ test("VS Code package metadata registers mixed-case JAGS and Stan extensions", (
     ".bugs",
     ".Bugs",
     ".BUGS",
+    ".bug",
+    ".buG",
+    ".bUg",
+    ".bUG",
+    ".Bug",
+    ".BuG",
+    ".BUg",
+    ".BUG",
   ]);
   expect(stan?.extensions).toEqual([".stan", ".Stan", ".STAN"]);
+});
+
+test("VS Code file watcher includes every contributed JAGS extension spelling", () => {
+  const extensionSource = fs.readFileSync(
+    path.join(import.meta.dir, "..", "..", "editors", "vscode", "src", "extension.ts"),
+    "utf8",
+  );
+  const watcher = extensionSource.match(
+    /createFileSystemWatcher\(\s*'\*\*\/\*\.\{([^']+)\}'/,
+  );
+
+  expect(watcher).not.toBeNull();
+  const watchedExtensions = watcher![1].split(",");
+  expect(watchedExtensions).toEqual([
+    "r",
+    "R",
+    "rmd",
+    "Rmd",
+    "RMD",
+    "rmarkdown",
+    "Rmarkdown",
+    "RMARKDOWN",
+    "qmd",
+    "Qmd",
+    "QMD",
+    "jags",
+    "Jags",
+    "JAGS",
+    "bugs",
+    "Bugs",
+    "BUGS",
+    "bug",
+    "buG",
+    "bUg",
+    "bUG",
+    "Bug",
+    "BuG",
+    "BUg",
+    "BUG",
+    "stan",
+    "Stan",
+    "STAN",
+  ]);
+  expect(watchedExtensions).not.toContain("bugx");
 });
 
 test("VS Code package metadata registers mixed-case R Markdown extensions", () => {

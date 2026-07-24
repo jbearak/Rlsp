@@ -23392,8 +23392,8 @@ pub(crate) async fn publish_diagnostics_inner(
         // Rmd/Quarto documents flow through too (issue #343): the snapshot
         // carries the masked analysis text + tree, so `diagnostics_from_snapshot`
         // sees only real R chunk-body content. Stan follows its syntax-only
-        // collector; JAGS dispatches strict syntax for both `.jags` and
-        // `.bugs` through their shared language identity.
+        // collector; JAGS dispatches strict syntax for `.jags`, `.bugs`, and
+        // `.bug` through their shared language identity.
         Some(snap)
             if matches!(
                 snap.file_type,
@@ -51739,7 +51739,7 @@ lineLength = 200
     }
 
     #[tokio::test]
-    async fn bugs_files_publish_and_clear_for_lower_and_uppercase_extensions() {
+    async fn jags_dialect_extensions_publish_and_clear_with_uri_fallback() {
         use futures_util::StreamExt;
         use std::time::Duration;
         use tower::{Service, ServiceExt};
@@ -51751,20 +51751,24 @@ lineLength = 200
 
         let tmp = TempDir::new().unwrap();
         let invalid = "model { x <- * 1 }\n";
-        let paths = [tmp.path().join("lower.bugs"), tmp.path().join("upper.BUGS")];
-        for path in &paths {
+        let cases = [
+            (tmp.path().join("lower.bugs"), "jags"),
+            (tmp.path().join("upper.BUGS"), "jags"),
+            (tmp.path().join("lower.bug"), "plaintext"),
+            (tmp.path().join("mixed.BuG"), "plaintext"),
+            (tmp.path().join("upper.BUG"), "plaintext"),
+        ];
+        for (path, _) in &cases {
             fs::write(path, invalid).unwrap();
         }
-        let uris = paths
+        let documents = cases
             .iter()
-            .map(|path| Url::from_file_path(path).unwrap())
+            .map(|(path, language_id)| (Url::from_file_path(path).unwrap(), *language_id))
             .collect::<Vec<_>>();
-        let unsupported_path = tmp.path().join("unsupported.bug");
-        let r_valid_jags_invalid = "x <- function(y) y\n";
-        fs::write(&unsupported_path, r_valid_jags_invalid).unwrap();
-        let unsupported_uri = Url::from_file_path(&unsupported_path).unwrap();
-        let mut diagnostic_uris = uris.iter().map(Url::to_string).collect::<Vec<_>>();
-        diagnostic_uris.push(unsupported_uri.to_string());
+        let diagnostic_uris = documents
+            .iter()
+            .map(|(uri, _)| uri.to_string())
+            .collect::<Vec<_>>();
 
         let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
         let initialize = Request::build("initialize")
@@ -51790,28 +51794,36 @@ lineLength = 200
             state.cross_file_config.revalidation_debounce_ms = 60_000;
         }
 
-        for (version, uri) in uris.iter().enumerate() {
+        for (version, (uri, language_id)) in documents.iter().enumerate() {
             backend
                 .did_open(DidOpenTextDocumentParams {
                     text_document: TextDocumentItem {
                         uri: uri.clone(),
-                        language_id: "jags".into(),
+                        language_id: (*language_id).into(),
                         version: version as i32 + 1,
                         text: invalid.into(),
                     },
                 })
                 .await;
+            {
+                let state = backend.state.read().await;
+                assert_eq!(
+                    state.get_document(uri).unwrap().file_type,
+                    crate::file_type::FileType::Jags,
+                    "all supported suffixes must select JAGS even when the client reports plaintext"
+                );
+            }
             backend.publish_diagnostics(uri).await;
             let published = tokio::time::timeout(Duration::from_secs(5), socket.next())
                 .await
-                .expect("BUGS diagnostics must publish")
+                .expect("JAGS-dialect diagnostics must publish")
                 .expect("client socket remains open");
             let published: PublishDiagnosticsParams =
                 serde_json::from_value(published.params().unwrap().clone()).unwrap();
             assert_eq!(published.uri, *uri);
             assert!(
                 !published.diagnostics.is_empty(),
-                "BUGS files must receive strict JAGS diagnostics"
+                "all JAGS-dialect extensions must receive strict JAGS diagnostics"
             );
             assert!(published.diagnostics.iter().all(|diagnostic| {
                 diagnostic.code
@@ -51836,41 +51848,13 @@ lineLength = 200
             backend.publish_diagnostics(uri).await;
             let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
                 .await
-                .expect("BUGS diagnostic clear must publish")
+                .expect("JAGS-dialect diagnostic clear must publish")
                 .expect("client socket remains open");
             let cleared: PublishDiagnosticsParams =
                 serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
             assert_eq!(cleared.uri, *uri);
             assert!(cleared.diagnostics.is_empty());
         }
-
-        backend
-            .did_open(DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri: unsupported_uri.clone(),
-                    language_id: "plaintext".into(),
-                    version: 1,
-                    text: r_valid_jags_invalid.into(),
-                },
-            })
-            .await;
-        {
-            let state = backend.state.read().await;
-            assert_eq!(
-                state.get_document(&unsupported_uri).unwrap().file_type,
-                crate::file_type::FileType::R,
-                "singular .bug must not opt into the JAGS parser"
-            );
-        }
-        backend.publish_diagnostics(&unsupported_uri).await;
-        let unsupported = tokio::time::timeout(Duration::from_secs(5), socket.next())
-            .await
-            .expect("unsupported .bug clear must publish")
-            .expect("client socket remains open");
-        let unsupported: PublishDiagnosticsParams =
-            serde_json::from_value(unsupported.params().unwrap().clone()).unwrap();
-        assert_eq!(unsupported.uri, unsupported_uri);
-        assert!(unsupported.diagnostics.is_empty());
     }
 
     #[tokio::test]

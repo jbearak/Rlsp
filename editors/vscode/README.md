@@ -27,7 +27,7 @@ Raven is designed to complement, not replace, your existing tools. But it *can* 
 - **[Directives](https://github.com/jbearak/raven/blob/main/docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **[Syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
 
-Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), go-to-definition, find references, and document outline with model structure navigation.
+Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`, `.bug`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), strict syntax diagnostics, go-to-definition, find references, and document outline with model structure navigation. All three JAGS extensions are matched case-insensitively and validated as strict JAGS, not as general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE input.
 
 ### R session integration
 

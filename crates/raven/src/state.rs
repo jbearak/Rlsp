@@ -12261,7 +12261,8 @@ struct ProcessedFile {
 /// deterministic order sort afterwards.
 ///
 /// This is the single directory walk shared by the workspace indexer (which
-/// passes [`is_stat_model_extension`] to collect `.r`/`.jags`/`.bugs`/`.stan`)
+/// passes [`is_stat_model_extension`] to collect
+/// `.r`/`.jags`/`.bugs`/`.bug`/`.stan`)
 /// and the CLI's [`crate::cli::shared::collect_r_file_paths`] (R-only). Sharing
 /// one walk is what keeps `raven check`'s *reported* file set equal to its
 /// *indexed* set: a `.R` file reachable only through a symlinked directory
@@ -12763,6 +12764,7 @@ fn is_stat_model_extension(path: &Path) -> bool {
             ext.eq_ignore_ascii_case("r")
                 || ext.eq_ignore_ascii_case("jags")
                 || ext.eq_ignore_ascii_case("bugs")
+                || ext.eq_ignore_ascii_case("bug")
                 || ext.eq_ignore_ascii_case("stan")
         })
 }
@@ -14774,6 +14776,21 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         assert!(!should_skip_directory("R"));
         assert!(!should_skip_directory("src"));
         assert!(!should_skip_directory("data"));
+    }
+
+    #[test]
+    fn stat_model_extensions_include_all_jags_suffixes_case_insensitively() {
+        for path in [
+            "model.jags",
+            "model.JAGS",
+            "model.bugs",
+            "model.BUGS",
+            "model.bug",
+            "model.BUG",
+        ] {
+            assert!(is_stat_model_extension(Path::new(path)), "{path}");
+        }
+        assert!(!is_stat_model_extension(Path::new("model.bugx")));
     }
 
     #[test]

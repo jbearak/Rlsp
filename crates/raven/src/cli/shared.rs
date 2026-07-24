@@ -161,13 +161,15 @@ pub fn is_stan_file(p: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("stan"))
 }
 
-/// True for standalone `.jags` and `.bugs` programs, matched
-/// case-insensitively. Singular `.bug` is not a supported model extension.
+/// True for standalone `.jags`, `.bugs`, and `.bug` programs, matched
+/// case-insensitively.
 pub fn is_jags_file(p: &Path) -> bool {
     p.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("jags") || extension.eq_ignore_ascii_case("bugs")
+            extension.eq_ignore_ascii_case("jags")
+                || extension.eq_ignore_ascii_case("bugs")
+                || extension.eq_ignore_ascii_case("bug")
         })
 }
 
@@ -220,7 +222,7 @@ pub fn collect_r_file_paths_with_exclusions(
 /// directory walk as [`collect_r_file_paths`] — symlinked directories are
 /// followed with canonical-path cycle detection and non-source directories
 /// pruned. Chunk documents are included so their R chunks are diagnosed (issue
-/// #343); singular `.bug` and Stan include fragments are not standalone targets.
+/// #343); Stan include fragments are not standalone targets.
 ///
 /// Used by `raven check`'s report walk (empty `PATHS` or an explicit
 /// directory). Results are unsorted; callers that need deterministic order
@@ -645,7 +647,9 @@ mod tests {
         assert!(is_jags_file(Path::new("a.JaGs")));
         assert!(is_jags_file(Path::new("a.bugs")));
         assert!(is_jags_file(Path::new("a.BuGs")));
-        assert!(!is_jags_file(Path::new("a.bug")));
+        assert!(is_jags_file(Path::new("a.bug")));
+        assert!(is_jags_file(Path::new("a.BuG")));
+        assert!(!is_jags_file(Path::new("a.bugx")));
     }
 
     #[test]
@@ -687,7 +691,9 @@ mod tests {
         fs::write(tmp.path().join("mixed.JAGS"), "model { x <- 1 }\n").unwrap();
         fs::write(tmp.path().join("legacy.bugs"), "model { x <- * 1 }\n").unwrap();
         fs::write(tmp.path().join("mixed.BUGS"), "model { x <- 1 }\n").unwrap();
-        fs::write(tmp.path().join("unsupported.bug"), "model { x <- * 1 }\n").unwrap();
+        fs::write(tmp.path().join("singular.bug"), "model { x <- * 1 }\n").unwrap();
+        fs::write(tmp.path().join("mixed.BUG"), "model { x <- 1 }\n").unwrap();
+        fs::write(tmp.path().join("near-miss.bugx"), "model { x <- * 1 }\n").unwrap();
         fs::write(tmp.path().join("helper.stanfunctions"), "functions {}\n").unwrap();
         fs::write(tmp.path().join("f.txt"), "not source\n").unwrap();
         fs::create_dir(tmp.path().join(".git")).unwrap();
@@ -697,17 +703,19 @@ mod tests {
         collect_check_target_paths(tmp.path(), &mut out);
         // a.R + sub/b.r + c.Rmd + d.Rmarkdown + e.qmd + .Rmarkdown + f.QMD +
         // g.RMARKDOWN; .txt skipped; .git pruned.
-        assert_eq!(out.len(), 14, "got {out:?}");
+        assert_eq!(out.len(), 16, "got {out:?}");
         assert!(
             out.iter()
                 .all(|p| is_r_file(p) || is_chunk_file(p) || is_jags_file(p) || is_stan_file(p))
         );
         assert!(out.iter().any(|p| is_chunk_file(p)));
         assert_eq!(out.iter().filter(|p| is_stan_file(p)).count(), 2);
-        assert_eq!(out.iter().filter(|p| is_jags_file(p)).count(), 4);
+        assert_eq!(out.iter().filter(|p| is_jags_file(p)).count(), 6);
         assert!(out.iter().any(|path| path.ends_with("legacy.bugs")));
         assert!(out.iter().any(|path| path.ends_with("mixed.BUGS")));
-        assert!(!out.iter().any(|path| path.ends_with("unsupported.bug")));
+        assert!(out.iter().any(|path| path.ends_with("singular.bug")));
+        assert!(out.iter().any(|path| path.ends_with("mixed.BUG")));
+        assert!(!out.iter().any(|path| path.ends_with("near-miss.bugx")));
     }
 
     #[cfg(unix)]

@@ -327,7 +327,22 @@ suite('Ark LSP Extension', () => {
         assert.ok(stan, 'Expected Stan language contribution');
         assert.deepStrictEqual(
             jags?.extensions,
-            ['.jags', '.Jags', '.JAGS', '.bugs', '.Bugs', '.BUGS'],
+            [
+                '.jags',
+                '.Jags',
+                '.JAGS',
+                '.bugs',
+                '.Bugs',
+                '.BUGS',
+                '.bug',
+                '.buG',
+                '.bUg',
+                '.bUG',
+                '.Bug',
+                '.BuG',
+                '.BUg',
+                '.BUG',
+            ],
         );
         assert.deepStrictEqual(
             stan?.extensions,

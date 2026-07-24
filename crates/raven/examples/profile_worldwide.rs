@@ -60,6 +60,7 @@ fn is_r_file(p: &Path) -> bool {
         ext.eq_ignore_ascii_case("r")
             || ext.eq_ignore_ascii_case("jags")
             || ext.eq_ignore_ascii_case("bugs")
+            || ext.eq_ignore_ascii_case("bug")
             || ext.eq_ignore_ascii_case("stan")
     })
 }

@@ -259,6 +259,7 @@ mod jags_stan_indexing_tests {
         // Create test files with various extensions
         fs::write(dir.join("model.jags"), "model { x ~ dnorm(0, 1) }").unwrap();
         fs::write(dir.join("model.bugs"), "model { y ~ dgamma(1, 1) }").unwrap();
+        fs::write(dir.join("model.bug"), "model { z ~ dnorm(0, 1) }").unwrap();
         fs::write(dir.join("model.stan"), "data { int N; }").unwrap();
         fs::write(dir.join("script.R"), "x <- 1").unwrap();
         fs::write(dir.join("readme.txt"), "not indexed").unwrap();
@@ -266,15 +267,16 @@ mod jags_stan_indexing_tests {
         let workspace_url = Url::from_file_path(dir).unwrap();
         let entries = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
-        // All R, JAGS, and Stan files should be indexed (4 total), .txt excluded
-        assert_eq!(entries.len(), 4, "Should index .jags, .bugs, .stan, and .R files");
-        assert_eq!(entries.len(), 4, "Should have 4 cross-file entries");
-        assert_eq!(entries.len(), 4, "Should have 4 new index entries");
+        // All R, JAGS, and Stan files should be indexed (5 total), .txt excluded
+        assert_eq!(entries.len(), 5, "Should index .jags, .bugs, .bug, .stan, and .R files");
+        assert_eq!(entries.len(), 5, "Should have 5 cross-file entries");
+        assert_eq!(entries.len(), 5, "Should have 5 new index entries");
 
         // Verify specific files are indexed by checking URIs
         let uris: Vec<String> = entries.keys().map(|u| u.to_string()).collect();
         assert!(uris.iter().any(|u| u.contains("model.jags")), "Should index .jags files");
         assert!(uris.iter().any(|u| u.contains("model.bugs")), "Should index .bugs files");
+        assert!(uris.iter().any(|u| u.contains("model.bug")), "Should index .bug files");
         assert!(uris.iter().any(|u| u.contains("model.stan")), "Should index .stan files");
         assert!(uris.iter().any(|u| u.contains("script.R")), "Should index .R files");
         assert!(!uris.iter().any(|u| u.contains("readme.txt")), "Should NOT index .txt files");
@@ -288,12 +290,13 @@ mod jags_stan_indexing_tests {
 
         fs::write(dir.join("upper.JAGS"), "model { x ~ dnorm(0, 1) }").unwrap();
         fs::write(dir.join("upper.BUGS"), "model { y ~ dgamma(1, 1) }").unwrap();
+        fs::write(dir.join("upper.BUG"), "model { z ~ dnorm(0, 1) }").unwrap();
         fs::write(dir.join("upper.STAN"), "data { int N; }").unwrap();
 
         let workspace_url = Url::from_file_path(dir).unwrap();
         let index = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
-        assert_eq!(index.len(), 3, "Should index uppercase JAGS/BUGS/STAN extensions");
+        assert_eq!(index.len(), 4, "Should index uppercase JAGS/BUGS/BUG/STAN extensions");
     }
 }
 
@@ -319,10 +322,13 @@ mod jags_stan_indexing_property_tests {
             Just("JAGS".to_string()),
             Just("bugs".to_string()),
             Just("BUGS".to_string()),
+            Just("bug".to_string()),
+            Just("BUG".to_string()),
             Just("stan".to_string()),
             Just("STAN".to_string()),
             Just("Jags".to_string()),
             Just("Bugs".to_string()),
+            Just("Bug".to_string()),
             Just("Stan".to_string()),
         ]
     }
@@ -332,7 +338,7 @@ mod jags_stan_indexing_property_tests {
 
         /// **Property 11: Workspace indexing includes JAGS/Stan files**
         ///
-        /// For any file path with a `.jags`, `.bugs`, or `.stan` extension present
+        /// For any file path with a `.jags`, `.bugs`, `.bug`, or `.stan` extension present
         /// in a workspace directory, after `scan_directory` completes, the workspace
         /// index shall contain an entry for that file's URI.
         ///
