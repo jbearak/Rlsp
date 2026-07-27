@@ -35,6 +35,16 @@ source structure, manual prose, tables, examples, or comments, and does not
 link or load JAGS at runtime for this feature. The reference above is retained
 for provenance and reproducibility.
 
+Raven's external diagnostic-corpus tooling can also fetch checksum-pinned
+models published by the official JAGS project as a post-hoc quality holdout.
+Those files are downloaded only on explicit materialization, are not committed
+or distributed with Raven, and remain subject to their upstream license. The
+fetch-only holdout does not inspect JAGS implementation or parser sources,
+inspect manual prose, or claim that the model files were manually reviewed or
+used to derive Raven's grammar. Exact artifact, revision, checksum,
+license, and allowlist provenance is recorded in the committed diagnostic-corpus
+manifest.
+
 ---
 
 Raven uses tree-sitter-stan (https://github.com/WardBrian/tree-sitter-stan),
@@ -113,6 +123,12 @@ Redistributions in binary form must reproduce the above copyright notice, this l
 Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Raven's external diagnostic-corpus tooling can fetch checksum-pinned models
+published by the official Stan project as a post-hoc quality holdout. The models
+are not committed or distributed with Raven; exact artifact, revision,
+checksum, license, and allowlist provenance is recorded in the committed
+diagnostic-corpus manifest. Materialized files retain their upstream licensing.
 
 ---
 

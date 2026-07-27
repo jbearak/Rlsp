@@ -22,12 +22,104 @@ env:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: integration-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # ── External model holdout ─────────────────────────────────────────────
+  # Keep one stable required check on every PR: manifest/provenance validation
+  # is offline and always runs. Network materialization and the ignored corpus
+  # runners expand on main and on a deliberately conservative set of parser,
+  # diagnostic, oracle, corpus, dependency, or workflow changes.
+  external-diagnostic-corpora:
+    name: External Diagnostic Corpora
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Check external corpus manifest (offline)
+        run: python3 scripts/diagnostic-corpora.py check
+
+      - name: Detect changes requiring full corpus validation
+        id: corpus-paths
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          filters: |
+            relevant:
+              - '.github/workflows/integration.yml'
+              - '.github/workflows/release-build.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/raven/Cargo.toml'
+              - 'crates/raven/src/**'
+              - 'crates/raven/tests/**'
+              - 'crates/tree-sitter-jags/**'
+              - 'crates/tree-sitter-stan/**'
+              - 'editors/vscode/package.json'
+              - 'editors/vscode/package-lock.json'
+              - 'editors/vscode/scripts/check-stan-diagnostics-fixtures.mjs'
+              - 'scripts/diagnostic-corpora.py'
+              - 'scripts/diagnostic-corpora.*'
+
+      - name: Setup Node.js for the Stan oracle
+        if: github.ref == 'refs/heads/main' || steps.corpus-paths.outputs.relevant == 'true'
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Set up sccache
+        if: github.ref == 'refs/heads/main' || steps.corpus-paths.outputs.relevant == 'true'
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.9
+
+      - name: Cache cargo registry
+        if: github.ref == 'refs/heads/main' || steps.corpus-paths.outputs.relevant == 'true'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: corpus-cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            corpus-cargo-registry-${{ runner.os }}-
+            cargo-registry-${{ runner.os }}-
+
+      - name: Install full-validation dependencies
+        if: github.ref == 'refs/heads/main' || steps.corpus-paths.outputs.relevant == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold
+          npm ci --prefix editors/vscode
+
+      - name: Materialize external corpora
+        if: github.ref == 'refs/heads/main' || steps.corpus-paths.outputs.relevant == 'true'
+        run: python3 scripts/diagnostic-corpora.py materialize --all
+
+      - name: Validate external Stan models with stanc3
+        if: github.ref == 'refs/heads/main' || steps.corpus-paths.outputs.relevant == 'true'
+        run: |
+          node editors/vscode/scripts/check-stan-diagnostics-fixtures.mjs \
+            --check-external --external-root target/diagnostic-corpora
+
+      - name: Verify external JAGS model outcomes
+        if: github.ref == 'refs/heads/main' || steps.corpus-paths.outputs.relevant == 'true'
+        run: |
+          python3 crates/tree-sitter-jags/oracle/jags_oracle.py \
+            --verify-external --external-root target/diagnostic-corpora
+
+      - name: Run external model diagnostic holdout
+        if: github.ref == 'refs/heads/main' || steps.corpus-paths.outputs.relevant == 'true'
+        run: |
+          cargo test -p raven --features test-support \
+            --test external_model_diagnostics -- --ignored
+
   # ── Formatting gate ────────────────────────────────────────────────────
   # Cheap, dependency-free check that the tree is `cargo fmt`-clean. The
   # toolchain — and its rustfmt component — is pinned by rust-toolchain.toml and
@@ -46,9 +138,17 @@ jobs:
         with:
           node-version: '24'
           cache: 'npm'
-          cache-dependency-path: crates/tree-sitter-jags/package-lock.json
+          cache-dependency-path: |
+            crates/tree-sitter-jags/package-lock.json
+            crates/tree-sitter-stan/package-lock.json
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Check generated Stan parsers
+        working-directory: crates/tree-sitter-stan
+        run: |
+          npm ci
+          npm run check:generated
+          npm run test:corpus
       - name: Check generated JAGS parser and Tree-sitter corpus
         working-directory: crates/tree-sitter-jags
         run: |

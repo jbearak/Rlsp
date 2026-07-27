@@ -1,0 +1,56 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "stan",
+      "camelcase": "Stan",
+      "title": "Stan",
+      "scope": "source.stan",
+      "path": "grammars/stan/",
+      "file-types": ["stan"],
+      "injection-regex": "^stan$",
+      "class-name": "TreeSitterStan",
+      "highlights": "./queries/highlights.scm",
+      "tags": "./queries/tags.scm",
+      "locals": "./queries/locals.scm"
+    },
+    {
+      "name": "stanfunctions",
+      "camelcase": "StanFunctions",
+      "title": "Stan Functions Files",
+      "scope": "source.stanfunctions",
+      "path": "grammars/stanfunctions/",
+      "file-types": ["stanfunctions"],
+      "injection-regex": "^stanfunctions$",
+      "class-name": "TreeSitterStanFunctions",
+      "highlights": "./queries/sf-highlights.scm",
+      "tags": "./queries/sf-tags.scm",
+      "locals": "./queries/sf-locals.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.3.1",
+    "license": "MIT",
+    "description": "A parser for the Stan modelling language",
+    "authors": [
+      {
+        "name": "Brian Ward",
+        "email": "bward@flatironinstitute.org",
+        "url": "https://brianward.dev"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/WardBrian/tree-sitter-stan"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "go": true,
+    "java": false,
+    "node": true,
+    "python": true,
+    "rust": true,
+    "swift": true,
+    "zig": false
+  }
+}

@@ -16,12 +16,65 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Release preflight: tags never use path-based skipping. Fetch and verify the
+  # pinned official-model holdout, validate Stan models with the development-time
+  # compiler oracle, and run Raven's ignored external diagnostic suite before any
+  # platform build can start.
+  external-diagnostic-corpora:
+    name: External Diagnostic Corpora
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Setup Node.js for the Stan oracle
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Cache cargo registry and corpus test build
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-corpus-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-corpus-${{ runner.os }}-
+
+      - name: Install Stan oracle dependencies
+        run: npm ci --prefix editors/vscode
+
+      - name: Check and materialize external corpora
+        run: |
+          python3 scripts/diagnostic-corpora.py check
+          python3 scripts/diagnostic-corpora.py materialize --all
+
+      - name: Validate external Stan models with stanc3
+        run: |
+          node editors/vscode/scripts/check-stan-diagnostics-fixtures.mjs \
+            --check-external --external-root target/diagnostic-corpora
+
+      - name: Verify external JAGS model outcomes
+        run: |
+          python3 crates/tree-sitter-jags/oracle/jags_oracle.py \
+            --verify-external --external-root target/diagnostic-corpora
+
+      - name: Run external model diagnostic holdout
+        run: |
+          cargo test -p raven --features test-support \
+            --test external_model_diagnostics -- --ignored
+
   # Compatibility gate: confirm the raven we're about to release can open and
   # validate the current `names-db` Release asset — the database users download
   # with `raven packages update`. names.db is NOT bundled into the release; this
   # only guards against shipping a raven whose names.db format support has drifted
   # from the live database.
   names-db-compat:
+    needs: external-diagnostic-corpora
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -123,15 +176,17 @@ jobs:
           fi
 
       - name: Create archive
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: |
           mkdir -p dist
-          if [[ "${{ matrix.platform }}" == *"windows"* ]]; then
+          if [[ "$PLATFORM" == *"windows"* ]]; then
             cp target/${{ matrix.target }}/release/raven.exe dist/
-            cp LICENSE dist/
+            cp LICENSE NOTICE dist/
             cd dist && 7z a -tzip ../raven-${{ matrix.platform }}.zip .
           else
             cp target/${{ matrix.target }}/release/raven dist/
-            cp LICENSE dist/
+            cp LICENSE NOTICE dist/
             cd dist && zip -r ../raven-${{ matrix.platform }}.zip .
           fi
 
@@ -180,7 +235,7 @@ jobs:
 
       - name: Extract version
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
       - name: Update package.json version
         run: |
@@ -214,6 +269,7 @@ jobs:
       - name: Package extension
         run: |
           cd editors/vscode
+          npm run copy-notice
           vsce package --target ${{ matrix.target }}
 
       - name: Attest build provenance (VSIX)

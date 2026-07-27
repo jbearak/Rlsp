@@ -509,10 +509,7 @@ pub(crate) fn package_policy(package: &str, name: &str) -> Option<ArgPolicy> {
             // case in which the forwarded `...` are columns). For `d*ply`,
             // `.variables` is typically a `.()` call whose quoted columns the
             // `WholeCall` arm above already suppresses (#466).
-            _ => match plyr_split_apply_formals(name) {
-                Some(formals) => ArgPolicy::per_formal(formals, &[], false),
-                None => return None,
-            },
+            _ => ArgPolicy::per_formal(plyr_split_apply_formals(name)?, &[], false),
         },
         _ => return None,
     };

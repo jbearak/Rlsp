@@ -6,6 +6,7 @@ out/
 .vscode-test/
 bin/raven
 bin/raven.exe
+editors/vscode/NOTICE
 
 # Claude Code local settings (but keep plans and rules)
 .claude/settings.local.json

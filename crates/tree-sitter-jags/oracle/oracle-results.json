@@ -39,7 +39,7 @@
   "failures": [],
   "inputs": {
     "corpus_generator_sha256": "e72214cc4088b7d6ef7717d3ec70750a4bae6d5637144938ae319ccfd2bf9803",
-    "oracle_harness_sha256": "4950f5649a3212f04121e86c71571581e57db0a0749f29949c068d97064a8195",
+    "oracle_harness_sha256": "d6e9dd000e28cb24be9884d5c8156b147ae155059f185d86f64dbf5d8e155e48",
     "quality_corpus_sha256": "cd8e3e1590fce3a6b35753ec39927f4dcce84c41b8d05204d2f4a3debea1b692",
     "source_set_sha256": "46eae062aaa00beb3256d288e679a465ed5ed0e2a872685722bce30249ff1d33",
     "syntax_matrix_sha256": "49aa39bb056bddb0bc94132b0a2c441c87b059853abdaea47f17c8e5e90a6aef"

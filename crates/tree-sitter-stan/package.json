@@ -1,0 +1,62 @@
+{
+  "name": "@wardbrian/tree-sitter-stan",
+  "version": "0.3.1",
+  "description": "A tree sitter grammer for modern Stan programs",
+  "main": "bindings/node",
+  "types": "bindings/node",
+  "scripts": {
+    "generate": "for dir in grammars/stan grammars/stanfunctions; do (cd \"$dir\" && tree-sitter generate --abi 14) || exit; done",
+    "check:generated": "npm run generate && git diff --exit-code -- grammars/stan/src grammars/stanfunctions/src",
+    "test:corpus": "tree-sitter test",
+    "prestart": "tree-sitter build grammars/stan --wasm -o grammars/stan/tree-sitter-stan.wasm",
+    "start": "tree-sitter playground",
+    "test": "node --test bindings/node/*_test.js"
+  },
+  "author": "Brian Ward",
+  "license": "MIT",
+  "dependencies": {
+    "node-addon-api": "^8.0.0",
+    "node-gyp-build": "^4.8.1"
+  },
+  "peerDependencies": {
+    "tree-sitter": "^0.25.0"
+  },
+  "peerDependenciesMeta": {
+    "tree-sitter": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.5",
+    "prebuildify": "^6.0.1"
+  },
+  "gypfile": true,
+  "directories": {
+    "test": "test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WardBrian/tree-sitter-stan.git"
+  },
+  "keywords": [
+    "tree-sitter",
+    "stan",
+    "parsing"
+  ],
+  "files": [
+    "grammars/stan/grammar.js",
+    "grammars/stanfunctions/grammar.js",
+    "binding.gyp",
+    "prebuilds/**",
+    "bindings/node/*",
+    "queries/*",
+    "grammars/stan/src/**",
+    "grammars/stanfunctions/src/**",
+    "grammars/stan/*.wasm",
+    "grammars/stanfunctions/*.wasm"
+  ],
+  "bugs": {
+    "url": "https://github.com/WardBrian/tree-sitter-stan/issues"
+  },
+  "homepage": "https://github.com/WardBrian/tree-sitter-stan#readme"
+}
