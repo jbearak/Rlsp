@@ -1,0 +1,378 @@
+{
+  "failures": [],
+  "inputs": {
+    "manifest_sha256": "b7186d65eefdada2f890539639cdfaf1815ba53370569a18f3b1bed6e16c558a",
+    "source_set_sha256": "40ad55ef01bf6bfcb4cafb8e8bb416a6fe7960c813eb5d76db88aeaa0ee05a39"
+  },
+  "oracle": {
+    "binding": "pinned-homebrew-arm64",
+    "terminal_path": "/opt/homebrew/Cellar/jags/4.3.2/libexec/jags-terminal",
+    "terminal_sha256": "982b72c690b734096ddb4bdccf55e5a312349ea51b50baa6eb277614bbf27a1e",
+    "version": "4.3.2",
+    "wrapper_path": "/opt/homebrew/bin/jags",
+    "wrapper_sha256": "8a2b5265d2a15136d74ea78c9c7365d3ed43e02c4987263f6290d8d5a7f972d8"
+  },
+  "results": [
+    {
+      "id": "classic-bugs-4.x:vol1/blocker/blocker.bug",
+      "materialized_path": "cases/classic-bugs-4.x/f581bb6244702aa2-blocker.bug",
+      "sha256": "f581bb6244702aa288aa5f0ca4d6bf6ab6b61c4f41237e8aa443ccaf65802b10",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/blocker/blockert.bug",
+      "materialized_path": "cases/classic-bugs-4.x/96817399a85d2105-blockert.bug",
+      "sha256": "96817399a85d2105ede437293794d3897c2356cd73e517935fdb711e620aa488",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/blocker/blockht.bug",
+      "materialized_path": "cases/classic-bugs-4.x/e4b326861de639bf-blockht.bug",
+      "sha256": "e4b326861de639bf1de7cf1faf212de277bd8e0c2daf47c90c40f348b0d4e51b",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/bones/bones.bug",
+      "materialized_path": "cases/classic-bugs-4.x/1667d7fa5828de39-bones.bug",
+      "sha256": "1667d7fa5828de395382500f803d8343ece961748bc7f8438423c9201f56ee69",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/bones/bones2.bug",
+      "materialized_path": "cases/classic-bugs-4.x/3bf2db8e51545889-bones2.bug",
+      "sha256": "3bf2db8e51545889211c829f00b17e6844dc16c3ed4320497ed5cf1d3f6b54a7",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/dyes/dyes.bug",
+      "materialized_path": "cases/classic-bugs-4.x/7adf6b0891b815ce-dyes.bug",
+      "sha256": "7adf6b0891b815ce3fac6a1d6e534d861aff8bf2f4b7f6fefef7c3bc94398da5",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/epil/epil2.bug",
+      "materialized_path": "cases/classic-bugs-4.x/28d00b758b00c697-epil2.bug",
+      "sha256": "28d00b758b00c697809db813619aafcaa63fa0034e6e20c90e5325d412eaa3c7",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/epil/epil3.bug",
+      "materialized_path": "cases/classic-bugs-4.x/1ee0e73fb4625947-epil3.bug",
+      "sha256": "1ee0e73fb4625947dccf4f0cc961da8f789a7c764c590919aa578caacfdcb835",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/equiv/equiv.bug",
+      "materialized_path": "cases/classic-bugs-4.x/039c0b9a4990dd07-equiv.bug",
+      "sha256": "039c0b9a4990dd07823cb5eb38dd66c19129dd1b2ba9d9373c6fb083ccae095c",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/inhaler/inhaler0.bug",
+      "materialized_path": "cases/classic-bugs-4.x/a1d21275edb3a301-inhaler0.bug",
+      "sha256": "a1d21275edb3a301d5d4f821a1e514e24400d7a3baff6af4430c27a9e7b0b89c",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/inhaler/inhaler1.bug",
+      "materialized_path": "cases/classic-bugs-4.x/84ebf85829735432-inhaler1.bug",
+      "sha256": "84ebf85829735432570bf1c86874886afdca5f6be0630c83ed1cafaeb5920f7a",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/inhaler/inhaler2.bug",
+      "materialized_path": "cases/classic-bugs-4.x/3131217daf9df6ea-inhaler2.bug",
+      "sha256": "3131217daf9df6ea5c74c7f2561d73c34980eaf807e36449d97a43bc9680e817",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/kidney/kidney.bug",
+      "materialized_path": "cases/classic-bugs-4.x/2e8d3213a72c487c-kidney.bug",
+      "sha256": "2e8d3213a72c487cf070da8350654adbf74e94a13f18d9fa32d7370b6685f46e",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/leuk/leuk-poisson.bug",
+      "materialized_path": "cases/classic-bugs-4.x/20a34485bf27a1ce-leuk-poisson.bug",
+      "sha256": "20a34485bf27a1ce5993c2496d4a59abf7457d38b53d00b3cce0a837a84429ed",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/leuk/leuk.bug",
+      "materialized_path": "cases/classic-bugs-4.x/21583fc1b7ff0949-leuk.bug",
+      "sha256": "21583fc1b7ff09495773cc9a81174502f427c6ffc6e090a89fb98285b998ae7d",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/leuk/leukfr.bug",
+      "materialized_path": "cases/classic-bugs-4.x/1e4fb147801e2c8f-leukfr.bug",
+      "sha256": "1e4fb147801e2c8fb2c2738b6b3ce82eea6470719d956fafb5ece9628816ec71",
+      "syntax_accepted": false
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/line/line.bug",
+      "materialized_path": "cases/classic-bugs-4.x/61a09eeec1589712-line.bug",
+      "sha256": "61a09eeec158971298d407846bc52f8fdb5e606c5ca854fb6ed5d8deb6361758",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/litters/litters.bug",
+      "materialized_path": "cases/classic-bugs-4.x/40cca0dcc3f1a3cd-litters.bug",
+      "sha256": "40cca0dcc3f1a3cd53525a415466321bf920c20379fc6b556bf0b8d20e69e220",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/lsat/lsat.bug",
+      "materialized_path": "cases/classic-bugs-4.x/edfe22342318536b-lsat.bug",
+      "sha256": "edfe22342318536be7aed2eaa2bcd10187a961ef2344b66559d21bb282645f44",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/lsat/lsat2.bug",
+      "materialized_path": "cases/classic-bugs-4.x/28072346ae098f37-lsat2.bug",
+      "sha256": "28072346ae098f3761a31556c71845fddfc6699f4c876477197a9bcfd2bc07c7",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/mice/mice.bug",
+      "materialized_path": "cases/classic-bugs-4.x/9cc6a3f57038cb65-mice.bug",
+      "sha256": "9cc6a3f57038cb65abff7668e0c8c41fbcaf15788175fad6b652b086db261142",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/oxford/oxford.bug",
+      "materialized_path": "cases/classic-bugs-4.x/390b40e6868b5d01-oxford.bug",
+      "sha256": "390b40e6868b5d017f14f3109250982deb745222abf6174f619cc1ab182f26f1",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/pump/pump.bug",
+      "materialized_path": "cases/classic-bugs-4.x/00fe33087010a77a-pump.bug",
+      "sha256": "00fe33087010a77a016cebe97d4e7a94e51de45d8cb9893434334eb5bf12c181",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/rats/rats.bug",
+      "materialized_path": "cases/classic-bugs-4.x/f4d71162e9cd3dc5-rats.bug",
+      "sha256": "f4d71162e9cd3dc5373adea6bc7d51db514df746fcddced43b1f18b10a202bdc",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/salm/salm-pareto.bug",
+      "materialized_path": "cases/classic-bugs-4.x/329fd66593ad070d-salm-pareto.bug",
+      "sha256": "329fd66593ad070d64dd903275221f98ff8ae421099f4c7446f03a840dc15902",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/salm/salm.bug",
+      "materialized_path": "cases/classic-bugs-4.x/c7dc60a9f0d3d7df-salm.bug",
+      "sha256": "c7dc60a9f0d3d7df341e5cedd4fc94ed9e12ffbf0df16a88922011da8a151f26",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/seeds/seeds.bug",
+      "materialized_path": "cases/classic-bugs-4.x/bdafd19b5ef7afef-seeds.bug",
+      "sha256": "bdafd19b5ef7afefb0c94fe336e701b413d928e0449acff1bca7aaf8d906356c",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/seeds/seedspar.bug",
+      "materialized_path": "cases/classic-bugs-4.x/4df7ab8c5477ebc3-seedspar.bug",
+      "sha256": "4df7ab8c5477ebc393b169e9afb61fe372d705235de425090f3eadbb2fc2e156",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/seeds/seedssig.bug",
+      "materialized_path": "cases/classic-bugs-4.x/df0e672280b2dd73-seedssig.bug",
+      "sha256": "df0e672280b2dd733d7d84a9760123780a4a927baa7027b6689f8d46b6a80e80",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/seeds/seedsuni.bug",
+      "materialized_path": "cases/classic-bugs-4.x/c805f988bca02b59-seedsuni.bug",
+      "sha256": "c805f988bca02b594e74448ec6dee14a2ace91424b34805ce43d8e5e96b90b42",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol1/seeds/seedszro.bug",
+      "materialized_path": "cases/classic-bugs-4.x/93978faac63da67c-seedszro.bug",
+      "sha256": "93978faac63da67c5b9a94a9a1df6e5c03657b19ba037cdbb418feeb4393dd35",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/air/air.bug",
+      "materialized_path": "cases/classic-bugs-4.x/d6b2eca62b169ace-air.bug",
+      "sha256": "d6b2eca62b169ace58c28a88da74f16cb8da7859b3438fdcdb48f5e9a3e6f09c",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/alli/alli.bug",
+      "materialized_path": "cases/classic-bugs-4.x/c43f2988adc085e8-alli.bug",
+      "sha256": "c43f2988adc085e8048fcaec0932ec8ce7273e6dd4ee25c00338200c2db4d4c6",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/asia/asia.bug",
+      "materialized_path": "cases/classic-bugs-4.x/11698647b6d35a16-asia.bug",
+      "sha256": "11698647b6d35a16b2470fa98f664c724df5a23e4bca2b065599f95495e66aa8",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/asia/asia2.bug",
+      "materialized_path": "cases/classic-bugs-4.x/abe7111b67af62a7-asia2.bug",
+      "sha256": "abe7111b67af62a77f6cf82b7a337d220d04b3e364ecb3fe2e3624a57d0cd9d5",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/beetles/beetles-cloglog.bug",
+      "materialized_path": "cases/classic-bugs-4.x/3e9f4b0c69555f4d-beetles-cloglog.bug",
+      "sha256": "3e9f4b0c69555f4d3e59e2d00331ed05e8ff55f2fe256c9013743565fb53b402",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/beetles/beetles-logit.bug",
+      "materialized_path": "cases/classic-bugs-4.x/56b40e1f4f5c9103-beetles-logit.bug",
+      "sha256": "56b40e1f4f5c9103f52aedbaa238eb89dde95ae31c82b0e43300a96d4e961235",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/beetles/beetles-probit.bug",
+      "materialized_path": "cases/classic-bugs-4.x/1b09ece591cfd215-beetles-probit.bug",
+      "sha256": "1b09ece591cfd21577c94604f33439e80695bc9b2b88af7c85597e2c0158f480",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/biops/biops.bug",
+      "materialized_path": "cases/classic-bugs-4.x/f3c55778c6b5085f-biops.bug",
+      "sha256": "f3c55778c6b5085f39a1e88f3725f50ae4e955cb53b1f48a594258cb9aa1eec6",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/birats/birats1.bug",
+      "materialized_path": "cases/classic-bugs-4.x/6cdb2a8d2c14a882-birats1.bug",
+      "sha256": "6cdb2a8d2c14a882b6ea923a8a93957ef19e04c68e127b02193d8f3f24fd70b2",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/birats/birats2.bug",
+      "materialized_path": "cases/classic-bugs-4.x/1f13090b93f8117e-birats2.bug",
+      "sha256": "1f13090b93f8117e078ae1b68325db9bc6692e879f3cc7d3fbb0a10684971a11",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/birats/birats3.bug",
+      "materialized_path": "cases/classic-bugs-4.x/af91a4a3afe5f117-birats3.bug",
+      "sha256": "af91a4a3afe5f11731a56f01574237d81bbb62e74c61ecdf48ce9fcc3b7cb766",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/birats/birats4.bug",
+      "materialized_path": "cases/classic-bugs-4.x/dcdd1ef6e59d1da5-birats4.bug",
+      "sha256": "dcdd1ef6e59d1da54f7e2f83cb53dd4aee33f2ac4609f46d82499302453caeca",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/cervix/cervix.bug",
+      "materialized_path": "cases/classic-bugs-4.x/9c733371de4b50a5-cervix.bug",
+      "sha256": "9c733371de4b50a515d33e7fb47719d5aaaafa28d3cc2a1004b66122c60a7203",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/dugongs/dugongs.bug",
+      "materialized_path": "cases/classic-bugs-4.x/9b5676c4b22ecbc4-dugongs.bug",
+      "sha256": "9b5676c4b22ecbc4c73bd71ff6361a9dcd79d1f18f4c78ab039443308d506a3a",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/eyes/eyes.bug",
+      "materialized_path": "cases/classic-bugs-4.x/960e6d5e4c8709c5-eyes.bug",
+      "sha256": "960e6d5e4c8709c51454ba7767b63f1a1542f04489abd37038f0efc910bd1f5f",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/eyes/eyes2.bug",
+      "materialized_path": "cases/classic-bugs-4.x/84299b3582693146-eyes2.bug",
+      "sha256": "84299b35826931462b19a5cf52032dc0820a3c17e71112de8eb66bb75731d65e",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/hearts/hearts.bug",
+      "materialized_path": "cases/classic-bugs-4.x/6867cb6d474240e5-hearts.bug",
+      "sha256": "6867cb6d474240e5046fcd37033a537dbee6a22d67e0e45dbdf453b5f7ae5b3d",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/ice/icear.bug",
+      "materialized_path": "cases/classic-bugs-4.x/4ef33dd32eaca9fc-icear.bug",
+      "sha256": "4ef33dd32eaca9fc3f21832c5efa18281f3b0c175b779a76e00ab0253723f54a",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/jaw/jaw-constant.bug",
+      "materialized_path": "cases/classic-bugs-4.x/624658479d514bec-jaw-constant.bug",
+      "sha256": "624658479d514bec45d0cc424a5af619976d4579bafc2eb2db7457f005000859",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/jaw/jaw-linear.bug",
+      "materialized_path": "cases/classic-bugs-4.x/6077aef2757156fb-jaw-linear.bug",
+      "sha256": "6077aef2757156fb433ae2282f0c52ba8b0ce75cf6abf05383630022ee909100",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/jaw/jaw-quadratic.bug",
+      "materialized_path": "cases/classic-bugs-4.x/b1e1fefd41cd0203-jaw-quadratic.bug",
+      "sha256": "b1e1fefd41cd02036ee2b2bda6db7a5b73f4e5dc69f5dbea6055a63f479b3af0",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/orange/mvotree.bug",
+      "materialized_path": "cases/classic-bugs-4.x/52f29c87350c5a6d-mvotree.bug",
+      "sha256": "52f29c87350c5a6dc3b6cef80fc64906ac8aeb5ccbcb37704593335d3e12b589",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/orange/otree.bug",
+      "materialized_path": "cases/classic-bugs-4.x/ce76f21a9be67f23-otree.bug",
+      "sha256": "ce76f21a9be67f23a940163aa71f892c28e87d263081ec964110f7e6f528f263",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/pigs/pigs.bug",
+      "materialized_path": "cases/classic-bugs-4.x/c8681a845aee27bf-pigs.bug",
+      "sha256": "c8681a845aee27bfe9fc26313045938567fc6536f7f4fec1aad07df7e09f8cf0",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/schools/schools.bug",
+      "materialized_path": "cases/classic-bugs-4.x/34072d31eddd0e73-schools.bug",
+      "sha256": "34072d31eddd0e732ec21efdd36d5e704783f25ced0d4305fdd272888aa390bd",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/schools/schools2.bug",
+      "materialized_path": "cases/classic-bugs-4.x/00b69762bc442d89-schools2.bug",
+      "sha256": "00b69762bc442d8927cdc6da1afc67bc472db5b563b142c33bd1c08a134f62ea",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/schools/test.bug",
+      "materialized_path": "cases/classic-bugs-4.x/74c52ea394eeb1f2-test.bug",
+      "sha256": "74c52ea394eeb1f284b00325ce6ec608a761b9aa995010d7249cd96f5bf05ee3",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/stagnant/stagnant.bug",
+      "materialized_path": "cases/classic-bugs-4.x/70f5cfc4be04e06b-stagnant.bug",
+      "sha256": "70f5cfc4be04e06ba2bafaca2cf949ae2bbe2a7424e13a61712748689a779f0b",
+      "syntax_accepted": true
+    },
+    {
+      "id": "classic-bugs-4.x:vol2/stagnant/stagnant2.bug",
+      "materialized_path": "cases/classic-bugs-4.x/b4badec0a02e0fd8-stagnant2.bug",
+      "sha256": "b4badec0a02e0fd896a8d82a92aeaa374ccea04ab574879a41bd6e94c508a55c",
+      "syntax_accepted": true
+    }
+  ],
+  "schema_version": 1
+}

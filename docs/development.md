@@ -10,6 +10,7 @@ User-facing docs:
 - `docs/r-package-dev.md`
 - `docs/directives.md`
 - `docs/diagnostics.md`
+- `docs/diagnostic-corpora.md`
 - `docs/indentation.md`
 - `docs/r-console.md`
 - `docs/plot-viewer.md`
@@ -1319,6 +1320,20 @@ Raven stays silent for compiler-valid groups, distinguishes clear undeclared
 variables in the semantic/type-invalid group, and reports bounded, stable,
 UTF-16-valid syntax findings for every syntax-invalid case.
 
+The separate external-model holdout is controlled by
+`scripts/diagnostic-corpora.py` and documented in
+`docs/diagnostic-corpora.md`. Its committed `check` is offline; full validation
+materializes checksum-pinned official upstream models under
+`target/diagnostic-corpora/`, runs the Stan oracle with `--check-external`, and
+runs the ignored `external_model_diagnostics` Rust integration target. The
+holdout is post-hoc and must not become a syntax authority. In particular, the
+JAGS leg is fetch-only: it does not inspect JAGS implementation, parser sources,
+or manual prose, and its official models were not manually inspected or used to
+derive the clean-room grammar. Integration CI always keeps
+the stable offline check present, expands to full validation on conservative
+relevant paths and `main`, and release builds require full validation before any
+platform build.
+
 Stan and JAGS dispatch through the same native-syntax collector limit from the
 diagnostics snapshot. `maxSyntaxDiagnosticsPerFile = 0` maps to unlimited;
 every finite value retains at most that many unique candidates in an ordered
@@ -1343,6 +1358,31 @@ bun editors/vscode/scripts/generate-stan-builtins.mjs --check
 ```
 
 Keep the package pin, `EXPECTED_STANC_PACKAGE_VERSION`, `DOCS_VERSION`, generated version constants, `docs/hover.md`, and the stanc3 attribution in `README.md` and `NOTICE` aligned. CI runs the check after `npm ci`; `#[rustfmt::skip]` on the large generated arrays makes the generator output independent of the host Rust toolchain while the surrounding hand-written module remains subject to the normal formatting gate.
+
+### Vendored Stan grammars
+
+`crates/tree-sitter-stan/` vendors the MIT-licensed Stan and Stan-functions
+Tree-sitter grammars used by Raven. Their generated C sources and JSON metadata
+under `grammars/stan/src/` and `grammars/stanfunctions/src/` are committed. The
+crate's `package-lock.json` and exact `tree-sitter-cli` 0.25.5 development pin
+match the generator recorded by the committed parser and keep regeneration
+independent of whichever Tree-sitter CLI happens to be installed globally.
+Both grammars are generated with ABI 14.
+
+After changing either `grammar.js`, regenerate and verify the committed output
+from the vendored crate directory:
+
+```sh
+cd crates/tree-sitter-stan
+npm ci
+npm run generate
+npm run check:generated
+```
+
+`check:generated` regenerates both parsers with the pinned local CLI and fails
+when any committed generated source differs. Integration CI runs this check in
+the formatting job, so grammar changes must include their regenerated output
+and lockfile changes must remain intentional.
 
 JAGS completion, hover, signature help, and built-in go-to-definition exclusion share `crates/raven/src/jags_builtins_generated.rs`. Its input is the checked-in factual manifest `editors/vscode/scripts/jags-builtins-4.3.2.tsv`, pinned to the official JAGS 4.3.2 SourceForge tarball and SHA-256 recorded in that file. The manifest contains independently verified names, aliases, arities, roles, and automatically loaded module ownership only. It deliberately contains no JAGS implementation code, source structure, manual prose, tables, examples, or comments. JAGS is GPL-2.0-only; Raven's catalog is a clean-room factual interoperability artifact, not copied JAGS expression. This is a maintainer provenance boundary, not legal advice.
 
@@ -1375,7 +1415,10 @@ the independently authored matrix and harness under `oracle/`. Do not inspect
 or copy JAGS's GPL-2-only parser source or manual prose when maintaining the
 grammar. Tree-sitter R and Stan are pinned MIT implementation references; the
 production mapping and complete quality evidence live in
-`PRODUCTION_MAPPING.md` and `QUALITY_GATES.md` inside the crate.
+`PRODUCTION_MAPPING.md` and `QUALITY_GATES.md` inside the crate. The fetched
+official-model holdout is post-hoc evidence only: it is not a third syntax
+authority and must not be used to reverse-engineer or revise productions from
+model contents.
 
 Generated parser artifacts and an 806-outcome oracle manifest are checked in.
 The manifest binds the deterministic matrix and quality corpus to their exact

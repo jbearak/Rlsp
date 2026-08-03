@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "language": "stan",
+  "suite": "external-no-false-positive",
+  "sources": [
+    {
+      "id": "stanc3-good-2.39.0",
+      "project": "stan-dev/stanc3",
+      "version": "2.39.0",
+      "revision": "739471362446086911f1d6472c19ae0749c366ea",
+      "archive_url": "https://github.com/stan-dev/stanc3/archive/739471362446086911f1d6472c19ae0749c366ea.tar.gz",
+      "archive_sha256": "0f94d6b30643f3fd289014d54b2d12abf64aa0fb7e6a8f7e6ce7f8a4680aab97",
+      "archive_root": "stanc3-739471362446086911f1d6472c19ae0749c366ea",
+      "redistribution": "fetch-only",
+      "license": {
+        "spdx": "BSD-3-Clause",
+        "evidence_url": "https://github.com/stan-dev/stanc3/blob/739471362446086911f1d6472c19ae0749c366ea/LICENSE"
+      },
+      "discovery": [
+        {
+          "type": "files",
+          "globs": ["test/integration/good/**/*.stan"],
+          "expected_count": 1226,
+          "kind": "complete-or-include",
+          "raven_mode": "oracle-classified",
+          "oracle_mode": "stanc"
+        }
+      ]
+    },
+    {
+      "id": "posteriordb-1.0.0",
+      "project": "stan-dev/posteriordb",
+      "version": "1.0.0",
+      "revision": "5f3bdb64799058fd76bcab0d3fb42f7f4b8f309a",
+      "archive_url": "https://github.com/stan-dev/posteriordb/archive/5f3bdb64799058fd76bcab0d3fb42f7f4b8f309a.tar.gz",
+      "archive_sha256": "b1be7fb07ce0062c123231a55d720fd419dac806018f317b6d56dc96d093a430",
+      "archive_root": "posteriordb-5f3bdb64799058fd76bcab0d3fb42f7f4b8f309a",
+      "redistribution": "fetch-only",
+      "license": {
+        "spdx": "per-model-metadata",
+        "evidence_url": "https://github.com/stan-dev/posteriordb/tree/5f3bdb64799058fd76bcab0d3fb42f7f4b8f309a/posterior_database/models/info"
+      },
+      "discovery": [
+        {
+          "type": "files",
+          "globs": ["posterior_database/models/stan/*.stan"],
+          "expected_count": 120,
+          "kind": "complete",
+          "raven_mode": "all",
+          "oracle_mode": "stanc",
+          "metadata": {
+            "path_template": "posterior_database/models/info/{stem}.info.json",
+            "license_field": "licence"
+          }
+        }
+      ]
+    },
+    {
+      "id": "cmdstan-2.39.0-examples",
+      "project": "stan-dev/cmdstan",
+      "version": "2.39.0",
+      "revision": "bd4aeedb8c09e4d214a9bb4728edeb734bf5fb28",
+      "archive_url": "https://github.com/stan-dev/cmdstan/archive/bd4aeedb8c09e4d214a9bb4728edeb734bf5fb28.tar.gz",
+      "archive_sha256": "32af164986bab9e308f8ff4203f48a2649345fc329ff6e767f1a3611f10e483e",
+      "archive_root": "cmdstan-bd4aeedb8c09e4d214a9bb4728edeb734bf5fb28",
+      "redistribution": "fetch-only",
+      "license": {
+        "spdx": "BSD-3-Clause",
+        "evidence_url": "https://github.com/stan-dev/cmdstan/blob/bd4aeedb8c09e4d214a9bb4728edeb734bf5fb28/LICENSE"
+      },
+      "discovery": [
+        {
+          "type": "files",
+          "globs": ["examples/**/*.stan"],
+          "expected_count": 1,
+          "kind": "complete",
+          "raven_mode": "all",
+          "oracle_mode": "stanc"
+        }
+      ]
+    },
+    {
+      "id": "stan-docs-088b8f7",
+      "project": "stan-dev/docs",
+      "version": "rolling-source-snapshot",
+      "revision": "088b8f7a8eb037abf37be60c852f9ed92e1b37b6",
+      "archive_url": "https://github.com/stan-dev/docs/archive/088b8f7a8eb037abf37be60c852f9ed92e1b37b6.tar.gz",
+      "archive_sha256": "56d5a1c7670df016cf712ee2077da99f5857f9cc6d7eddd7f86ba41615a12c17",
+      "archive_root": "docs-088b8f7a8eb037abf37be60c852f9ed92e1b37b6",
+      "redistribution": "fetch-only",
+      "license": {
+        "spdx": "BSD-3-Clause-code",
+        "evidence_url": "https://github.com/stan-dev/docs/blob/088b8f7a8eb037abf37be60c852f9ed92e1b37b6/LICENSE"
+      },
+      "discovery": [
+        {
+          "type": "qmd-fences",
+          "globs": [
+            "src/stan-users-guide/**/*.qmd",
+            "src/reference-manual/**/*.qmd"
+          ],
+          "fence_language": "stan",
+          "expected_count": 808,
+          "kind": "documentation-snippet",
+          "raven_mode": "oracle-classified",
+          "oracle_mode": "stanc-contextual"
+        }
+      ]
+    }
+  ]
+}

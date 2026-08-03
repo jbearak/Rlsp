@@ -253,7 +253,7 @@ fn collect_function_namespace(
         budget.check()?;
         if is_recovery_node(child) {
             for name in recovered_function_names(child, text) {
-                namespace.recovered_candidates.insert(name.to_string());
+                insert_function_name(&mut namespace.recovered_candidates, name);
             }
             continue;
         }
@@ -267,10 +267,26 @@ fn collect_function_namespace(
             continue;
         };
         if let Some(value) = identifier_text(name, text) {
-            namespace.declared.insert(value.to_string());
+            insert_function_name(&mut namespace.declared, value);
         }
     }
     Some(namespace)
+}
+
+/// Insert a declared function and the compiler-provided unnormalized alias for
+/// a user-defined probability function.
+///
+/// Stan makes `name_lupdf` available when `name_lpdf` is declared, and likewise
+/// makes `name_lupmf` available for `name_lpmf`. Those aliases can appear as
+/// higher-order function values, where the grammar represents them as ordinary
+/// variable expressions rather than call names.
+fn insert_function_name(namespace: &mut HashSet<String>, name: &str) {
+    namespace.insert(name.to_string());
+    if let Some(base) = name.strip_suffix("_lpdf") {
+        namespace.insert(format!("{base}_lupdf"));
+    } else if let Some(base) = name.strip_suffix("_lpmf") {
+        namespace.insert(format!("{base}_lupmf"));
+    }
 }
 
 /// Recover only the narrow function-name shapes exposed directly by a broken
@@ -953,6 +969,29 @@ model {
 }
 "#;
         assert!(findings(source).is_empty());
+    }
+
+    #[test]
+    fn user_probability_functions_supply_unnormalized_higher_order_aliases() {
+        let source = r#"functions {
+  real foo_lpdf(array[] real slice, int start, int end) {
+    return normal_lpdf(slice | 0, 1);
+  }
+  real bar_lpmf(array[] int slice, int start, int end) {
+    return poisson_lpmf(slice | 1);
+  }
+}
+data {
+  array[2] real y;
+  array[2] int n;
+}
+model {
+  target += reduce_sum(foo_lupdf, y, 1);
+  target += reduce_sum(bar_lupmf, n, 1);
+  target += reduce_sum(missing_lupdf, y, 1);
+}
+"#;
+        assert_eq!(names(source), ["missing_lupdf"]);
     }
 
     #[test]

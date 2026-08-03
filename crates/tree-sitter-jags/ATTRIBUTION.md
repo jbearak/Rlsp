@@ -4,6 +4,13 @@ The JAGS grammar is an independently authored implementation based on the
 black-box observations under `oracle/`. No JAGS source, parser file, or manual
 prose was inspected or copied. JAGS is not linked into this crate.
 
+Raven also has an optional, checksum-pinned official-model holdout documented in
+`../../docs/diagnostic-corpora.md`. It was added post-hoc and is fetch-only; the
+selected model files were not manually inspected or used to derive grammar
+productions. The upstream files are neither
+committed nor distributed with Raven. This quality check does not weaken or
+replace the clean-room boundary above.
+
 Implementation structure and small Tree-sitter idioms were informed by these
 MIT-licensed references already pinned by Raven:
 

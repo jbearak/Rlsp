@@ -38,6 +38,15 @@ live-verifying the results additionally requires the exact wrapper and terminal
 hashes in `provenance.json`; an explicit unpinned override cannot refresh the
 committed manifest.
 
+A separate external-model gate materializes a checksum-pinned allowlist of
+models published by the official JAGS project and runs Raven's diagnostics over
+them. It is a post-hoc holdout, not part of the 806 authored oracle outcomes and
+not a grammar input. Materialization is fetch-only: no JAGS
+implementation/parser source or manual prose is inspected, and the model files
+were not manually reviewed to derive or tune productions. The
+upstream files are disposable test inputs and are not committed or shipped.
+See `../../docs/diagnostic-corpora.md` for commands and CI policy.
+
 Recovery checks include exact issue kinds and byte/point ranges for six defect
 families, separated-fault locality, deterministic high-fault recovery, Unicode,
 CRLF, BOM, EOF, bounded tree growth, and cancellation after 256 parser progress

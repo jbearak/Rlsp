@@ -40,6 +40,93 @@ fn analyze(fixture: &Fixture) -> (WorldState, Url, Vec<tower_lsp::lsp_types::Dia
     (state, uri, findings)
 }
 
+fn stan_uncovered_source_is_trivia(mut source: &str, allow_bom: bool) -> bool {
+    if allow_bom {
+        source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    }
+    loop {
+        source = source.trim_start_matches(char::is_whitespace);
+        if source.is_empty() {
+            return true;
+        }
+        // `#` lines outside the root range are masked Raven directives, but
+        // `#include` is Stan source (a `preproc_include` extra), never trivia.
+        if source.starts_with("#include") {
+            return false;
+        }
+        if let Some(comment) = source
+            .strip_prefix("//")
+            .or_else(|| source.strip_prefix('#'))
+        {
+            source = comment.split_once('\n').map_or("", |(_, rest)| rest);
+            continue;
+        }
+        if let Some(comment) = source.strip_prefix("/*") {
+            let Some((_, rest)) = comment.split_once("*/") else {
+                return false;
+            };
+            source = rest;
+            continue;
+        }
+        return false;
+    }
+}
+
+fn assert_clean_stan_document(state: &WorldState, uri: &Url, fixture: &Fixture) {
+    let document = state.get_document(uri).unwrap_or_else(|| {
+        panic!(
+            "Stan fixture {} has no Document at {uri}; source: {}",
+            fixture.name,
+            fixture.code.escape_debug()
+        )
+    });
+    let tree = document.tree.as_ref().unwrap_or_else(|| {
+        panic!(
+            "Stan fixture {} has a Document but no syntax tree at {uri}; source: {}",
+            fixture.name,
+            fixture.code.escape_debug()
+        )
+    });
+    let root = tree.root_node();
+    assert_eq!(
+        root.kind(),
+        "program",
+        "Stan fixture {} has the wrong root kind at {uri}; root: {}; source: {}",
+        fixture.name,
+        root.to_sexp(),
+        fixture.code.escape_debug()
+    );
+    assert!(
+        !root.has_error(),
+        "Stan grammar rejected fixture {} at {uri}; root: {}; source: {}",
+        fixture.name,
+        root.to_sexp(),
+        fixture.code.escape_debug()
+    );
+    assert!(
+        fixture
+            .code
+            .get(..root.start_byte())
+            .is_some_and(|prefix| stan_uncovered_source_is_trivia(prefix, true)),
+        "Stan fixture {} has non-trivia source before root byte range {:?} at {uri}; root: {}; source: {}",
+        fixture.name,
+        root.byte_range(),
+        root.to_sexp(),
+        fixture.code.escape_debug()
+    );
+    assert!(
+        fixture
+            .code
+            .get(root.end_byte()..)
+            .is_some_and(|suffix| stan_uncovered_source_is_trivia(suffix, false)),
+        "Stan fixture {} has non-trivia source after root byte range {:?} at {uri}; root: {}; source: {}",
+        fixture.name,
+        root.byte_range(),
+        root.to_sexp(),
+        fixture.code.escape_debug()
+    );
+}
+
 #[test]
 fn compiler_valid_corpora_have_no_false_positives() {
     let groups = [
@@ -52,22 +139,12 @@ fn compiler_valid_corpora_have_no_false_positives() {
 
     for fixture in groups.into_iter().flat_map(fixtures) {
         let (state, uri, findings) = analyze(&fixture);
+        assert_clean_stan_document(&state, &uri, &fixture);
         assert!(
             findings.is_empty(),
-            "Stan false positive in {}: {findings:#?}",
-            fixture.name
-        );
-        assert!(
-            !state
-                .get_document(&uri)
-                .unwrap()
-                .tree
-                .as_ref()
-                .unwrap()
-                .root_node()
-                .has_error(),
-            "Stan grammar rejected fixture {}",
-            fixture.name
+            "Stan false positive in {} at {uri}; source: {}; findings: {findings:#?}",
+            fixture.name,
+            fixture.code.escape_debug()
         );
     }
 }
@@ -82,18 +159,7 @@ fn focused_semantic_scope_oracle_reports_each_single_missing_name() {
             code: expected.code,
         };
         let (state, uri, findings) = analyze(&fixture);
-        assert!(
-            !state
-                .get_document(&uri)
-                .unwrap()
-                .tree
-                .as_ref()
-                .unwrap()
-                .root_node()
-                .has_error(),
-            "focused semantic fixture {} must remain syntax-valid",
-            expected.name
-        );
+        assert_clean_stan_document(&state, &uri, &fixture);
         assert_eq!(findings.len(), 1, "{}: {findings:#?}", expected.name);
         assert_eq!(
             findings[0].message,
@@ -112,18 +178,7 @@ fn compiler_semantic_only_corpus_reports_only_clear_undeclared_variables() {
     ]);
     for fixture in fixtures(include_str!("fixtures/stan/syntax_only.json")) {
         let (state, uri, findings) = analyze(&fixture);
-        assert!(
-            !state
-                .get_document(&uri)
-                .unwrap()
-                .tree
-                .as_ref()
-                .unwrap()
-                .root_node()
-                .has_error(),
-            "Stan grammar rejected semantic fixture {}",
-            fixture.name
-        );
+        assert_clean_stan_document(&state, &uri, &fixture);
         let observed: Vec<_> = findings
             .iter()
             .filter(|finding| {
