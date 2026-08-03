@@ -14,7 +14,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import signal
 import subprocess
@@ -32,6 +32,12 @@ DEFAULT_MATRIX = ORACLE_DIR / "syntax-matrix.json"
 DEFAULT_CORPUS = ORACLE_DIR / "quality-corpus.json"
 DEFAULT_RESULTS = ORACLE_DIR / "oracle-results.json"
 DEFAULT_PROVENANCE = ORACLE_DIR / "provenance.json"
+REPO_ROOT = ORACLE_DIR.parents[2]
+DEFAULT_EXTERNAL_MANIFEST = (
+    REPO_ROOT / "crates/raven/tests/fixtures/diagnostic_corpora/jags.json"
+)
+DEFAULT_EXTERNAL_ROOT = REPO_ROOT / "target/diagnostic-corpora"
+DEFAULT_EXTERNAL_RESULTS = ORACLE_DIR / "external-model-results.json"
 
 
 def sha256(path: Path) -> str:
@@ -338,6 +344,430 @@ def verify_committed_results(
     return failures
 
 
+def load_json_object(path: Path, description: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read {description} {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{description} {path} must contain a JSON object")
+    return value
+
+
+def require_external_string(record: dict[str, Any], key: str, context: str) -> str:
+    value = record.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{context}.{key} must be a non-empty string")
+    return value
+
+
+def materialized_file(root: Path, relative: str, context: str) -> Path:
+    if "\\" in relative:
+        raise ValueError(f"{context}.materialized_path must use POSIX separators")
+    raw_parts = relative.split("/")
+    pure = PurePosixPath(relative)
+    if (
+        pure.is_absolute()
+        or not raw_parts
+        or any(part in {"", ".", ".."} for part in raw_parts)
+    ):
+        raise ValueError(f"{context}.materialized_path must be a safe relative path")
+    candidate = root.joinpath(*pure.parts)
+    current = root
+    try:
+        for part in pure.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(
+                    f"{context}.materialized_path traverses a symbolic link"
+                )
+        if not candidate.is_file():
+            raise ValueError(
+                f"{context}.materialized_path is not a regular file: {candidate}"
+            )
+        resolved_root = root.resolve(strict=True)
+        resolved_candidate = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(
+            f"cannot inspect {context}.materialized_path {candidate}: {error}"
+        ) from error
+    if not resolved_candidate.is_relative_to(resolved_root):
+        raise ValueError(f"{context}.materialized_path escapes the materialized root")
+    return candidate
+
+
+def external_cases(
+    manifest_path: Path,
+    external_root: Path,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    manifest = load_json_object(manifest_path, "external manifest")
+    if manifest.get("schema_version") != 1 or manifest.get("language") != "jags":
+        raise ValueError(
+            "external JAGS manifest must have schema_version 1 and language jags"
+        )
+    sources = manifest.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("external JAGS manifest sources must be a non-empty array")
+
+    source_rules: dict[str, set[tuple[str, str, str]]] = {}
+    for source_index, source_value in enumerate(sources):
+        context = f"manifest.sources[{source_index}]"
+        if not isinstance(source_value, dict):
+            raise ValueError(f"{context} must be an object")
+        source_id = require_external_string(source_value, "id", context)
+        if source_id in source_rules:
+            raise ValueError(f"duplicate external source id {source_id}")
+        discoveries = source_value.get("discovery")
+        if not isinstance(discoveries, list) or not discoveries:
+            raise ValueError(f"{context}.discovery must be a non-empty array")
+        rules: set[tuple[str, str, str]] = set()
+        for discovery_index, discovery_value in enumerate(discoveries):
+            discovery_context = f"{context}.discovery[{discovery_index}]"
+            if not isinstance(discovery_value, dict):
+                raise ValueError(f"{discovery_context} must be an object")
+            oracle_mode = require_external_string(
+                discovery_value, "oracle_mode", discovery_context
+            )
+            if oracle_mode != "jags-model-in":
+                raise ValueError(
+                    f"{discovery_context}.oracle_mode is unsupported: {oracle_mode}"
+                )
+            rules.add((
+                require_external_string(discovery_value, "kind", discovery_context),
+                require_external_string(
+                    discovery_value, "raven_mode", discovery_context
+                ),
+                oracle_mode,
+            ))
+        source_rules[source_id] = rules
+
+    materialized_root = external_root / "materialized"
+    index_path = materialized_root / "index.json"
+    index = load_json_object(index_path, "materialized index")
+    index_cases = index.get("cases")
+    if index.get("schema_version") != 1 or not isinstance(index_cases, list):
+        raise ValueError(
+            "materialized index must have schema_version 1 and a cases array"
+        )
+    manifest_digest = sha256(manifest_path)
+    binding = index.get("manifest_binding")
+    if not isinstance(binding, list) or not any(
+        isinstance(item, dict) and item.get("sha256") == manifest_digest
+        for item in binding
+    ):
+        raise ValueError(
+            "materialized index is not bound to the supplied external manifest"
+        )
+
+    cases: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_paths: set[str] = set()
+    for case_index, case_value in enumerate(index_cases):
+        if not isinstance(case_value, dict) or case_value.get("language") != "jags":
+            continue
+        context = f"index.cases[{case_index}]"
+        case_id = require_external_string(case_value, "id", context)
+        relative_path = require_external_string(
+            case_value, "materialized_path", context
+        )
+        if case_id in seen_ids:
+            raise ValueError(f"duplicate materialized JAGS case id {case_id}")
+        if relative_path in seen_paths:
+            raise ValueError(f"duplicate materialized JAGS path {relative_path}")
+        seen_ids.add(case_id)
+        seen_paths.add(relative_path)
+        source_id = require_external_string(case_value, "source_id", context)
+        rule = (
+            require_external_string(case_value, "kind", context),
+            require_external_string(case_value, "raven_mode", context),
+            require_external_string(case_value, "oracle_mode", context),
+        )
+        if rule not in source_rules.get(source_id, set()):
+            raise ValueError(
+                f"{context} does not match a discovery rule for {source_id}"
+            )
+        source_path = materialized_file(materialized_root, relative_path, context)
+        source_bytes = source_path.read_bytes()
+        expected_hash = require_external_string(case_value, "sha256", context)
+        actual_hash = sha256_bytes(source_bytes)
+        if actual_hash != expected_hash:
+            raise ValueError(
+                f"{case_id}: materialized SHA-256 mismatch "
+                f"(expected {expected_hash}, got {actual_hash})"
+            )
+        cases.append({
+            "id": case_id,
+            "group": "external-diagnostic-corpus",
+            "family": source_id,
+            "template": relative_path,
+            "source_bytes": source_bytes,
+            "compile": False,
+            "expect_parse": "accepted",
+            "expect_semantic_error": None,
+            "source_id": source_id,
+            "materialized_path": relative_path,
+            "sha256": expected_hash,
+            "kind": rule[0],
+            "raven_mode": rule[1],
+            "oracle_mode": rule[2],
+        })
+    if not cases:
+        raise ValueError("materialized index contains no JAGS cases")
+    counts = index.get("counts")
+    if (
+        isinstance(counts, dict)
+        and isinstance(counts.get("jags"), int)
+        and counts["jags"] != len(cases)
+    ):
+        raise ValueError(
+            f"materialized JAGS count drifted: "
+            f"index={counts['jags']}, observed={len(cases)}"
+        )
+    source_set = [{
+        key: case[key]
+        for key in (
+            "id",
+            "source_id",
+            "materialized_path",
+            "sha256",
+            "kind",
+            "raven_mode",
+            "oracle_mode",
+        )
+    } for case in cases]
+    source_set_digest = sha256_bytes(json.dumps(
+        source_set,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8"))
+    return cases, {
+        "manifest_sha256": manifest_digest,
+        "materialized_index_sha256": sha256(index_path),
+        "source_set_sha256": source_set_digest,
+    }
+
+
+def run_external_cases(
+    cases: list[dict[str, Any]],
+    jags: Path,
+    expected_version: str,
+    timeout_seconds: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    records: list[dict[str, Any]] = []
+    verified: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for case in cases:
+        result = run_probe(jags, case["source_bytes"], False, timeout_seconds)
+        accepted = bool(result["syntax_accepted"]) and not bool(result["timed_out"])
+        record = {
+            "id": case["id"],
+            "source_id": case["source_id"],
+            "materialized_path": case["materialized_path"],
+            "sha256": case["sha256"],
+            "kind": case["kind"],
+            "raven_mode": case["raven_mode"],
+            "oracle_mode": case["oracle_mode"],
+            "outcome": "accepted-direct" if accepted else "rejected",
+            "wrapper_id": "model-in" if accepted else None,
+            "syntax_accepted": accepted,
+            "version": result["version"],
+            "timed_out": result["timed_out"],
+        }
+        records.append(record)
+        if result["timed_out"]:
+            failures.append(
+                f'{case["id"]}: exceeded {timeout_seconds:.3f}s timeout'
+            )
+            continue
+        if result["version"] != expected_version:
+            failures.append(
+                f'{case["id"]}: expected JAGS {expected_version}, '
+                f'got {result["version"]}'
+            )
+        if accepted:
+            verified.append({
+                "id": case["id"],
+                "materialized_path": f'materialized/{case["materialized_path"]}',
+                "sha256": case["sha256"],
+                "raven_mode": "syntax-only",
+                "wrapper_id": "model-in",
+                "source": {
+                    "materialized_path": f'materialized/{case["materialized_path"]}',
+                    "sha256": case["sha256"],
+                },
+            })
+    return records, verified, failures
+
+
+def external_result_record(
+    case: dict[str, Any], syntax_accepted: bool
+) -> dict[str, Any]:
+    return {
+        "id": case["id"],
+        "materialized_path": case["materialized_path"],
+        "sha256": case["sha256"],
+        "syntax_accepted": syntax_accepted,
+    }
+
+
+def external_outcomes_sha256(records: list[dict[str, Any]]) -> str:
+    return sha256_bytes(json.dumps(
+        records,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8"))
+
+
+def verify_external_results(
+    committed: dict[str, Any],
+    provenance: dict[str, Any],
+    inputs: dict[str, str],
+    cases: list[dict[str, Any]],
+) -> list[str]:
+    failures: list[str] = []
+    if committed.get("schema_version") != 1:
+        failures.append("external results schema_version must be 1")
+    expected_inputs = {
+        "manifest_sha256": inputs["manifest_sha256"],
+        "source_set_sha256": inputs["source_set_sha256"],
+    }
+    if committed.get("inputs") != expected_inputs:
+        failures.append("external result input hashes drifted; refresh external results")
+    expected_oracle = {
+        "version": provenance["target"]["version"],
+        "wrapper_sha256": provenance["homebrew_installation"]["wrapper_sha256"],
+        "terminal_sha256": provenance["homebrew_installation"]["terminal_sha256"],
+        "binding": "pinned-homebrew-arm64",
+    }
+    observed_oracle = committed.get("oracle")
+    if not isinstance(observed_oracle, dict):
+        failures.append("external results oracle binding is missing")
+    else:
+        for key, expected in expected_oracle.items():
+            if observed_oracle.get(key) != expected:
+                failures.append(
+                    f"external results {key}: expected {expected}, "
+                    f"got {observed_oracle.get(key)}"
+                )
+    records = committed.get("results")
+    if not isinstance(records, list) or len(records) != len(cases):
+        failures.append(
+            f"external result records: expected {len(cases)}, "
+            f"got {len(records) if isinstance(records, list) else 'non-list'}"
+        )
+        return failures
+    for case, observed in zip(cases, records, strict=True):
+        if not isinstance(observed, dict):
+            failures.append(f'{case["id"]}: external result must be an object')
+            continue
+        expected = external_result_record(
+            case, bool(observed.get("syntax_accepted"))
+        )
+        if not isinstance(observed.get("syntax_accepted"), bool):
+            failures.append(
+                f'{case["id"]}: committed syntax_accepted must be boolean'
+            )
+        for key, value in expected.items():
+            if observed.get(key) != value:
+                failures.append(
+                    f'{case["id"]}: committed {key} drifted '
+                    f'(expected {value!r}, got {observed.get(key)!r})'
+                )
+    holdout = provenance.get("official_model_holdout")
+    if not isinstance(holdout, dict):
+        failures.append("provenance official_model_holdout binding is missing")
+    else:
+        accepted_count = sum(
+            isinstance(record, dict) and record.get("syntax_accepted") is True
+            for record in records
+        )
+        if accepted_count != holdout.get("accepted_count"):
+            failures.append(
+                "external accepted count drifted "
+                f"(expected {holdout.get('accepted_count')}, got {accepted_count})"
+            )
+        actual_digest = external_outcomes_sha256(records)
+        if actual_digest != holdout.get("outcomes_sha256"):
+            failures.append(
+                "external canonical outcome digest drifted "
+                f"(expected {holdout.get('outcomes_sha256')}, got {actual_digest})"
+            )
+    if committed.get("failures") != []:
+        failures.append("committed external results contain failures")
+    return failures
+
+
+def external_report_records(
+    cases: list[dict[str, Any]], committed: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    results: list[dict[str, Any]] = []
+    verified: list[dict[str, Any]] = []
+    committed_records = committed["results"]
+    for case, outcome in zip(cases, committed_records, strict=True):
+        accepted = bool(outcome["syntax_accepted"])
+        results.append({
+            "id": case["id"],
+            "source_id": case["source_id"],
+            "materialized_path": case["materialized_path"],
+            "sha256": case["sha256"],
+            "kind": case["kind"],
+            "raven_mode": case["raven_mode"],
+            "oracle_mode": case["oracle_mode"],
+            "outcome": "accepted-direct" if accepted else "rejected",
+            "wrapper_id": "model-in" if accepted else None,
+            "syntax_accepted": accepted,
+            "version": committed["oracle"]["version"],
+            "timed_out": False,
+        })
+        if accepted:
+            verified.append({
+                "id": case["id"],
+                "materialized_path": f'materialized/{case["materialized_path"]}',
+                "sha256": case["sha256"],
+                "raven_mode": "syntax-only",
+                "wrapper_id": "model-in",
+                "source": {
+                    "materialized_path": f'materialized/{case["materialized_path"]}',
+                    "sha256": case["sha256"],
+                },
+            })
+    return results, verified
+
+
+def write_external_report(
+    external_root: Path,
+    oracle: dict[str, str],
+    inputs: dict[str, str],
+    results: list[dict[str, Any]],
+    verified_cases: list[dict[str, Any]],
+    failures: list[str],
+) -> Path:
+    report = {
+        "schema_version": 1,
+        "oracle": {"version": EXPECTED_VERSION, **oracle},
+        "inputs": inputs,
+        "counts": {
+            "total": len(results),
+            "accepted_direct": len(verified_cases),
+            "rejected": len(results) - len(verified_cases),
+            "verified": len(verified_cases),
+        },
+        "verified_cases": verified_cases,
+        "outcomes": results,
+        "failures": failures,
+    }
+    report_path = external_root / "materialized/jags-oracle.json"
+    temporary = report_path.with_name(f"{report_path.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, report_path)
+    return report_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -364,22 +794,184 @@ def main() -> int:
     mode.add_argument("--refresh-results", action="store_true")
     mode.add_argument("--verify-results", action="store_true")
     mode.add_argument("--verify-results-live", action="store_true")
+    mode.add_argument("--verify-external", action="store_true")
+    mode.add_argument("--verify-external-live", action="store_true")
+    mode.add_argument("--refresh-external-results", action="store_true")
+    parser.add_argument(
+        "--external-manifest", type=Path, default=DEFAULT_EXTERNAL_MANIFEST
+    )
+    parser.add_argument("--external-root", type=Path, default=DEFAULT_EXTERNAL_ROOT)
+    parser.add_argument(
+        "--external-results", type=Path, default=DEFAULT_EXTERNAL_RESULTS
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     if args.probe_timeout_seconds <= 0:
         parser.error("--probe-timeout-seconds must be positive")
+    provenance = json.loads(args.provenance.read_text(encoding="utf-8"))
+
+    external_mode = (
+        args.verify_external
+        or args.verify_external_live
+        or args.refresh_external_results
+    )
+    if external_mode:
+        try:
+            selected_cases, external_inputs = external_cases(
+                args.external_manifest.resolve(), args.external_root.resolve()
+            )
+        except ValueError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 2
+
+        external_committed: dict[str, Any] | None = None
+        if args.verify_external or args.verify_external_live:
+            try:
+                external_committed = load_json_object(
+                    args.external_results, "committed external results"
+                )
+            except ValueError as error:
+                print(f"ERROR: {error}", file=sys.stderr)
+                return 2
+            offline_failures = verify_external_results(
+                external_committed, provenance, external_inputs, selected_cases
+            )
+            if offline_failures:
+                for failure in offline_failures:
+                    print(f"ERROR: {failure}", file=sys.stderr)
+                return 1
+            if args.verify_external:
+                results, verified_cases = external_report_records(
+                    selected_cases, external_committed
+                )
+                report_path = write_external_report(
+                    args.external_root.resolve(),
+                    external_committed["oracle"],
+                    external_inputs,
+                    results,
+                    verified_cases,
+                    [],
+                )
+                if args.json:
+                    print(report_path.read_text(encoding="utf-8"), end="")
+                else:
+                    print(
+                        f"verified {len(results)} committed external JAGS outcomes "
+                        f"and wrote {report_path}"
+                    )
+                return 0
+
+        try:
+            oracle = validate_oracle_hashes(
+                args.jags,
+                args.terminal,
+                provenance,
+                args.allow_unpinned_oracle or allow_unpinned_from_environment(),
+            )
+        except ValueError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 2
+        expected_version = provenance["target"]["version"]
+        results, verified_cases, failures = run_external_cases(
+            selected_cases,
+            args.jags,
+            expected_version,
+            args.probe_timeout_seconds,
+        )
+
+        if args.verify_external_live and external_committed is not None:
+            for case, fresh, recorded in zip(
+                selected_cases, results, external_committed["results"], strict=True
+            ):
+                expected = external_result_record(
+                    case, bool(fresh["syntax_accepted"])
+                )
+                if expected != recorded:
+                    failures.append(
+                        f'{case["id"]}: live external outcome differs from committed'
+                    )
+
+        if args.refresh_external_results:
+            if oracle["binding"] != "pinned-homebrew-arm64":
+                print(
+                    "ERROR: refusing to commit external results from an unpinned oracle",
+                    file=sys.stderr,
+                )
+                return 2
+            if failures:
+                for failure in failures:
+                    print(f"ERROR: {failure}", file=sys.stderr)
+                return 1
+            committed_report = {
+                "schema_version": 1,
+                "inputs": {
+                    "manifest_sha256": external_inputs["manifest_sha256"],
+                    "source_set_sha256": external_inputs["source_set_sha256"],
+                },
+                "oracle": {"version": expected_version, **oracle},
+                "results": [
+                    external_result_record(
+                        case, bool(result["syntax_accepted"])
+                    )
+                    for case, result in zip(selected_cases, results, strict=True)
+                ],
+                "failures": [],
+            }
+            args.external_results.write_text(
+                json.dumps(
+                    committed_report,
+                    indent=2,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            print(
+                f"wrote {len(selected_cases)} pinned external outcomes "
+                f"to {args.external_results}"
+            )
+            return 0
+
+        report_path = write_external_report(
+            args.external_root.resolve(),
+            oracle,
+            external_inputs,
+            results,
+            verified_cases,
+            failures,
+        )
+        if args.json:
+            print(report_path.read_text(encoding="utf-8"), end="")
+        else:
+            for item in results:
+                status = "PASS" if item["syntax_accepted"] else "SKIP"
+                print(
+                    f'{status:4} external-diagnostic-corpus '
+                    f'{item["id"]:52} '
+                    f'{"accepted" if item["syntax_accepted"] else "rejected"}'
+                )
+            print(
+                f"\n{len(results)} external probes: "
+                f"{len(verified_cases)} accepted, "
+                f"{len(results) - len(verified_cases)} rejected/accounted"
+            )
+            for failure in failures:
+                print(f"ERROR: {failure}", file=sys.stderr)
+        return 1 if failures else 0
+
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     corpus = json.loads(args.quality_corpus.read_text(encoding="utf-8"))
-    provenance = json.loads(args.provenance.read_text(encoding="utf-8"))
     all_cases = matrix_cases(manifest) + quality_cases(corpus)
     selected_cases = all_cases if (
         args.refresh_results or args.verify_results or args.verify_results_live
     ) else matrix_cases(manifest)
     binding = input_binding(args.manifest, args.quality_corpus, all_cases)
 
+    committed: dict[str, Any] | None = None
     if args.verify_results or args.verify_results_live:
         committed = json.loads(args.results.read_text(encoding="utf-8"))
+        assert committed is not None
         offline_failures = verify_committed_results(
             committed,
             provenance,
@@ -439,6 +1031,7 @@ def main() -> int:
         return 0
 
     if args.verify_results_live:
+        assert committed is not None
         committed_records = committed["results"]
         for fresh, recorded in zip(results, committed_records, strict=True):
             for key in (

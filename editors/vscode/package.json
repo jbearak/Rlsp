@@ -2429,13 +2429,14 @@
     "bundle": "bun scripts/build.js",
     "bundle:webview-test": "bun scripts/build-test-harness.js",
     "copy-binary": "bun scripts/bundle-binary.js",
+    "copy-notice": "node -e \"require('node:fs').copyFileSync('../../NOTICE', 'NOTICE')\"",
     "compile": "bun run bundle",
     "compile:test": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "bun run compile:test && bun run bundle && bun run bundle:webview-test && bun run copy-binary",
     "test": "vscode-test",
-    "package": "bun run bundle && bun run copy-binary && vsce package --allow-missing-repository",
-    "package:target": "bun run bundle && bun run copy-binary && vsce package --target",
+    "package": "bun run bundle && bun run copy-binary && bun run copy-notice && vsce package --allow-missing-repository",
+    "package:target": "bun run bundle && bun run copy-binary && bun run copy-notice && vsce package --target",
     "typecheck": "tsc --noEmit && tsc --noEmit -p src/plot/webview && tsc --noEmit -p src/help/webview && tsc --noEmit -p src/data-viewer/webview"
   },
   "dependencies": {

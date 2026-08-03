@@ -1669,18 +1669,14 @@ fn function_scope_at(tree: &Tree, text: &str, line: u32, utf16_col: u32) -> Func
 fn enclosing_function_id(node: Node) -> FunctionScopeId {
     let mut current = node;
     loop {
-        match current.parent() {
-            Some(p) => {
-                if p.kind() == "function_definition" {
-                    return Some(p.id());
-                }
-                if p.kind() == "program" {
-                    return None;
-                }
-                current = p;
-            }
-            None => return None,
+        let parent = current.parent()?;
+        if parent.kind() == "function_definition" {
+            return Some(parent.id());
         }
+        if parent.kind() == "program" {
+            return None;
+        }
+        current = parent;
     }
 }
 

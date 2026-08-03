@@ -44,6 +44,53 @@ fn analyze(state: &mut WorldState, uri: &Url, source: &str, language_id: &str) -
     diagnostics(state, uri, &DiagCancelToken::never())
 }
 
+fn assert_clean_jags_document(state: &WorldState, uri: &Url, name: &str, source: &str) {
+    let document = state.get_document(uri).unwrap_or_else(|| {
+        panic!(
+            "JAGS case {name} has no Document at {uri}; source: {}",
+            source.escape_debug()
+        )
+    });
+    let tree = document.tree.as_ref().unwrap_or_else(|| {
+        panic!(
+            "JAGS case {name} has a Document but no syntax tree at {uri}; source: {}",
+            source.escape_debug()
+        )
+    });
+    let root = tree.root_node();
+    assert_eq!(
+        root.kind(),
+        "program",
+        "JAGS case {name} has the wrong root kind at {uri}; root: {}; source: {}",
+        root.to_sexp(),
+        source.escape_debug()
+    );
+    assert!(
+        !root.has_error(),
+        "JAGS grammar rejected case {name} at {uri}; root: {}; source: {}",
+        root.to_sexp(),
+        source.escape_debug()
+    );
+    assert!(
+        source
+            .get(..root.start_byte())
+            .is_some_and(|prefix| prefix.trim_matches(char::is_whitespace).is_empty()),
+        "JAGS case {name} has non-whitespace source before root byte range {:?} at {uri}; root: {}; source: {}",
+        root.byte_range(),
+        root.to_sexp(),
+        source.escape_debug()
+    );
+    assert!(
+        source
+            .get(root.end_byte()..)
+            .is_some_and(|suffix| suffix.trim_matches(char::is_whitespace).is_empty()),
+        "JAGS case {name} has non-whitespace source after root byte range {:?} at {uri}; root: {}; source: {}",
+        root.byte_range(),
+        root.to_sexp(),
+        source.escape_debug()
+    );
+}
+
 fn assert_syntax_only_in_bounds(name: &str, source: &str, findings: &[Diagnostic]) {
     let mut unique = HashSet::new();
     assert!(findings.len() <= 500, "{name} exceeded the diagnostic cap");
@@ -108,11 +155,13 @@ fn all_committed_oracle_outcomes_map_to_raven_diagnostics() {
             assert_syntax_only_in_bounds(&case.id, &case.source, &findings);
             if case.expect_parse == "accepted" {
                 accepted += 1;
+                assert_clean_jags_document(&state, &uri, &case.id, &case.source);
                 assert!(
                     findings.is_empty(),
-                    "false positive for {} ({} as .{extension}): {findings:#?}",
+                    "false positive for {} ({} as .{extension}) at {uri}; source: {}; findings: {findings:#?}",
                     case.id,
-                    case.group
+                    case.group,
+                    case.source.escape_debug()
                 );
             } else {
                 rejected += 1;
@@ -142,10 +191,12 @@ fn all_committed_oracle_outcomes_map_to_raven_diagnostics() {
             assert_syntax_only_in_bounds(&case.name, &source, &findings);
             if case.expect_parse == "accepted" {
                 accepted += 1;
+                assert_clean_jags_document(&state, &uri, &case.name, &source);
                 assert!(
                     findings.is_empty(),
-                    "false positive for syntax-matrix case {} as .{extension}: {findings:#?}",
-                    case.name
+                    "false positive for syntax-matrix case {} as .{extension} at {uri}; source: {}; findings: {findings:#?}",
+                    case.name,
+                    source.escape_debug()
                 );
             } else {
                 rejected += 1;
@@ -316,9 +367,12 @@ fn leading_and_trailing_whitespace_are_not_root_coverage_errors() {
         Url::parse("file:///tmp/whitespace.bugs").unwrap(),
         Url::parse("file:///tmp/whitespace.bug").unwrap(),
     ] {
+        let findings = analyze(&mut state, &uri, source, "jags");
+        assert_clean_jags_document(&state, &uri, "leading-and-trailing-whitespace", source);
         assert!(
-            analyze(&mut state, &uri, source, "jags").is_empty(),
-            "grammar extras outside the named root must remain valid"
+            findings.is_empty(),
+            "grammar extras outside the named root must remain valid at {uri}; source: {}; findings: {findings:#?}",
+            source.escape_debug()
         );
     }
 }

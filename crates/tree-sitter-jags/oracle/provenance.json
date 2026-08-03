@@ -23,5 +23,16 @@
     "inspected_jags_parser": false,
     "copied_jags_manual_prose": false,
     "observations": "independently authored inputs and public command-line outputs only"
+  },
+  "official_model_holdout": {
+    "purpose": "fetch-only post-hoc Raven diagnostics quality holdout",
+    "managed_by": "../../../scripts/diagnostic-corpora.py",
+    "used_to_derive_or_tune_grammar": false,
+    "model_files_manually_inspected": false,
+    "inspects_jags_implementation_or_parser": false,
+    "inspects_jags_manual_prose": false,
+    "distributed_with_raven": false,
+    "accepted_count": 59,
+    "outcomes_sha256": "32810d648cae1ce41393869f4bf6764bc4bf293d76f10126b0b535ea1ee5e75c"
   }
 }

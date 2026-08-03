@@ -2668,11 +2668,7 @@ fn classify_delimiter_line(line: &str) -> Option<BannerDelimKind> {
     }
 
     // Case 2: "# <delimiters>" — leading # then space then 4+ of one delimiter
-    let content = if let Some(rest) = after_first_hash.strip_prefix(' ') {
-        rest.trim()
-    } else {
-        return None;
-    };
+    let content = after_first_hash.strip_prefix(' ')?.trim();
 
     if content.len() < 4 {
         return None;
@@ -26265,11 +26261,10 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     let subscript_name;
     let name: &str = if node.kind() == "identifier" {
         node_text(node, &text)
-    } else if let Some(m) = crate::qualified_resolve::string_subscript_member_at(node, &text) {
+    } else {
+        let m = crate::qualified_resolve::string_subscript_member_at(node, &text)?;
         subscript_name = crate::cross_file::directive::callee_name_for_match(&m.value);
         &subscript_name
-    } else {
-        return None;
     };
     let shiny_application = active_shiny_application(state, uri);
     let shiny_name_based_search = node.kind() != "identifier" || is_structural_label(node);

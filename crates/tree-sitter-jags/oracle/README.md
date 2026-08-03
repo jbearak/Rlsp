@@ -47,3 +47,11 @@ shell-wrapper digest.
 
 The matrix targets JAGS 4.3.2 only. It is not a compatibility claim for
 OpenBUGS, WinBUGS, MultiBUGS, NIMBLE, or other BUGS-family implementations.
+
+Raven's external diagnostic corpus is deliberately outside this oracle. It
+fetches a checksum-pinned allowlist of official JAGS model files and uses them
+only as a post-hoc Raven-diagnostics holdout. That path does not inspect
+implementation/parser sources or manual prose, and does not claim manual
+inspection of the model files. The models were not used to derive
+or tune this grammar, and their outcomes are not included in
+`oracle-results.json`. See `../../../docs/diagnostic-corpora.md`.

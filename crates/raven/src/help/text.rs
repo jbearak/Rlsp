@@ -173,15 +173,10 @@ impl HelpCache {
         }
 
         // Cache miss — fetch help text and parse arguments
-        let help_text = self.get_or_fetch(topic, package, r_path);
-        let args = match help_text {
-            Some(text) => {
-                let map = extract_arguments_from_help(&text);
-                if map.is_empty() { None } else { Some(map) }
-            }
-            // Transient R failure — don't cache so retries can succeed later
-            None => return None,
-        };
+        // Transient R failure — don't cache so retries can succeed later.
+        let help_text = self.get_or_fetch(topic, package, r_path)?;
+        let map = extract_arguments_from_help(&help_text);
+        let args = if map.is_empty() { None } else { Some(map) };
 
         // Cache the parsed result (including None for "no Arguments section" cases)
         if let Ok(mut guard) = self.arguments.write() {

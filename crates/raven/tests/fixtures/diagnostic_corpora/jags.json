@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "language": "jags",
+  "suite": "external-no-false-positive",
+  "oracle": {
+    "version": "4.3.2",
+    "mode": "model-in"
+  },
+  "sources": [
+    {
+      "id": "classic-bugs-4.x",
+      "project": "JAGS official Classic BUGS examples",
+      "version": "4.x-2017-08-10",
+      "revision": "sourceforge-classic-bugs-2017-08-10",
+      "archive_url": "https://downloads.sourceforge.net/project/mcmc-jags/Examples/4.x/classic-bugs.tar.gz",
+      "archive_sha256": "cbecdd184516ed1e0ed26993335c7ce6b50b85875c66a059a4ad51780547e580",
+      "archive_root": "classic-bugs",
+      "redistribution": "fetch-only",
+      "license": {
+        "spdx": "NOASSERTION",
+        "evidence_url": "https://sourceforge.net/projects/mcmc-jags/files/Examples/4.x/"
+      },
+      "discovery": [
+        {
+          "type": "files",
+          "globs": ["vol1/**/*.bug", "vol2/**/*.bug"],
+          "expected_count": 60,
+          "kind": "complete",
+          "raven_mode": "syntax-only",
+          "oracle_mode": "jags-model-in"
+        }
+      ]
+    }
+  ]
+}
