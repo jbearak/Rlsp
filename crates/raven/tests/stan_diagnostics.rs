@@ -49,6 +49,11 @@ fn stan_uncovered_source_is_trivia(mut source: &str, allow_bom: bool) -> bool {
         if source.is_empty() {
             return true;
         }
+        // `#` lines outside the root range are masked Raven directives, but
+        // `#include` is Stan source (a `preproc_include` extra), never trivia.
+        if source.starts_with("#include") {
+            return false;
+        }
         if let Some(comment) = source
             .strip_prefix("//")
             .or_else(|| source.strip_prefix('#'))

@@ -76,4 +76,44 @@ mod tests {
             .set_language(&super::LANGUAGE_STANFUNCTIONS.into())
             .expect("Error loading Stan parser");
     }
+
+    /// Every vendored query must compile against the grammar it is registered
+    /// for in `tree-sitter.json`; an invalid query fails at load time and
+    /// silently disables the whole feature in downstream consumers.
+    #[test]
+    fn test_queries_compile_against_their_grammars() {
+        let stan: tree_sitter::Language = super::LANGUAGE_STAN.into();
+        let stanfunctions: tree_sitter::Language = super::LANGUAGE_STANFUNCTIONS.into();
+        for (language, name, source) in [
+            (
+                &stan,
+                "highlights.scm",
+                include_str!("../../queries/highlights.scm"),
+            ),
+            (
+                &stan,
+                "locals.scm",
+                include_str!("../../queries/locals.scm"),
+            ),
+            (&stan, "tags.scm", include_str!("../../queries/tags.scm")),
+            (
+                &stanfunctions,
+                "sf-highlights.scm",
+                include_str!("../../queries/sf-highlights.scm"),
+            ),
+            (
+                &stanfunctions,
+                "sf-locals.scm",
+                include_str!("../../queries/sf-locals.scm"),
+            ),
+            (
+                &stanfunctions,
+                "sf-tags.scm",
+                include_str!("../../queries/sf-tags.scm"),
+            ),
+        ] {
+            tree_sitter::Query::new(language, source)
+                .unwrap_or_else(|error| panic!("{name} must compile: {error}"));
+        }
+    }
 }
