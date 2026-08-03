@@ -1,6 +1,6 @@
 # Raven
 
-Raven is a language server for R, Stan, and JAGS. Its defining idea: **what's in scope depends on where your cursor is.** Raven traces `source()` chains and resolves scope at your position, so completions, diagnostics, and navigation reflect what's actually defined when each line runs — across files, and within a single script (a variable defined on line 50 isn't in scope on line 10).
+Raven is a language server for R, with additional support for Stan and JAGS. Its defining idea: **what's in scope depends on where your cursor is.** Raven traces `source()` chains and resolves scope at your position, so completions, diagnostics, and navigation reflect what's actually defined when each line runs — across files, and within a single script (a variable defined on line 50 isn't in scope on line 10).
 
 Because scope is resolved by position, Raven can flag genuinely undefined variables — and, parsing as you type, it catches parse errors (unclosed brackets, an `else` stranded from its `}`) and likely-bug patterns like mixed logical operators (`a & b | c`).
 
@@ -27,7 +27,9 @@ Raven is designed to complement, not replace, your existing tools. But it *can* 
 - **[Directives](https://github.com/jbearak/raven/blob/main/docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **[Syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting
 
-Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`, `.bug`) and **Stan** (`.stan`) files: syntax highlighting, completions (keywords, distributions, file-local symbols), strict syntax diagnostics, conservative Stan undeclared-variable diagnostics for complete programs, go-to-definition, find references, and document outline with model structure navigation. Block-free Stan fragments and files containing `#include` fail closed for semantic findings. All three JAGS extensions are matched case-insensitively and validated as strict JAGS, not as general OpenBUGS, WinBUGS, MultiBUGS, or NIMBLE input.
+Raven's R diagnostics include scope-aware findings and tailored explanations. Its cross-file scope model follows `source()` chains, `.Rprofile`, supported package attachment and import forms, static `{targets}` / `{tarchetypes}` patterns, and testthat/testit/Shiny conventions.
+
+Raven also supports **JAGS** (`.jags`, `.bugs`, `.bug`) and **Stan** (`.stan`) files with [syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md#jags-and-stan), [completions](https://github.com/jbearak/raven/blob/main/docs/completion.md#jags-and-stan), [hover](https://github.com/jbearak/raven/blob/main/docs/hover.md), [syntax diagnostics](https://github.com/jbearak/raven/blob/main/docs/diagnostics.md#jags-and-stan-parse-errors), [go-to-definition](https://github.com/jbearak/raven/blob/main/docs/go-to-definition.md#jags-and-stan), [find references](https://github.com/jbearak/raven/blob/main/docs/find-references.md#jags-and-stan), and [model-structure outlines](https://github.com/jbearak/raven/blob/main/docs/document-outline.md#jags-and-stan-model-structure). JAGS additionally provides static signature help for built-ins, while Stan provides conservative [undeclared-variable diagnostics](https://github.com/jbearak/raven/blob/main/docs/diagnostics.md#stan-undeclared-variables).
 
 ### R session integration
 
