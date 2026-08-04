@@ -5,7 +5,7 @@ use std::process::Command;
 use raven::handlers::{DiagCancelToken, diagnostics};
 use raven::state::WorldState;
 use serde::Deserialize;
-use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Url};
+use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Position, Range, Url};
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -290,9 +290,222 @@ fn compiler_syntax_error_corpus_is_detected_without_cascades_or_duplicates() {
 }
 
 #[test]
-fn stan_syntax_ranges_are_exact_across_utf16_line_endings_and_eof() {
-    use tower_lsp::lsp_types::{Position, Range};
+fn stan_delimiter_recovery_messages_and_ranges_are_explanatory() {
+    let cases = [
+        (
+            "missing-paren",
+            "model { target += f(1,2; }\n",
+            "Unclosed `(`: missing matching `)`",
+            Range::new(Position::new(0, 19), Position::new(0, 26)),
+        ),
+        (
+            "missing-bracket",
+            "model { target += [1,2; }\n",
+            "Unclosed `[`: missing matching `]`",
+            Range::new(Position::new(0, 18), Position::new(0, 25)),
+        ),
+        (
+            "missing-brace",
+            "model { target += 1;\n",
+            "Unclosed `{`: missing matching `}`",
+            Range::new(Position::new(0, 6), Position::new(0, 20)),
+        ),
+        (
+            "stray-paren",
+            "model { target += 1); }\n",
+            "Missing opening `(`",
+            Range::new(Position::new(0, 19), Position::new(0, 20)),
+        ),
+        (
+            "stray-bracket",
+            "model { target += 1]; }\n",
+            "Missing opening `[`",
+            Range::new(Position::new(0, 19), Position::new(0, 20)),
+        ),
+        (
+            "stray-bracket-before-real-paren-close",
+            "model { target += f(1] ); }\n",
+            "Missing opening `[`",
+            Range::new(Position::new(0, 21), Position::new(0, 22)),
+        ),
+        (
+            "stray-brace",
+            "model { target += 1; } }\n",
+            "Missing opening `{`",
+            Range::new(Position::new(0, 23), Position::new(0, 24)),
+        ),
+        (
+            "mismatched-paren",
+            "model { target += f(1]; }\n",
+            "Mismatched brackets: `(` opened here; close with `)` not `]`.",
+            Range::new(Position::new(0, 21), Position::new(0, 22)),
+        ),
+        (
+            "mismatched-bracket",
+            "model { target += [1,2); }\n",
+            "Mismatched brackets: `[` opened here; close with `]` not `)`.",
+            Range::new(Position::new(0, 22), Position::new(0, 23)),
+        ),
+        (
+            "mismatch-before-intervening-siblings",
+            "model { target += f([1,2), g(3)); }\n",
+            "Mismatched brackets: `[` opened here; close with `]` not `)`.",
+            Range::new(Position::new(0, 24), Position::new(0, 25)),
+        ),
+        (
+            "mismatched-brace",
+            "model { target += {1,2]; }\n",
+            "Mismatched brackets: `{` opened here; close with `}` not `]`.",
+            Range::new(Position::new(0, 22), Position::new(0, 23)),
+        ),
+        (
+            "mismatched-brace-before-line-comment",
+            "model { target += 1; ]\n// tail\n",
+            "Mismatched brackets: `{` opened here; close with `}` not `]`.",
+            Range::new(Position::new(0, 21), Position::new(0, 22)),
+        ),
+        (
+            "mismatch-coalesces-missing-closer",
+            "model { target += f(}; }\n",
+            "Mismatched brackets: `(` opened here; close with `)` not `}`.",
+            Range::new(Position::new(0, 20), Position::new(0, 21)),
+        ),
+    ];
 
+    for (name, code, message, range) in cases {
+        let fixture = Fixture {
+            name: name.to_string(),
+            code: code.to_string(),
+        };
+        let (_, _, findings) = analyze(&fixture);
+        assert_eq!(findings.len(), 1, "{name}: {findings:#?}");
+        assert_eq!(findings[0].message, message, "{name}");
+        assert_eq!(findings[0].range, range, "{name}");
+        assert_eq!(findings[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            findings[0].code,
+            Some(NumberOrString::String("syntax-error".to_string()))
+        );
+    }
+}
+
+#[test]
+fn stan_balanced_real_closer_keeps_leading_wrong_closer_generic() {
+    let fixture = Fixture {
+        name: "balanced-real-closer".to_string(),
+        code: "model { target += f(]1); }\n".to_string(),
+    };
+    let (_, _, findings) = analyze(&fixture);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].message, "Stan code could not be parsed here");
+    assert_eq!(
+        findings[0].range,
+        Range::new(Position::new(0, 20), Position::new(0, 22))
+    );
+}
+
+#[test]
+fn stan_balanced_openers_leave_wrong_closers_as_strays() {
+    let cases = [
+        "model { target += f(1]); }\n",
+        "model { target += {1,2]}; }\n",
+    ];
+    for code in cases {
+        let fixture = Fixture {
+            name: "balanced-opener-with-stray-closer".to_string(),
+            code: code.to_string(),
+        };
+        let (_, _, findings) = analyze(&fixture);
+        assert_eq!(findings.len(), 1, "{code:?}: {findings:#?}");
+        assert_eq!(findings[0].message, "Missing opening `[`", "{code:?}");
+    }
+}
+
+#[test]
+fn stan_recovered_balanced_delimiters_stay_generic() {
+    let cases = [
+        "model { target += [1,\n] foo; }\n",
+        "model { target += {1);, 2}; }\n",
+        "model { target += f([1)]}; }\n",
+        "model { target += ([1)]; }\n",
+        "model { target += {f(1}); }\n",
+        "model { target += normal_lpdf(y[n] ;; mu, 1); }\n",
+        "model { target += f(theta;;, sigma); }\n",
+        "data { int N; } ;; model {}\n",
+    ];
+    for (index, code) in cases.into_iter().enumerate() {
+        let fixture = Fixture {
+            name: format!("recovered-balanced-delimiters-{index}"),
+            code: code.to_string(),
+        };
+        let (_, _, findings) = analyze(&fixture);
+        assert!(!findings.is_empty(), "{code:?}: {findings:#?}");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.message.contains("Stan")),
+            "ambiguous recovery must stay generic: {code:?}: {findings:#?}"
+        );
+    }
+}
+
+#[test]
+fn stan_unclosed_delimiter_range_is_utf16_comment_aware_and_uses_masked_text() {
+    let cases = [
+        (
+            "first-line-bom",
+            "\u{feff}model { target += f(1; }\n",
+            Range::new(Position::new(0, 20), Position::new(0, 25)),
+        ),
+        (
+            "line-comment-and-masking",
+            "# raven: var host\nmodel { print(\"😀\"); target += f(1; // tail\n}\n",
+            Range::new(Position::new(1, 32), Position::new(1, 35)),
+        ),
+        (
+            "block-comment",
+            "model { target += f(1; /* tail */ }\n",
+            Range::new(Position::new(0, 19), Position::new(0, 22)),
+        ),
+        (
+            "inline-block-comment",
+            "model { target += f(1 /* note */ + 2; }\n",
+            Range::new(Position::new(0, 19), Position::new(0, 39)),
+        ),
+    ];
+    for (name, code, expected) in cases {
+        let fixture = Fixture {
+            name: name.to_string(),
+            code: code.to_string(),
+        };
+        let (_, _, findings) = analyze(&fixture);
+        assert_eq!(findings.len(), 1, "{name}: {findings:#?}");
+        assert_eq!(findings[0].message, "Unclosed `(`: missing matching `)`");
+        assert_eq!(findings[0].range, expected, "{name}");
+    }
+}
+
+#[test]
+fn stan_unclosed_ranges_recompute_meaningful_end_for_each_same_line_opener() {
+    let fixture = Fixture {
+        name: "same-line-unclosed-openers".to_string(),
+        code: "transformed parameters { real x = f(1; /* c */ } model { target += g(2; }"
+            .to_string(),
+    };
+    let (_, _, findings) = analyze(&fixture);
+    let second = findings
+        .iter()
+        .find(|finding| finding.range.start == Position::new(0, 68))
+        .unwrap_or_else(|| panic!("missing second opener diagnostic: {findings:#?}"));
+    assert_eq!(second.message, "Unclosed `(`: missing matching `)`");
+    assert_eq!(
+        second.range,
+        Range::new(Position::new(0, 68), Position::new(0, 73))
+    );
+}
+
+#[test]
+fn stan_syntax_ranges_are_exact_across_utf16_line_endings_and_eof() {
     let cases = [
         (
             "ascii",

@@ -101,7 +101,13 @@ fn assert_syntax_only_in_bounds(name: &str, source: &str, findings: &[Diagnostic
             Some(NumberOrString::String("syntax-error".to_string())),
             "{name}"
         );
-        assert!(finding.message.contains("JAGS"), "{name}: {finding:?}");
+        assert!(
+            finding.message.contains("JAGS")
+                || finding.message.starts_with("Unclosed `")
+                || finding.message.starts_with("Missing opening `")
+                || finding.message.starts_with("Mismatched brackets: `"),
+            "{name}: {finding:?}"
+        );
         let line = source
             .split('\n')
             .nth(finding.range.start.line as usize)
@@ -320,6 +326,192 @@ fn cancelled_jags_diagnostics_fail_closed() {
 }
 
 #[test]
+fn jags_delimiter_recovery_messages_and_ranges_are_explanatory() {
+    let cases = [
+        (
+            "missing-paren",
+            "model { x <- f(1 }\n",
+            "Unclosed `(`: missing matching `)`",
+            Range::new(Position::new(0, 14), Position::new(0, 18)),
+        ),
+        (
+            "missing-bracket",
+            "model { x <- a[i }\n",
+            "Unclosed `[`: missing matching `]`",
+            Range::new(Position::new(0, 14), Position::new(0, 18)),
+        ),
+        (
+            "missing-brace",
+            "model { x <- 1\n",
+            "Unclosed `{`: missing matching `}`",
+            Range::new(Position::new(0, 6), Position::new(0, 14)),
+        ),
+        (
+            "stray-paren",
+            "model { x <- 1 ) }\n",
+            "Missing opening `(`",
+            Range::new(Position::new(0, 15), Position::new(0, 16)),
+        ),
+        (
+            "stray-bracket",
+            "model { x <- 1 ] }\n",
+            "Missing opening `[`",
+            Range::new(Position::new(0, 15), Position::new(0, 16)),
+        ),
+        (
+            "stray-bracket-before-real-paren-close",
+            "model { x <- f(1] ) }\n",
+            "Missing opening `[`",
+            Range::new(Position::new(0, 16), Position::new(0, 17)),
+        ),
+        (
+            "stray-bracket-before-content-and-real-paren-close",
+            "model { x <- f(]1) }\n",
+            "Missing opening `[`",
+            Range::new(Position::new(0, 15), Position::new(0, 16)),
+        ),
+        (
+            "stray-brace",
+            "model { x <- 1 } }\n",
+            "Missing opening `{`",
+            Range::new(Position::new(0, 17), Position::new(0, 18)),
+        ),
+        (
+            "mismatched-paren",
+            "model { x <- f(1] }\n",
+            "Mismatched brackets: `(` opened here; close with `)` not `]`.",
+            Range::new(Position::new(0, 16), Position::new(0, 17)),
+        ),
+        (
+            "mismatched-bracket",
+            "model { x <- a[i) }\n",
+            "Mismatched brackets: `[` opened here; close with `]` not `)`.",
+            Range::new(Position::new(0, 16), Position::new(0, 17)),
+        ),
+        (
+            "mismatched-brace",
+            "model { x <- 1 ]\n",
+            "Mismatched brackets: `{` opened here; close with `}` not `]`.",
+            Range::new(Position::new(0, 15), Position::new(0, 16)),
+        ),
+        (
+            "mismatched-brace-before-line-comment",
+            "model { x <- 1 ]\n# tail\n",
+            "Mismatched brackets: `{` opened here; close with `}` not `]`.",
+            Range::new(Position::new(0, 15), Position::new(0, 16)),
+        ),
+        (
+            "mismatch-coalesces-missing-closer",
+            "model { x <- f(} }\n",
+            "Mismatched brackets: `(` opened here; close with `)` not `}`.",
+            Range::new(Position::new(0, 15), Position::new(0, 16)),
+        ),
+    ];
+
+    let uri = Url::parse("untitled:jags-delimiter-recovery").unwrap();
+    let mut state = WorldState::new();
+    for (name, source, message, range) in cases {
+        let findings = analyze(&mut state, &uri, source, "jags");
+        assert_eq!(findings.len(), 1, "{name}: {findings:#?}");
+        assert_eq!(findings[0].message, message, "{name}");
+        assert_eq!(findings[0].range, range, "{name}");
+        assert_eq!(findings[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            findings[0].code,
+            Some(NumberOrString::String("syntax-error".to_string()))
+        );
+    }
+}
+
+#[test]
+fn jags_ambiguous_recovery_does_not_blame_balanced_braces() {
+    let cases = [
+        "model { for (i in 1:3 { x[i] <- f(a[i]) } }",
+        "model { for (iin 1:3) { x[i] <- f(a[i]) } }",
+        "model { for (i in 1:3) { x[i] - f(a[i]) } y <- 2 }",
+        "model { x <- f(*[i]) }",
+        "model { x[i <- 1 }",
+        "model { *[i] ~ dnorm(0,1) }",
+        "model { x <- f([1)]} }",
+        "model { ) }",
+        "model { for i in 1:n) { x <- 1 } }",
+        "model { for (i in 1:n) { x[i <- i } }",
+    ];
+    let uri = Url::parse("untitled:jags-ambiguous-delimiter-recovery").unwrap();
+    let mut state = WorldState::new();
+    for source in cases {
+        let findings = analyze(&mut state, &uri, source, "jags");
+        assert!(!findings.is_empty(), "{source:?}");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.message.contains("JAGS")),
+            "ambiguous recovery must stay generic: {source:?}: {findings:#?}"
+        );
+    }
+}
+
+#[test]
+fn jags_balanced_call_opener_leaves_wrong_closer_as_stray() {
+    let source = "model { x <- f(1]) }";
+    let uri = Url::parse("untitled:jags-balanced-call-with-stray-closer").unwrap();
+    let mut state = WorldState::new();
+    let findings = analyze(&mut state, &uri, source, "jags");
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].message, "Missing opening `[`", "{findings:#?}");
+}
+
+#[test]
+fn jags_unclosed_delimiter_range_is_utf16_and_comment_aware() {
+    let cases = [
+        (
+            "line-comment-and-utf16",
+            "/* 😀 */ model { x <- f(1 # tail\n}\n",
+            Range::new(Position::new(0, 23), Position::new(0, 25)),
+        ),
+        (
+            "block-comment",
+            "model { x <- f(1 /* tail */ }\n",
+            Range::new(Position::new(0, 14), Position::new(0, 16)),
+        ),
+        (
+            "inline-block-comment",
+            "model { x <- f(1 /* note */ + 2 }\n",
+            Range::new(Position::new(0, 14), Position::new(0, 33)),
+        ),
+        (
+            "hash-in-special-operator",
+            "model { x <- f(1 %#% 2 }\n",
+            Range::new(Position::new(0, 14), Position::new(0, 24)),
+        ),
+    ];
+    let uri = Url::parse("untitled:jags-delimiter-comment-range").unwrap();
+    let mut state = WorldState::new();
+    for (name, source, expected) in cases {
+        let findings = analyze(&mut state, &uri, source, "jags");
+        assert_eq!(findings.len(), 1, "{name}: {findings:#?}");
+        assert_eq!(findings[0].message, "Unclosed `(`: missing matching `)`");
+        assert_eq!(findings[0].range, expected, "{name}");
+    }
+}
+
+#[test]
+fn jags_explanatory_range_accounts_for_a_retained_first_line_bom() {
+    let source = "\u{feff}model { x <- f(1 }\n";
+    let uri = Url::parse("untitled:jags-delimiter-bom-range").unwrap();
+    let mut state = WorldState::new();
+    let findings = analyze(&mut state, &uri, source, "jags");
+    let finding = findings
+        .iter()
+        .find(|finding| finding.message == "Unclosed `(`: missing matching `)`")
+        .unwrap_or_else(|| panic!("missing explanatory diagnostic: {findings:#?}"));
+    assert_eq!(
+        finding.range,
+        Range::new(Position::new(0, 15), Position::new(0, 19))
+    );
+}
+
+#[test]
 fn jags_ranges_are_exact_for_bom_crlf_astral_and_eof_recovery() {
     let cases = [
         (
@@ -340,7 +532,7 @@ fn jags_ranges_are_exact_for_bom_crlf_astral_and_eof_recovery() {
         (
             "eof-recovery",
             "model { x <- 1",
-            Range::new(Position::new(0, 13), Position::new(0, 14)),
+            Range::new(Position::new(0, 6), Position::new(0, 14)),
         ),
         (
             "raw-bom",
