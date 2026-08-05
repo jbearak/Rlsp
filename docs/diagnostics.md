@@ -112,6 +112,16 @@ unlimited findings. The finite limit bounds retained collector memory and the
 editor/CLI payload while traversal continues so cancellation remains
 responsive. It does not apply to R diagnostics.
 
+When Tree-sitter recovery provides clear structural evidence, Stan and JAGS
+parse findings explain missing closers, missing openers, and mismatches for
+`()`, `[]`, and `{}` using the same wording as R. An unclosed-delimiter range
+starts at the opener and spans the meaningful code on that line; a stray or
+wrong closer is highlighted directly. Stan and JAGS do not use R's special
+`[[` / `]]` delimiter semantics. Ambiguous recovery keeps the generic
+`Stan code could not be parsed here` or `JAGS code could not be parsed here`
+message rather than guessing. These explanatory findings retain the
+non-suppressible `syntax-error` code.
+
 JAGS findings come from Raven's in-tree clean-room Tree-sitter grammar. They
 cover parser `ERROR` and required `MISSING` nodes, are emitted in stable source
 order without duplicate recovery cascades.

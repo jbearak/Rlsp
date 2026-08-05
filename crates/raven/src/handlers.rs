@@ -153,6 +153,126 @@ generated quantities { real z = twice(mu); }
     }
 
     #[test]
+    fn stan_and_jags_explain_clear_delimiter_recovery() {
+        let cases = [
+            (
+                "jags",
+                "model { x <- f(1 }\n",
+                "Unclosed `(`: missing matching `)`",
+                Range::new(Position::new(0, 14), Position::new(0, 18)),
+            ),
+            (
+                "jags",
+                "model { x <- a[i }\n",
+                "Unclosed `[`: missing matching `]`",
+                Range::new(Position::new(0, 14), Position::new(0, 18)),
+            ),
+            (
+                "jags",
+                "model { x <- 1\n",
+                "Unclosed `{`: missing matching `}`",
+                Range::new(Position::new(0, 6), Position::new(0, 14)),
+            ),
+            (
+                "stan",
+                "model { target += f(1,2; }\n",
+                "Unclosed `(`: missing matching `)`",
+                Range::new(Position::new(0, 19), Position::new(0, 26)),
+            ),
+            (
+                "stan",
+                "model { target += [1,2; }\n",
+                "Unclosed `[`: missing matching `]`",
+                Range::new(Position::new(0, 18), Position::new(0, 25)),
+            ),
+            (
+                "stan",
+                "model { target += 1;\n",
+                "Unclosed `{`: missing matching `}`",
+                Range::new(Position::new(0, 6), Position::new(0, 20)),
+            ),
+            (
+                "jags",
+                "model { x <- 1 ) }\n",
+                "Missing opening `(`",
+                Range::new(Position::new(0, 15), Position::new(0, 16)),
+            ),
+            (
+                "jags",
+                "model { x <- 1 ] }\n",
+                "Missing opening `[`",
+                Range::new(Position::new(0, 15), Position::new(0, 16)),
+            ),
+            (
+                "jags",
+                "model { x <- 1 } }\n",
+                "Missing opening `{`",
+                Range::new(Position::new(0, 17), Position::new(0, 18)),
+            ),
+            (
+                "stan",
+                "model { target += 1); }\n",
+                "Missing opening `(`",
+                Range::new(Position::new(0, 19), Position::new(0, 20)),
+            ),
+            (
+                "stan",
+                "model { target += 1]; }\n",
+                "Missing opening `[`",
+                Range::new(Position::new(0, 19), Position::new(0, 20)),
+            ),
+            (
+                "stan",
+                "model { target += 1; } }\n",
+                "Missing opening `{`",
+                Range::new(Position::new(0, 23), Position::new(0, 24)),
+            ),
+            (
+                "jags",
+                "model { x <- a[i) }\n",
+                "Mismatched brackets: `[` opened here; close with `]` not `)`.",
+                Range::new(Position::new(0, 16), Position::new(0, 17)),
+            ),
+            (
+                "jags",
+                "model { x <- f(1] }\n",
+                "Mismatched brackets: `(` opened here; close with `)` not `]`.",
+                Range::new(Position::new(0, 16), Position::new(0, 17)),
+            ),
+            (
+                "stan",
+                "model { target += f(1]; }\n",
+                "Mismatched brackets: `(` opened here; close with `)` not `]`.",
+                Range::new(Position::new(0, 21), Position::new(0, 22)),
+            ),
+            (
+                "stan",
+                "model { target += [1,2); }\n",
+                "Mismatched brackets: `[` opened here; close with `]` not `)`.",
+                Range::new(Position::new(0, 22), Position::new(0, 23)),
+            ),
+            (
+                "stan",
+                "model { target += {1,2]; }\n",
+                "Mismatched brackets: `{` opened here; close with `}` not `]`.",
+                Range::new(Position::new(0, 22), Position::new(0, 23)),
+            ),
+        ];
+
+        for (language, code, message, range) in cases {
+            let findings = diagnostics_for_language_with_cap(language, code, 0);
+            assert_eq!(findings.len(), 1, "{language}: {code:?}: {findings:#?}");
+            assert_eq!(findings[0].message, message, "{language}: {code:?}");
+            assert_eq!(findings[0].range, range, "{language}: {code:?}");
+            assert_eq!(findings[0].severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(
+                findings[0].code,
+                Some(NumberOrString::String("syntax-error".to_string()))
+            );
+        }
+    }
+
+    #[test]
     fn raven_directives_are_masked_but_unknown_hash_lines_are_diagnosed() {
         assert!(
             diagnostics_for("# raven: source helper.R\nmodel {}\n").is_empty(),
@@ -403,6 +523,59 @@ model {
             assert_eq!(below_default, unlimited[..137]);
             assert_eq!(above_default, unlimited[..700]);
         }
+    }
+
+    #[test]
+    fn delimiter_diagnostic_cap_matches_unlimited_source_order_prefix() {
+        let mut code = String::new();
+        for index in 0..240 {
+            code.push_str(&format!("model {{ target += f({index}; }}\n"));
+        }
+        let unlimited = diagnostics_for_language_with_cap("stan", &code, 0);
+        assert!(
+            unlimited.len() > 200,
+            "fixture must produce many delimiter diagnostics: {unlimited:#?}"
+        );
+        assert!(
+            unlimited
+                .iter()
+                .any(|diagnostic| diagnostic.message.starts_with("Unclosed `(")),
+            "fixture must exercise opener-anchored retention: {unlimited:#?}"
+        );
+        let capped = diagnostics_for_language_with_cap("stan", &code, 37);
+        assert_eq!(capped, unlimited[..37]);
+    }
+
+    #[test]
+    fn delimiter_collection_cancels_after_its_cap_is_saturated() {
+        let mut code = String::new();
+        for index in 0..240 {
+            code.push_str(&format!("model {{ target += f({index}; }}\n"));
+        }
+        let tree = crate::stan::parse(&code).expect("delimiter-heavy Stan tree");
+        let saturated = collect_foreign_syntax_errors_with_cancel_check(
+            tree.root_node(),
+            &code,
+            ForeignSyntaxLanguage::Stan,
+            5,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(saturated.len(), 5);
+
+        let mut checks = 0usize;
+        let cancelled = collect_foreign_syntax_errors_with_cancel_check(
+            tree.root_node(),
+            &code,
+            ForeignSyntaxLanguage::Stan,
+            5,
+            || {
+                checks += 1;
+                checks >= 73
+            },
+        );
+        assert!(cancelled.is_none());
+        assert_eq!(checks, 73);
     }
 
     #[test]
@@ -11159,15 +11332,1431 @@ impl ForeignSyntaxLanguage {
     }
 }
 
-fn foreign_syntax_diagnostic(language: ForeignSyntaxLanguage, range: Range) -> Diagnostic {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForeignDelimiterKind {
+    Paren,
+    Bracket,
+    Brace,
+}
+
+impl ForeignDelimiterKind {
+    fn index(self) -> usize {
+        match self {
+            Self::Paren => 0,
+            Self::Bracket => 1,
+            Self::Brace => 2,
+        }
+    }
+
+    fn opener(self) -> &'static str {
+        match self {
+            Self::Paren => "(",
+            Self::Bracket => "[",
+            Self::Brace => "{",
+        }
+    }
+
+    fn closer(self) -> &'static str {
+        match self {
+            Self::Paren => ")",
+            Self::Bracket => "]",
+            Self::Brace => "}",
+        }
+    }
+
+    fn from_opener(text: &str) -> Option<Self> {
+        match text {
+            "(" => Some(Self::Paren),
+            "[" => Some(Self::Bracket),
+            "{" => Some(Self::Brace),
+            _ => None,
+        }
+    }
+
+    fn from_closer(text: &str) -> Option<Self> {
+        match text {
+            ")" => Some(Self::Paren),
+            "]" => Some(Self::Bracket),
+            "}" => Some(Self::Brace),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ForeignCloser {
+    kind: ForeignDelimiterKind,
+    start_byte: usize,
+    end_byte: usize,
+    start_point: Point,
+    end_point: Point,
+}
+
+#[derive(Default)]
+struct ForeignRangeCache {
+    position_row: Option<usize>,
+    position_line_start: usize,
+    position_byte_column: usize,
+    position_utf16_column: u32,
+    meaningful_row: Option<usize>,
+    meaningful_scan_start: usize,
+    meaningful_end: u32,
+}
+
+fn foreign_source_line_start(text: &str, byte_offset: usize, point: Point) -> usize {
+    if point.row == 0 && text.starts_with('\u{feff}') {
+        0
+    } else {
+        byte_offset.saturating_sub(point.column)
+    }
+}
+
+impl ForeignRangeCache {
+    /// Convert source-order Tree-sitter points without rescanning a long line's
+    /// prefix for every diagnostic. Resetting on a row change or backward move
+    /// preserves correctness for the occasional out-of-order recovery node.
+    fn position(&mut self, text: &str, byte_offset: usize, point: Point) -> Position {
+        let line_start = foreign_source_line_start(text, byte_offset, point);
+        let byte_column = byte_offset.saturating_sub(line_start);
+        if self.position_row != Some(point.row)
+            || byte_column < self.position_byte_column
+            || line_start != self.position_line_start
+        {
+            self.position_row = Some(point.row);
+            self.position_line_start = line_start;
+            self.position_byte_column = 0;
+            self.position_utf16_column = 0;
+        }
+
+        let segment_start = self.position_line_start + self.position_byte_column;
+        let Some(segment) = text.get(segment_start..byte_offset) else {
+            return byte_offset_to_position(text, byte_offset);
+        };
+        self.position_utf16_column += utf16_len(segment);
+        self.position_byte_column = byte_column;
+        Position::new(point.row as u32, self.position_utf16_column)
+    }
+
+    fn meaningful_end(&mut self, opener: Node, text: &str, language: ForeignSyntaxLanguage) -> u32 {
+        let row = opener.start_position().row;
+        let line_start =
+            foreign_source_line_start(text, opener.start_byte(), opener.start_position());
+        let scan_start = opener.end_byte().saturating_sub(line_start);
+        if self.meaningful_row == Some(row) && self.meaningful_scan_start == scan_start {
+            return self.meaningful_end;
+        }
+
+        let line_tail = text.get(line_start..).unwrap_or("");
+        let line_end = line_tail.find(['\r', '\n']).unwrap_or(line_tail.len());
+        let line = &line_tail[..line_end];
+        self.meaningful_row = Some(row);
+        self.meaningful_scan_start = scan_start;
+        self.meaningful_end = foreign_end_of_meaningful_content(line, scan_start, language);
+        self.meaningful_end
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ForeignMissingDelimiterEvidence<'tree> {
+    opener: Node<'tree>,
+    missing: Node<'tree>,
+    kind: ForeignDelimiterKind,
+    wrong_closer: Option<ForeignCloser>,
+}
+
+#[derive(Clone, Copy)]
+enum ForeignEvidenceFailure {
+    Cancelled,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy)]
+enum UniqueForeignEvidence<T> {
+    None,
+    One(T),
+    Ambiguous,
+}
+
+impl<T: Copy + PartialEq> UniqueForeignEvidence<T> {
+    fn observe(&mut self, value: T) {
+        *self = match self {
+            Self::None => Self::One(value),
+            Self::One(existing) if *existing == value => Self::One(value),
+            Self::One(_) | Self::Ambiguous => Self::Ambiguous,
+        };
+    }
+}
+
+#[derive(Clone)]
+enum ForeignDelimiterClassification {
+    Specific(ClassifiedSyntaxDiagnostic),
+    CoveredByMismatch,
+    Ambiguous,
+}
+
+fn foreign_syntax_diagnostic_with_message(range: Range, message: String) -> Diagnostic {
     Diagnostic {
         range,
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String(
             crate::diagnostic_code::SYNTAX_ERROR.to_string(),
         )),
-        message: format!("{} code could not be parsed here", language.label()),
+        message,
         ..Default::default()
+    }
+}
+
+fn foreign_syntax_diagnostic(language: ForeignSyntaxLanguage, range: Range) -> Diagnostic {
+    foreign_syntax_diagnostic_with_message(
+        range,
+        format!("{} code could not be parsed here", language.label()),
+    )
+}
+
+fn foreign_closer_from_error(node: Node, text: &str, allow_run: bool) -> Option<ForeignCloser> {
+    if !node.is_error() {
+        return None;
+    }
+    let raw = text.get(node.start_byte()..node.end_byte())?;
+    if raw.contains(['\r', '\n']) {
+        return None;
+    }
+    let trimmed = raw.trim();
+    let first = trimmed.chars().next()?;
+    if !trimmed.chars().all(|character| character == first) || (!allow_run && trimmed.len() != 1) {
+        return None;
+    }
+    let kind = ForeignDelimiterKind::from_closer(&first.to_string())?;
+    let leading = raw.len() - raw.trim_start().len();
+    let start_point = Point {
+        row: node.start_position().row,
+        column: node.start_position().column + leading,
+    };
+    let end_point = Point {
+        row: start_point.row,
+        column: start_point.column + trimmed.len(),
+    };
+    Some(ForeignCloser {
+        kind,
+        start_byte: node.start_byte() + leading,
+        end_byte: node.start_byte() + leading + trimmed.len(),
+        start_point,
+        end_point,
+    })
+}
+
+fn foreign_wrong_closer_before_missing(
+    missing: Node,
+    opener: Node,
+    expected: ForeignDelimiterKind,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<ForeignCloser>, ForeignEvidenceFailure> {
+    const MAX_PRECEDING_RECOVERY_SIBLINGS: usize = 64;
+
+    let mut evidence = UniqueForeignEvidence::None;
+    let mut sibling = missing.prev_sibling();
+    for _ in 0..MAX_PRECEDING_RECOVERY_SIBLINGS {
+        let Some(node) = sibling else {
+            return Err(ForeignEvidenceFailure::Ambiguous);
+        };
+        if is_cancelled() {
+            return Err(ForeignEvidenceFailure::Cancelled);
+        }
+        if node == opener {
+            return match evidence {
+                UniqueForeignEvidence::None => Ok(None),
+                UniqueForeignEvidence::One(closer) => Ok(Some(closer)),
+                UniqueForeignEvidence::Ambiguous => Err(ForeignEvidenceFailure::Ambiguous),
+            };
+        }
+        if let Some(token) = foreign_delimiter_token(node, text)
+            && !token.is_opener
+        {
+            if token.kind == expected {
+                return Err(ForeignEvidenceFailure::Ambiguous);
+            }
+            evidence.observe(ForeignCloser {
+                kind: token.kind,
+                start_byte: token.start_byte,
+                end_byte: token.end_byte,
+                start_point: token.start_point,
+                end_point: token.end_point,
+            });
+        } else if node.child_count() != 0 {
+            match foreign_recovery_subtree_contains_closer(node, expected, text, is_cancelled) {
+                Some(true) => return Err(ForeignEvidenceFailure::Ambiguous),
+                Some(false) => {}
+                None => return Err(ForeignEvidenceFailure::Cancelled),
+            }
+        }
+        sibling = node.prev_sibling();
+    }
+    Err(ForeignEvidenceFailure::Ambiguous)
+}
+
+/// Recover the opener owned by the same grammar production as a required
+/// closing-delimiter `MISSING` node. This deliberately considers only direct
+/// siblings: searching arbitrary source text would turn delimiters in comments,
+/// strings, or unrelated recovery subtrees into misleading evidence.
+fn foreign_evidence_for_missing<'tree>(
+    missing: Node<'tree>,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<ForeignMissingDelimiterEvidence<'tree>>, ForeignEvidenceFailure> {
+    let Some(kind) = ForeignDelimiterKind::from_closer(missing.kind()) else {
+        return Ok(None);
+    };
+    let Some(parent) = missing.parent() else {
+        return Ok(None);
+    };
+    let mut opener = UniqueForeignEvidence::None;
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        if is_cancelled() {
+            return Err(ForeignEvidenceFailure::Cancelled);
+        }
+        if child.start_byte() >= missing.start_byte() {
+            continue;
+        }
+        let Some(child_text) = text.get(child.start_byte()..child.end_byte()) else {
+            return Ok(None);
+        };
+        if ForeignDelimiterKind::from_opener(child_text) == Some(kind) {
+            opener.observe(child);
+        }
+    }
+    let UniqueForeignEvidence::One(opener) = opener else {
+        return Ok(None);
+    };
+    let wrong_closer =
+        foreign_wrong_closer_before_missing(missing, opener, kind, text, is_cancelled)?;
+    Ok(Some(ForeignMissingDelimiterEvidence {
+        opener,
+        missing,
+        kind,
+        wrong_closer,
+    }))
+}
+
+fn foreign_closer_range(
+    closer: ForeignCloser,
+    text: &str,
+    range_cache: &mut ForeignRangeCache,
+) -> Range {
+    Range::new(
+        range_cache.position(text, closer.start_byte, closer.start_point),
+        range_cache.position(text, closer.end_byte, closer.end_point),
+    )
+}
+
+/// Return the end of meaningful code on an opener's line using the target
+/// language's lexical comment rules. Scanning starts after the parser-confirmed
+/// opener, so no multiline lexical state from an earlier part of the file needs
+/// to be reconstructed.
+fn foreign_end_of_meaningful_content(
+    line: &str,
+    scan_start: usize,
+    language: ForeignSyntaxLanguage,
+) -> u32 {
+    let bytes = line.as_bytes();
+    let mut index = scan_start.min(bytes.len());
+    let mut meaningful_end = index;
+    let mut in_stan_string = false;
+    let mut escaped = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_stan_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_stan_string = false;
+            }
+            index += 1;
+            meaningful_end = index;
+            continue;
+        }
+        if language == ForeignSyntaxLanguage::Stan && byte == b'"' {
+            in_stan_string = true;
+            index += 1;
+            meaningful_end = index;
+            continue;
+        }
+        if language == ForeignSyntaxLanguage::Jags
+            && byte == b'%'
+            && let Some(relative_end) = line[index + 1..].find('%')
+        {
+            index += relative_end + 2;
+            meaningful_end = index;
+            continue;
+        }
+        if language == ForeignSyntaxLanguage::Jags && byte == b'#' {
+            break;
+        }
+        if byte == b'/' && index + 1 < bytes.len() {
+            let next = bytes[index + 1];
+            if language == ForeignSyntaxLanguage::Stan && next == b'/' {
+                break;
+            }
+            if next == b'*' {
+                let Some(relative_end) = line[index + 2..].find("*/") else {
+                    break;
+                };
+                index += 2 + relative_end + 2;
+                let trailing = line[index..].trim_start();
+                if trailing.is_empty()
+                    || trailing
+                        .get(..1)
+                        .is_some_and(|token| ForeignDelimiterKind::from_closer(token).is_some())
+                {
+                    break;
+                }
+                continue;
+            }
+        }
+        index += 1;
+        if !byte.is_ascii_whitespace() {
+            meaningful_end = index;
+        }
+    }
+
+    byte_offset_to_utf16_column(line, meaningful_end)
+}
+
+fn foreign_suffix_has_meaningful_content(suffix: &str, language: ForeignSyntaxLanguage) -> bool {
+    let bytes = suffix.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if language == ForeignSyntaxLanguage::Jags && bytes[index] == b'#' {
+            index = suffix[index..]
+                .find(['\r', '\n'])
+                .map_or(bytes.len(), |offset| index + offset + 1);
+            continue;
+        }
+        if bytes[index] == b'/' && index + 1 < bytes.len() {
+            if language == ForeignSyntaxLanguage::Stan && bytes[index + 1] == b'/' {
+                index = suffix[index + 2..]
+                    .find(['\r', '\n'])
+                    .map_or(bytes.len(), |offset| index + 2 + offset + 1);
+                continue;
+            }
+            if bytes[index + 1] == b'*' {
+                let Some(offset) = suffix[index + 2..].find("*/") else {
+                    return false;
+                };
+                index += 2 + offset + 2;
+                continue;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn foreign_unclosed_range(
+    opener: Node,
+    text: &str,
+    language: ForeignSyntaxLanguage,
+    range_cache: &mut ForeignRangeCache,
+) -> Range {
+    let row = opener.start_position().row as u32;
+    let start = range_cache.position(text, opener.start_byte(), opener.start_position());
+    let opener_end = range_cache.position(text, opener.end_byte(), opener.end_position());
+    let meaningful_end = range_cache.meaningful_end(opener, text, language);
+    Range::new(
+        start,
+        Position::new(row, meaningful_end.max(opener_end.character)),
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ForeignMismatch {
+    opener_kind: ForeignDelimiterKind,
+    closer: ForeignCloser,
+}
+
+#[derive(Clone, Copy)]
+struct ForeignDelimiterToken {
+    kind: ForeignDelimiterKind,
+    is_opener: bool,
+    start_byte: usize,
+    end_byte: usize,
+    start_point: Point,
+    end_point: Point,
+}
+
+fn foreign_delimiter_token(node: Node, text: &str) -> Option<ForeignDelimiterToken> {
+    if node.is_missing() {
+        return None;
+    }
+    if node.is_error() {
+        let closer = foreign_closer_from_error(node, text, false)?;
+        return Some(ForeignDelimiterToken {
+            kind: closer.kind,
+            is_opener: false,
+            start_byte: closer.start_byte,
+            end_byte: closer.end_byte,
+            start_point: closer.start_point,
+            end_point: closer.end_point,
+        });
+    }
+    if node.child_count() != 0 {
+        return None;
+    }
+    let raw = text.get(node.start_byte()..node.end_byte())?;
+    if let Some(kind) = ForeignDelimiterKind::from_opener(raw) {
+        return Some(ForeignDelimiterToken {
+            kind,
+            is_opener: true,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            start_point: node.start_position(),
+            end_point: node.end_position(),
+        });
+    }
+    ForeignDelimiterKind::from_closer(raw).map(|kind| ForeignDelimiterToken {
+        kind,
+        is_opener: false,
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_point: node.start_position(),
+        end_point: node.end_position(),
+    })
+}
+
+fn foreign_opaque_child_contains_delimiter(
+    child: Node,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_OPAQUE_DESCENDANTS: usize = 64;
+
+    let mut visited = 0usize;
+    let mut cursor = child.walk();
+    if !cursor.goto_first_child() {
+        return Some(false);
+    }
+    loop {
+        if is_cancelled() {
+            return None;
+        }
+        visited += 1;
+        if visited > MAX_OPAQUE_DESCENDANTS
+            || foreign_delimiter_token(cursor.node(), text).is_some()
+        {
+            return Some(true);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() || cursor.node() == child {
+                return Some(false);
+            }
+        }
+    }
+}
+
+/// Find a unique wrong-closer pair among one ERROR node's direct recovery
+/// tokens. The fixed stack bounds classifier memory; deeper or multiply
+/// mismatched recovery remains generic rather than guessing.
+fn foreign_direct_error_mismatch(
+    error: Node,
+    text: &str,
+    language: ForeignSyntaxLanguage,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<UniqueForeignEvidence<ForeignMismatch>> {
+    const MAX_RECOVERY_DELIMITER_DEPTH: usize = 32;
+
+    let mut stack = [None; MAX_RECOVERY_DELIMITER_DEPTH];
+    let mut stack_len = 0usize;
+    let mut mismatch: UniqueForeignEvidence<ForeignMismatch> = UniqueForeignEvidence::None;
+    let mut provisional_deeper_mismatch = false;
+    let mut has_opaque_delimiters = false;
+    let mut cursor = error.walk();
+    for child in error.children(&mut cursor) {
+        if is_cancelled() {
+            return None;
+        }
+        let Some(token) = foreign_delimiter_token(child, text) else {
+            if child.child_count() != 0
+                && foreign_opaque_child_contains_delimiter(child, text, is_cancelled)?
+            {
+                has_opaque_delimiters = true;
+            }
+            continue;
+        };
+        if token.is_opener {
+            if provisional_deeper_mismatch || stack_len == stack.len() {
+                return Some(UniqueForeignEvidence::Ambiguous);
+            }
+            stack[stack_len] = Some(token.kind);
+            stack_len += 1;
+            continue;
+        }
+        let Some(opener_kind) = stack_len.checked_sub(1).and_then(|index| stack[index]) else {
+            continue;
+        };
+        if opener_kind == token.kind {
+            stack_len -= 1;
+            stack[stack_len] = None;
+            if matches!(
+                mismatch,
+                UniqueForeignEvidence::One(candidate) if candidate.opener_kind == token.kind
+            ) {
+                if provisional_deeper_mismatch {
+                    // The earlier closer crossed this opener to match a deeper
+                    // one. Seeing the real top closer confirms multiple
+                    // structural interpretations rather than erasing them.
+                    return Some(UniqueForeignEvidence::Ambiguous);
+                }
+                mismatch = UniqueForeignEvidence::None;
+            }
+            continue;
+        }
+
+        let candidate = ForeignMismatch {
+            opener_kind,
+            closer: ForeignCloser {
+                kind: token.kind,
+                start_byte: token.start_byte,
+                end_byte: token.end_byte,
+                start_point: token.start_point,
+                end_point: token.end_point,
+            },
+        };
+        let mut deeper_match = None;
+        let mut deeper_match_count = 0usize;
+        for index in (0..stack_len - 1).rev() {
+            if stack[index] == Some(token.kind) {
+                deeper_match.get_or_insert(index);
+                deeper_match_count += 1;
+            }
+        }
+        if let Some(matching_index) = deeper_match {
+            let mismatch_accounts_for_top = matches!(
+                mismatch,
+                UniqueForeignEvidence::One(existing)
+                    if existing.opener_kind == opener_kind
+                        && (!provisional_deeper_mismatch
+                            || existing.closer.kind == token.kind)
+            );
+            if mismatch_accounts_for_top {
+                // An established mismatch accounts for the unmatched top opener.
+                // A provisional deeper match becomes established only when a
+                // later closer of the same kind can close the structural opener.
+                for index in matching_index..stack_len - 1 {
+                    stack[index] = stack[index + 1];
+                }
+                stack_len -= 1;
+                stack[stack_len] = None;
+                provisional_deeper_mismatch = false;
+            } else if matches!(mismatch, UniqueForeignEvidence::None) {
+                if deeper_match_count > 1 {
+                    return Some(UniqueForeignEvidence::Ambiguous);
+                }
+                // A lone closer matching a deeper opener is structural, not a
+                // mismatch with the top opener. Keep it provisional until a
+                // later closer proves that the top opener was the typo.
+                mismatch = UniqueForeignEvidence::One(candidate);
+                provisional_deeper_mismatch = true;
+            } else {
+                return Some(UniqueForeignEvidence::Ambiguous);
+            }
+        } else {
+            if provisional_deeper_mismatch
+                || (opener_kind == ForeignDelimiterKind::Brace
+                    && text.get(error.end_byte()..).is_some_and(|suffix| {
+                        foreign_suffix_has_meaningful_content(suffix, language)
+                    }))
+            {
+                return Some(UniqueForeignEvidence::Ambiguous);
+            }
+            mismatch.observe(candidate);
+        }
+    }
+    if provisional_deeper_mismatch {
+        Some(UniqueForeignEvidence::None)
+    } else if (has_opaque_delimiters && !matches!(mismatch, UniqueForeignEvidence::None))
+        || matches!(
+            mismatch,
+            UniqueForeignEvidence::One(candidate)
+                if foreign_following_recovery_contains_real_closer(
+                    error,
+                    candidate.opener_kind,
+                    text,
+                    is_cancelled,
+                )?
+        )
+    {
+        Some(UniqueForeignEvidence::Ambiguous)
+    } else {
+        Some(mismatch)
+    }
+}
+
+/// Recognize a wrong closer at the start of a larger recovery fragment.
+/// A closer-only ERROR is a stray closer, even when its parent already has a
+/// real matching closer; requiring trailing recovery text avoids relabeling it
+/// as a mismatch. Delimiter-bearing trailing text remains ambiguous.
+fn foreign_leading_closer_with_recovery(node: Node, text: &str) -> Option<ForeignCloser> {
+    if !node.is_error() {
+        return None;
+    }
+    let raw = text.get(node.start_byte()..node.end_byte())?;
+    let trimmed = raw.trim_start();
+    let closer_text = trimmed.get(..1)?;
+    let kind = ForeignDelimiterKind::from_closer(closer_text)?;
+    let trailing = trimmed[1..].trim();
+    if trailing.is_empty()
+        || trailing.chars().any(|character| {
+            ForeignDelimiterKind::from_opener(&character.to_string()).is_some()
+                || ForeignDelimiterKind::from_closer(&character.to_string()).is_some()
+        })
+    {
+        return None;
+    }
+    let leading = raw.len() - trimmed.len();
+    let start_point = Point {
+        row: node.start_position().row,
+        column: node.start_position().column + leading,
+    };
+    Some(ForeignCloser {
+        kind,
+        start_byte: node.start_byte() + leading,
+        end_byte: node.start_byte() + leading + 1,
+        start_point,
+        end_point: Point {
+            row: start_point.row,
+            column: start_point.column + 1,
+        },
+    })
+}
+
+fn foreign_parent_error_mismatch(
+    error: Node,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<UniqueForeignEvidence<ForeignMismatch>> {
+    const MAX_PARENT_RECOVERY_CHILDREN: usize = 64;
+
+    let Some(closer) = foreign_leading_closer_with_recovery(error, text) else {
+        return Some(UniqueForeignEvidence::None);
+    };
+    let Some(parent) = error.parent() else {
+        return Some(UniqueForeignEvidence::None);
+    };
+    // Only the outer-ERROR shape shows that Stan borrowed an enclosing block's
+    // `}` as the array's closer. A normally nested array with its own real `}`
+    // makes the leading closer stray, not mismatched. Bound the parent scan so
+    // repeated recovery fragments cannot turn this classifier quadratic.
+    if parent.kind() != "array_expression" || !parent.parent().is_some_and(|node| node.is_error()) {
+        return Some(UniqueForeignEvidence::None);
+    }
+
+    let mut opener = UniqueForeignEvidence::None;
+    let mut closer_after = [false; 3];
+    let mut cursor = parent.walk();
+    for (index, child) in parent.children(&mut cursor).enumerate() {
+        if is_cancelled() {
+            return None;
+        }
+        if index >= MAX_PARENT_RECOVERY_CHILDREN {
+            return Some(UniqueForeignEvidence::Ambiguous);
+        }
+        let Some(token) = foreign_delimiter_token(child, text) else {
+            continue;
+        };
+        if child.start_byte() < error.start_byte() && token.is_opener {
+            opener.observe(token.kind);
+        } else if child.start_byte() >= error.end_byte() && !token.is_opener {
+            closer_after[token.kind.index()] = true;
+        }
+    }
+
+    Some(match opener {
+        UniqueForeignEvidence::One(opener_kind) if opener_kind != closer.kind => {
+            let has_matching_closer = closer_after[opener_kind.index()];
+            if has_matching_closer {
+                UniqueForeignEvidence::One(ForeignMismatch {
+                    opener_kind,
+                    closer,
+                })
+            } else {
+                UniqueForeignEvidence::None
+            }
+        }
+        UniqueForeignEvidence::Ambiguous => UniqueForeignEvidence::Ambiguous,
+        UniqueForeignEvidence::None | UniqueForeignEvidence::One(_) => UniqueForeignEvidence::None,
+    })
+}
+
+fn foreign_recovery_mismatch(
+    error: Node,
+    text: &str,
+    language: ForeignSyntaxLanguage,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<UniqueForeignEvidence<ForeignMismatch>> {
+    let mut mismatch = UniqueForeignEvidence::None;
+    let mut cursor = error.walk();
+    loop {
+        if is_cancelled() {
+            return None;
+        }
+        let node = cursor.node();
+        if node.is_error() {
+            for candidate in [
+                foreign_direct_error_mismatch(node, text, language, is_cancelled)?,
+                foreign_parent_error_mismatch(node, text, is_cancelled)?,
+            ] {
+                match candidate {
+                    UniqueForeignEvidence::None => {}
+                    UniqueForeignEvidence::One(candidate) => mismatch.observe(candidate),
+                    UniqueForeignEvidence::Ambiguous => {
+                        return Some(UniqueForeignEvidence::Ambiguous);
+                    }
+                }
+            }
+        }
+
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return Some(mismatch);
+            }
+        }
+    }
+}
+
+fn foreign_recovery_subtree_contains_closer(
+    root: Node,
+    kind: ForeignDelimiterKind,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_DESCENDANTS: usize = 64;
+
+    let mut visited = 0usize;
+    let mut cursor = root.walk();
+    loop {
+        if is_cancelled() {
+            return None;
+        }
+        visited += 1;
+        if visited > MAX_RECOVERY_DESCENDANTS {
+            return Some(true);
+        }
+        if foreign_delimiter_token(cursor.node(), text)
+            .is_some_and(|token| !token.is_opener && token.kind == kind)
+        {
+            return Some(true);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return Some(false);
+            }
+        }
+    }
+}
+
+fn foreign_following_recovery_contains_closer(
+    missing: Node,
+    kind: ForeignDelimiterKind,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_ANCESTORS: usize = 8;
+    const MAX_RECOVERY_SIBLINGS: usize = 16;
+
+    let mut current = missing;
+    for _ in 0..MAX_RECOVERY_ANCESTORS {
+        let mut sibling = current.next_sibling();
+        for _ in 0..MAX_RECOVERY_SIBLINGS {
+            let Some(node) = sibling else {
+                break;
+            };
+            if is_cancelled() {
+                return None;
+            }
+            if node.is_missing()
+                || foreign_delimiter_token(node, text)
+                    .is_some_and(|token| !token.is_opener && token.kind == kind)
+                || (node.has_error()
+                    && foreign_recovery_subtree_contains_closer(node, kind, text, is_cancelled)?)
+            {
+                return Some(true);
+            }
+            sibling = node.next_sibling();
+        }
+        if sibling.is_some() {
+            return Some(true);
+        }
+        let Some(parent) = current.parent() else {
+            return Some(false);
+        };
+        current = parent;
+    }
+    Some(true)
+}
+
+fn foreign_following_recovery_contains_real_closer(
+    root: Node,
+    kind: ForeignDelimiterKind,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_ANCESTORS: usize = 8;
+    const MAX_RECOVERY_SIBLINGS: usize = 16;
+
+    let mut current = root;
+    for _ in 0..MAX_RECOVERY_ANCESTORS {
+        let mut sibling = current.next_sibling();
+        for _ in 0..MAX_RECOVERY_SIBLINGS {
+            let Some(node) = sibling else {
+                break;
+            };
+            if is_cancelled() {
+                return None;
+            }
+            if foreign_delimiter_token(node, text)
+                .is_some_and(|token| !token.is_opener && token.kind == kind)
+                || (node.has_error()
+                    && foreign_recovery_subtree_contains_closer(node, kind, text, is_cancelled)?)
+            {
+                return Some(true);
+            }
+            sibling = node.next_sibling();
+        }
+        if sibling.is_some() {
+            return Some(true);
+        }
+        let Some(parent) = current.parent() else {
+            return Some(false);
+        };
+        current = parent;
+    }
+    Some(true)
+}
+
+fn foreign_recovery_subtree_contains_missing_closer(
+    root: Node,
+    kind: ForeignDelimiterKind,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_DESCENDANTS: usize = 64;
+
+    let mut visited = 0usize;
+    let mut cursor = root.walk();
+    loop {
+        if is_cancelled() {
+            return None;
+        }
+        visited += 1;
+        if visited > MAX_RECOVERY_DESCENDANTS {
+            return Some(true);
+        }
+        let node = cursor.node();
+        if node.is_missing() && ForeignDelimiterKind::from_closer(node.kind()) == Some(kind) {
+            return Some(true);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return Some(false);
+            }
+        }
+    }
+}
+
+fn foreign_following_recovery_contains_missing_closer(
+    root: Node,
+    kind: ForeignDelimiterKind,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_ANCESTORS: usize = 8;
+    const MAX_RECOVERY_CHILDREN: usize = 64;
+
+    let mut current = root;
+    for _ in 0..MAX_RECOVERY_ANCESTORS {
+        let Some(parent) = current.parent() else {
+            return Some(false);
+        };
+        let mut found_current = false;
+        let mut cursor = parent.walk();
+        for (index, node) in parent.children(&mut cursor).enumerate() {
+            if is_cancelled() {
+                return None;
+            }
+            if index >= MAX_RECOVERY_CHILDREN {
+                return Some(true);
+            }
+            if !found_current {
+                found_current = node == current;
+                continue;
+            }
+            if (node.is_missing() && ForeignDelimiterKind::from_closer(node.kind()) == Some(kind))
+                || (node.has_error()
+                    && foreign_recovery_subtree_contains_missing_closer(node, kind, is_cancelled)?)
+            {
+                return Some(true);
+            }
+        }
+        if !found_current {
+            return Some(true);
+        }
+        current = parent;
+    }
+    Some(true)
+}
+
+fn foreign_recovery_between_contains_closer(
+    opener: Node,
+    missing: Node,
+    kind: ForeignDelimiterKind,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_SIBLINGS: usize = 64;
+
+    let mut sibling = opener.next_sibling();
+    for _ in 0..MAX_RECOVERY_SIBLINGS {
+        let Some(node) = sibling else {
+            return Some(false);
+        };
+        if node == missing {
+            return Some(false);
+        }
+        if is_cancelled() {
+            return None;
+        }
+        if node.has_error()
+            && foreign_recovery_subtree_contains_closer(node, kind, text, is_cancelled)?
+        {
+            return Some(true);
+        }
+        sibling = node.next_sibling();
+    }
+    Some(true)
+}
+
+fn foreign_error_has_preceding_same_kind_opener(
+    error: Node,
+    closer: ForeignCloser,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_ANCESTORS: usize = 8;
+    const MAX_RECOVERY_SIBLINGS: usize = 64;
+
+    let mut current = error;
+    for _ in 0..MAX_RECOVERY_ANCESTORS {
+        let mut sibling = current.prev_sibling();
+        for _ in 0..MAX_RECOVERY_SIBLINGS {
+            let Some(node) = sibling else {
+                break;
+            };
+            if is_cancelled() {
+                return None;
+            }
+            if foreign_delimiter_token(node, text)
+                .is_some_and(|token| token.is_opener && token.kind == closer.kind)
+            {
+                return Some(true);
+            }
+            sibling = node.prev_sibling();
+        }
+        if sibling.is_some() {
+            return Some(true);
+        }
+        let Some(parent) = current.parent() else {
+            return Some(false);
+        };
+        current = parent;
+    }
+    Some(true)
+}
+
+fn foreign_error_has_preceding_opener_with_following_missing_closer(
+    error: Node,
+    closer: ForeignCloser,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_ANCESTORS: usize = 8;
+    const MAX_RECOVERY_SIBLINGS: usize = 64;
+
+    let mut preceding_openers = [false; 3];
+    let mut current = error;
+    for ancestor in 0..MAX_RECOVERY_ANCESTORS {
+        let mut sibling = current.prev_sibling();
+        for _ in 0..MAX_RECOVERY_SIBLINGS {
+            let Some(node) = sibling else {
+                break;
+            };
+            if is_cancelled() {
+                return None;
+            }
+            if let Some(token) = foreign_delimiter_token(node, text)
+                && token.is_opener
+            {
+                preceding_openers[token.kind.index()] = true;
+            }
+            sibling = node.prev_sibling();
+        }
+        if sibling.is_some() {
+            return Some(true);
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+        if ancestor + 1 == MAX_RECOVERY_ANCESTORS {
+            return Some(true);
+        }
+    }
+
+    for kind in [
+        ForeignDelimiterKind::Paren,
+        ForeignDelimiterKind::Bracket,
+        ForeignDelimiterKind::Brace,
+    ] {
+        if kind != closer.kind
+            && preceding_openers[kind.index()]
+            && foreign_following_recovery_contains_missing_closer(error, kind, is_cancelled)?
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn foreign_preceding_recovery_is_clean(
+    error: Node,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_PRECEDING_RECOVERY_ANCESTORS: usize = 8;
+    const MAX_PRECEDING_RECOVERY_SIBLINGS: usize = 16;
+    const MAX_RECOVERY_DESCENDANTS: usize = 64;
+
+    let mut current = error;
+    for _ in 0..MAX_PRECEDING_RECOVERY_ANCESTORS {
+        let mut previous = current.prev_sibling();
+        for _ in 0..MAX_PRECEDING_RECOVERY_SIBLINGS {
+            let Some(root) = previous else {
+                break;
+            };
+            let mut visited = 0usize;
+            let mut cursor = root.walk();
+            loop {
+                if is_cancelled() {
+                    return None;
+                }
+                visited += 1;
+                if visited > MAX_RECOVERY_DESCENDANTS {
+                    return Some(false);
+                }
+                let node = cursor.node();
+                if node.is_error() || node.is_missing() {
+                    return Some(false);
+                }
+                if cursor.goto_first_child() {
+                    continue;
+                }
+                while !cursor.goto_next_sibling() {
+                    if !cursor.goto_parent() {
+                        break;
+                    }
+                }
+                if cursor.node() == root {
+                    break;
+                }
+            }
+            previous = root.prev_sibling();
+        }
+        if previous.is_some() {
+            return Some(false);
+        }
+        let Some(parent) = current.parent() else {
+            return Some(true);
+        };
+        current = parent;
+    }
+    Some(false)
+}
+
+fn foreign_mismatch_diagnostic(
+    opener_kind: ForeignDelimiterKind,
+    closer: ForeignCloser,
+    text: &str,
+    range_cache: &mut ForeignRangeCache,
+) -> ClassifiedSyntaxDiagnostic {
+    ClassifiedSyntaxDiagnostic {
+        message: format!(
+            "Mismatched brackets: `{}` opened here; close with `{}` not `{}`.",
+            opener_kind.opener(),
+            opener_kind.closer(),
+            closer.kind.closer(),
+        ),
+        range: foreign_closer_range(closer, text, range_cache),
+    }
+}
+
+fn classify_foreign_missing_delimiter(
+    missing: Node,
+    text: &str,
+    language: ForeignSyntaxLanguage,
+    range_cache: &mut ForeignRangeCache,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<ForeignDelimiterClassification> {
+    let evidence = match foreign_evidence_for_missing(missing, text, is_cancelled) {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) | Err(ForeignEvidenceFailure::Ambiguous) => {
+            return Some(ForeignDelimiterClassification::Ambiguous);
+        }
+        Err(ForeignEvidenceFailure::Cancelled) => return None,
+    };
+    if evidence.wrong_closer.is_some() {
+        return Some(ForeignDelimiterClassification::CoveredByMismatch);
+    }
+    if foreign_recovery_between_contains_closer(
+        evidence.opener,
+        missing,
+        evidence.kind,
+        text,
+        is_cancelled,
+    )? || foreign_following_recovery_contains_closer(missing, evidence.kind, text, is_cancelled)?
+    {
+        return Some(ForeignDelimiterClassification::Ambiguous);
+    }
+    Some(ForeignDelimiterClassification::Specific(
+        ClassifiedSyntaxDiagnostic {
+            message: format!(
+                "Unclosed `{}`: missing matching `{}`",
+                evidence.kind.opener(),
+                evidence.kind.closer(),
+            ),
+            range: foreign_unclosed_range(evidence.opener, text, language, range_cache),
+        },
+    ))
+}
+
+fn classify_foreign_error_delimiter(
+    error: Node,
+    text: &str,
+    language: ForeignSyntaxLanguage,
+    range_cache: &mut ForeignRangeCache,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<ForeignDelimiterClassification> {
+    // A wrong closer can precede the required MISSING closer from the same
+    // production with otherwise-valid siblings between them. Scan only a
+    // bounded run of direct siblings and require the missing-node evidence to
+    // point back to this exact closer before coalescing the recovery unit.
+    if let Some(wrong_closer) = foreign_closer_from_error(error, text, false) {
+        const MAX_FOLLOWING_RECOVERY_SIBLINGS: usize = 64;
+
+        let Some(parent) = error.parent() else {
+            return Some(ForeignDelimiterClassification::Ambiguous);
+        };
+        let child_count = parent.child_count();
+        let child_at = |index| parent.child(u32::try_from(index).ok()?);
+        let mut low = 0usize;
+        let mut high = child_count;
+        while low < high {
+            if is_cancelled() {
+                return None;
+            }
+            let middle = low + (high - low) / 2;
+            let Some(child) = child_at(middle) else {
+                return Some(ForeignDelimiterClassification::Ambiguous);
+            };
+            if child.start_byte() < error.start_byte() {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+
+        let mut error_index = None;
+        for index in low..child_count.min(low + MAX_FOLLOWING_RECOVERY_SIBLINGS) {
+            if is_cancelled() {
+                return None;
+            }
+            let Some(child) = child_at(index) else {
+                return Some(ForeignDelimiterClassification::Ambiguous);
+            };
+            if child == error {
+                error_index = Some(index);
+                break;
+            }
+            if child.start_byte() > error.start_byte() {
+                break;
+            }
+        }
+        let Some(error_index) = error_index else {
+            return Some(ForeignDelimiterClassification::Ambiguous);
+        };
+
+        let mut mismatch = UniqueForeignEvidence::None;
+        let following_end = child_count.min(error_index + 1 + MAX_FOLLOWING_RECOVERY_SIBLINGS);
+        for index in error_index + 1..following_end {
+            if is_cancelled() {
+                return None;
+            }
+            let Some(child) = child_at(index) else {
+                return Some(ForeignDelimiterClassification::Ambiguous);
+            };
+            if child.is_missing() && ForeignDelimiterKind::from_closer(child.kind()).is_some() {
+                let evidence = match foreign_evidence_for_missing(child, text, is_cancelled) {
+                    Ok(Some(evidence)) => evidence,
+                    Ok(None) | Err(ForeignEvidenceFailure::Ambiguous) => continue,
+                    Err(ForeignEvidenceFailure::Cancelled) => return None,
+                };
+                if evidence.wrong_closer.is_some_and(|closer| {
+                    closer.start_byte == wrong_closer.start_byte
+                        && closer.end_byte == wrong_closer.end_byte
+                }) {
+                    mismatch.observe(evidence);
+                }
+            }
+        }
+        if following_end < child_count {
+            return Some(ForeignDelimiterClassification::Ambiguous);
+        }
+        if let UniqueForeignEvidence::One(evidence) = mismatch {
+            return Some(ForeignDelimiterClassification::Specific(
+                foreign_mismatch_diagnostic(evidence.kind, wrong_closer, text, range_cache),
+            ));
+        }
+        if matches!(mismatch, UniqueForeignEvidence::Ambiguous) {
+            return Some(ForeignDelimiterClassification::Ambiguous);
+        }
+    }
+
+    match foreign_recovery_mismatch(error, text, language, is_cancelled)? {
+        UniqueForeignEvidence::One(mismatch) => {
+            return Some(ForeignDelimiterClassification::Specific(
+                foreign_mismatch_diagnostic(
+                    mismatch.opener_kind,
+                    mismatch.closer,
+                    text,
+                    range_cache,
+                ),
+            ));
+        }
+        UniqueForeignEvidence::Ambiguous => {
+            return Some(ForeignDelimiterClassification::Ambiguous);
+        }
+        UniqueForeignEvidence::None => {}
+    }
+
+    // Outer ERROR nodes suppress nested recovery diagnostics, so inspect their
+    // MISSING descendants with fixed-size uniqueness state and emit at most one
+    // explanation for the entire recovery unit. TreeCursor supplies a bounded
+    // traversal stack even for adversarially deep recovery trees.
+    let mut evidence = UniqueForeignEvidence::None;
+    let mut cursor = error.walk();
+    loop {
+        if is_cancelled() {
+            return None;
+        }
+        let node = cursor.node();
+        if node.is_missing() && ForeignDelimiterKind::from_closer(node.kind()).is_some() {
+            let candidate = match foreign_evidence_for_missing(node, text, is_cancelled) {
+                Ok(Some(candidate)) => candidate,
+                Ok(None) | Err(ForeignEvidenceFailure::Ambiguous) => {
+                    return Some(ForeignDelimiterClassification::Ambiguous);
+                }
+                Err(ForeignEvidenceFailure::Cancelled) => return None,
+            };
+            evidence.observe(candidate);
+        }
+
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return Some(match evidence {
+                    UniqueForeignEvidence::One(evidence) => {
+                        if let Some(closer) = evidence.wrong_closer {
+                            ForeignDelimiterClassification::Specific(foreign_mismatch_diagnostic(
+                                evidence.kind,
+                                closer,
+                                text,
+                                range_cache,
+                            ))
+                        } else if foreign_recovery_between_contains_closer(
+                            evidence.opener,
+                            evidence.missing,
+                            evidence.kind,
+                            text,
+                            is_cancelled,
+                        )? || foreign_following_recovery_contains_closer(
+                            evidence.missing,
+                            evidence.kind,
+                            text,
+                            is_cancelled,
+                        )? {
+                            ForeignDelimiterClassification::Ambiguous
+                        } else {
+                            ForeignDelimiterClassification::Specific(ClassifiedSyntaxDiagnostic {
+                                message: format!(
+                                    "Unclosed `{}`: missing matching `{}`",
+                                    evidence.kind.opener(),
+                                    evidence.kind.closer(),
+                                ),
+                                range: foreign_unclosed_range(
+                                    evidence.opener,
+                                    text,
+                                    language,
+                                    range_cache,
+                                ),
+                            })
+                        }
+                    }
+                    UniqueForeignEvidence::Ambiguous => ForeignDelimiterClassification::Ambiguous,
+                    UniqueForeignEvidence::None => {
+                        let Some(closer) = foreign_closer_from_error(error, text, true) else {
+                            return Some(ForeignDelimiterClassification::Ambiguous);
+                        };
+                        if !foreign_preceding_recovery_is_clean(error, is_cancelled)?
+                            || foreign_error_has_preceding_same_kind_opener(
+                                error,
+                                closer,
+                                text,
+                                is_cancelled,
+                            )?
+                            || foreign_error_has_preceding_opener_with_following_missing_closer(
+                                error,
+                                closer,
+                                text,
+                                is_cancelled,
+                            )?
+                        {
+                            return Some(ForeignDelimiterClassification::Ambiguous);
+                        }
+                        ForeignDelimiterClassification::Specific(ClassifiedSyntaxDiagnostic {
+                            message: format!("Missing opening `{}`", closer.kind.opener()),
+                            range: foreign_closer_range(closer, text, range_cache),
+                        })
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -11219,24 +12808,26 @@ fn retain_foreign_syntax_diagnostic(
     }
 }
 
+/// Skip classification only when source ordering proves this ERROR cannot
+/// displace the retained window. Every ERROR-derived foreign range starts at
+/// or after the ERROR start: mismatch/stray ranges point inside the ERROR, and
+/// an unclosed opener is a descendant of that ERROR. Standalone MISSING nodes
+/// do not use this shortcut because their anchor may move to an earlier line.
 fn error_node_starts_after_retained_diagnostic_window(
     node: Node,
+    text: &str,
     diagnostics: &[Diagnostic],
     retention_limit: Option<usize>,
+    range_cache: &mut ForeignRangeCache,
 ) -> bool {
-    retention_limit.is_some_and(|cap| diagnostics.len() == cap)
-        && diagnostics.last().is_some_and(|last| {
-            // Tree-sitter's source-order invariant places an ERROR node and
-            // all of its descendants at or after that node's start point.
-            // `minimize_error_range` is lower-bounded by that ERROR row, and
-            // clamping never moves it earlier. A later-row ERROR therefore
-            // cannot displace the retained last row after
-            // sort/dedup/truncate. Comparing only rows is deliberately
-            // conservative across UTF-8 / UTF-16 columns: same-line errors
-            // always take the full path. Standalone MISSING nodes do not use
-            // this shortcut because their anchor may walk to an earlier line.
-            node.start_position().row as u32 > last.range.start.line
-        })
+    if retention_limit.is_none_or(|cap| diagnostics.len() != cap) {
+        return false;
+    }
+    let Some(last) = diagnostics.last() else {
+        return false;
+    };
+    let start = range_cache.position(text, node.start_byte(), node.start_position());
+    (start.line, start.character) > (last.range.start.line, last.range.start.character)
 }
 
 fn byte_offset_to_position(text: &str, offset: usize) -> Position {
@@ -11293,6 +12884,7 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
     retention_limit: Option<usize>,
 ) -> Option<Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
+    let mut range_cache = ForeignRangeCache::default();
 
     // Tree-sitter consumes a leading UTF-8 BOM before invoking a grammar. JAGS
     // rejects that byte sequence, so parser acceptance also requires complete
@@ -11345,23 +12937,77 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
         if node.is_error() {
             if error_node_starts_after_retained_diagnostic_window(
                 node,
+                text,
                 &diagnostics,
                 retention_limit,
+                &mut range_cache,
             ) {
                 continue;
             }
-            let range = clamp_foreign_diagnostic_range(text, minimize_error_range(node, text));
-            retain_foreign_syntax_diagnostic(
-                &mut diagnostics,
-                foreign_syntax_diagnostic(language, range),
-                retention_limit,
-            );
-            // The range helper inspected nested MISSING nodes. Do not recurse:
+            let diagnostic = match classify_foreign_error_delimiter(
+                node,
+                text,
+                language,
+                &mut range_cache,
+                &mut is_cancelled,
+            )? {
+                ForeignDelimiterClassification::Specific(classified) => {
+                    foreign_syntax_diagnostic_with_message(classified.range, classified.message)
+                }
+                ForeignDelimiterClassification::CoveredByMismatch
+                | ForeignDelimiterClassification::Ambiguous => {
+                    let range =
+                        clamp_foreign_diagnostic_range(text, minimize_error_range(node, text));
+                    foreign_syntax_diagnostic(language, range)
+                }
+            };
+            retain_foreign_syntax_diagnostic(&mut diagnostics, diagnostic, retention_limit);
+            // The classifier inspected nested MISSING nodes. Do not recurse:
             // nested recovery errors describe the same outer parse failure.
             continue;
         }
 
         if node.is_missing() {
+            if ForeignDelimiterKind::from_closer(node.kind()).is_some() {
+                match classify_foreign_missing_delimiter(
+                    node,
+                    text,
+                    language,
+                    &mut range_cache,
+                    &mut is_cancelled,
+                )? {
+                    ForeignDelimiterClassification::Specific(classified) => {
+                        retain_foreign_syntax_diagnostic(
+                            &mut diagnostics,
+                            foreign_syntax_diagnostic_with_message(
+                                classified.range,
+                                classified.message,
+                            ),
+                            retention_limit,
+                        );
+                    }
+                    ForeignDelimiterClassification::CoveredByMismatch => {}
+                    ForeignDelimiterClassification::Ambiguous => {
+                        let (row, col) = anchor_missing_position(
+                            node.start_position().row,
+                            node.start_position().column,
+                            0,
+                            node.start_byte(),
+                            text,
+                        );
+                        retain_foreign_syntax_diagnostic(
+                            &mut diagnostics,
+                            foreign_syntax_diagnostic(
+                                language,
+                                visible_anchor_range(text, row, col),
+                            ),
+                            retention_limit,
+                        );
+                    }
+                }
+                continue;
+            }
+
             let (row, col) = anchor_missing_position(
                 node.start_position().row,
                 node.start_position().column,
@@ -11370,22 +13016,17 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
                 text,
             );
             let kind = node.kind();
-            let message = if matches!(kind, ";" | "," | ")" | "]" | "}" | "in" | "else" | "while") {
+            let message = if matches!(kind, ";" | "," | "in" | "else" | "while") {
                 format!("Missing {kind} in {} code", language.label())
             } else {
                 format!("{} code could not be parsed here", language.label())
             };
             retain_foreign_syntax_diagnostic(
                 &mut diagnostics,
-                Diagnostic {
-                    range: visible_anchor_range(text, row, col),
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: Some(NumberOrString::String(
-                        crate::diagnostic_code::SYNTAX_ERROR.to_string(),
-                    )),
+                foreign_syntax_diagnostic_with_message(
+                    visible_anchor_range(text, row, col),
                     message,
-                    ..Default::default()
-                },
+                ),
                 retention_limit,
             );
             continue;

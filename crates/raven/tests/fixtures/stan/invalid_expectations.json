@@ -7,7 +7,7 @@
   { "name": "missing-sampling-semicolon", "expected_lines": [0], "min_diagnostics": 1, "max_diagnostics": 1 },
   { "name": "missing-return-semicolon", "expected_lines": [0], "min_diagnostics": 1, "max_diagnostics": 1 },
   { "name": "missing-data-close", "expected_lines": [1], "min_diagnostics": 1, "max_diagnostics": 1 },
-  { "name": "missing-model-close", "expected_lines": [1], "min_diagnostics": 1, "max_diagnostics": 1 },
+  { "name": "missing-model-close", "expected_lines": [0], "min_diagnostics": 1, "max_diagnostics": 1 },
   { "name": "missing-functions-close", "expected_lines": [1], "min_diagnostics": 1, "max_diagnostics": 1 },
   { "name": "missing-call-close", "expected_lines": [0], "min_diagnostics": 1, "max_diagnostics": 1 },
   { "name": "missing-index-close", "expected_lines": [0], "min_diagnostics": 1, "max_diagnostics": 1 },
