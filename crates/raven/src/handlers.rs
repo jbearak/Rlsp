@@ -11340,6 +11340,14 @@ enum ForeignDelimiterKind {
 }
 
 impl ForeignDelimiterKind {
+    fn index(self) -> usize {
+        match self {
+            Self::Paren => 0,
+            Self::Bracket => 1,
+            Self::Brace => 2,
+        }
+    }
+
     fn opener(self) -> &'static str {
         match self {
             Self::Paren => "(",
@@ -12052,21 +12060,13 @@ fn foreign_parent_error_mismatch(
         if child.start_byte() < error.start_byte() && token.is_opener {
             opener.observe(token.kind);
         } else if child.start_byte() >= error.end_byte() && !token.is_opener {
-            closer_after[match token.kind {
-                ForeignDelimiterKind::Paren => 0,
-                ForeignDelimiterKind::Bracket => 1,
-                ForeignDelimiterKind::Brace => 2,
-            }] = true;
+            closer_after[token.kind.index()] = true;
         }
     }
 
     Some(match opener {
         UniqueForeignEvidence::One(opener_kind) if opener_kind != closer.kind => {
-            let has_matching_closer = closer_after[match opener_kind {
-                ForeignDelimiterKind::Paren => 0,
-                ForeignDelimiterKind::Bracket => 1,
-                ForeignDelimiterKind::Brace => 2,
-            }];
+            let has_matching_closer = closer_after[opener_kind.index()];
             if has_matching_closer {
                 UniqueForeignEvidence::One(ForeignMismatch {
                     opener_kind,
@@ -12385,7 +12385,9 @@ fn classify_foreign_error_delimiter(
     if let Some(wrong_closer) = foreign_closer_from_error(error, text, false) {
         const MAX_FOLLOWING_RECOVERY_SIBLINGS: usize = 64;
 
-        let parent = error.parent()?;
+        let Some(parent) = error.parent() else {
+            return Some(ForeignDelimiterClassification::Ambiguous);
+        };
         let child_count = parent.child_count();
         let child_at = |index| parent.child(u32::try_from(index).ok()?);
         let mut low = 0usize;
@@ -12395,7 +12397,9 @@ fn classify_foreign_error_delimiter(
                 return None;
             }
             let middle = low + (high - low) / 2;
-            let child = child_at(middle)?;
+            let Some(child) = child_at(middle) else {
+                return Some(ForeignDelimiterClassification::Ambiguous);
+            };
             if child.start_byte() < error.start_byte() {
                 low = middle + 1;
             } else {
@@ -12408,7 +12412,9 @@ fn classify_foreign_error_delimiter(
             if is_cancelled() {
                 return None;
             }
-            let child = child_at(index)?;
+            let Some(child) = child_at(index) else {
+                return Some(ForeignDelimiterClassification::Ambiguous);
+            };
             if child == error {
                 error_index = Some(index);
                 break;
@@ -12427,7 +12433,9 @@ fn classify_foreign_error_delimiter(
             if is_cancelled() {
                 return None;
             }
-            let child = child_at(index)?;
+            let Some(child) = child_at(index) else {
+                return Some(ForeignDelimiterClassification::Ambiguous);
+            };
             if child.is_missing() && ForeignDelimiterKind::from_closer(child.kind()).is_some() {
                 let evidence = match foreign_evidence_for_missing(child, text, is_cancelled) {
                     Ok(Some(evidence)) => evidence,
@@ -12623,7 +12631,7 @@ fn error_node_starts_after_retained_diagnostic_window(
     retention_limit: Option<usize>,
     range_cache: &mut ForeignRangeCache,
 ) -> bool {
-    if !retention_limit.is_some_and(|cap| diagnostics.len() == cap) {
+    if retention_limit.is_none_or(|cap| diagnostics.len() != cap) {
         return false;
     }
     let Some(last) = diagnostics.last() else {
@@ -12757,10 +12765,8 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
                 ForeignDelimiterClassification::Specific(classified) => {
                     foreign_syntax_diagnostic_with_message(classified.range, classified.message)
                 }
-                ForeignDelimiterClassification::CoveredByMismatch => unreachable!(
-                    "ERROR delimiter classification never suppresses its own diagnostic"
-                ),
-                ForeignDelimiterClassification::Ambiguous => {
+                ForeignDelimiterClassification::CoveredByMismatch
+                | ForeignDelimiterClassification::Ambiguous => {
                     let range =
                         clamp_foreign_diagnostic_range(text, minimize_error_range(node, text));
                     foreign_syntax_diagnostic(language, range)
