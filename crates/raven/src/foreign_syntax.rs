@@ -317,6 +317,15 @@ mod tests {
             Some(1)
         );
 
+        let trivia_before_closer = "x // note\n}";
+        let mut closer_builder = DelimiterIndexBuilder::new(trivia_before_closer.len());
+        closer_builder.push_span(2..9, LexicalSpanKind::Trivia);
+        let closer_index = closer_builder.finish(trivia_before_closer.len());
+        assert_eq!(
+            closer_index.meaningful_end(trivia_before_closer, 0, trivia_before_closer.len()),
+            Some(1)
+        );
+
         let code = "#include <fake[delimiter]>";
         let mut code_builder = DelimiterIndexBuilder::new(code.len());
         code_builder.push_span(0..code.len(), LexicalSpanKind::Code);

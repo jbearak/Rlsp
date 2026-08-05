@@ -1296,17 +1296,23 @@ balanced document into a false explanation.
 Delimiter classification runs before program-structure classification. The
 latter accepts only direct, uniquely complete program recovery and validates
 fragments with bounded in-process Tree-sitter reparsing: at most 256 KiB per
-candidate and 4 MiB cumulatively per collection. Preliminary child and sibling
-walks stream without proportional allocations, check cancellation, and fail
-closed after 65,536 visited nodes. Stan tries the shared canonical
-`stan::PROGRAM_BLOCKS` wrappers but never guesses a destination block. JAGS
-checks complete model content, missing/duplicate/out-of-order sections, and
+candidate and 4 MiB cumulatively per collection. Each attempted Stan block
+wrapper spends the fragment bytes independently, so trying all canonical block
+contexts cannot multiply the effective cumulative parser budget. Preliminary
+child and sibling walks stream without proportional allocations, check
+cancellation, and fail closed after 65,536 visited nodes. Stan tries the shared
+canonical `stan::PROGRAM_BLOCKS` wrappers but never guesses a destination block.
+JAGS checks complete model content, missing/duplicate/out-of-order sections, and
 empty models with the in-tree clean-room parser and a legal synthetic sentinel;
 it never invokes JAGS, R, a network service, or another runtime oracle.
 
-Finite retention may skip expensive classification only after the earliest
-possible recovery anchor (the top-level recovery window start) is later than the
-last retained finding. Traversal and cancellation checks continue after
+Before delimiter classification, finite retention may skip work only when the
+earliest possible recovery anchor (the top-level recovery window start) is later
+than the last retained finding. After a non-specific delimiter result rules out
+an earlier opener anchor, the collector may use the actual `ERROR` start to skip
+program-structure and generic-range work that cannot displace the saturated
+retained window. Equal starts remain eligible because range ends and messages
+also participate in ordering. Traversal and cancellation checks continue after
 retention saturates, preserving the rule that every finite result is the sorted,
 exactly deduplicated prefix of unlimited output. After a Tree-sitter runtime or
 Stan/JAGS grammar update, re-audit the exact recovery fingerprints in

@@ -24,35 +24,44 @@ pub(crate) fn parse_with_old_tree(text: &str, old_tree: Option<&Tree>) -> Option
     parser.parse(text, old_tree)
 }
 
+enum SpecialOperatorScan {
+    None,
+    End(usize),
+    Cancelled,
+}
+
 fn special_operator_end_with_cancel_check(
     bytes: &[u8],
     start: usize,
     limit: usize,
     mut is_cancelled_at: impl FnMut(usize) -> bool,
-) -> Result<Option<usize>, ()> {
+) -> SpecialOperatorScan {
     if bytes.get(start) != Some(&b'%') || start + 1 >= limit {
-        return Ok(None);
+        return SpecialOperatorScan::None;
     }
     if bytes[start + 1] == b'%' {
-        return Ok(Some(start + 2));
+        return SpecialOperatorScan::End(start + 2);
     }
 
     let mut index = start + 1;
     while index < limit && !bytes[index].is_ascii_whitespace() {
         if is_cancelled_at(index) {
-            return Err(());
+            return SpecialOperatorScan::Cancelled;
         }
         if bytes[index] == b'%' {
-            return Ok((index > start + 1).then_some(index + 1));
+            return SpecialOperatorScan::End(index + 1);
         }
         index += 1;
     }
-    Ok(None)
+    SpecialOperatorScan::None
 }
 
 fn special_operator_end(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
-    special_operator_end_with_cancel_check(bytes, start, limit, |_| false)
-        .expect("non-cancelling special-operator scan")
+    match special_operator_end_with_cancel_check(bytes, start, limit, |_| false) {
+        SpecialOperatorScan::End(end) => Some(end),
+        SpecialOperatorScan::None => None,
+        SpecialOperatorScan::Cancelled => unreachable!("non-cancelling special-operator scan"),
+    }
 }
 
 /// Build bounded delimiter evidence using JAGS comment and `%...%` operator
@@ -78,21 +87,22 @@ pub(crate) fn delimiter_index(
             next_cancellation_check = index.saturating_add(CANCELLATION_INTERVAL);
         }
 
-        let special_operator_end =
-            special_operator_end_with_cancel_check(bytes, index, limit, |position| {
-                if position < next_cancellation_check {
-                    return false;
-                }
-                next_cancellation_check = position.saturating_add(CANCELLATION_INTERVAL);
-                is_cancelled()
-            })
-            .ok()?;
-        if let Some(end) = special_operator_end {
-            if !builder.push_span(index..end, LexicalSpanKind::Code) {
-                break;
+        match special_operator_end_with_cancel_check(bytes, index, limit, |position| {
+            if position < next_cancellation_check {
+                return false;
             }
-            index = end;
-            continue;
+            next_cancellation_check = position.saturating_add(CANCELLATION_INTERVAL);
+            is_cancelled()
+        }) {
+            SpecialOperatorScan::End(end) => {
+                if !builder.push_span(index..end, LexicalSpanKind::Code) {
+                    break;
+                }
+                index = end;
+                continue;
+            }
+            SpecialOperatorScan::None => {}
+            SpecialOperatorScan::Cancelled => return None,
         }
 
         if bytes[index] == b'#' {
@@ -938,6 +948,40 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn special_operators_are_opaque_in_tokens_delimiters_and_relation_ranges() {
+        let code = "model { x <- values %in% set; y <- a %*% b }";
+        assert_eq!(
+            recovery_relation_identifiers(code),
+            vec![
+                JagsRecoveryRelation {
+                    name: "x".to_string(),
+                    range: Range::new(Position::new(0, 8), Position::new(0, 29)),
+                    selection_range: Range::new(Position::new(0, 8), Position::new(0, 9)),
+                },
+                JagsRecoveryRelation {
+                    name: "y".to_string(),
+                    range: Range::new(Position::new(0, 30), Position::new(0, 42)),
+                    selection_range: Range::new(Position::new(0, 30), Position::new(0, 31)),
+                },
+            ]
+        );
+
+        let identifiers: Vec<_> = tokenize(code)
+            .into_iter()
+            .filter_map(|token| match token.kind {
+                TokenKind::Identifier(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(identifiers, ["model", "x", "values", "set", "y", "a", "b"]);
+
+        let opaque = "%in% %*% %)#(%";
+        let index = delimiter_index(opaque, || false).expect("special-operator delimiter scan");
+        assert!(index.is_reliable(0..opaque.len()));
+        assert!(index.events_in(0..opaque.len()).is_empty());
     }
 
     #[test]

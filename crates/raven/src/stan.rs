@@ -543,6 +543,53 @@ model { target += missing; }
     }
 
     #[test]
+    fn delimiter_index_records_stan_delimiters_in_source_order() {
+        let source = "model { x[1] = f(2); }";
+        let index = delimiter_index(source, || false).expect("Stan delimiter scan");
+        assert_eq!(
+            index.events_in(0..source.len()),
+            &[
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Brace,
+                    is_opener: true,
+                    start_byte: 6,
+                    end_byte: 7,
+                },
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Bracket,
+                    is_opener: true,
+                    start_byte: 9,
+                    end_byte: 10,
+                },
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Bracket,
+                    is_opener: false,
+                    start_byte: 11,
+                    end_byte: 12,
+                },
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Paren,
+                    is_opener: true,
+                    start_byte: 16,
+                    end_byte: 17,
+                },
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Paren,
+                    is_opener: false,
+                    start_byte: 18,
+                    end_byte: 19,
+                },
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Brace,
+                    is_opener: false,
+                    start_byte: 21,
+                    end_byte: 22,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn delimiter_index_trusts_only_complete_include_paths() {
         for source in [
             "#include helper.stanfunctions",

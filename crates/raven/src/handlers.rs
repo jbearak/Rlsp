@@ -673,14 +673,36 @@ model {
     }
 
     #[test]
+    fn stan_structure_budget_is_charged_per_block_reparse_attempt() {
+        let fragment = "target += ;";
+        let mut budget = ForeignStructureBudget {
+            remaining_bytes: fragment.len() * 2,
+        };
+        let mut checks = 0usize;
+
+        assert_eq!(
+            stan_fragment_is_complete_program_content(fragment, &mut budget, &mut || {
+                checks += 1;
+                false
+            }),
+            Some(false)
+        );
+        assert_eq!(budget.remaining_bytes, 0);
+        assert_eq!(checks, 3, "the third attempt must stop at the budget check");
+    }
+
+    #[test]
     fn jags_empty_model_structure_walk_observes_cancellation() {
         let source = format!("model {{\n{}}}\n", "# comment\n".repeat(1_024));
         let tree = crate::jags::parse_with_old_tree(&source, None).expect("empty model tree");
         let error = tree.root_node().named_child(0).expect("program recovery");
         assert!(error.is_error(), "{}", tree.root_node().to_sexp());
+        let context = jags_program_structure_context(error, &mut || false)
+            .expect("not cancelled")
+            .expect("bounded recovery");
         let mut checks = 0usize;
 
-        let classified = classify_jags_empty_model(error, &source, &mut || {
+        let classified = classify_jags_empty_model(error, &source, context, &mut || {
             checks += 1;
             checks == 128
         });
@@ -701,10 +723,9 @@ model {
         assert!(error.is_error(), "{}", tree.root_node().to_sexp());
         assert!(!foreign_structure_candidate_is_bounded(error));
 
-        let mut budget = ForeignStructureBudget::default();
         let mut checks = 0usize;
         assert!(matches!(
-            classify_jags_missing_model(error, &source, &mut budget, &mut || {
+            jags_program_structure_context(error, &mut || {
                 checks += 1;
                 false
             }),
@@ -11649,6 +11670,8 @@ impl<T: Copy + PartialEq> UniqueForeignEvidence<T> {
     }
 }
 
+const MAX_LEXICAL_DELIMITER_DEPTH: usize = 256;
+
 #[derive(Clone)]
 enum ForeignDelimiterClassification {
     Specific(ClassifiedSyntaxDiagnostic),
@@ -11989,8 +12012,6 @@ fn classify_foreign_lexical_missing(
     range_cache: &mut ForeignRangeCache,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Option<ForeignLexicalDelimiterClassification> {
-    const MAX_LEXICAL_DELIMITER_DEPTH: usize = 256;
-
     let Some(window) = foreign_lexical_window_for_recovery(evidence.missing) else {
         return Some(ForeignLexicalDelimiterClassification::Ambiguous);
     };
@@ -12072,8 +12093,6 @@ fn foreign_lexical_imbalance(
     window: std::ops::Range<usize>,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Option<ForeignLexicalImbalance> {
-    const MAX_LEXICAL_DELIMITER_DEPTH: usize = 256;
-
     let mut stack = Vec::<DelimiterEvent>::new();
     let mut stray = None;
     for event in delimiter_index.events_in(window) {
@@ -12180,8 +12199,6 @@ fn foreign_lexically_corroborates_mismatch(
     delimiter_index: &DelimiterIndex,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Option<bool> {
-    const MAX_LEXICAL_DELIMITER_DEPTH: usize = 256;
-
     let Some(window) = foreign_lexical_window_for_recovery(recovery) else {
         return Some(false);
     };
@@ -13286,11 +13303,15 @@ fn foreign_program_has_only_error_and_comments(
 
 fn stan_fragment_is_complete_program_content(
     fragment: &str,
+    budget: &mut ForeignStructureBudget,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Option<bool> {
     for block_kind in crate::stan::PROGRAM_BLOCKS {
         if is_cancelled() {
             return None;
+        }
+        if !budget.spend(fragment.len()) {
+            return Some(false);
         }
         let block_keyword = block_kind.replace('_', " ");
         let wrapped = format!("{block_keyword} {{\n{fragment}\n}}\n");
@@ -13322,9 +13343,7 @@ fn classify_stan_program_structure(
     let Some(fragment) = text.get(error.start_byte()..error.end_byte()) else {
         return Some(None);
     };
-    if !budget.spend(fragment.len())
-        || !stan_fragment_is_complete_program_content(fragment, is_cancelled)?
-    {
+    if !stan_fragment_is_complete_program_content(fragment, budget, is_cancelled)? {
         return Some(None);
     }
 
@@ -13352,18 +13371,40 @@ fn jags_fragment_is_complete_section(fragment: &str, keyword: &str) -> bool {
     }
 }
 
-fn classify_jags_empty_model(
+#[derive(Clone, Copy)]
+struct JagsProgramStructureContext {
+    direct_program_error: bool,
+    isolated_program_error: bool,
+}
+
+fn jags_program_structure_context(
     error: Node,
-    text: &str,
     is_cancelled: &mut impl FnMut() -> bool,
-) -> Option<Option<ClassifiedSyntaxDiagnostic>> {
+) -> Option<Option<JagsProgramStructureContext>> {
     if !foreign_structure_candidate_is_bounded(error) {
         return Some(None);
     }
     let Some(program) = foreign_direct_program_error(error) else {
-        return Some(None);
+        return Some(Some(JagsProgramStructureContext {
+            direct_program_error: false,
+            isolated_program_error: false,
+        }));
     };
-    if !foreign_program_has_only_error_and_comments(program, error, is_cancelled)? {
+    let isolated_program_error =
+        foreign_program_has_only_error_and_comments(program, error, is_cancelled)?;
+    Some(Some(JagsProgramStructureContext {
+        direct_program_error: true,
+        isolated_program_error,
+    }))
+}
+
+fn classify_jags_empty_model(
+    error: Node,
+    text: &str,
+    context: JagsProgramStructureContext,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<Option<ClassifiedSyntaxDiagnostic>> {
+    if !context.isolated_program_error {
         return Some(None);
     }
 
@@ -13406,16 +13447,11 @@ fn classify_jags_empty_model(
 fn classify_jags_missing_model(
     error: Node,
     text: &str,
+    context: JagsProgramStructureContext,
     budget: &mut ForeignStructureBudget,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Option<Option<ClassifiedSyntaxDiagnostic>> {
-    if !foreign_structure_candidate_is_bounded(error) {
-        return Some(None);
-    }
-    let Some(program) = foreign_direct_program_error(error) else {
-        return Some(None);
-    };
-    if !foreign_program_has_only_error_and_comments(program, error, is_cancelled)? {
+    if !context.isolated_program_error {
         return Some(None);
     }
 
@@ -13490,13 +13526,11 @@ fn jags_previous_sections(
 fn classify_jags_section_order(
     error: Node,
     text: &str,
+    context: JagsProgramStructureContext,
     budget: &mut ForeignStructureBudget,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Option<Option<ClassifiedSyntaxDiagnostic>> {
-    if !foreign_structure_candidate_is_bounded(error) {
-        return Some(None);
-    }
-    if foreign_direct_program_error(error).is_some() {
+    if context.direct_program_error {
         let mut keyword = None;
         for candidate in ["var", "data", "model"] {
             if let Some(node) =
@@ -13598,32 +13632,33 @@ fn classify_jags_program_structure(
     if is_cancelled() {
         return None;
     }
-    if let Some(classified) = classify_jags_empty_model(error, text, is_cancelled)? {
+    let Some(context) = jags_program_structure_context(error, is_cancelled)? else {
+        return Some(None);
+    };
+    if let Some(classified) = classify_jags_empty_model(error, text, context, is_cancelled)? {
         return Some(Some(classified));
     }
     if is_cancelled() {
         return None;
     }
-    if let Some(classified) = classify_jags_missing_model(error, text, budget, is_cancelled)? {
+    if let Some(classified) =
+        classify_jags_missing_model(error, text, context, budget, is_cancelled)?
+    {
         return Some(Some(classified));
     }
     if is_cancelled() {
         return None;
     }
-    if let Some(classified) = classify_jags_section_order(error, text, budget, is_cancelled)? {
+    if let Some(classified) =
+        classify_jags_section_order(error, text, context, budget, is_cancelled)?
+    {
         return Some(Some(classified));
     }
     if is_cancelled() {
         return None;
     }
 
-    if !foreign_structure_candidate_is_bounded(error) {
-        return Some(None);
-    }
-    let Some(program) = foreign_direct_program_error(error) else {
-        return Some(None);
-    };
-    if !foreign_program_has_only_error_and_comments(program, error, is_cancelled)? {
+    if !context.isolated_program_error {
         return Some(None);
     }
     let Some(fragment) = text.get(error.start_byte()..error.end_byte()) else {
@@ -13727,6 +13762,27 @@ fn error_node_starts_after_retained_diagnostic_window(
     let earliest_byte =
         foreign_lexical_window_for_recovery(node).map_or(node.start_byte(), |window| window.start);
     let start = byte_offset_to_position(text, earliest_byte);
+    (start.line, start.character) > (last.range.start.line, last.range.start.character)
+}
+
+/// After delimiter classification rules out an earlier lexical anchor, skip
+/// structure and generic-range work for an ERROR that cannot displace the
+/// saturated retained window. Equal starts remain eligible because range ends
+/// and messages also participate in stable ordering.
+fn error_node_actual_start_after_retained_diagnostic_window(
+    node: Node,
+    text: &str,
+    diagnostics: &[Diagnostic],
+    retention_limit: Option<usize>,
+    range_cache: &mut ForeignRangeCache,
+) -> bool {
+    if retention_limit.is_none_or(|cap| diagnostics.len() != cap) {
+        return false;
+    }
+    let Some(last) = diagnostics.last() else {
+        return false;
+    };
+    let start = range_cache.position(text, node.start_byte(), node.start_position());
     (start.line, start.character) > (last.range.start.line, last.range.start.character)
 }
 
@@ -13848,14 +13904,28 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
             ) {
                 continue;
             }
-            let diagnostic = match classify_foreign_error_delimiter(
+            let delimiter_classification = classify_foreign_error_delimiter(
                 node,
                 text,
                 language,
                 &delimiter_index,
                 &mut range_cache,
                 &mut is_cancelled,
-            )? {
+            )?;
+            if !matches!(
+                &delimiter_classification,
+                ForeignDelimiterClassification::Specific(_)
+            ) && error_node_actual_start_after_retained_diagnostic_window(
+                node,
+                text,
+                &diagnostics,
+                retention_limit,
+                &mut range_cache,
+            ) {
+                continue;
+            }
+
+            let diagnostic = match delimiter_classification {
                 ForeignDelimiterClassification::Specific(classified) => {
                     foreign_syntax_diagnostic_with_message(classified.range, classified.message)
                 }
