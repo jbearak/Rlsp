@@ -20,6 +20,9 @@ use crate::content_provider::{ContentProvider, OpenDocumentsView};
 use crate::cross_file::dependency::compute_inherited_working_directory;
 use crate::cross_file::{ScopedSymbol, scope};
 use crate::file_type::{FileType, file_type_from_uri};
+use crate::foreign_syntax::{
+    DelimiterEvent, DelimiterIndex, DelimiterKind as ForeignDelimiterKind,
+};
 use crate::state::WorldState;
 use crate::utf16::{byte_offset_to_utf16_column, utf16_column_to_byte_offset};
 
@@ -526,24 +529,243 @@ model {
     }
 
     #[test]
-    fn delimiter_diagnostic_cap_matches_unlimited_source_order_prefix() {
-        let mut code = String::new();
-        for index in 0..240 {
-            code.push_str(&format!("model {{ target += f({index}; }}\n"));
+    fn delimiter_diagnostic_cap_matches_opener_anchored_source_order_prefix() {
+        let code = "model { target += f(1; }\nreal x;\n";
+        let unlimited = diagnostics_for_language_with_cap("stan", code, 0);
+        assert!(unlimited.len() > 1, "fixture drifted: {unlimited:#?}");
+        assert_eq!(
+            unlimited[0].message, "Unclosed `(`: missing matching `)`",
+            "the opener-anchored explanation must sort before later recovery: {unlimited:#?}"
+        );
+
+        let capped = diagnostics_for_language_with_cap("stan", code, 1);
+        assert_eq!(capped, unlimited[..1]);
+    }
+
+    #[test]
+    fn retained_window_uses_the_earliest_possible_recovery_anchor() {
+        let source = "data { int N;\nmodel {}\n";
+        let tree = crate::stan::parse(source).expect("missing block closer tree");
+        let mut stack = vec![tree.root_node()];
+        let mut recovery = None;
+        while let Some(node) = stack.pop() {
+            if node.is_error()
+                && foreign_lexical_window_for_recovery(node)
+                    .is_some_and(|window| window.start < node.start_byte())
+            {
+                recovery = Some(node);
+                break;
+            }
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.children(&mut cursor).collect();
+            stack.extend(children.into_iter().rev());
         }
-        let unlimited = diagnostics_for_language_with_cap("stan", &code, 0);
+        let recovery = recovery.unwrap_or_else(|| panic!("{}", tree.root_node().to_sexp()));
+        let retained = vec![foreign_syntax_diagnostic(
+            ForeignSyntaxLanguage::Stan,
+            Range::new(Position::new(0, 10), Position::new(0, 11)),
+        )];
         assert!(
-            unlimited.len() > 200,
-            "fixture must produce many delimiter diagnostics: {unlimited:#?}"
+            (
+                recovery.start_position().row,
+                recovery.start_position().column
+            ) > (0, 10),
+            "fixture must distinguish ERROR start from opener anchor"
         );
+        assert!(!error_node_starts_after_retained_diagnostic_window(
+            recovery,
+            source,
+            &retained,
+            Some(1),
+        ));
+    }
+
+    #[test]
+    fn lexical_delimiter_depth_limit_fails_closed_at_257() {
+        fn index_at_depth(depth: usize, closers: usize) -> DelimiterIndex {
+            let source_len = depth + closers;
+            let mut builder = crate::foreign_syntax::DelimiterIndexBuilder::new(source_len);
+            for offset in 0..depth {
+                assert!(builder.push_event(ForeignDelimiterKind::Paren, true, offset, offset + 1,));
+            }
+            for offset in depth..source_len {
+                assert!(
+                    builder.push_event(ForeignDelimiterKind::Paren, false, offset, offset + 1,)
+                );
+            }
+            builder.finish(source_len)
+        }
+
+        let bounded = index_at_depth(256, 255);
+        assert!(matches!(
+            foreign_lexical_imbalance(&bounded, 0..511, &mut || false),
+            Some(ForeignLexicalImbalance::Unclosed(_))
+        ));
+
+        let too_deep = index_at_depth(257, 257);
+        assert_eq!(
+            foreign_lexical_imbalance(&too_deep, 0..514, &mut || false),
+            Some(ForeignLexicalImbalance::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn foreign_structure_budget_enforces_candidate_and_cumulative_limits() {
+        let mut budget = ForeignStructureBudget::default();
+        assert!(budget.spend(MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES));
+        assert!(!budget.spend(MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES + 1));
+        for _ in 1..16 {
+            assert!(budget.spend(MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES));
+        }
+        assert!(!budget.spend(1));
+
+        let mut fresh = ForeignStructureBudget::default();
+        assert!(!fresh.spend(MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES + 1));
+        assert!(fresh.spend(MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES));
+    }
+
+    #[test]
+    fn stan_structure_guidance_fails_closed_beyond_the_candidate_limit() {
+        fn top_level_function(fragment_bytes: usize) -> String {
+            let prefix = "real f(real x) { /*";
+            let suffix = "*/ return x; }";
+            assert!(fragment_bytes >= prefix.len() + suffix.len());
+            format!(
+                "{prefix}{}{suffix}\n",
+                "a".repeat(fragment_bytes - prefix.len() - suffix.len())
+            )
+        }
+
+        let at_limit = top_level_function(MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES);
+        let at_limit_findings = diagnostics_for_language_with_cap("stan", &at_limit, 0);
+        assert_eq!(at_limit_findings.len(), 1, "{at_limit_findings:#?}");
         assert!(
-            unlimited
-                .iter()
-                .any(|diagnostic| diagnostic.message.starts_with("Unclosed `(")),
-            "fixture must exercise opener-anchored retention: {unlimited:#?}"
+            at_limit_findings[0]
+                .message
+                .starts_with("Stan declarations and statements must appear inside"),
+            "{at_limit_findings:#?}"
         );
-        let capped = diagnostics_for_language_with_cap("stan", &code, 37);
-        assert_eq!(capped, unlimited[..37]);
+
+        let over_limit = top_level_function(MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES + 1);
+        let over_limit_findings = diagnostics_for_language_with_cap("stan", &over_limit, 0);
+        assert_eq!(over_limit_findings.len(), 1, "{over_limit_findings:#?}");
+        assert_eq!(
+            over_limit_findings[0].message,
+            "Stan code could not be parsed here"
+        );
+    }
+
+    #[test]
+    fn stan_structure_validation_cancels_between_block_reparse_attempts() {
+        let source = "target += 1;\n";
+        let tree = crate::stan::parse(source).expect("top-level statement tree");
+        let error = tree.root_node().named_child(0).expect("program recovery");
+        assert!(error.is_error(), "{}", tree.root_node().to_sexp());
+        let mut budget = ForeignStructureBudget::default();
+        let mut checks = 0usize;
+
+        let classified = classify_stan_program_structure(error, source, &mut budget, &mut || {
+            checks += 1;
+            checks == 3
+        });
+        assert!(classified.is_none());
+        assert_eq!(checks, 3);
+    }
+
+    #[test]
+    fn stan_structure_budget_is_charged_per_block_reparse_attempt() {
+        let fragment = "target += ;";
+        let mut budget = ForeignStructureBudget {
+            remaining_bytes: fragment.len() * 2,
+        };
+        let mut checks = 0usize;
+
+        assert_eq!(
+            stan_fragment_is_complete_program_content(fragment, &mut budget, &mut || {
+                checks += 1;
+                false
+            }),
+            Some(false)
+        );
+        assert_eq!(budget.remaining_bytes, 0);
+        assert_eq!(checks, 3, "the third attempt must stop at the budget check");
+    }
+
+    #[test]
+    fn jags_empty_model_structure_walk_observes_cancellation() {
+        let source = format!("model {{\n{}}}\n", "# comment\n".repeat(1_024));
+        let tree = crate::jags::parse_with_old_tree(&source, None).expect("empty model tree");
+        let error = tree.root_node().named_child(0).expect("program recovery");
+        assert!(error.is_error(), "{}", tree.root_node().to_sexp());
+        let context = jags_program_structure_context(error, &mut || false)
+            .expect("not cancelled")
+            .expect("bounded recovery");
+        let mut checks = 0usize;
+
+        let classified = classify_jags_empty_model(error, &source, context, &mut || {
+            checks += 1;
+            checks == 128
+        });
+        assert!(classified.is_none());
+        assert_eq!(checks, 128);
+    }
+
+    #[test]
+    fn jags_structure_guidance_fails_closed_beyond_the_candidate_limit() {
+        let prefix = "data {\n  x <- 1\n  #";
+        let suffix = "\n}\n";
+        let source = format!(
+            "{prefix}{}{suffix}",
+            "a".repeat(MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES)
+        );
+        let tree = crate::jags::parse_with_old_tree(&source, None).expect("missing model tree");
+        let error = tree.root_node().named_child(0).expect("program recovery");
+        assert!(error.is_error(), "{}", tree.root_node().to_sexp());
+        assert!(!foreign_structure_candidate_is_bounded(error));
+
+        let mut checks = 0usize;
+        assert!(matches!(
+            jags_program_structure_context(error, &mut || {
+                checks += 1;
+                false
+            }),
+            Some(None)
+        ));
+        assert_eq!(checks, 0, "the byte limit must precede child traversal");
+
+        let findings = diagnostics_for_language_with_cap("jags", &source, 0);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].message, "JAGS code could not be parsed here");
+    }
+
+    #[test]
+    fn jags_previous_section_walk_accepts_exact_node_limit_and_rejects_overflow() {
+        for (comment_count, expected_bounded) in [
+            (MAX_FOREIGN_STRUCTURE_NODES, true),
+            (MAX_FOREIGN_STRUCTURE_NODES + 1, false),
+        ] {
+            let source = format!(
+                "{}model {{ x <- 1 }}\nmodel {{ y <- 2 }}\n",
+                "#\n".repeat(comment_count)
+            );
+            let tree =
+                crate::jags::parse_with_old_tree(&source, None).expect("duplicate model tree");
+            let root = tree.root_node();
+            let error = {
+                let mut cursor = root.walk();
+                root.named_children(&mut cursor)
+                    .find(|child| child.is_error())
+                    .unwrap_or_else(|| panic!("{}", root.to_sexp()))
+            };
+            let mut checks = 0usize;
+            let previous = jags_previous_sections(error, &mut || {
+                checks += 1;
+                false
+            })
+            .expect("not cancelled");
+            assert_eq!(previous.is_some(), expected_bounded);
+            assert_eq!(checks, MAX_FOREIGN_STRUCTURE_NODES);
+        }
     }
 
     #[test]
@@ -750,14 +972,6 @@ model {
             "fixture must contain MISSING: {sexp}"
         );
 
-        let bounded = collect_foreign_syntax_errors_with_cancel_check_and_retention(
-            tree.root_node(),
-            code,
-            ForeignSyntaxLanguage::Jags,
-            || false,
-            Some(100),
-        )
-        .unwrap();
         let reference = collect_foreign_syntax_errors_with_cancel_check_and_retention(
             tree.root_node(),
             code,
@@ -766,8 +980,19 @@ model {
             None,
         )
         .unwrap();
+        assert!(reference.len() > 1, "fixture drifted: {reference:#?}");
 
-        assert_eq!(bounded, reference);
+        for cap in 1..reference.len() {
+            let bounded = collect_foreign_syntax_errors_with_cancel_check_and_retention(
+                tree.root_node(),
+                code,
+                ForeignSyntaxLanguage::Jags,
+                || false,
+                Some(cap),
+            )
+            .unwrap();
+            assert_eq!(bounded, reference[..cap], "cap {cap}");
+        }
     }
 
     #[test]
@@ -11332,57 +11557,6 @@ impl ForeignSyntaxLanguage {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ForeignDelimiterKind {
-    Paren,
-    Bracket,
-    Brace,
-}
-
-impl ForeignDelimiterKind {
-    fn index(self) -> usize {
-        match self {
-            Self::Paren => 0,
-            Self::Bracket => 1,
-            Self::Brace => 2,
-        }
-    }
-
-    fn opener(self) -> &'static str {
-        match self {
-            Self::Paren => "(",
-            Self::Bracket => "[",
-            Self::Brace => "{",
-        }
-    }
-
-    fn closer(self) -> &'static str {
-        match self {
-            Self::Paren => ")",
-            Self::Bracket => "]",
-            Self::Brace => "}",
-        }
-    }
-
-    fn from_opener(text: &str) -> Option<Self> {
-        match text {
-            "(" => Some(Self::Paren),
-            "[" => Some(Self::Bracket),
-            "{" => Some(Self::Brace),
-            _ => None,
-        }
-    }
-
-    fn from_closer(text: &str) -> Option<Self> {
-        match text {
-            ")" => Some(Self::Paren),
-            "]" => Some(Self::Bracket),
-            "}" => Some(Self::Brace),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ForeignCloser {
     kind: ForeignDelimiterKind,
@@ -11437,7 +11611,13 @@ impl ForeignRangeCache {
         Position::new(point.row as u32, self.position_utf16_column)
     }
 
-    fn meaningful_end(&mut self, opener: Node, text: &str, language: ForeignSyntaxLanguage) -> u32 {
+    fn meaningful_end(
+        &mut self,
+        opener: Node,
+        text: &str,
+        language: ForeignSyntaxLanguage,
+        delimiter_index: &DelimiterIndex,
+    ) -> u32 {
         let row = opener.start_position().row;
         let line_start =
             foreign_source_line_start(text, opener.start_byte(), opener.start_position());
@@ -11451,7 +11631,10 @@ impl ForeignRangeCache {
         let line = &line_tail[..line_end];
         self.meaningful_row = Some(row);
         self.meaningful_scan_start = scan_start;
-        self.meaningful_end = foreign_end_of_meaningful_content(line, scan_start, language);
+        self.meaningful_end = delimiter_index
+            .meaningful_end(text, opener.end_byte(), line_start + line_end)
+            .map(|end| byte_offset_to_utf16_column(line, end.saturating_sub(line_start)))
+            .unwrap_or_else(|| foreign_end_of_meaningful_content(line, scan_start, language));
         self.meaningful_end
     }
 }
@@ -11487,10 +11670,13 @@ impl<T: Copy + PartialEq> UniqueForeignEvidence<T> {
     }
 }
 
+const MAX_LEXICAL_DELIMITER_DEPTH: usize = 256;
+
 #[derive(Clone)]
 enum ForeignDelimiterClassification {
     Specific(ClassifiedSyntaxDiagnostic),
     CoveredByMismatch,
+    NoMatch,
     Ambiguous,
 }
 
@@ -11583,12 +11769,6 @@ fn foreign_wrong_closer_before_missing(
                 start_point: token.start_point,
                 end_point: token.end_point,
             });
-        } else if node.child_count() != 0 {
-            match foreign_recovery_subtree_contains_closer(node, expected, text, is_cancelled) {
-                Some(true) => return Err(ForeignEvidenceFailure::Ambiguous),
-                Some(false) => {}
-                None => return Err(ForeignEvidenceFailure::Cancelled),
-            }
         }
         sibling = node.prev_sibling();
     }
@@ -11764,22 +11944,302 @@ fn foreign_unclosed_range(
     opener: Node,
     text: &str,
     language: ForeignSyntaxLanguage,
+    delimiter_index: &DelimiterIndex,
     range_cache: &mut ForeignRangeCache,
 ) -> Range {
     let row = opener.start_position().row as u32;
     let start = range_cache.position(text, opener.start_byte(), opener.start_position());
     let opener_end = range_cache.position(text, opener.end_byte(), opener.end_position());
-    let meaningful_end = range_cache.meaningful_end(opener, text, language);
+    let meaningful_end = range_cache.meaningful_end(opener, text, language, delimiter_index);
     Range::new(
         start,
         Position::new(row, meaningful_end.max(opener_end.character)),
     )
 }
 
+fn foreign_lexical_unclosed_range(
+    opener_start: usize,
+    opener_end: usize,
+    text: &str,
+    delimiter_index: &DelimiterIndex,
+) -> Range {
+    let start = byte_offset_to_position(text, opener_start);
+    let opener_end_position = byte_offset_to_position(text, opener_end);
+    let line_end = text[opener_end..]
+        .find(['\r', '\n'])
+        .map_or(text.len(), |offset| opener_end + offset);
+    let meaningful_end = delimiter_index
+        .meaningful_end(text, opener_end, line_end)
+        .map(|end| byte_offset_to_position(text, end).character)
+        .unwrap_or(opener_end_position.character);
+    Range::new(
+        start,
+        Position::new(
+            start.line,
+            meaningful_end.max(opener_end_position.character),
+        ),
+    )
+}
+
+#[derive(Clone)]
+enum ForeignLexicalDelimiterClassification {
+    Specific(ClassifiedSyntaxDiagnostic),
+    NoMatch,
+    Ambiguous,
+}
+
+fn foreign_lexical_window_for_recovery(node: Node) -> Option<std::ops::Range<usize>> {
+    const MAX_RECOVERY_ANCESTORS: usize = 256;
+
+    let mut current = node;
+    for _ in 0..MAX_RECOVERY_ANCESTORS {
+        let Some(parent) = current.parent() else {
+            return Some(current.start_byte()..current.end_byte());
+        };
+        if parent.kind() == "program" {
+            return Some(current.start_byte()..current.end_byte());
+        }
+        current = parent;
+    }
+    None
+}
+
+fn classify_foreign_lexical_missing(
+    evidence: ForeignMissingDelimiterEvidence<'_>,
+    text: &str,
+    language: ForeignSyntaxLanguage,
+    delimiter_index: &DelimiterIndex,
+    range_cache: &mut ForeignRangeCache,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<ForeignLexicalDelimiterClassification> {
+    let Some(window) = foreign_lexical_window_for_recovery(evidence.missing) else {
+        return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+    };
+    if !delimiter_index.is_reliable(window.clone()) {
+        return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+    }
+
+    let mut stack = Vec::<DelimiterEvent>::new();
+    let mut inserted = false;
+    for event in delimiter_index.events_in(window.clone()) {
+        if is_cancelled() {
+            return None;
+        }
+        if !inserted && event.start_byte >= evidence.missing.start_byte() {
+            let Some(opener) = stack.pop() else {
+                return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+            };
+            if opener.kind != evidence.kind || opener.start_byte != evidence.opener.start_byte() {
+                return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+            }
+            inserted = true;
+        }
+
+        if event.is_opener {
+            if stack.len() == MAX_LEXICAL_DELIMITER_DEPTH {
+                return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+            }
+            stack.push(*event);
+        } else {
+            let Some(opener) = stack.pop() else {
+                return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+            };
+            if opener.kind != event.kind {
+                return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+            }
+        }
+    }
+
+    if !inserted {
+        let Some(opener) = stack.pop() else {
+            return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+        };
+        if opener.kind != evidence.kind || opener.start_byte != evidence.opener.start_byte() {
+            return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+        }
+    }
+    if !stack.is_empty() {
+        return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+    }
+
+    Some(ForeignLexicalDelimiterClassification::Specific(
+        ClassifiedSyntaxDiagnostic {
+            message: format!(
+                "Unclosed `{}`: missing matching `{}`",
+                evidence.kind.opener(),
+                evidence.kind.closer(),
+            ),
+            range: foreign_unclosed_range(
+                evidence.opener,
+                text,
+                language,
+                delimiter_index,
+                range_cache,
+            ),
+        },
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForeignLexicalImbalance {
+    Unclosed(DelimiterEvent),
+    Stray(DelimiterEvent),
+    None,
+    Ambiguous,
+}
+
+fn foreign_lexical_imbalance(
+    delimiter_index: &DelimiterIndex,
+    window: std::ops::Range<usize>,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<ForeignLexicalImbalance> {
+    let mut stack = Vec::<DelimiterEvent>::new();
+    let mut stray = None;
+    for event in delimiter_index.events_in(window) {
+        if is_cancelled() {
+            return None;
+        }
+        if event.is_opener {
+            if stack.len() == MAX_LEXICAL_DELIMITER_DEPTH {
+                return Some(ForeignLexicalImbalance::Ambiguous);
+            }
+            stack.push(*event);
+            continue;
+        }
+        let Some(opener) = stack.last() else {
+            if stray.replace(*event).is_some() {
+                return Some(ForeignLexicalImbalance::Ambiguous);
+            }
+            continue;
+        };
+        if opener.kind != event.kind {
+            return Some(ForeignLexicalImbalance::Ambiguous);
+        }
+        stack.pop();
+    }
+
+    Some(match (stack.as_slice(), stray) {
+        ([opener], None) => ForeignLexicalImbalance::Unclosed(*opener),
+        ([], Some(closer)) => ForeignLexicalImbalance::Stray(closer),
+        ([], None) => ForeignLexicalImbalance::None,
+        _ => ForeignLexicalImbalance::Ambiguous,
+    })
+}
+
+fn classify_foreign_lexical_error(
+    error: Node,
+    text: &str,
+    delimiter_index: &DelimiterIndex,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<ForeignLexicalDelimiterClassification> {
+    let Some(window) = foreign_lexical_window_for_recovery(error) else {
+        return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+    };
+    if !delimiter_index.is_reliable(window.clone()) {
+        return Some(ForeignLexicalDelimiterClassification::Ambiguous);
+    }
+
+    let local = foreign_lexical_imbalance(delimiter_index, window.clone(), is_cancelled)?;
+    if matches!(
+        local,
+        ForeignLexicalImbalance::Unclosed(_) | ForeignLexicalImbalance::Stray(_)
+    ) && window != (0..text.len())
+    {
+        let document_window = 0..text.len();
+        if !delimiter_index.is_reliable(document_window.clone())
+            || foreign_lexical_imbalance(delimiter_index, document_window, is_cancelled)? != local
+        {
+            return Some(ForeignLexicalDelimiterClassification::NoMatch);
+        }
+    }
+
+    Some(match local {
+        ForeignLexicalImbalance::Unclosed(opener) => {
+            ForeignLexicalDelimiterClassification::Specific(ClassifiedSyntaxDiagnostic {
+                message: format!(
+                    "Unclosed `{}`: missing matching `{}`",
+                    opener.kind.opener(),
+                    opener.kind.closer(),
+                ),
+                range: foreign_lexical_unclosed_range(
+                    opener.start_byte,
+                    opener.end_byte,
+                    text,
+                    delimiter_index,
+                ),
+            })
+        }
+        ForeignLexicalImbalance::Stray(closer) => {
+            ForeignLexicalDelimiterClassification::Specific(ClassifiedSyntaxDiagnostic {
+                message: format!("Missing opening `{}`", closer.kind.opener()),
+                range: Range::new(
+                    byte_offset_to_position(text, closer.start_byte),
+                    byte_offset_to_position(text, closer.end_byte),
+                ),
+            })
+        }
+        ForeignLexicalImbalance::None => ForeignLexicalDelimiterClassification::NoMatch,
+        ForeignLexicalImbalance::Ambiguous => ForeignLexicalDelimiterClassification::Ambiguous,
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ForeignMismatch {
     opener_kind: ForeignDelimiterKind,
     closer: ForeignCloser,
+}
+
+/// Require lexical delimiter topology to agree with one structural wrong-closer
+/// interpretation. The wrong closer virtually replaces the expected closer for
+/// the current stack top; a second mismatch, any stray closer, or any remaining
+/// opener makes the recovery unit ambiguous.
+fn foreign_lexically_corroborates_mismatch(
+    recovery: Node,
+    expected: ForeignMismatch,
+    delimiter_index: &DelimiterIndex,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    let Some(window) = foreign_lexical_window_for_recovery(recovery) else {
+        return Some(false);
+    };
+    if !delimiter_index.is_reliable(window.clone()) {
+        return Some(false);
+    }
+
+    let mut stack = Vec::<DelimiterEvent>::new();
+    let mut mismatch = None;
+    for event in delimiter_index.events_in(window) {
+        if is_cancelled() {
+            return None;
+        }
+        if event.is_opener {
+            if stack.len() == MAX_LEXICAL_DELIMITER_DEPTH {
+                return Some(false);
+            }
+            stack.push(*event);
+            continue;
+        }
+
+        let Some(opener) = stack.pop() else {
+            return Some(false);
+        };
+        if opener.kind == event.kind {
+            continue;
+        }
+        if mismatch.replace((opener.kind, *event)).is_some() {
+            return Some(false);
+        }
+    }
+
+    Some(
+        stack.is_empty()
+            && mismatch.is_some_and(|(opener_kind, closer)| {
+                opener_kind == expected.opener_kind
+                    && closer.kind == expected.closer.kind
+                    && closer.start_byte == expected.closer.start_byte
+                    && closer.end_byte == expected.closer.end_byte
+            }),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -12171,46 +12631,6 @@ fn foreign_recovery_subtree_contains_closer(
     }
 }
 
-fn foreign_following_recovery_contains_closer(
-    missing: Node,
-    kind: ForeignDelimiterKind,
-    text: &str,
-    is_cancelled: &mut impl FnMut() -> bool,
-) -> Option<bool> {
-    const MAX_RECOVERY_ANCESTORS: usize = 8;
-    const MAX_RECOVERY_SIBLINGS: usize = 16;
-
-    let mut current = missing;
-    for _ in 0..MAX_RECOVERY_ANCESTORS {
-        let mut sibling = current.next_sibling();
-        for _ in 0..MAX_RECOVERY_SIBLINGS {
-            let Some(node) = sibling else {
-                break;
-            };
-            if is_cancelled() {
-                return None;
-            }
-            if node.is_missing()
-                || foreign_delimiter_token(node, text)
-                    .is_some_and(|token| !token.is_opener && token.kind == kind)
-                || (node.has_error()
-                    && foreign_recovery_subtree_contains_closer(node, kind, text, is_cancelled)?)
-            {
-                return Some(true);
-            }
-            sibling = node.next_sibling();
-        }
-        if sibling.is_some() {
-            return Some(true);
-        }
-        let Some(parent) = current.parent() else {
-            return Some(false);
-        };
-        current = parent;
-    }
-    Some(true)
-}
-
 fn foreign_following_recovery_contains_real_closer(
     root: Node,
     kind: ForeignDelimiterKind,
@@ -12319,36 +12739,6 @@ fn foreign_following_recovery_contains_missing_closer(
             return Some(true);
         }
         current = parent;
-    }
-    Some(true)
-}
-
-fn foreign_recovery_between_contains_closer(
-    opener: Node,
-    missing: Node,
-    kind: ForeignDelimiterKind,
-    text: &str,
-    is_cancelled: &mut impl FnMut() -> bool,
-) -> Option<bool> {
-    const MAX_RECOVERY_SIBLINGS: usize = 64;
-
-    let mut sibling = opener.next_sibling();
-    for _ in 0..MAX_RECOVERY_SIBLINGS {
-        let Some(node) = sibling else {
-            return Some(false);
-        };
-        if node == missing {
-            return Some(false);
-        }
-        if is_cancelled() {
-            return None;
-        }
-        if node.has_error()
-            && foreign_recovery_subtree_contains_closer(node, kind, text, is_cancelled)?
-        {
-            return Some(true);
-        }
-        sibling = node.next_sibling();
     }
     Some(true)
 }
@@ -12519,6 +12909,7 @@ fn classify_foreign_missing_delimiter(
     missing: Node,
     text: &str,
     language: ForeignSyntaxLanguage,
+    delimiter_index: &DelimiterIndex,
     range_cache: &mut ForeignRangeCache,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Option<ForeignDelimiterClassification> {
@@ -12532,32 +12923,32 @@ fn classify_foreign_missing_delimiter(
     if evidence.wrong_closer.is_some() {
         return Some(ForeignDelimiterClassification::CoveredByMismatch);
     }
-    if foreign_recovery_between_contains_closer(
-        evidence.opener,
-        missing,
-        evidence.kind,
-        text,
-        is_cancelled,
-    )? || foreign_following_recovery_contains_closer(missing, evidence.kind, text, is_cancelled)?
-    {
-        return Some(ForeignDelimiterClassification::Ambiguous);
-    }
-    Some(ForeignDelimiterClassification::Specific(
-        ClassifiedSyntaxDiagnostic {
-            message: format!(
-                "Unclosed `{}`: missing matching `{}`",
-                evidence.kind.opener(),
-                evidence.kind.closer(),
-            ),
-            range: foreign_unclosed_range(evidence.opener, text, language, range_cache),
+
+    Some(
+        match classify_foreign_lexical_missing(
+            evidence,
+            text,
+            language,
+            delimiter_index,
+            range_cache,
+            is_cancelled,
+        )? {
+            ForeignLexicalDelimiterClassification::Specific(classified) => {
+                ForeignDelimiterClassification::Specific(classified)
+            }
+            ForeignLexicalDelimiterClassification::NoMatch
+            | ForeignLexicalDelimiterClassification::Ambiguous => {
+                ForeignDelimiterClassification::Ambiguous
+            }
         },
-    ))
+    )
 }
 
 fn classify_foreign_error_delimiter(
     error: Node,
     text: &str,
     language: ForeignSyntaxLanguage,
+    delimiter_index: &DelimiterIndex,
     range_cache: &mut ForeignRangeCache,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Option<ForeignDelimiterClassification> {
@@ -12637,8 +13028,25 @@ fn classify_foreign_error_delimiter(
             return Some(ForeignDelimiterClassification::Ambiguous);
         }
         if let UniqueForeignEvidence::One(evidence) = mismatch {
+            let mismatch = ForeignMismatch {
+                opener_kind: evidence.kind,
+                closer: wrong_closer,
+            };
+            if !foreign_lexically_corroborates_mismatch(
+                error,
+                mismatch,
+                delimiter_index,
+                is_cancelled,
+            )? {
+                return Some(ForeignDelimiterClassification::Ambiguous);
+            }
             return Some(ForeignDelimiterClassification::Specific(
-                foreign_mismatch_diagnostic(evidence.kind, wrong_closer, text, range_cache),
+                foreign_mismatch_diagnostic(
+                    mismatch.opener_kind,
+                    mismatch.closer,
+                    text,
+                    range_cache,
+                ),
             ));
         }
         if matches!(mismatch, UniqueForeignEvidence::Ambiguous) {
@@ -12648,6 +13056,14 @@ fn classify_foreign_error_delimiter(
 
     match foreign_recovery_mismatch(error, text, language, is_cancelled)? {
         UniqueForeignEvidence::One(mismatch) => {
+            if !foreign_lexically_corroborates_mismatch(
+                error,
+                mismatch,
+                delimiter_index,
+                is_cancelled,
+            )? {
+                return Some(ForeignDelimiterClassification::Ambiguous);
+            }
             return Some(ForeignDelimiterClassification::Specific(
                 foreign_mismatch_diagnostic(
                     mismatch.opener_kind,
@@ -12693,45 +13109,67 @@ fn classify_foreign_error_delimiter(
                 return Some(match evidence {
                     UniqueForeignEvidence::One(evidence) => {
                         if let Some(closer) = evidence.wrong_closer {
-                            ForeignDelimiterClassification::Specific(foreign_mismatch_diagnostic(
-                                evidence.kind,
+                            let mismatch = ForeignMismatch {
+                                opener_kind: evidence.kind,
                                 closer,
-                                text,
-                                range_cache,
-                            ))
-                        } else if foreign_recovery_between_contains_closer(
-                            evidence.opener,
-                            evidence.missing,
-                            evidence.kind,
-                            text,
-                            is_cancelled,
-                        )? || foreign_following_recovery_contains_closer(
-                            evidence.missing,
-                            evidence.kind,
-                            text,
-                            is_cancelled,
-                        )? {
-                            ForeignDelimiterClassification::Ambiguous
+                            };
+                            if foreign_lexically_corroborates_mismatch(
+                                error,
+                                mismatch,
+                                delimiter_index,
+                                is_cancelled,
+                            )? {
+                                ForeignDelimiterClassification::Specific(
+                                    foreign_mismatch_diagnostic(
+                                        mismatch.opener_kind,
+                                        mismatch.closer,
+                                        text,
+                                        range_cache,
+                                    ),
+                                )
+                            } else {
+                                ForeignDelimiterClassification::Ambiguous
+                            }
                         } else {
-                            ForeignDelimiterClassification::Specific(ClassifiedSyntaxDiagnostic {
-                                message: format!(
-                                    "Unclosed `{}`: missing matching `{}`",
-                                    evidence.kind.opener(),
-                                    evidence.kind.closer(),
-                                ),
-                                range: foreign_unclosed_range(
-                                    evidence.opener,
-                                    text,
-                                    language,
-                                    range_cache,
-                                ),
-                            })
+                            match classify_foreign_lexical_missing(
+                                evidence,
+                                text,
+                                language,
+                                delimiter_index,
+                                range_cache,
+                                is_cancelled,
+                            )? {
+                                ForeignLexicalDelimiterClassification::Specific(classified) => {
+                                    ForeignDelimiterClassification::Specific(classified)
+                                }
+                                ForeignLexicalDelimiterClassification::NoMatch
+                                | ForeignLexicalDelimiterClassification::Ambiguous => {
+                                    ForeignDelimiterClassification::Ambiguous
+                                }
+                            }
                         }
                     }
                     UniqueForeignEvidence::Ambiguous => ForeignDelimiterClassification::Ambiguous,
                     UniqueForeignEvidence::None => {
+                        let lexical_ambiguous = match classify_foreign_lexical_error(
+                            error,
+                            text,
+                            delimiter_index,
+                            is_cancelled,
+                        )? {
+                            ForeignLexicalDelimiterClassification::Specific(classified) => {
+                                return Some(ForeignDelimiterClassification::Specific(classified));
+                            }
+                            ForeignLexicalDelimiterClassification::NoMatch => false,
+                            ForeignLexicalDelimiterClassification::Ambiguous => true,
+                        };
+
                         let Some(closer) = foreign_closer_from_error(error, text, true) else {
-                            return Some(ForeignDelimiterClassification::Ambiguous);
+                            return Some(if lexical_ambiguous {
+                                ForeignDelimiterClassification::Ambiguous
+                            } else {
+                                ForeignDelimiterClassification::NoMatch
+                            });
                         };
                         if !foreign_preceding_recovery_is_clean(error, is_cancelled)?
                             || foreign_error_has_preceding_same_kind_opener(
@@ -12756,6 +13194,502 @@ fn classify_foreign_error_delimiter(
                     }
                 });
             }
+        }
+    }
+}
+
+const MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES: usize = 256 * 1024;
+const MAX_FOREIGN_STRUCTURE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FOREIGN_STRUCTURE_NODES: usize = 65_536;
+
+fn foreign_structure_candidate_is_bounded(node: Node) -> bool {
+    node.end_byte().saturating_sub(node.start_byte()) <= MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES
+}
+
+struct ForeignStructureBudget {
+    remaining_bytes: usize,
+}
+
+impl Default for ForeignStructureBudget {
+    fn default() -> Self {
+        Self {
+            remaining_bytes: MAX_FOREIGN_STRUCTURE_TOTAL_BYTES,
+        }
+    }
+}
+
+impl ForeignStructureBudget {
+    fn spend(&mut self, bytes: usize) -> bool {
+        if bytes > MAX_FOREIGN_STRUCTURE_CANDIDATE_BYTES || bytes > self.remaining_bytes {
+            return false;
+        }
+        self.remaining_bytes -= bytes;
+        true
+    }
+}
+
+fn foreign_trimmed_node_range(node: Node, text: &str) -> Option<Range> {
+    let raw = text.get(node.start_byte()..node.end_byte())?;
+    let leading = raw.len() - raw.trim_start_matches(char::is_whitespace).len();
+    let trailing = raw.len() - raw.trim_end_matches(char::is_whitespace).len();
+    let start = node.start_byte() + leading;
+    let end = node.end_byte().saturating_sub(trailing);
+    (start < end).then(|| {
+        Range::new(
+            byte_offset_to_position(text, start),
+            byte_offset_to_position(text, end),
+        )
+    })
+}
+
+fn foreign_node_range(node: Node, text: &str) -> Range {
+    Range::new(
+        byte_offset_to_position(text, node.start_byte()),
+        byte_offset_to_position(text, node.end_byte()),
+    )
+}
+
+fn foreign_direct_child_with_text<'tree>(
+    node: Node<'tree>,
+    text: &str,
+    expected: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<Option<Node<'tree>>> {
+    let mut cursor = node.walk();
+    for (index, child) in node.children(&mut cursor).enumerate() {
+        if index == MAX_FOREIGN_STRUCTURE_NODES {
+            return Some(None);
+        }
+        if is_cancelled() {
+            return None;
+        }
+        if text.get(child.start_byte()..child.end_byte()) == Some(expected) {
+            return Some(Some(child));
+        }
+    }
+    Some(None)
+}
+
+fn foreign_direct_program_error(error: Node) -> Option<Node> {
+    let parent = error.parent()?;
+    (parent.kind() == "program").then_some(parent)
+}
+
+fn foreign_program_has_only_error_and_comments(
+    program: Node,
+    error: Node,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    let mut cursor = program.walk();
+    let mut saw_error = false;
+    for (index, child) in program.named_children(&mut cursor).enumerate() {
+        if index == MAX_FOREIGN_STRUCTURE_NODES {
+            return Some(false);
+        }
+        if is_cancelled() {
+            return None;
+        }
+        if child == error {
+            if saw_error {
+                return Some(false);
+            }
+            saw_error = true;
+        } else if child.kind() != "comment" {
+            return Some(false);
+        }
+    }
+    Some(saw_error)
+}
+
+fn stan_fragment_is_complete_program_content(
+    fragment: &str,
+    budget: &mut ForeignStructureBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    for block_kind in crate::stan::PROGRAM_BLOCKS {
+        if is_cancelled() {
+            return None;
+        }
+        if !budget.spend(fragment.len()) {
+            return Some(false);
+        }
+        let block_keyword = block_kind.replace('_', " ");
+        let wrapped = format!("{block_keyword} {{\n{fragment}\n}}\n");
+        let Some(tree) = crate::stan::parse(&wrapped) else {
+            continue;
+        };
+        if !tree.root_node().has_error() {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn classify_stan_program_structure(
+    error: Node,
+    text: &str,
+    budget: &mut ForeignStructureBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<Option<ClassifiedSyntaxDiagnostic>> {
+    if !foreign_structure_candidate_is_bounded(error) {
+        return Some(None);
+    }
+    let Some(program) = foreign_direct_program_error(error) else {
+        return Some(None);
+    };
+    if !foreign_program_has_only_error_and_comments(program, error, is_cancelled)? {
+        return Some(None);
+    }
+    let Some(fragment) = text.get(error.start_byte()..error.end_byte()) else {
+        return Some(None);
+    };
+    if !stan_fragment_is_complete_program_content(fragment, budget, is_cancelled)? {
+        return Some(None);
+    }
+
+    Some(foreign_trimmed_node_range(error, text).map(|range| ClassifiedSyntaxDiagnostic {
+        message: "Stan declarations and statements must appear inside a program block such as `functions`, `data`, `parameters`, or `model`.".to_string(),
+        range,
+    }))
+}
+
+fn jags_parse_is_clean(source: &str) -> bool {
+    crate::jags::parse_with_old_tree(source, None).is_some_and(|tree| !tree.root_node().has_error())
+}
+
+fn jags_fragment_is_complete_model_content(fragment: &str) -> bool {
+    jags_parse_is_clean(&format!("model {{\n{fragment}\n}}\n"))
+}
+
+fn jags_fragment_is_complete_section(fragment: &str, keyword: &str) -> bool {
+    match keyword {
+        "model" => jags_parse_is_clean(fragment),
+        "var" | "data" => {
+            jags_parse_is_clean(&format!("{fragment}\nmodel {{ raven_sentinel <- 0 }}\n"))
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct JagsProgramStructureContext {
+    direct_program_error: bool,
+    isolated_program_error: bool,
+}
+
+fn jags_program_structure_context(
+    error: Node,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<Option<JagsProgramStructureContext>> {
+    if !foreign_structure_candidate_is_bounded(error) {
+        return Some(None);
+    }
+    let Some(program) = foreign_direct_program_error(error) else {
+        return Some(Some(JagsProgramStructureContext {
+            direct_program_error: false,
+            isolated_program_error: false,
+        }));
+    };
+    let isolated_program_error =
+        foreign_program_has_only_error_and_comments(program, error, is_cancelled)?;
+    Some(Some(JagsProgramStructureContext {
+        direct_program_error: true,
+        isolated_program_error,
+    }))
+}
+
+fn classify_jags_empty_model(
+    error: Node,
+    text: &str,
+    context: JagsProgramStructureContext,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<Option<ClassifiedSyntaxDiagnostic>> {
+    if !context.isolated_program_error {
+        return Some(None);
+    }
+
+    let mut cursor = error.walk();
+    let mut children = error.children(&mut cursor);
+    let Some(model) = children.next() else {
+        return Some(None);
+    };
+    let Some(opener) = children.next() else {
+        return Some(None);
+    };
+    let Some(mut closer) = children.next() else {
+        return Some(None);
+    };
+    for (visited, child) in (3usize..).zip(children) {
+        if visited == MAX_FOREIGN_STRUCTURE_NODES {
+            return Some(None);
+        }
+        if is_cancelled() {
+            return None;
+        }
+        if closer.kind() != "comment" {
+            return Some(None);
+        }
+        closer = child;
+    }
+    if text.get(model.start_byte()..model.end_byte()) != Some("model")
+        || text.get(opener.start_byte()..opener.end_byte()) != Some("{")
+        || text.get(closer.start_byte()..closer.end_byte()) != Some("}")
+    {
+        return Some(None);
+    }
+
+    Some(Some(ClassifiedSyntaxDiagnostic {
+        message: "JAGS `model` block must contain at least one relation or loop.".to_string(),
+        range: foreign_node_range(model, text),
+    }))
+}
+
+fn classify_jags_missing_model(
+    error: Node,
+    text: &str,
+    context: JagsProgramStructureContext,
+    budget: &mut ForeignStructureBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<Option<ClassifiedSyntaxDiagnostic>> {
+    if !context.isolated_program_error {
+        return Some(None);
+    }
+
+    let mut cursor = error.walk();
+    let mut anchor = None;
+    for (index, child) in error.named_children(&mut cursor).enumerate() {
+        if index == MAX_FOREIGN_STRUCTURE_NODES {
+            return Some(None);
+        }
+        if is_cancelled() {
+            return None;
+        }
+        if !matches!(child.kind(), "variable_declaration" | "data_block") || child.has_error() {
+            return Some(None);
+        }
+        anchor = Some(child);
+    }
+    let Some(anchor) = anchor else {
+        return Some(None);
+    };
+    let Some(fragment) = text.get(error.start_byte()..error.end_byte()) else {
+        return Some(None);
+    };
+    if !budget.spend(fragment.len())
+        || !jags_parse_is_clean(&format!("{fragment}\nmodel {{ raven_sentinel <- 0 }}\n"))
+    {
+        return Some(None);
+    }
+
+    Some(Some(ClassifiedSyntaxDiagnostic {
+        message: "Missing required `model` block in JAGS program".to_string(),
+        range: foreign_node_range(anchor, text),
+    }))
+}
+
+#[derive(Default)]
+struct JagsPreviousSections {
+    variable_declaration: bool,
+    data_block: bool,
+    model_block: bool,
+}
+
+fn jags_previous_sections(
+    node: Node,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<Option<JagsPreviousSections>> {
+    let Some(parent) = node.parent() else {
+        return Some(None);
+    };
+    let mut sections = JagsPreviousSections::default();
+    let mut cursor = parent.walk();
+    for (previous_count, previous) in parent.named_children(&mut cursor).enumerate() {
+        if previous == node {
+            return Some(Some(sections));
+        }
+        if previous_count == MAX_FOREIGN_STRUCTURE_NODES {
+            return Some(None);
+        }
+        if is_cancelled() {
+            return None;
+        }
+        match previous.kind() {
+            "variable_declaration" => sections.variable_declaration = true,
+            "data_block" => sections.data_block = true,
+            "model_block" => sections.model_block = true,
+            _ => {}
+        }
+    }
+    Some(None)
+}
+
+fn classify_jags_section_order(
+    error: Node,
+    text: &str,
+    context: JagsProgramStructureContext,
+    budget: &mut ForeignStructureBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<Option<ClassifiedSyntaxDiagnostic>> {
+    if context.direct_program_error {
+        let mut keyword = None;
+        for candidate in ["var", "data", "model"] {
+            if let Some(node) =
+                foreign_direct_child_with_text(error, text, candidate, is_cancelled)?
+            {
+                keyword = Some((candidate, node));
+                break;
+            }
+        }
+        let Some(keyword) = keyword else {
+            return Some(None);
+        };
+        let Some(fragment) = text.get(error.start_byte()..error.end_byte()) else {
+            return Some(None);
+        };
+        if !budget.spend(fragment.len()) || !jags_fragment_is_complete_section(fragment, keyword.0)
+        {
+            return Some(None);
+        }
+        let Some(previous) = jags_previous_sections(error, is_cancelled)? else {
+            return Some(None);
+        };
+
+        let duplicate_model_anchor = if keyword.0 == "model" {
+            if previous.model_block {
+                Some(keyword.1)
+            } else if let Some(sibling) = error
+                .next_named_sibling()
+                .filter(|sibling| sibling.kind() == "model_block")
+            {
+                foreign_direct_child_with_text(sibling, text, "model", is_cancelled)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let message = match keyword.0 {
+            "var" if previous.variable_declaration => {
+                "JAGS program may contain only one `var` declaration."
+            }
+            "var" if previous.data_block || previous.model_block => {
+                "JAGS `var` declaration must appear before `data` and `model` blocks."
+            }
+            "data" if previous.data_block => "JAGS program may contain only one `data` block.",
+            "data" if previous.model_block => {
+                "JAGS `data` block must appear before the `model` block."
+            }
+            "model" if duplicate_model_anchor.is_some() => {
+                "JAGS program may contain only one `model` block."
+            }
+            _ => return Some(None),
+        };
+        return Some(Some(ClassifiedSyntaxDiagnostic {
+            message: message.to_string(),
+            range: foreign_node_range(duplicate_model_anchor.unwrap_or(keyword.1), text),
+        }));
+    }
+
+    let Some(parent) = error.parent() else {
+        return Some(None);
+    };
+    if parent.kind() != "model_block" {
+        return Some(None);
+    }
+    let Some(data) = foreign_direct_child_with_text(error, text, "data", is_cancelled)? else {
+        return Some(None);
+    };
+    let mut error_cursor = error.walk();
+    let mut has_complete_block = false;
+    for (index, child) in error.named_children(&mut error_cursor).enumerate() {
+        if index == MAX_FOREIGN_STRUCTURE_NODES {
+            return Some(None);
+        }
+        if is_cancelled() {
+            return None;
+        }
+        has_complete_block |= child.kind() == "block_statement" && !child.has_error();
+    }
+    if !has_complete_block
+        || parent
+            .child_by_field_name("body")
+            .is_none_or(|body| body.has_error())
+    {
+        return Some(None);
+    }
+    Some(Some(ClassifiedSyntaxDiagnostic {
+        message: "JAGS `data` block must appear before the `model` block.".to_string(),
+        range: foreign_node_range(data, text),
+    }))
+}
+
+fn classify_jags_program_structure(
+    error: Node,
+    text: &str,
+    budget: &mut ForeignStructureBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<Option<ClassifiedSyntaxDiagnostic>> {
+    if is_cancelled() {
+        return None;
+    }
+    let Some(context) = jags_program_structure_context(error, is_cancelled)? else {
+        return Some(None);
+    };
+    if let Some(classified) = classify_jags_empty_model(error, text, context, is_cancelled)? {
+        return Some(Some(classified));
+    }
+    if is_cancelled() {
+        return None;
+    }
+    if let Some(classified) =
+        classify_jags_missing_model(error, text, context, budget, is_cancelled)?
+    {
+        return Some(Some(classified));
+    }
+    if is_cancelled() {
+        return None;
+    }
+    if let Some(classified) =
+        classify_jags_section_order(error, text, context, budget, is_cancelled)?
+    {
+        return Some(Some(classified));
+    }
+    if is_cancelled() {
+        return None;
+    }
+
+    if !context.isolated_program_error {
+        return Some(None);
+    }
+    let Some(fragment) = text.get(error.start_byte()..error.end_byte()) else {
+        return Some(None);
+    };
+    if !budget.spend(fragment.len()) || !jags_fragment_is_complete_model_content(fragment) {
+        return Some(None);
+    }
+
+    Some(
+        foreign_trimmed_node_range(error, text).map(|range| ClassifiedSyntaxDiagnostic {
+            message: "JAGS relations and loops must appear inside a `data` or `model` block."
+                .to_string(),
+            range,
+        }),
+    )
+}
+
+fn classify_foreign_program_structure(
+    error: Node,
+    text: &str,
+    language: ForeignSyntaxLanguage,
+    budget: &mut ForeignStructureBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<Option<ClassifiedSyntaxDiagnostic>> {
+    match language {
+        ForeignSyntaxLanguage::Stan => {
+            classify_stan_program_structure(error, text, budget, is_cancelled)
+        }
+        ForeignSyntaxLanguage::Jags => {
+            classify_jags_program_structure(error, text, budget, is_cancelled)
         }
     }
 }
@@ -12808,12 +13742,34 @@ fn retain_foreign_syntax_diagnostic(
     }
 }
 
-/// Skip classification only when source ordering proves this ERROR cannot
-/// displace the retained window. Every ERROR-derived foreign range starts at
-/// or after the ERROR start: mismatch/stray ranges point inside the ERROR, and
-/// an unclosed opener is a descendant of that ERROR. Standalone MISSING nodes
-/// do not use this shortcut because their anchor may move to an earlier line.
+/// Skip classification only when source ordering proves this recovery unit
+/// cannot displace the retained window. Lexical fallback may anchor on an
+/// opener before the ERROR itself, so use the top-level recovery window's start
+/// rather than the parser's ERROR start. Standalone MISSING nodes do not use
+/// this shortcut because their virtual-closer owner may move independently.
 fn error_node_starts_after_retained_diagnostic_window(
+    node: Node,
+    text: &str,
+    diagnostics: &[Diagnostic],
+    retention_limit: Option<usize>,
+) -> bool {
+    if retention_limit.is_none_or(|cap| diagnostics.len() != cap) {
+        return false;
+    }
+    let Some(last) = diagnostics.last() else {
+        return false;
+    };
+    let earliest_byte =
+        foreign_lexical_window_for_recovery(node).map_or(node.start_byte(), |window| window.start);
+    let start = byte_offset_to_position(text, earliest_byte);
+    (start.line, start.character) > (last.range.start.line, last.range.start.character)
+}
+
+/// After delimiter classification rules out an earlier lexical anchor, skip
+/// structure and generic-range work for an ERROR that cannot displace the
+/// saturated retained window. Equal starts remain eligible because range ends
+/// and messages also participate in stable ordering.
+fn error_node_actual_start_after_retained_diagnostic_window(
     node: Node,
     text: &str,
     diagnostics: &[Diagnostic],
@@ -12883,8 +13839,13 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
     mut is_cancelled: impl FnMut() -> bool,
     retention_limit: Option<usize>,
 ) -> Option<Vec<Diagnostic>> {
+    let delimiter_index = match language {
+        ForeignSyntaxLanguage::Stan => crate::stan::delimiter_index(text, &mut is_cancelled)?,
+        ForeignSyntaxLanguage::Jags => crate::jags::delimiter_index(text, &mut is_cancelled)?,
+    };
     let mut diagnostics = Vec::new();
     let mut range_cache = ForeignRangeCache::default();
+    let mut structure_budget = ForeignStructureBudget::default();
 
     // Tree-sitter consumes a leading UTF-8 BOM before invoking a grammar. JAGS
     // rejects that byte sequence, so parser acceptance also requires complete
@@ -12940,19 +13901,48 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
                 text,
                 &diagnostics,
                 retention_limit,
+            ) {
+                continue;
+            }
+            let delimiter_classification = classify_foreign_error_delimiter(
+                node,
+                text,
+                language,
+                &delimiter_index,
+                &mut range_cache,
+                &mut is_cancelled,
+            )?;
+            if !matches!(
+                &delimiter_classification,
+                ForeignDelimiterClassification::Specific(_)
+            ) && error_node_actual_start_after_retained_diagnostic_window(
+                node,
+                text,
+                &diagnostics,
+                retention_limit,
                 &mut range_cache,
             ) {
                 continue;
             }
-            let diagnostic = match classify_foreign_error_delimiter(
-                node,
-                text,
-                language,
-                &mut range_cache,
-                &mut is_cancelled,
-            )? {
+
+            let diagnostic = match delimiter_classification {
                 ForeignDelimiterClassification::Specific(classified) => {
                     foreign_syntax_diagnostic_with_message(classified.range, classified.message)
+                }
+                ForeignDelimiterClassification::NoMatch => {
+                    if let Some(classified) = classify_foreign_program_structure(
+                        node,
+                        text,
+                        language,
+                        &mut structure_budget,
+                        &mut is_cancelled,
+                    )? {
+                        foreign_syntax_diagnostic_with_message(classified.range, classified.message)
+                    } else {
+                        let range =
+                            clamp_foreign_diagnostic_range(text, minimize_error_range(node, text));
+                        foreign_syntax_diagnostic(language, range)
+                    }
                 }
                 ForeignDelimiterClassification::CoveredByMismatch
                 | ForeignDelimiterClassification::Ambiguous => {
@@ -12973,6 +13963,7 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
                     node,
                     text,
                     language,
+                    &delimiter_index,
                     &mut range_cache,
                     &mut is_cancelled,
                 )? {
@@ -12987,7 +13978,8 @@ fn collect_foreign_syntax_errors_with_cancel_check_and_retention(
                         );
                     }
                     ForeignDelimiterClassification::CoveredByMismatch => {}
-                    ForeignDelimiterClassification::Ambiguous => {
+                    ForeignDelimiterClassification::NoMatch
+                    | ForeignDelimiterClassification::Ambiguous => {
                         let (row, col) = anchor_missing_position(
                             node.start_position().row,
                             node.start_position().column,

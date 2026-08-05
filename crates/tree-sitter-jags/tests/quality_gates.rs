@@ -708,7 +708,7 @@ fn recovery_issues(tree: &Tree) -> Vec<RecoveryIssue> {
 
 #[test]
 fn representative_recovery_trees_and_ranges_are_exact() {
-    let cases: [(&str, &str, &[RecoveryIssue]); 6] = [
+    let cases: [(&str, &str, &[RecoveryIssue]); 17] = [
         (
             "missing-operand",
             "model { x <- * 1 }\n",
@@ -777,6 +777,116 @@ fn representative_recovery_trees_and_ranges_are_exact() {
                 },
             ],
         ),
+        (
+            "top-level-relation",
+            "x <- 1\n",
+            &[RecoveryIssue {
+                kind: "ERROR".to_owned(),
+                missing: false,
+                bytes: 0..6,
+                points: (Point::new(0, 0), Point::new(0, 6)),
+            }],
+        ),
+        (
+            "missing-model-after-data",
+            "data { x <- 1 }\n",
+            &[RecoveryIssue {
+                kind: "ERROR".to_owned(),
+                missing: false,
+                bytes: 0..15,
+                points: (Point::new(0, 0), Point::new(0, 15)),
+            }],
+        ),
+        (
+            "missing-model-after-var",
+            "var x;\n",
+            &[RecoveryIssue {
+                kind: "ERROR".to_owned(),
+                missing: false,
+                bytes: 0..6,
+                points: (Point::new(0, 0), Point::new(0, 6)),
+            }],
+        ),
+        (
+            "data-after-model",
+            "model { x <- 1 } data { y <- 2 }\n",
+            &[RecoveryIssue {
+                kind: "ERROR".to_owned(),
+                missing: false,
+                bytes: 6..21,
+                points: (Point::new(0, 6), Point::new(0, 21)),
+            }],
+        ),
+        (
+            "var-after-data",
+            "data { y <- 2 } var x; model { x <- y }\n",
+            &[RecoveryIssue {
+                kind: "ERROR".to_owned(),
+                missing: false,
+                bytes: 16..22,
+                points: (Point::new(0, 16), Point::new(0, 22)),
+            }],
+        ),
+        (
+            "duplicate-model",
+            "model { x <- 1 } model { y <- 2 }\n",
+            &[RecoveryIssue {
+                kind: "ERROR".to_owned(),
+                missing: false,
+                bytes: 0..16,
+                points: (Point::new(0, 0), Point::new(0, 16)),
+            }],
+        ),
+        (
+            "duplicate-data",
+            "data { x <- 1 } data { y <- 2 } model { z <- 3 }\n",
+            &[RecoveryIssue {
+                kind: "ERROR".to_owned(),
+                missing: false,
+                bytes: 16..31,
+                points: (Point::new(0, 16), Point::new(0, 31)),
+            }],
+        ),
+        (
+            "empty-model",
+            "model {}\n",
+            &[RecoveryIssue {
+                kind: "ERROR".to_owned(),
+                missing: false,
+                bytes: 0..8,
+                points: (Point::new(0, 0), Point::new(0, 8)),
+            }],
+        ),
+        (
+            "nested-unclosed-call",
+            "model { x <- f(g(1, 2) }\n",
+            &[RecoveryIssue {
+                kind: ")".to_owned(),
+                missing: true,
+                bytes: 22..22,
+                points: (Point::new(0, 22), Point::new(0, 22)),
+            }],
+        ),
+        (
+            "nested-unclosed-subset",
+            "model { x <- a[b[c] }\n",
+            &[RecoveryIssue {
+                kind: "]".to_owned(),
+                missing: true,
+                bytes: 19..19,
+                points: (Point::new(0, 19), Point::new(0, 19)),
+            }],
+        ),
+        (
+            "balanced-malformed-delimiters",
+            "model { x <- f(]1) }\n",
+            &[RecoveryIssue {
+                kind: "ERROR".to_owned(),
+                missing: false,
+                bytes: 15..16,
+                points: (Point::new(0, 15), Point::new(0, 16)),
+            }],
+        ),
     ];
     let mut parser = parser();
     for (name, source, expected) in cases {
@@ -790,6 +900,54 @@ fn representative_recovery_trees_and_ranges_are_exact() {
             first.root_node().to_sexp()
         );
         assert_recursive_ranges(first.root_node(), source.len());
+    }
+}
+
+#[test]
+fn program_recovery_fingerprints_are_exact() {
+    let cases = [
+        (
+            "top-level-relation",
+            "x <- 1\n",
+            r#"(program:1:0:0 (ERROR:1:0:1 (identifier:1:0:0) (<:0:0:0) (-:0:0:0) (number:1:0:0)))"#,
+        ),
+        (
+            "missing-model-after-data",
+            "data { x <- 1 }\n",
+            r#"(program:1:0:0 (ERROR:1:0:1 (data_block:1:0:0 (data:0:0:0) body=(block_statement:1:0:0 ({:0:0:0) (deterministic_relation:1:0:0 lhs=(identifier:1:0:0) operator=(<-:0:0:0) rhs=(number:1:0:0)) (}:0:0:0)))))"#,
+        ),
+        (
+            "data-after-model",
+            "model { x <- 1 } data { y <- 2 }\n",
+            r#"(program:1:0:0 (model_block:1:0:0 (model:0:0:0) (ERROR:1:0:1 (block_statement:1:0:0 ({:0:0:0) (deterministic_relation:1:0:0 lhs=(identifier:1:0:0) operator=(<-:0:0:0) rhs=(number:1:0:0)) (}:0:0:0)) (identifier:1:0:0)) body=(block_statement:1:0:0 ({:0:0:0) (deterministic_relation:1:0:0 lhs=(identifier:1:0:0) operator=(<-:0:0:0) rhs=(number:1:0:0)) (}:0:0:0))))"#,
+        ),
+        (
+            "duplicate-model",
+            "model { x <- 1 } model { y <- 2 }\n",
+            r#"(program:1:0:0 (ERROR:1:0:1 (model:0:0:0) (block_statement:1:0:0 ({:0:0:0) (deterministic_relation:1:0:0 lhs=(identifier:1:0:0) operator=(<-:0:0:0) rhs=(number:1:0:0)) (}:0:0:0))) (model_block:1:0:0 (model:0:0:0) body=(block_statement:1:0:0 ({:0:0:0) (deterministic_relation:1:0:0 lhs=(identifier:1:0:0) operator=(<-:0:0:0) rhs=(number:1:0:0)) (}:0:0:0))))"#,
+        ),
+        (
+            "empty-model",
+            "model {}\n",
+            r#"(program:1:0:0 (ERROR:1:0:1 (model:0:0:0) ({:0:0:0) (}:0:0:0)))"#,
+        ),
+        (
+            "nested-unclosed-call",
+            "model { x <- f(g(1, 2) }\n",
+            r#"(program:1:0:0 (model_block:1:0:0 (model:0:0:0) body=(block_statement:1:0:0 ({:0:0:0) (deterministic_relation:1:0:0 lhs=(identifier:1:0:0) operator=(<-:0:0:0) rhs=(call:1:0:0 function=(identifier:1:0:0) arguments=(call_arguments:1:0:0 ((:0:0:0) argument=(call:1:0:0 function=(identifier:1:0:0) arguments=(call_arguments:1:0:0 ((:0:0:0) argument=(number:1:0:0) (,:0:0:0) argument=(number:1:0:0) ():0:0:0))) ():0:1:0)))) (}:0:0:0))))"#,
+        ),
+        (
+            "nested-unclosed-subset",
+            "model { x <- a[b[c] }\n",
+            r#"(program:1:0:0 (model_block:1:0:0 (model:0:0:0) body=(block_statement:1:0:0 ({:0:0:0) (deterministic_relation:1:0:0 lhs=(identifier:1:0:0) operator=(<-:0:0:0) rhs=(subset:1:0:0 function=(identifier:1:0:0) arguments=(subset_arguments:1:0:0 ([:0:0:0) argument=(subset:1:0:0 function=(identifier:1:0:0) arguments=(subset_arguments:1:0:0 ([:0:0:0) argument=(identifier:1:0:0) (]:0:0:0))) (]:0:1:0)))) (}:0:0:0))))"#,
+        ),
+    ];
+
+    let mut parser = parser();
+    for (name, source, expected) in cases {
+        let tree = parse(&mut parser, source, None);
+        assert_eq!(structural_shape(&tree), expected, "{name}");
+        assert_recursive_ranges(tree.root_node(), source.len());
     }
 }
 

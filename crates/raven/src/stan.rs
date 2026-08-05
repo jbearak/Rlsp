@@ -12,6 +12,65 @@ use std::borrow::Cow;
 
 use tree_sitter::{Parser, Tree};
 
+use crate::foreign_syntax::{
+    DelimiterIndex, DelimiterIndexBuilder, DelimiterKind, LexicalSpanKind,
+};
+
+/// Canonical grammar order for Stan's seven top-level program blocks.
+pub(crate) const PROGRAM_BLOCKS: [&str; 7] = [
+    "functions",
+    "data",
+    "transformed_data",
+    "parameters",
+    "transformed_parameters",
+    "model",
+    "generated_quantities",
+];
+
+fn complete_include_line(line: &str) -> bool {
+    let Some(suffix) = line.strip_prefix("#include") else {
+        return false;
+    };
+    if !suffix.starts_with(char::is_whitespace) && !suffix.starts_with(['<', '\'', '"']) {
+        return false;
+    }
+
+    let path = suffix.trim_start();
+    let Some(opener) = path.chars().next() else {
+        return false;
+    };
+    match opener {
+        '<' => path
+            .get(1..)
+            .and_then(|rest| rest.split_once('>'))
+            .is_some_and(|(path, trailing)| !path.is_empty() && trailing.trim().is_empty()),
+        '\'' | '"' => complete_quoted_include_path(path, opener),
+        _ => {
+            let mut parts = path.split_whitespace();
+            parts.next().is_some_and(|path| !path.is_empty()) && parts.next().is_none()
+        }
+    }
+}
+
+fn complete_quoted_include_path(path: &str, quote: char) -> bool {
+    let mut escaped = false;
+    for (offset, character) in path[quote.len_utf8()..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == quote {
+            let end = quote.len_utf8() + offset + character.len_utf8();
+            return offset > 0 && path[end..].trim().is_empty();
+        }
+    }
+    false
+}
+
 /// Parse a Stan document after applying Raven's geometry-preserving extension
 /// mask. The returned analysis text must be retained alongside the tree.
 pub(crate) fn parse(text: &str) -> Option<Tree> {
@@ -20,6 +79,165 @@ pub(crate) fn parse(text: &str) -> Option<Tree> {
         .set_language(&tree_sitter_stan::LANGUAGE_STAN.into())
         .ok()?;
     parser.parse(text, None)
+}
+
+/// Build bounded delimiter evidence from the same masked source that produced
+/// the Stan tree. Strings, comments, and `#include` paths are lexically opaque;
+/// unknown hash syntax and unfinished opaque constructs make intersecting
+/// recovery windows ambiguous rather than supplying invented delimiters.
+pub(crate) fn delimiter_index(
+    text: &str,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Option<DelimiterIndex> {
+    const CANCELLATION_INTERVAL: usize = 4 * 1024;
+
+    let bytes = text.as_bytes();
+    let mut builder = DelimiterIndexBuilder::new(bytes.len());
+    let limit = builder.scan_limit();
+    let mut index = 0usize;
+    let mut next_cancellation_check = 0usize;
+
+    while index < limit {
+        if index >= next_cancellation_check {
+            if is_cancelled() {
+                return None;
+            }
+            next_cancellation_check = index.saturating_add(CANCELLATION_INTERVAL);
+        }
+
+        if bytes[index] == b'"' {
+            let start = index;
+            index += 1;
+            let mut terminated = false;
+            while index < limit {
+                if index >= next_cancellation_check {
+                    if is_cancelled() {
+                        return None;
+                    }
+                    next_cancellation_check = index.saturating_add(CANCELLATION_INTERVAL);
+                }
+                match bytes[index] {
+                    b'\\' if index + 1 < limit => index += 2,
+                    b'"' => {
+                        index += 1;
+                        terminated = true;
+                        break;
+                    }
+                    _ => index += 1,
+                }
+            }
+            if !builder.push_span(
+                start..index,
+                if terminated {
+                    LexicalSpanKind::Code
+                } else {
+                    LexicalSpanKind::AmbiguousCode
+                },
+            ) {
+                break;
+            }
+            continue;
+        }
+
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            let start = index;
+            index += 2;
+            while index < limit && !matches!(bytes[index], b'\r' | b'\n') {
+                if index >= next_cancellation_check {
+                    if is_cancelled() {
+                        return None;
+                    }
+                    next_cancellation_check = index.saturating_add(CANCELLATION_INTERVAL);
+                }
+                index += 1;
+            }
+            if !builder.push_span(start..index, LexicalSpanKind::Trivia) {
+                break;
+            }
+            continue;
+        }
+
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            let start = index;
+            index += 2;
+            let mut terminated = false;
+            while index < limit {
+                if index >= next_cancellation_check {
+                    if is_cancelled() {
+                        return None;
+                    }
+                    next_cancellation_check = index.saturating_add(CANCELLATION_INTERVAL);
+                }
+                if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    index += 2;
+                    terminated = true;
+                    break;
+                }
+                index += 1;
+            }
+            if !builder.push_span(
+                start..index,
+                if terminated {
+                    LexicalSpanKind::Trivia
+                } else {
+                    LexicalSpanKind::AmbiguousCode
+                },
+            ) {
+                break;
+            }
+            continue;
+        }
+
+        if bytes[index] == b'#' {
+            let start = index;
+            while index < limit && !matches!(bytes[index], b'\r' | b'\n') {
+                if index >= next_cancellation_check {
+                    if is_cancelled() {
+                        return None;
+                    }
+                    next_cancellation_check = index.saturating_add(CANCELLATION_INTERVAL);
+                }
+                index += 1;
+            }
+            let directive = text.get(start..index).unwrap_or("");
+            if !builder.push_span(
+                start..index,
+                if complete_include_line(directive) {
+                    LexicalSpanKind::Code
+                } else {
+                    LexicalSpanKind::AmbiguousCode
+                },
+            ) {
+                break;
+            }
+            continue;
+        }
+
+        let delimiter = match bytes[index] {
+            b'(' => Some((DelimiterKind::Paren, true)),
+            b')' => Some((DelimiterKind::Paren, false)),
+            b'[' => Some((DelimiterKind::Bracket, true)),
+            b']' => Some((DelimiterKind::Bracket, false)),
+            b'{' => Some((DelimiterKind::Brace, true)),
+            b'}' => Some((DelimiterKind::Brace, false)),
+            _ => None,
+        };
+        if let Some((kind, is_opener)) = delimiter
+            && !builder.push_event(kind, is_opener, index, index + 1)
+        {
+            break;
+        }
+        index += text[index..]
+            .chars()
+            .next()
+            .expect("index is on a UTF-8 boundary")
+            .len_utf8();
+    }
+
+    if is_cancelled() {
+        return None;
+    }
+    Some(builder.finish(index))
 }
 
 /// Mask recognized Raven directive regions without changing byte length or
@@ -322,5 +540,106 @@ model { target += missing; }
         let masked = mask_raven_directives(block_then_real).expect("real post-block marker");
         assert!(masked.contains("# raven: ignore-file[undefined-variable]"));
         assert!(!masked.ends_with("# raven: ignore[undefined-variable]\n"));
+    }
+
+    #[test]
+    fn delimiter_index_records_stan_delimiters_in_source_order() {
+        let source = "model { x[1] = f(2); }";
+        let index = delimiter_index(source, || false).expect("Stan delimiter scan");
+        assert_eq!(
+            index.events_in(0..source.len()),
+            &[
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Brace,
+                    is_opener: true,
+                    start_byte: 6,
+                    end_byte: 7,
+                },
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Bracket,
+                    is_opener: true,
+                    start_byte: 9,
+                    end_byte: 10,
+                },
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Bracket,
+                    is_opener: false,
+                    start_byte: 11,
+                    end_byte: 12,
+                },
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Paren,
+                    is_opener: true,
+                    start_byte: 16,
+                    end_byte: 17,
+                },
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Paren,
+                    is_opener: false,
+                    start_byte: 18,
+                    end_byte: 19,
+                },
+                crate::foreign_syntax::DelimiterEvent {
+                    kind: DelimiterKind::Brace,
+                    is_opener: false,
+                    start_byte: 21,
+                    end_byte: 22,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn delimiter_index_trusts_only_complete_include_paths() {
+        for source in [
+            "#include helper.stanfunctions",
+            "#include<fake.)]}.stan>",
+            "#include \"fake ) path.stan\"",
+            "#include 'fake ] path.stan'",
+        ] {
+            let index = delimiter_index(source, || false).expect("complete include scan");
+            assert!(index.is_reliable(0..source.len()), "{source:?}");
+            assert!(index.events_in(0..source.len()).is_empty(), "{source:?}");
+        }
+
+        for source in [
+            "#include",
+            "#include ",
+            "#include <fake.)]}",
+            "#include \"fake )",
+            "#include 'fake ]",
+            "#include helper other",
+            "#include <>",
+            "#include \"\"",
+        ] {
+            let index = delimiter_index(source, || false).expect("unfinished include scan");
+            assert!(!index.is_reliable(0..source.len()), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn delimiter_index_cancels_inside_long_opaque_tokens() {
+        let payload = "x".repeat(16 * 1024);
+        let sources = [
+            format!("//{payload}"),
+            format!("#include <{payload}>"),
+            format!("# unknown {payload}"),
+            format!("\"{payload}\""),
+            format!("/*{payload}*/"),
+        ];
+
+        for source in sources {
+            let mut checks = 0usize;
+            let index = delimiter_index(&source, || {
+                checks += 1;
+                checks == 3
+            });
+            assert!(
+                index.is_none(),
+                "scan did not cancel for token: {}",
+                &source[..2]
+            );
+            assert_eq!(checks, 3, "unexpected cancellation cadence");
+        }
     }
 }

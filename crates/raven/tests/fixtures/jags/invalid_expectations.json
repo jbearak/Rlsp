@@ -1,6 +1,6 @@
 {
   "syntax-invalid-empty-model-01": { "lines": [0], "min_count": 1, "max_count": 1 },
-  "syntax-invalid-empty-model-02": { "lines": [1], "min_count": 1, "max_count": 1 },
+  "syntax-invalid-empty-model-02": { "lines": [0], "min_count": 1, "max_count": 1 },
   "syntax-invalid-missing-model-01": { "lines": [0], "min_count": 1, "max_count": 1 },
   "syntax-invalid-missing-model-02": { "lines": [0], "min_count": 1, "max_count": 1 },
   "syntax-invalid-block-order-01": { "lines": [0], "min_count": 1, "max_count": 1 },

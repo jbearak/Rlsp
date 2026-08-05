@@ -34,3 +34,74 @@ transformeddata {
 (program
   (ERROR
     (identifier)))
+
+================================================================================
+Top-level declaration requires a program block
+================================================================================
+
+real x;
+
+--------------------------------------------------------------------------------
+
+(program (ERROR (identifier) (identifier)))
+
+================================================================================
+Top-level statement requires a program block
+================================================================================
+
+x = 1;
+
+--------------------------------------------------------------------------------
+
+(program (ERROR (identifier) (integer_literal)))
+
+================================================================================
+Top-level function definition requires the functions block
+================================================================================
+
+real f(real x) { return x; }
+
+--------------------------------------------------------------------------------
+
+(program (ERROR (identifier) (identifier) (identifier) (identifier)))
+
+================================================================================
+Missing outer call closer after a nested call
+================================================================================
+
+model { target += f(g(1, 2); }
+
+--------------------------------------------------------------------------------
+
+(program (model (target_statement (function_expression name: (identifier) (argument_list (function_expression name: (identifier) (argument_list (integer_literal) (integer_literal))) (MISSING ")"))))))
+
+================================================================================
+Missing outer index closer after a nested index
+================================================================================
+
+model { target += a[b[c]; }
+
+--------------------------------------------------------------------------------
+
+(program (model (target_statement (indexed_expression (variable_expression (identifier)) (index (indexed_expression (variable_expression (identifier)) (index (variable_expression (identifier))))) (MISSING "]")))))
+
+================================================================================
+Missing block closer before a later block keyword
+================================================================================
+
+data { int N;
+model {}
+
+--------------------------------------------------------------------------------
+
+(program (data (top_var_decl_no_assign (top_var_type (int_type)) name: (identifier)) (ERROR (identifier))))
+
+================================================================================
+Balanced delimiters with malformed expression recovery
+================================================================================
+
+model { target += f(]1); }
+
+--------------------------------------------------------------------------------
+
+(program (model (target_statement (function_expression name: (identifier) (argument_list (ERROR))))))

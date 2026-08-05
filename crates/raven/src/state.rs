@@ -14957,45 +14957,92 @@ tarchetypes::tar_render(nested, "nested.Rmd")
 
     #[test]
     fn jags_batch_reparse_matches_fresh_tree_and_diagnostics_reuse_it() {
-        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
-        JAGS_INCREMENTAL_PARSE_COUNT.with(|count| count.set(0));
-        let mut document =
-            Document::new_with_file_type("model { x <- 1 }\n", Some(1), FileType::Jags);
-        DOCUMENT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
-        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
+        let original = "model { x <- 1 }\n";
         let changed = "model { x <- * 1 }\n";
-        document.apply_changes([TextDocumentContentChangeEvent {
-            range: None,
-            range_length: None,
-            text: changed.to_string(),
-        }]);
-        DOCUMENT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
-        JAGS_INCREMENTAL_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
-        let fresh = Document::new_with_file_type(changed, Some(2), FileType::Jags);
-        assert_eq!(
-            document.tree.as_ref().unwrap().root_node().to_sexp(),
-            fresh.tree.as_ref().unwrap().root_node().to_sexp()
-        );
-
         let uri = Url::parse("untitled:jags-parse-count").unwrap();
         let mut state = WorldState::new();
-        state.open_document_with_language_id(uri.clone(), changed, Some(2), Some("jags"));
+        state.open_document_with_language_id(uri.clone(), original, Some(1), Some("jags"));
+
+        DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
+        JAGS_INCREMENTAL_PARSE_COUNT.with(|count| count.set(0));
+        let prepared = state
+            .prepare_document_changes(
+                &uri,
+                [TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 13), Position::new(0, 13))),
+                    range_length: None,
+                    text: "* ".to_string(),
+                }],
+                2,
+            )
+            .unwrap();
+        assert_eq!(prepared.document().text(), changed);
+        DOCUMENT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+        JAGS_INCREMENTAL_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+        state
+            .commit_document_changes(
+                &uri,
+                prepared,
+                Arc::new(crate::cross_file::CrossFileMetadata::default()),
+            )
+            .unwrap();
+
+        let fresh_document = Document::new_with_file_type(changed, Some(2), FileType::Jags);
+        let incremental_document = state.documents.get(&uri).unwrap();
+        assert_eq!(incremental_document.text(), changed);
+        assert_eq!(
+            incremental_document
+                .tree
+                .as_ref()
+                .unwrap()
+                .root_node()
+                .to_sexp(),
+            fresh_document.tree.as_ref().unwrap().root_node().to_sexp()
+        );
+        assert_eq!(
+            incremental_document
+                .tree
+                .as_ref()
+                .unwrap()
+                .root_node()
+                .range(),
+            fresh_document.tree.as_ref().unwrap().root_node().range()
+        );
+
         DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
         let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &uri).unwrap();
-        let findings = crate::handlers::diagnostics_from_snapshot(
+        let incremental_findings = crate::handlers::diagnostics_from_snapshot(
             &snapshot,
             &uri,
             &crate::handlers::DiagCancelToken::never(),
         )
         .unwrap();
-        assert!(!findings.is_empty());
+        assert!(!incremental_findings.is_empty());
         DOCUMENT_PARSE_COUNT.with(|count| {
             assert_eq!(
                 count.get(),
                 0,
-                "diagnostics must reuse the stored JAGS tree"
+                "diagnostics must reuse the incrementally edited JAGS tree"
             )
         });
+
+        let fresh_uri = Url::parse("untitled:fresh-jags-parse-count").unwrap();
+        let mut fresh_state = WorldState::new();
+        fresh_state.open_document_with_language_id(
+            fresh_uri.clone(),
+            changed,
+            Some(2),
+            Some("jags"),
+        );
+        let fresh_snapshot =
+            crate::handlers::DiagnosticsSnapshot::build(&fresh_state, &fresh_uri).unwrap();
+        let fresh_findings = crate::handlers::diagnostics_from_snapshot(
+            &fresh_snapshot,
+            &fresh_uri,
+            &crate::handlers::DiagCancelToken::never(),
+        )
+        .unwrap();
+        assert_eq!(incremental_findings, fresh_findings);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Posit
 use tree_sitter::Node;
 
 use crate::handlers::DiagCancelToken;
+use crate::stan::PROGRAM_BLOCKS;
 use crate::utf16::byte_offset_to_utf16_column;
 
 /// Fixed per-file bound for Stan semantic findings.
@@ -29,16 +30,6 @@ use crate::utf16::byte_offset_to_utf16_column;
 /// cancellation stays responsive. The ordered retention set contains at most
 /// this many entries at every point.
 pub(crate) const MAX_STAN_SEMANTIC_DIAGNOSTICS: usize = 500;
-
-const PROGRAM_BLOCKS: [&str; 7] = [
-    "functions",
-    "data",
-    "transformed_data",
-    "parameters",
-    "transformed_parameters",
-    "model",
-    "generated_quantities",
-];
 
 const ORDERED_VARIABLE_BLOCKS: [(&str, bool); 6] = [
     ("data", true),
