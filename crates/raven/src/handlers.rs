@@ -11978,7 +11978,18 @@ fn foreign_direct_error_mismatch(
     }
     if provisional_deeper_mismatch {
         Some(UniqueForeignEvidence::None)
-    } else if has_opaque_delimiters && !matches!(mismatch, UniqueForeignEvidence::None) {
+    } else if (has_opaque_delimiters && !matches!(mismatch, UniqueForeignEvidence::None))
+        || matches!(
+            mismatch,
+            UniqueForeignEvidence::One(candidate)
+                if foreign_following_recovery_contains_real_closer(
+                    error,
+                    candidate.opener_kind,
+                    text,
+                    is_cancelled,
+                )?
+        )
+    {
         Some(UniqueForeignEvidence::Ambiguous)
     } else {
         Some(mismatch)
@@ -12194,6 +12205,118 @@ fn foreign_following_recovery_contains_closer(
     Some(true)
 }
 
+fn foreign_following_recovery_contains_real_closer(
+    root: Node,
+    kind: ForeignDelimiterKind,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_ANCESTORS: usize = 8;
+    const MAX_RECOVERY_SIBLINGS: usize = 16;
+
+    let mut current = root;
+    for _ in 0..MAX_RECOVERY_ANCESTORS {
+        let mut sibling = current.next_sibling();
+        for _ in 0..MAX_RECOVERY_SIBLINGS {
+            let Some(node) = sibling else {
+                break;
+            };
+            if is_cancelled() {
+                return None;
+            }
+            if foreign_delimiter_token(node, text)
+                .is_some_and(|token| !token.is_opener && token.kind == kind)
+                || (node.has_error()
+                    && foreign_recovery_subtree_contains_closer(node, kind, text, is_cancelled)?)
+            {
+                return Some(true);
+            }
+            sibling = node.next_sibling();
+        }
+        if sibling.is_some() {
+            return Some(true);
+        }
+        let Some(parent) = current.parent() else {
+            return Some(false);
+        };
+        current = parent;
+    }
+    Some(true)
+}
+
+fn foreign_recovery_subtree_contains_missing_closer(
+    root: Node,
+    kind: ForeignDelimiterKind,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_DESCENDANTS: usize = 64;
+
+    let mut visited = 0usize;
+    let mut cursor = root.walk();
+    loop {
+        if is_cancelled() {
+            return None;
+        }
+        visited += 1;
+        if visited > MAX_RECOVERY_DESCENDANTS {
+            return Some(true);
+        }
+        let node = cursor.node();
+        if node.is_missing() && ForeignDelimiterKind::from_closer(node.kind()) == Some(kind) {
+            return Some(true);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return Some(false);
+            }
+        }
+    }
+}
+
+fn foreign_following_recovery_contains_missing_closer(
+    root: Node,
+    kind: ForeignDelimiterKind,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_ANCESTORS: usize = 8;
+    const MAX_RECOVERY_CHILDREN: usize = 64;
+
+    let mut current = root;
+    for _ in 0..MAX_RECOVERY_ANCESTORS {
+        let Some(parent) = current.parent() else {
+            return Some(false);
+        };
+        let mut found_current = false;
+        let mut cursor = parent.walk();
+        for (index, node) in parent.children(&mut cursor).enumerate() {
+            if is_cancelled() {
+                return None;
+            }
+            if index >= MAX_RECOVERY_CHILDREN {
+                return Some(true);
+            }
+            if !found_current {
+                found_current = node == current;
+                continue;
+            }
+            if (node.is_missing() && ForeignDelimiterKind::from_closer(node.kind()) == Some(kind))
+                || (node.has_error()
+                    && foreign_recovery_subtree_contains_missing_closer(node, kind, is_cancelled)?)
+            {
+                return Some(true);
+            }
+        }
+        if !found_current {
+            return Some(true);
+        }
+        current = parent;
+    }
+    Some(true)
+}
+
 fn foreign_recovery_between_contains_closer(
     opener: Node,
     missing: Node,
@@ -12259,6 +12382,60 @@ fn foreign_error_has_preceding_same_kind_opener(
         current = parent;
     }
     Some(true)
+}
+
+fn foreign_error_has_preceding_opener_with_following_missing_closer(
+    error: Node,
+    closer: ForeignCloser,
+    text: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    const MAX_RECOVERY_ANCESTORS: usize = 8;
+    const MAX_RECOVERY_SIBLINGS: usize = 64;
+
+    let mut preceding_openers = [false; 3];
+    let mut current = error;
+    for ancestor in 0..MAX_RECOVERY_ANCESTORS {
+        let mut sibling = current.prev_sibling();
+        for _ in 0..MAX_RECOVERY_SIBLINGS {
+            let Some(node) = sibling else {
+                break;
+            };
+            if is_cancelled() {
+                return None;
+            }
+            if let Some(token) = foreign_delimiter_token(node, text)
+                && token.is_opener
+            {
+                preceding_openers[token.kind.index()] = true;
+            }
+            sibling = node.prev_sibling();
+        }
+        if sibling.is_some() {
+            return Some(true);
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+        if ancestor + 1 == MAX_RECOVERY_ANCESTORS {
+            return Some(true);
+        }
+    }
+
+    for kind in [
+        ForeignDelimiterKind::Paren,
+        ForeignDelimiterKind::Bracket,
+        ForeignDelimiterKind::Brace,
+    ] {
+        if kind != closer.kind
+            && preceding_openers[kind.index()]
+            && foreign_following_recovery_contains_missing_closer(error, kind, is_cancelled)?
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 fn foreign_preceding_recovery_is_clean(
@@ -12552,6 +12729,12 @@ fn classify_foreign_error_delimiter(
                         };
                         if !foreign_preceding_recovery_is_clean(error, is_cancelled)?
                             || foreign_error_has_preceding_same_kind_opener(
+                                error,
+                                closer,
+                                text,
+                                is_cancelled,
+                            )?
+                            || foreign_error_has_preceding_opener_with_following_missing_closer(
                                 error,
                                 closer,
                                 text,
