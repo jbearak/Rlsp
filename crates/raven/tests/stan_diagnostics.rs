@@ -431,6 +431,7 @@ fn stan_recovered_balanced_delimiters_stay_generic() {
         "model { target += {f(1}); }\n",
         "model { target += {f(]2,6), 3}; }\n",
         "model { target += a[a[3)]; }\n",
+        "model { target += f(+)x,]x; }\n",
         "model { target += normal_lpdf(y[n] ;; mu, 1); }\n",
         "model { target += f(theta;;, sigma); }\n",
         "data { int N; } ;; model {}\n",

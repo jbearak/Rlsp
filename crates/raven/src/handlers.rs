@@ -11583,6 +11583,12 @@ fn foreign_wrong_closer_before_missing(
                 start_point: token.start_point,
                 end_point: token.end_point,
             });
+        } else if node.child_count() != 0 {
+            match foreign_recovery_subtree_contains_closer(node, expected, text, is_cancelled) {
+                Some(true) => return Err(ForeignEvidenceFailure::Ambiguous),
+                Some(false) => {}
+                None => return Err(ForeignEvidenceFailure::Cancelled),
+            }
         }
         sibling = node.prev_sibling();
     }
