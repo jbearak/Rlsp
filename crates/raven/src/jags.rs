@@ -11,6 +11,10 @@
 use tower_lsp::lsp_types::{Position, Range};
 use tree_sitter::{Parser, Tree};
 
+use crate::foreign_syntax::{
+    DelimiterIndex, DelimiterIndexBuilder, DelimiterKind, LexicalSpanKind,
+};
+
 /// Parse JAGS source while reusing an edited tree from the prior raw text.
 pub(crate) fn parse_with_old_tree(text: &str, old_tree: Option<&Tree>) -> Option<Tree> {
     let mut parser = Parser::new();
@@ -18,6 +22,180 @@ pub(crate) fn parse_with_old_tree(text: &str, old_tree: Option<&Tree>) -> Option
         .set_language(&tree_sitter_jags::LANGUAGE.into())
         .ok()?;
     parser.parse(text, old_tree)
+}
+
+fn special_operator_end_with_cancel_check(
+    bytes: &[u8],
+    start: usize,
+    limit: usize,
+    mut is_cancelled_at: impl FnMut(usize) -> bool,
+) -> Result<Option<usize>, ()> {
+    if bytes.get(start) != Some(&b'%') || start + 1 >= limit {
+        return Ok(None);
+    }
+    if bytes[start + 1] == b'%' {
+        return Ok(Some(start + 2));
+    }
+
+    let mut index = start + 1;
+    while index < limit && !bytes[index].is_ascii_whitespace() {
+        if is_cancelled_at(index) {
+            return Err(());
+        }
+        if bytes[index] == b'%' {
+            return Ok((index > start + 1).then_some(index + 1));
+        }
+        index += 1;
+    }
+    Ok(None)
+}
+
+fn special_operator_end(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
+    special_operator_end_with_cancel_check(bytes, start, limit, |_| false)
+        .expect("non-cancelling special-operator scan")
+}
+
+/// Build bounded delimiter evidence using JAGS comment and `%...%` operator
+/// rules. Quote-bearing spans remain deliberately opaque because JAGS does not
+/// define string literals for Raven to interpret during parser recovery.
+pub(crate) fn delimiter_index(
+    text: &str,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Option<DelimiterIndex> {
+    const CANCELLATION_INTERVAL: usize = 4 * 1024;
+
+    let bytes = text.as_bytes();
+    let mut builder = DelimiterIndexBuilder::new(bytes.len());
+    let limit = builder.scan_limit();
+    let mut index = 0usize;
+    let mut next_cancellation_check = 0usize;
+
+    while index < limit {
+        if index >= next_cancellation_check {
+            if is_cancelled() {
+                return None;
+            }
+            next_cancellation_check = index.saturating_add(CANCELLATION_INTERVAL);
+        }
+
+        let special_operator_end =
+            special_operator_end_with_cancel_check(bytes, index, limit, |position| {
+                if position < next_cancellation_check {
+                    return false;
+                }
+                next_cancellation_check = position.saturating_add(CANCELLATION_INTERVAL);
+                is_cancelled()
+            })
+            .ok()?;
+        if let Some(end) = special_operator_end {
+            if !builder.push_span(index..end, LexicalSpanKind::Code) {
+                break;
+            }
+            index = end;
+            continue;
+        }
+
+        if bytes[index] == b'#' {
+            let start = index;
+            index += 1;
+            while index < limit && !matches!(bytes[index], b'\r' | b'\n') {
+                if index >= next_cancellation_check {
+                    if is_cancelled() {
+                        return None;
+                    }
+                    next_cancellation_check = index.saturating_add(CANCELLATION_INTERVAL);
+                }
+                index += 1;
+            }
+            if !builder.push_span(start..index, LexicalSpanKind::Trivia) {
+                break;
+            }
+            continue;
+        }
+
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            let start = index;
+            index += 2;
+            let mut terminated = false;
+            while index < limit {
+                if index >= next_cancellation_check {
+                    if is_cancelled() {
+                        return None;
+                    }
+                    next_cancellation_check = index.saturating_add(CANCELLATION_INTERVAL);
+                }
+                if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    index += 2;
+                    terminated = true;
+                    break;
+                }
+                index += 1;
+            }
+            if !builder.push_span(
+                start..index,
+                if terminated {
+                    LexicalSpanKind::Trivia
+                } else {
+                    LexicalSpanKind::AmbiguousCode
+                },
+            ) {
+                break;
+            }
+            continue;
+        }
+
+        if matches!(bytes[index], b'"' | b'\'') {
+            let start = index;
+            let terminator = bytes[index];
+            index += 1;
+            while index < limit {
+                if index >= next_cancellation_check {
+                    if is_cancelled() {
+                        return None;
+                    }
+                    next_cancellation_check = index.saturating_add(CANCELLATION_INTERVAL);
+                }
+                if bytes[index] == b'\\' && index + 1 < limit {
+                    index += 2;
+                } else {
+                    let byte = bytes[index];
+                    index += 1;
+                    if byte == terminator {
+                        break;
+                    }
+                }
+            }
+            if !builder.push_span(start..index, LexicalSpanKind::AmbiguousCode) {
+                break;
+            }
+            continue;
+        }
+
+        let delimiter = match bytes[index] {
+            b'(' => Some((DelimiterKind::Paren, true)),
+            b')' => Some((DelimiterKind::Paren, false)),
+            b'[' => Some((DelimiterKind::Bracket, true)),
+            b']' => Some((DelimiterKind::Bracket, false)),
+            b'{' => Some((DelimiterKind::Brace, true)),
+            b'}' => Some((DelimiterKind::Brace, false)),
+            _ => None,
+        };
+        if let Some((kind, is_opener)) = delimiter
+            && !builder.push_event(kind, is_opener, index, index + 1)
+        {
+            break;
+        }
+        index += text[index..]
+            .chars()
+            .next()
+            .expect("index is on a UTF-8 boundary")
+            .len_utf8();
+    }
+
+    if is_cancelled() {
+        return None;
+    }
+    Some(builder.finish(index))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,6 +337,12 @@ fn tokenize_until(text: &str, limit: usize) -> (Vec<Token>, LexState) {
     while index < limit {
         match state {
             LexState::Code => {
+                if let Some(end) = special_operator_end(bytes, index, limit) {
+                    while index < end {
+                        advance_char(text, &mut index, &mut line, &mut column);
+                    }
+                    continue;
+                }
                 if bytes[index] == b'#' {
                     state = LexState::LineComment;
                     advance_ascii(bytes[index], &mut index, &mut line, &mut column);
@@ -587,7 +771,10 @@ fn recovery_relation_end_byte(text: &str, start: usize) -> usize {
             LexState::Code => {
                 let byte = bytes[index];
                 let top_level = parentheses == 0 && brackets == 0;
-                if byte == b'#' {
+                if let Some(end) = special_operator_end(bytes, index, bytes.len()) {
+                    last_code_end = end;
+                    index = end;
+                } else if byte == b'#' {
                     state = LexState::LineComment;
                     index += 1;
                 } else if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
@@ -898,5 +1085,31 @@ mod tests {
         let last_line = 4_000;
         let site = call_site_at_position(&code, Position::new(last_line, 10)).unwrap();
         assert_eq!(site.name, "dnorm");
+    }
+
+    #[test]
+    fn delimiter_index_cancels_inside_long_opaque_tokens() {
+        let payload = "x".repeat(16 * 1024);
+        let sources = [
+            format!("#{payload}"),
+            format!("%{payload}%"),
+            format!("\"{payload}\""),
+            format!("'{payload}'"),
+            format!("/*{payload}*/"),
+        ];
+
+        for source in sources {
+            let mut checks = 0usize;
+            let index = delimiter_index(&source, || {
+                checks += 1;
+                checks == 3
+            });
+            assert!(
+                index.is_none(),
+                "scan did not cancel for token: {}",
+                &source[..1]
+            );
+            assert_eq!(checks, 3, "unexpected cancellation cadence");
+        }
     }
 }

@@ -1264,6 +1264,55 @@ metadata, scope artifacts, and package sets, and R-only async filesystem
 diagnostics never run for them. Keep those boundaries explicit when adding a
 new document lifecycle or disk fallback path.
 
+The native Stan/JAGS syntax collector builds exactly one language-specific
+`foreign_syntax::DelimiterIndex` from the same geometry-preserving source used
+for diagnostics. The scan is bounded to 4 MiB, 65,536 delimiter events, and
+65,536 lexical spans, with cancellation checks at least every 4 KiB and after
+scanning. Ambiguous spans have a separate source-ordered index so recovery-window
+reliability checks remain logarithmic rather than rescanning all ordinary spans.
+Stan strings, comments, and complete recognized `#include` lines are opaque;
+unknown hash syntax and unfinished includes or other opaque constructs make
+intersecting recovery ambiguous. JAGS `%...%` operators are atomic (including
+`%#%`), comments are
+trivia, and quote-bearing spans are deliberately ambiguous rather than treated
+as invented JAGS strings. Reaching any bound makes later windows unreliable;
+it must never produce a partial specific explanation.
+
+Each outer `ERROR` owns its nested `ERROR` and `MISSING` recovery, so one grammar
+recovery unit emits at most one finding. Delimiter classification uses the
+highest bounded ancestor whose parent is `program`: smaller windows can miss a
+closer borrowed by recovery, while a whole-document window lets independent
+blocks interfere. For a parser `MISSING` closer, the collector requires the
+parser-confirmed opener to be the lexical stack top, virtually inserts the
+closer, and scans the remainder of that recovery unit. A structural mismatch is
+specific only when a lexical scan finds exactly the same opener kind and closer
+byte range as its sole mismatch and becomes fully balanced when that wrong
+closer virtually replaces the expected one. A second mismatch, stray closer,
+remaining opener, opaque span, or structural/lexical disagreement keeps the
+owner generic. Pure lexical unclosed/stray fallback additionally requires the
+same exact imbalance document-wide so a parser-borrowed closer cannot turn a
+balanced document into a false explanation.
+
+Delimiter classification runs before program-structure classification. The
+latter accepts only direct, uniquely complete program recovery and validates
+fragments with bounded in-process Tree-sitter reparsing: at most 256 KiB per
+candidate and 4 MiB cumulatively per collection. Preliminary child and sibling
+walks stream without proportional allocations, check cancellation, and fail
+closed after 65,536 visited nodes. Stan tries the shared canonical
+`stan::PROGRAM_BLOCKS` wrappers but never guesses a destination block. JAGS
+checks complete model content, missing/duplicate/out-of-order sections, and
+empty models with the in-tree clean-room parser and a legal synthetic sentinel;
+it never invokes JAGS, R, a network service, or another runtime oracle.
+
+Finite retention may skip expensive classification only after the earliest
+possible recovery anchor (the top-level recovery window start) is later than the
+last retained finding. Traversal and cancellation checks continue after
+retention saturates, preserving the rule that every finite result is the sorted,
+exactly deduplicated prefix of unlimited output. After a Tree-sitter runtime or
+Stan/JAGS grammar update, re-audit the exact recovery fingerprints in
+`crates/tree-sitter-stan/test/corpus/error.txt` and
+`crates/tree-sitter-jags/tests/quality_gates.rs` before changing policy.
+
 Before Stan diagnostic parsing, `stan::mask_raven_directives` replaces
 canonically recognized full-line Raven directives, plus the comment suffix of
 a recognized trailing same-line ignore, with spaces while preserving every
@@ -1403,7 +1452,12 @@ native parser for Raven JAGS documents. `Document` retains one JAGS tree per
 text revision. Each edit in an LSP change batch is applied to the retained tree
 with Tree-sitter's byte-and-point `InputEdit`; Raven then incrementally parses
 the batch's final text once against that edited tree. Diagnostics reuse the
-stored result without reparsing. This optimization is JAGS-only: R Markdown
+stored result without reparsing. Representative valid-to-invalid edits must
+preserve the same diagnostic invariants as a fresh parse. Do not require
+arbitrary invalid-to-invalid edits to produce an identical recovery topology:
+Tree-sitter may legally retain a different error shape, so tests should assert
+bounded, in-range, conservative findings rather than canonizing that shape.
+This optimization is JAGS-only: R Markdown
 masking and Stan directive masking make their raw-text edit coordinates
 incompatible with the previously masked tree. JAGS documents contribute empty
 R metadata, scope artifacts, and package sets, and every R-only async

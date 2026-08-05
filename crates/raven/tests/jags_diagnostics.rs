@@ -341,6 +341,18 @@ fn jags_delimiter_recovery_messages_and_ranges_are_explanatory() {
             Range::new(Position::new(0, 14), Position::new(0, 18)),
         ),
         (
+            "missing-outer-paren-after-balanced-inner-call",
+            "model { x <- f(g(1, 2) }\n",
+            "Unclosed `(`: missing matching `)`",
+            Range::new(Position::new(0, 14), Position::new(0, 24)),
+        ),
+        (
+            "missing-outer-bracket-after-balanced-inner-index",
+            "model { x <- a[b[c] }\n",
+            "Unclosed `[`: missing matching `]`",
+            Range::new(Position::new(0, 14), Position::new(0, 21)),
+        ),
+        (
             "missing-brace",
             "model { x <- 1\n",
             "Unclosed `{`: missing matching `}`",
@@ -419,6 +431,174 @@ fn jags_delimiter_recovery_messages_and_ranges_are_explanatory() {
         assert_eq!(
             findings[0].code,
             Some(NumberOrString::String("syntax-error".to_string()))
+        );
+    }
+}
+
+#[test]
+fn jags_opaque_delimiters_do_not_change_unique_missing_closer() {
+    let cases = [
+        ("line-comment", "model { x <- f(1 # fake ) ] }\n}\n"),
+        ("block-comment", "model { x <- f(1 /* fake ) ] } */ + 2 }\n"),
+        ("special-operator", "model { x <- f(1 %)]}% 2 }\n"),
+    ];
+    let uri = Url::parse("untitled:jags-opaque-delimiters").unwrap();
+    let mut state = WorldState::new();
+    for (name, source) in cases {
+        let findings = analyze(&mut state, &uri, source, "jags");
+        assert_eq!(findings.len(), 1, "{name}: {findings:#?}");
+        assert_eq!(
+            findings[0].message, "Unclosed `(`: missing matching `)`",
+            "{name}: {findings:#?}"
+        );
+    }
+}
+
+#[test]
+fn jags_program_structure_messages_and_ranges_are_explanatory() {
+    let cases = [
+        (
+            "top-level-relation",
+            "x <- 1\n",
+            "JAGS relations and loops must appear inside a `data` or `model` block.",
+            Range::new(Position::new(0, 0), Position::new(0, 6)),
+        ),
+        (
+            "top-level-loop",
+            "for (i in 1:3) { x[i] <- i }\n",
+            "JAGS relations and loops must appear inside a `data` or `model` block.",
+            Range::new(Position::new(0, 0), Position::new(0, 28)),
+        ),
+        (
+            "missing-model-after-var",
+            "var x;\n",
+            "Missing required `model` block in JAGS program",
+            Range::new(Position::new(0, 0), Position::new(0, 6)),
+        ),
+        (
+            "missing-model-after-data",
+            "data { x <- 1 }\n",
+            "Missing required `model` block in JAGS program",
+            Range::new(Position::new(0, 0), Position::new(0, 15)),
+        ),
+        (
+            "missing-model-after-var-and-data",
+            "var x; data { x <- 1 }\n",
+            "Missing required `model` block in JAGS program",
+            Range::new(Position::new(0, 7), Position::new(0, 22)),
+        ),
+        (
+            "duplicate-var",
+            "var x; var y; model { z <- 3 }\n",
+            "JAGS program may contain only one `var` declaration.",
+            Range::new(Position::new(0, 7), Position::new(0, 10)),
+        ),
+        (
+            "var-after-data",
+            "data { y <- 2 } var x; model { x <- y }\n",
+            "JAGS `var` declaration must appear before `data` and `model` blocks.",
+            Range::new(Position::new(0, 16), Position::new(0, 19)),
+        ),
+        (
+            "var-after-model",
+            "model { x <- 1 } var y;\n",
+            "JAGS `var` declaration must appear before `data` and `model` blocks.",
+            Range::new(Position::new(0, 17), Position::new(0, 20)),
+        ),
+        (
+            "duplicate-data",
+            "data { x <- 1 } data { y <- 2 } model { z <- 3 }\n",
+            "JAGS program may contain only one `data` block.",
+            Range::new(Position::new(0, 16), Position::new(0, 20)),
+        ),
+        (
+            "data-after-model",
+            "model { x <- 1 } data { y <- 2 }\n",
+            "JAGS `data` block must appear before the `model` block.",
+            Range::new(Position::new(0, 17), Position::new(0, 21)),
+        ),
+        (
+            "duplicate-model",
+            "model { x <- 1 } model { y <- 2 }\n",
+            "JAGS program may contain only one `model` block.",
+            Range::new(Position::new(0, 17), Position::new(0, 22)),
+        ),
+        (
+            "empty-model",
+            "model {}\n",
+            "JAGS `model` block must contain at least one relation or loop.",
+            Range::new(Position::new(0, 0), Position::new(0, 5)),
+        ),
+        (
+            "comment-only-model",
+            "model { # no relation\n}\n",
+            "JAGS `model` block must contain at least one relation or loop.",
+            Range::new(Position::new(0, 0), Position::new(0, 5)),
+        ),
+    ];
+
+    let uri = Url::parse("untitled:jags-program-structure").unwrap();
+    let mut state = WorldState::new();
+    for (name, source, message, range) in cases {
+        let findings = analyze(&mut state, &uri, source, "jags");
+        assert_eq!(findings.len(), 1, "{name}: {findings:#?}");
+        assert_eq!(findings[0].message, message, "{name}");
+        assert_eq!(findings[0].range, range, "{name}");
+        assert_eq!(findings[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            findings[0].code,
+            Some(NumberOrString::String("syntax-error".to_string()))
+        );
+    }
+}
+
+#[test]
+fn jags_program_structure_range_handles_astral_prefix_and_crlf() {
+    let source = "# 😀\r\nmodel {x<-1} model {y<-2}\r\n";
+    let uri = Url::parse("untitled:jags-structure-utf16-crlf").unwrap();
+    let findings = analyze(&mut WorldState::new(), &uri, source, "jags");
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(
+        findings[0].message,
+        "JAGS program may contain only one `model` block."
+    );
+    assert_eq!(
+        findings[0].range,
+        Range::new(Position::new(1, 13), Position::new(1, 18))
+    );
+}
+
+#[test]
+fn jags_ambiguous_program_structure_stays_generic() {
+    let cases = [
+        ("incomplete-relation", "x <-\n"),
+        ("quote-bearing-source", "x <- 'quoted'\n"),
+        (
+            "single-quoted-delimiter-recovery",
+            "model { x <- f('fake )', 1 }\n",
+        ),
+        (
+            "double-quoted-delimiter-recovery",
+            "model { x <- f(\"fake )\", 1 }\n",
+        ),
+        ("unterminated-single-quote", "model { x <- f('fake ), 1 }\n"),
+        (
+            "unterminated-double-quote",
+            "model { x <- f(\"fake ), 1 }\n",
+        ),
+        ("incomplete-data", "data { x <- }\n"),
+        ("incomplete-var", "var ; model { x <- 1 }\n"),
+    ];
+    let uri = Url::parse("untitled:jags-ambiguous-program-structure").unwrap();
+    let mut state = WorldState::new();
+    for (name, source) in cases {
+        let findings = analyze(&mut state, &uri, source, "jags");
+        assert!(!findings.is_empty(), "{name}: {findings:#?}");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.message == "JAGS code could not be parsed here"),
+            "ambiguous structure must stay generic: {name}: {findings:#?}"
         );
     }
 }

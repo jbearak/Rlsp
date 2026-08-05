@@ -305,6 +305,24 @@ fn stan_delimiter_recovery_messages_and_ranges_are_explanatory() {
             Range::new(Position::new(0, 18), Position::new(0, 25)),
         ),
         (
+            "missing-outer-paren-after-balanced-inner-call",
+            "model { target += f(g(1, 2); }\n",
+            "Unclosed `(`: missing matching `)`",
+            Range::new(Position::new(0, 19), Position::new(0, 30)),
+        ),
+        (
+            "missing-outer-bracket-after-balanced-inner-index",
+            "model { target += a[b[c]; }\n",
+            "Unclosed `[`: missing matching `]`",
+            Range::new(Position::new(0, 19), Position::new(0, 27)),
+        ),
+        (
+            "missing-block-brace-before-later-block",
+            "data { int N;\nmodel {}\n",
+            "Unclosed `{`: missing matching `}`",
+            Range::new(Position::new(0, 5), Position::new(0, 13)),
+        ),
+        (
             "missing-brace",
             "model { target += 1;\n",
             "Unclosed `{`: missing matching `}`",
@@ -385,6 +403,139 @@ fn stan_delimiter_recovery_messages_and_ranges_are_explanatory() {
         assert_eq!(
             findings[0].code,
             Some(NumberOrString::String("syntax-error".to_string()))
+        );
+    }
+}
+
+#[test]
+fn stan_opaque_delimiters_do_not_change_unique_missing_closer() {
+    let cases = [
+        (
+            "terminated-string",
+            "model { print(\"fake ) ] }\"); target += f(1; }\n",
+        ),
+        ("line-comment", "model { target += f(1; // fake ) ] }\n}\n"),
+        (
+            "block-comment",
+            "model { target += f(1 /* fake ) ] } */ + 2; }\n",
+        ),
+        (
+            "include-path",
+            "model {\n#include <fake.)]}.stan>\n  target += f(1;\n}\n",
+        ),
+    ];
+
+    for (name, code) in cases {
+        let fixture = Fixture {
+            name: name.to_string(),
+            code: code.to_string(),
+        };
+        let (_, _, findings) = analyze(&fixture);
+        assert_eq!(findings.len(), 1, "{name}: {findings:#?}");
+        assert_eq!(
+            findings[0].message, "Unclosed `(`: missing matching `)`",
+            "{name}: {findings:#?}"
+        );
+    }
+}
+
+#[test]
+fn stan_top_level_program_content_gets_block_placement_guidance() {
+    let message = "Stan declarations and statements must appear inside a program block such as `functions`, `data`, `parameters`, or `model`.";
+    let cases = [
+        ("declaration", "real x;\n", Position::new(0, 7)),
+        (
+            "constrained-declaration",
+            "int<lower=0> N;\n",
+            Position::new(0, 15),
+        ),
+        ("assignment", "x = 1;\n", Position::new(0, 6)),
+        (
+            "target-statement",
+            "target += normal_lpdf(y | 0, 1);\n",
+            Position::new(0, 32),
+        ),
+        (
+            "function-definition",
+            "real f(real x) { return x; }\n",
+            Position::new(0, 28),
+        ),
+    ];
+
+    for (name, code, end) in cases {
+        let fixture = Fixture {
+            name: name.to_string(),
+            code: code.to_string(),
+        };
+        let (_, _, findings) = analyze(&fixture);
+        assert_eq!(findings.len(), 1, "{name}: {findings:#?}");
+        assert_eq!(findings[0].message, message, "{name}");
+        assert_eq!(
+            findings[0].range,
+            Range::new(Position::new(0, 0), end),
+            "{name}"
+        );
+        assert_eq!(findings[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            findings[0].code,
+            Some(NumberOrString::String("syntax-error".to_string()))
+        );
+    }
+}
+
+#[test]
+fn stan_program_structure_range_handles_bom_astral_prefix_and_crlf() {
+    let message = "Stan declarations and statements must appear inside a program block such as `functions`, `data`, `parameters`, or `model`.";
+    let fixture = Fixture {
+        name: "structure-utf16-crlf".to_string(),
+        code: "\u{feff}// 😀\r\nreal x;\r\n".to_string(),
+    };
+    let (_, _, findings) = analyze(&fixture);
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].message, message);
+    assert_eq!(
+        findings[0].range,
+        Range::new(Position::new(1, 0), Position::new(1, 7))
+    );
+}
+
+#[test]
+fn stan_ambiguous_program_structure_stays_generic() {
+    let cases = [
+        ("misspelled-block", "modle { target += 1; }\n"),
+        ("incomplete-top-level", "real x =\n"),
+        ("unknown-hash-syntax", "#unknown {\nreal x;\n"),
+        (
+            "unfinished-string",
+            "model { print(\"unterminated ); target += f(1; }\n",
+        ),
+        (
+            "unfinished-block-comment",
+            "model { target += f(1; /* unterminated ) ] }",
+        ),
+        (
+            "unknown-hash-inside-recovery",
+            "model {\n#unknown ) ] }\n  target += f(1;\n}\n",
+        ),
+        (
+            "unfinished-include-inside-recovery",
+            "model {\n#include <fake ) ] }\n  target += f(1;\n}\n",
+        ),
+        ("multiple-unclosed-openers", "model { target += f(g(1; }\n"),
+    ];
+
+    for (name, code) in cases {
+        let fixture = Fixture {
+            name: name.to_string(),
+            code: code.to_string(),
+        };
+        let (_, _, findings) = analyze(&fixture);
+        assert!(!findings.is_empty(), "{name}: {findings:#?}");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.message == "Stan code could not be parsed here"),
+            "ambiguous structure must stay generic: {name}: {findings:#?}"
         );
     }
 }
@@ -533,7 +684,7 @@ fn stan_syntax_ranges_are_exact_across_utf16_line_endings_and_eof() {
         (
             "eof-recovery",
             "model {\n  target += 1",
-            Range::new(Position::new(1, 12), Position::new(1, 13)),
+            Range::new(Position::new(0, 6), Position::new(0, 7)),
         ),
     ];
 

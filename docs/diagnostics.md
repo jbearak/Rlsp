@@ -117,10 +117,36 @@ parse findings explain missing closers, missing openers, and mismatches for
 `()`, `[]`, and `{}` using the same wording as R. An unclosed-delimiter range
 starts at the opener and spans the meaningful code on that line; a stray or
 wrong closer is highlighted directly. Stan and JAGS do not use R's special
-`[[` / `]]` delimiter semantics. Ambiguous recovery keeps the generic
+`[[` / `]]` delimiter semantics.
+
+Raven corroborates these explanations with one bounded, language-aware lexical
+scan of the document. Delimiters inside Stan strings, comments, and complete
+`#include` paths or inside JAGS comments and `%...%` operators do not affect
+pairing; unfinished includes keep the generic fallback. A parser-inserted missing
+closer can still be explained when a later closer
+cleanly belongs to an enclosing construct. If structural and lexical evidence
+disagree, a scan limit is reached, opaque source intersects the recovery, or
+more than one delimiter fault is plausible, Raven keeps the generic
 `Stan code could not be parsed here` or `JAGS code could not be parsed here`
-message rather than guessing. These explanatory findings retain the
-non-suppressible `syntax-error` code.
+message rather than guessing.
+
+High-confidence program-structure recovery also gets actionable wording:
+
+- Complete Stan declarations, function definitions, and statements at the top
+  level are told that they must appear inside a program block such as
+  `functions`, `data`, `parameters`, or `model`. Raven deliberately does not
+  guess which one is semantically appropriate.
+- Complete top-level JAGS relations and loops are told that they belong inside
+  a `data` or `model` block.
+- A uniquely missing required JAGS `model` block, an empty/comment-only model,
+  and duplicate or out-of-order `var`, `data`, and `model` sections receive
+  dedicated explanations anchored on the relevant section.
+
+Incomplete fragments, misspelled block names, balanced malformed expressions,
+and otherwise ambiguous recovery remain generic. All explanatory findings keep
+ERROR severity and the non-suppressible `syntax-error` code. This native pass
+applies to standalone Stan and JAGS documents only; fenced Stan/JAGS chunks in
+R Markdown or Quarto are not checked as standalone programs.
 
 JAGS findings come from Raven's in-tree clean-room Tree-sitter grammar. They
 cover parser `ERROR` and required `MISSING` nodes, are emitted in stable source

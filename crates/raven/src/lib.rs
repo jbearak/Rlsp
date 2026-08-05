@@ -31,6 +31,7 @@ pub mod extract_op;
 pub mod file_path_intellisense;
 pub mod file_type;
 pub mod foreach;
+mod foreign_syntax;
 pub mod handlers;
 pub mod help;
 pub mod import_pkg;
