@@ -46,6 +46,8 @@ enabled = true
 
 [diagnostics]
 enabled = true
+jags = "on"
+stan = "on"
 
 [diagnostics.severity]
 undefinedVariable = "warning"
@@ -80,8 +82,15 @@ Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rprofi
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.diagnostics.enabled` | `true` | Master switch for all diagnostics |
+| `raven.diagnostics.enabled` | `true` | Master switch for all diagnostics. When false, the model-language switches below cannot enable findings. |
+| `raven.diagnostics.jags` | `"off"` | Set to `"on"` to enable native syntax diagnostics for standalone JAGS/BUGS files. Portable as `[diagnostics] jags = "on"` in `raven.toml`. Parsing and language intelligence remain active when off. |
+| `raven.diagnostics.stan` | `"off"` | Set to `"on"` to enable native syntax and conservative undeclared-variable diagnostics for standalone Stan files. Portable as `[diagnostics] stan = "on"` in `raven.toml`. `undefinedVariableSeverity = "off"` disables only the semantic findings. Parsing and language intelligence remain active when off. |
 | `raven.diagnostics.maxSyntaxDiagnosticsPerFile` | `500` | Maximum native Tree-sitter syntax findings retained per Stan or JAGS/BUGS file after exact deduplication and stable source ordering. `0` means unlimited. Does not cap R diagnostics. Portable as `[diagnostics] maxSyntaxDiagnosticsPerFile = 500` in `raven.toml`; the editor and `raven check` use the same value. |
+
+The two model-language switches layer per key like every other project setting:
+a value in `raven.toml` overrides the corresponding editor/LSP-client value,
+while an unpinned key continues to use the client value or its built-in `"off"`
+default. The global `enabled` switch is always dominant.
 
 ## Cross-File Settings
 

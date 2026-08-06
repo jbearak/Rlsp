@@ -349,7 +349,12 @@ fn normalize_document_indent_unit(unit: u32) -> u32 {
 ///         "rPath": "/usr/bin/R",
 ///         "missingPackageSeverity": "information"
 ///     },
-///     "diagnostics": { "enabled": true, "undefinedVariableSeverity": "warning" }
+///     "diagnostics": {
+///         "enabled": true,
+///         "jags": "on",
+///         "stan": "on",
+///         "undefinedVariableSeverity": "warning"
+///     }
 /// });
 ///
 /// let cfg = raven::backend::parse_cross_file_config(&settings).unwrap();
@@ -359,6 +364,8 @@ fn normalize_document_indent_unit(unit: u32) -> u32 {
 /// assert!(cfg.index_workspace);
 /// assert!(cfg.packages_enabled);
 /// assert!(cfg.diagnostics_enabled);
+/// assert!(cfg.jags_diagnostics_enabled);
+/// assert!(cfg.stan_diagnostics_enabled);
 /// ```
 pub(crate) fn parse_cross_file_config(
     settings: &serde_json::Value,
@@ -540,6 +547,12 @@ pub(crate) fn parse_cross_file_config(
         // Parse diagnostics.enabled (master switch)
         if let Some(v) = diag.get("enabled").and_then(|v| v.as_bool()) {
             config.diagnostics_enabled = v;
+        }
+        if let Some(v) = diag.get("jags").and_then(|v| v.as_str()) {
+            config.jags_diagnostics_enabled = v == "on";
+        }
+        if let Some(v) = diag.get("stan").and_then(|v| v.as_str()) {
+            config.stan_diagnostics_enabled = v == "on";
         }
         // Parse diagnostics.maxSyntaxDiagnosticsPerFile. Zero deliberately
         // means unlimited; unlike cache sizes, it must not be clamped upward.
@@ -16175,9 +16188,10 @@ async fn run_debounced_diagnostics(
     traversal_truncation: Option<Arc<TraversalTruncationState>>,
 ) {
     // Schedule with cancellation token, gated on the trigger still matching
-    // the document's current (version, revision, epoch) under the same read
-    // lock. A mismatched worker is already obsolete (a newer edit's worker
-    // owns the current state) or belongs to a retired lifecycle (spawned
+    // the document's current (version, revision, epoch, config generation)
+    // under the same read lock. A mismatched worker is already obsolete (a
+    // newer edit or configuration owns the current state) or belongs to a
+    // retired lifecycle (spawned
     // before a close+reopen or tab removal, which did_close's cancel cannot
     // reach because the worker had not scheduled yet — the epoch comparison
     // is what catches it even when version and revision coincide). Letting
@@ -23303,11 +23317,11 @@ pub(crate) async fn publish_diagnostics_inner(
         coherence_generation,
     ) = {
         let state = state_arc.read().await;
-        // Full trigger capture (version + revision + epoch): the direct
-        // path has no cancellation token, so the commit-time comparison
-        // against this snapshot is its only defense against a lifecycle
-        // reuse (close+reopen) or a same-version edit racing the off-lock
-        // compute below.
+        // Full trigger capture (version + revision + epoch + config
+        // generation): the direct path has no cancellation token, so the
+        // commit-time comparison against this snapshot is its only defense
+        // against a lifecycle reuse (close+reopen), a same-version edit, or a
+        // configuration reload racing the off-lock compute below.
         let trigger = DiagnosticsTrigger::capture(&state, uri);
 
         if !state.diagnostics_publish_allowed(uri) {
@@ -27389,8 +27403,10 @@ mod tests {
         use tower::{Service, ServiceExt};
         use tower_lsp::jsonrpc::Request;
         use tower_lsp::lsp_types::{
-            Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams,
-            PublishDiagnosticsParams, Range, TextDocumentIdentifier, TextDocumentItem, Url,
+            Diagnostic, DidChangeConfigurationParams, DidChangeTextDocumentParams,
+            DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams,
+            PublishDiagnosticsParams, Range, TextDocumentContentChangeEvent,
+            TextDocumentIdentifier, TextDocumentItem, Url, VersionedTextDocumentIdentifier,
         };
         use tower_lsp::{ClientSocket, LanguageServer, LspService};
 
@@ -27462,6 +27478,149 @@ mod tests {
                     },
                 })
                 .await;
+        }
+
+        /// A model worker computed under the previous parsed configuration must
+        /// not consume the same-version force marker that belongs to the config
+        /// reload's empty publication. Otherwise stale findings can survive a
+        /// live switch from `"on"` to `"off"` until another edit or reload.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn config_reload_rejects_model_worker_captured_before_disable() {
+            async fn next_publish(
+                socket: &mut ClientSocket,
+                uri: &Url,
+            ) -> PublishDiagnosticsParams {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let message = socket.next().await.expect("client socket remains open");
+                        if message.method() != "textDocument/publishDiagnostics" {
+                            continue;
+                        }
+                        let params: PublishDiagnosticsParams =
+                            serde_json::from_value(message.params().unwrap().clone()).unwrap();
+                        if params.uri == *uri {
+                            return params;
+                        }
+                    }
+                })
+                .await
+                .expect("diagnostic publication must arrive")
+            }
+
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("config-race.stan");
+            let invalid = "model { target += ; }\n";
+            std::fs::write(&path, invalid).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+            let (svc, mut socket) = lifecycle_service(std::slice::from_ref(&uri)).await;
+            let backend = svc.inner();
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "crossFile": {
+                            "indexWorkspace": false,
+                            "revalidationDebounceMs": 60_000
+                        },
+                        "diagnostics": { "stan": "on" },
+                        "packages": { "enabled": false }
+                    }),
+                })
+                .await;
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "stan".into(),
+                        version: 1,
+                        text: invalid.into(),
+                    },
+                })
+                .await;
+            backend.publish_diagnostics(&uri).await;
+            let initial = next_publish(&mut socket, &uri).await;
+            assert!(!initial.diagnostics.is_empty());
+
+            backend
+                .did_change(DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version: 2,
+                    },
+                    content_changes: vec![TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: invalid.into(),
+                    }],
+                })
+                .await;
+
+            let old_worker_pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_post_publish_lock_test_pause
+                .arm(uri.clone());
+            let stale_backend = (*backend).clone();
+            let stale_uri = uri.clone();
+            let stale_worker = tokio::spawn(async move {
+                stale_backend.publish_diagnostics(&stale_uri).await;
+            });
+            tokio::time::timeout(Duration::from_secs(5), old_worker_pause.wait_arrived())
+                .await
+                .expect("old-config worker must hold the diagnostics publish lock");
+
+            let reload_backend = (*backend).clone();
+            let reload = tokio::spawn(async move {
+                reload_backend
+                    .did_change_configuration(DidChangeConfigurationParams {
+                        settings: serde_json::json!({
+                            "crossFile": {
+                                "indexWorkspace": false,
+                                "revalidationDebounceMs": 60_000
+                            },
+                            "diagnostics": { "stan": "off" },
+                            "packages": { "enabled": false }
+                        }),
+                    })
+                    .await;
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let state = backend.state.read().await;
+                    if !state.cross_file_config.stan_diagnostics_enabled
+                        && state.diagnostics_gate.force_republish_count_for_test(&uri) > 0
+                    {
+                        break;
+                    }
+                    drop(state);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("config reload must install its empty-publication force marker");
+
+            old_worker_pause.release();
+            stale_worker.await.unwrap();
+            reload.await.unwrap();
+
+            let cleared = next_publish(&mut socket, &uri).await;
+            assert!(cleared.diagnostics.is_empty());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err(),
+                "the stale old-config worker must not publish"
+            );
+            assert_eq!(
+                backend
+                    .state
+                    .read()
+                    .await
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&uri),
+                0
+            );
         }
 
         /// A receipt-owned successor may cancel an older diagnostic after the
@@ -28935,6 +29094,7 @@ mod tests {
                 state.cross_file_config.packages_enabled = false;
                 state.cross_file_config.on_demand_indexing_enabled = false;
                 state.cross_file_config.revalidation_debounce_ms = 60_000;
+                state.cross_file_config.stan_diagnostics_enabled = true;
             }
 
             backend
@@ -29042,6 +29202,7 @@ mod tests {
                 state.cross_file_config.packages_enabled = false;
                 state.cross_file_config.on_demand_indexing_enabled = false;
                 state.cross_file_config.revalidation_debounce_ms = 60_000;
+                state.cross_file_config.jags_diagnostics_enabled = true;
             }
 
             backend
@@ -31133,6 +31294,35 @@ mod tests {
                 .unwrap()
                 .unwrap();
                 assert_eq!(config.max_syntax_diagnostics_per_file, cap);
+            }
+        }
+
+        #[test]
+        fn parse_cross_file_config_reads_independent_model_diagnostic_switches() {
+            for (jags, stan, expected_jags, expected_stan) in [
+                (None, None, false, false),
+                (Some("off"), None, false, false),
+                (Some("on"), None, true, false),
+                (None, Some("on"), false, true),
+                (Some("on"), Some("off"), true, false),
+                (Some("off"), Some("on"), false, true),
+                (Some("on"), Some("on"), true, true),
+            ] {
+                let mut diagnostics = serde_json::Map::new();
+                if let Some(jags) = jags {
+                    diagnostics.insert("jags".to_string(), json!(jags));
+                }
+                if let Some(stan) = stan {
+                    diagnostics.insert("stan".to_string(), json!(stan));
+                }
+                let config = crate::backend::parse_cross_file_config(&json!({
+                    "diagnostics": diagnostics
+                }))
+                .unwrap()
+                .unwrap();
+
+                assert_eq!(config.jags_diagnostics_enabled, expected_jags);
+                assert_eq!(config.stan_diagnostics_enabled, expected_stan);
             }
         }
 
@@ -51520,6 +51710,7 @@ lineLength = 200
                     initialization_options: Some(serde_json::json!({
                         "diagnosticUris": [uri.to_string()],
                         "crossFile": { "indexWorkspace": false },
+                        "diagnostics": { "stan": "on" },
                         "packages": { "enabled": false }
                     })),
                     ..Default::default()
@@ -51649,6 +51840,7 @@ lineLength = 200
         };
         let mut diagnostic_state = super::WorldState::new();
         diagnostic_state.workspace_scan_complete = true;
+        diagnostic_state.cross_file_config.stan_diagnostics_enabled = true;
         diagnostic_state.documents.insert(uri.clone(), document);
         assert!(!snapshot_diagnostics(&diagnostic_state, &uri).is_empty());
     }
@@ -51682,7 +51874,10 @@ lineLength = 200
                     initialization_options: Some(serde_json::json!({
                         "diagnosticUris": [uri.to_string()],
                         "crossFile": { "indexWorkspace": false },
-                        "diagnostics": { "maxSyntaxDiagnosticsPerFile": 3 },
+                        "diagnostics": {
+                            "jags": "on",
+                            "maxSyntaxDiagnosticsPerFile": 3
+                        },
                         "packages": { "enabled": false }
                     })),
                     ..Default::default()
@@ -51868,6 +52063,7 @@ lineLength = 200
                             "indexWorkspace": false,
                             "revalidationDebounceMs": 60_000
                         },
+                        "diagnostics": { "jags": "on", "stan": "on" },
                         "packages": { "enabled": false }
                     })),
                     ..Default::default()
@@ -51918,7 +52114,11 @@ lineLength = 200
                     "indexWorkspace": false,
                     "revalidationDebounceMs": 60_000
                 },
-                "diagnostics": { "maxSyntaxDiagnosticsPerFile": 7 },
+                "diagnostics": {
+                    "jags": "on",
+                    "stan": "on",
+                    "maxSyntaxDiagnosticsPerFile": 7
+                },
                 "packages": { "enabled": false }
             }),
         });
@@ -51931,24 +52131,59 @@ lineLength = 200
                     "indexWorkspace": false,
                     "revalidationDebounceMs": 60_000
                 },
+                "diagnostics": { "jags": "on", "stan": "on" },
                 "packages": { "enabled": false }
             }),
         });
         let ((), reset) = tokio::join!(reset_cap, next_publish_batch(&mut socket, &expected_uris));
         assert_batch(&reset, &expected_uris, 500);
 
+        let disable_models = backend.did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({
+                "crossFile": {
+                    "indexWorkspace": false,
+                    "revalidationDebounceMs": 60_000
+                },
+                "diagnostics": { "jags": "off", "stan": "off" },
+                "packages": { "enabled": false }
+            }),
+        });
+        let ((), disabled) = tokio::join!(
+            disable_models,
+            next_publish_batch(&mut socket, &expected_uris)
+        );
+        assert_batch(&disabled, &expected_uris, 0);
+
+        let reenable_models = backend.did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({
+                "crossFile": {
+                    "indexWorkspace": false,
+                    "revalidationDebounceMs": 60_000
+                },
+                "diagnostics": { "jags": "on", "stan": "on" },
+                "packages": { "enabled": false }
+            }),
+        });
+        let ((), reenabled) = tokio::join!(
+            reenable_models,
+            next_publish_batch(&mut socket, &expected_uris)
+        );
+        assert_batch(&reenabled, &expected_uris, 500);
+
         let state = backend.state.read().await;
         assert_eq!(
             state.cross_file_config.max_syntax_diagnostics_per_file,
             crate::cross_file::config::DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE
         );
+        assert!(state.cross_file_config.jags_diagnostics_enabled);
+        assert!(state.cross_file_config.stan_diagnostics_enabled);
         assert!(
             expected_uris.iter().all(|uri| {
                 state
                     .get_document(uri)
                     .is_some_and(|document| document.version == Some(1))
             }),
-            "all three publish batches must occur without an edit; the latter two require the force-republish gate"
+            "all publish batches must occur without an edit; configuration changes require the force-republish gate"
         );
         assert!(
             expected_uris
@@ -51997,6 +52232,7 @@ lineLength = 200
                     initialization_options: Some(serde_json::json!({
                         "diagnosticUris": diagnostic_uris,
                         "crossFile": { "indexWorkspace": false },
+                        "diagnostics": { "jags": "on" },
                         "packages": { "enabled": false }
                     })),
                     ..Default::default()
@@ -52086,6 +52322,12 @@ lineLength = 200
 
         let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
         let backend = svc.inner();
+        backend
+            .state
+            .write()
+            .await
+            .cross_file_config
+            .stan_diagnostics_enabled = true;
         let uri = Url::parse("untitled:stan-buffer").unwrap();
         backend
             .did_open(DidOpenTextDocumentParams {

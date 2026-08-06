@@ -284,6 +284,7 @@ fn generate_stan_code_of_size(target_bytes: usize, malformed: bool) -> String {
 fn analyze_stan(code: &str) -> usize {
     let uri = Url::parse("untitled:stan-performance-budget").unwrap();
     let mut state = WorldState::new();
+    state.cross_file_config.stan_diagnostics_enabled = true;
     state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
     diagnostics(&state, &uri, &DiagCancelToken::never()).len()
 }
@@ -351,6 +352,7 @@ fn generate_jags_code_of_size(target_bytes: usize, malformed: bool) -> String {
 fn analyze_jags(code: &str) -> usize {
     let uri = Url::parse("untitled:jags-performance-budget").unwrap();
     let mut state = WorldState::new();
+    state.cross_file_config.jags_diagnostics_enabled = true;
     state.open_document_with_language_id(uri.clone(), code, Some(1), Some("jags"));
     diagnostics(&state, &uri, &DiagCancelToken::never()).len()
 }

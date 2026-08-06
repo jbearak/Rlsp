@@ -79,6 +79,14 @@ pub struct CrossFileConfig {
     /// Master switch for all diagnostics
     /// When false, all diagnostics are suppressed regardless of individual severity settings
     pub diagnostics_enabled: bool,
+    /// Whether native JAGS diagnostics are enabled.
+    ///
+    /// The global [`Self::diagnostics_enabled`] switch still takes precedence.
+    pub jags_diagnostics_enabled: bool,
+    /// Whether native Stan syntax and semantic diagnostics are enabled.
+    ///
+    /// The global [`Self::diagnostics_enabled`] switch still takes precedence.
+    pub stan_diagnostics_enabled: bool,
     /// Maximum native Tree-sitter syntax diagnostics retained for one Stan or
     /// JAGS file after exact deduplication and source ordering. `0` is
     /// unlimited. This does not cap R diagnostics.
@@ -252,6 +260,8 @@ impl Default for CrossFileConfig {
     fn default() -> Self {
         Self {
             diagnostics_enabled: true,
+            jags_diagnostics_enabled: false,
+            stan_diagnostics_enabled: false,
             max_syntax_diagnostics_per_file: DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE,
             max_backward_depth: 10,
             max_forward_depth: 10,
@@ -325,6 +335,8 @@ mod tests {
         assert_eq!(config.max_revalidations_per_trigger, 10);
         assert_eq!(config.revalidation_debounce_ms, 200);
         assert_eq!(config.edited_file_debounce_ms, 50);
+        assert!(!config.jags_diagnostics_enabled);
+        assert!(!config.stan_diagnostics_enabled);
         assert_eq!(
             config.max_syntax_diagnostics_per_file,
             DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE
@@ -411,6 +423,14 @@ mod tests {
         assert!(!config1.scope_settings_changed(&config2));
 
         config2.undefined_variable_severity = None;
+        assert!(!config1.scope_settings_changed(&config2));
+
+        config2 = CrossFileConfig::default();
+        config2.jags_diagnostics_enabled = true;
+        assert!(!config1.scope_settings_changed(&config2));
+
+        config2 = CrossFileConfig::default();
+        config2.stan_diagnostics_enabled = true;
         assert!(!config1.scope_settings_changed(&config2));
 
         // Non-None -> non-None transitions (e.g. WARNING -> ERROR) also do not

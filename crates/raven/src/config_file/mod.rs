@@ -238,6 +238,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn model_diagnostic_switches_layer_independently_and_reset_to_defaults() {
+        let mut state = WorldState::new();
+        state.raw_client_settings = json!({
+            "diagnostics": { "jags": "on", "stan": "off" }
+        });
+        state.raw_project_settings = Some(json!({
+            "diagnostics": { "stan": "on" }
+        }));
+        recompute_parsed_configs(&mut state);
+        assert!(state.cross_file_config.jags_diagnostics_enabled);
+        assert!(state.cross_file_config.stan_diagnostics_enabled);
+
+        state.raw_project_settings = Some(json!({
+            "diagnostics": { "jags": "off" }
+        }));
+        recompute_parsed_configs(&mut state);
+        assert!(!state.cross_file_config.jags_diagnostics_enabled);
+        assert!(!state.cross_file_config.stan_diagnostics_enabled);
+
+        state.raw_client_settings = json!({});
+        state.raw_project_settings = None;
+        recompute_parsed_configs(&mut state);
+        assert!(!state.cross_file_config.jags_diagnostics_enabled);
+        assert!(!state.cross_file_config.stan_diagnostics_enabled);
+    }
+
     /// The per-URI resolved-config cache serves repeated lookups, evicts a
     /// closed document, and is cleared by `recompute_parsed_configs`, so no
     /// stale value survives either lifecycle transition.

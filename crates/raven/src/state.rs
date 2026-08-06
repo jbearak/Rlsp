@@ -1492,19 +1492,21 @@ pub struct WorldState {
     pub(crate) sysdata_fallback_retry: crate::package_state::PackageSeedRetryLifecycle,
 }
 
-/// A snapshot of the lifecycle state a diagnostics run was triggered
-/// against: the URI's `(version, revision, epoch)` captured under a
-/// `WorldState` lock when the work was spawned, carried through the
-/// debounce → compute → publish pipeline, and re-compared at every
-/// freshness checkpoint via [`Self::is_stale`].
+/// A snapshot of the lifecycle and analysis configuration a diagnostics run
+/// was triggered against: the URI's `(version, revision, epoch)` plus the
+/// parsed-config generation, captured under a `WorldState` lock when the work
+/// was spawned, carried through the debounce → compute → publish pipeline, and
+/// re-compared at every freshness checkpoint via [`Self::is_stale`].
 ///
-/// Bundling the three fields keeps every checkpoint epoch-aware by
+/// Bundling these fields keeps every checkpoint lifecycle- and config-aware by
 /// construction. The loose `(version, revision)` pair this replaces cannot
-/// identify a lifecycle (issue #603): a client may reopen at the same
-/// version, and `Document::revision` restarts at 0 on every open, so a
-/// worker retired by a close or tab removal could pass both comparisons
-/// against the URI's next lifecycle. The epoch is globally unique per
-/// lifecycle and never reused.
+/// identify a lifecycle (issue #603): a client may reopen at the same version,
+/// and `Document::revision` restarts at 0 on every open, so a worker retired by
+/// a close or tab removal could pass both comparisons against the URI's next
+/// lifecycle. The epoch is globally unique per lifecycle and never reused.
+/// The config generation prevents a worker computed under old diagnostic
+/// settings from consuming a same-version force-republish marker after a live
+/// configuration reload.
 ///
 /// `version`/`revision` are `None` when the document is not open;
 /// `epoch` is `None` when the URI is not diagnostic-eligible (never began,
@@ -1516,6 +1518,7 @@ pub(crate) struct DiagnosticsTrigger {
     pub(crate) version: Option<i32>,
     pub(crate) revision: Option<u64>,
     pub(crate) epoch: Option<DiagnosticsEpoch>,
+    analysis_config_generation: AnalysisConfigGeneration,
 }
 
 #[derive(Debug, Default)]
@@ -1656,13 +1659,14 @@ pub(crate) struct DidOpenCommitSnapshot {
 
 impl DiagnosticsTrigger {
     /// Capture `uri`'s current trigger snapshot. The caller must hold a
-    /// `WorldState` lock for the duration so the three reads are coherent.
+    /// `WorldState` lock for the duration so all reads are coherent.
     pub(crate) fn capture(state: &WorldState, uri: &Url) -> Self {
         let doc = state.documents.get(uri);
         Self {
             version: doc.and_then(|d| d.version),
             revision: doc.map(|d| d.revision),
             epoch: state.diagnostics_gate.current_epoch(uri),
+            analysis_config_generation: state.analysis_config_generation,
         }
     }
 
@@ -14914,6 +14918,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
 
         let uri = Url::parse("untitled:stan-parse-count").unwrap();
         let mut state = WorldState::new();
+        state.cross_file_config.stan_diagnostics_enabled = true;
         state.open_document_with_language_id(uri.clone(), &document.text(), Some(2), Some("stan"));
         DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
         let snapshot = crate::handlers::DiagnosticsSnapshot::build(&state, &uri).unwrap();
@@ -14961,6 +14966,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         let changed = "model { x <- * 1 }\n";
         let uri = Url::parse("untitled:jags-parse-count").unwrap();
         let mut state = WorldState::new();
+        state.cross_file_config.jags_diagnostics_enabled = true;
         state.open_document_with_language_id(uri.clone(), original, Some(1), Some("jags"));
 
         DOCUMENT_PARSE_COUNT.with(|count| count.set(0));
@@ -15028,6 +15034,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
 
         let fresh_uri = Url::parse("untitled:fresh-jags-parse-count").unwrap();
         let mut fresh_state = WorldState::new();
+        fresh_state.cross_file_config.jags_diagnostics_enabled = true;
         fresh_state.open_document_with_language_id(
             fresh_uri.clone(),
             changed,
@@ -17480,6 +17487,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
 
         let mut open_state = WorldState::new();
         open_state.workspace_scan_complete = true;
+        open_state.cross_file_config.stan_diagnostics_enabled = true;
         open_state.documents.insert(uri.clone(), document);
         let open_findings = crate::handlers::diagnostics(
             &open_state,
@@ -17488,6 +17496,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         );
         let mut closed_state = WorldState::new();
         closed_state.workspace_scan_complete = true;
+        closed_state.cross_file_config.stan_diagnostics_enabled = true;
         closed_state.workspace_index.insert(uri.clone(), entry);
         closed_state.documents.insert(uri.clone(), reconstructed);
         let closed_findings = crate::handlers::diagnostics(
@@ -17546,6 +17555,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         };
         let mut diagnostic_state = WorldState::new();
         diagnostic_state.workspace_scan_complete = true;
+        diagnostic_state.cross_file_config.stan_diagnostics_enabled = true;
         diagnostic_state
             .documents
             .insert(model_uri.clone(), document);
@@ -17599,6 +17609,7 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         };
         let mut diagnostic_state = WorldState::new();
         diagnostic_state.workspace_scan_complete = true;
+        diagnostic_state.cross_file_config.stan_diagnostics_enabled = true;
         diagnostic_state
             .documents
             .insert(model_uri.clone(), document);

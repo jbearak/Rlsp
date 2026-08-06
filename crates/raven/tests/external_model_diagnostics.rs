@@ -554,6 +554,11 @@ fn run_external(language: &str, report_name: &str) {
     let uri = Url::parse(&format!("untitled:raven-external-{language}"))
         .expect("static external corpus URI must parse");
     let mut state = WorldState::new();
+    match language {
+        "stan" => state.cross_file_config.stan_diagnostics_enabled = true,
+        "jags" => state.cross_file_config.jags_diagnostics_enabled = true,
+        _ => unreachable!("validated language must be Stan or JAGS"),
+    }
     let mut version = 0i32;
     let mut failures = Vec::new();
     let mut selected_cases = 0usize;

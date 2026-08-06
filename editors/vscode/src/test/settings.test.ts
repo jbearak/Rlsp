@@ -105,6 +105,8 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'crossFile.cache.workspaceIndexMaxEntries', jsonPath: ['crossFile', 'cache', 'workspaceIndexMaxEntries'], type: 'number' },
     // Diagnostics settings
     { vsCodeKey: 'diagnostics.enabled', jsonPath: ['diagnostics', 'enabled'], type: 'boolean', defaultWhenUnconfigured: true },
+    { vsCodeKey: 'diagnostics.jags', jsonPath: ['diagnostics', 'jags'], type: 'enum', enumValues: ['off', 'on'] as const },
+    { vsCodeKey: 'diagnostics.stan', jsonPath: ['diagnostics', 'stan'], type: 'enum', enumValues: ['off', 'on'] as const },
     { vsCodeKey: 'diagnostics.maxSyntaxDiagnosticsPerFile', jsonPath: ['diagnostics', 'maxSyntaxDiagnosticsPerFile'], type: 'number', defaultWhenUnconfigured: 500 },
     { vsCodeKey: 'diagnostics.undefinedVariableSeverity', jsonPath: ['diagnostics', 'undefinedVariableSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'info', 'hint', 'off'] as const },
     { vsCodeKey: 'diagnostics.undefinedVariableInCallArguments', jsonPath: ['diagnostics', 'undefinedVariableInCallArguments'], type: 'boolean' },
@@ -734,6 +736,8 @@ suite('Settings Transmission Unit Tests', () => {
     test('diagnostics settings transmit correctly', () => {
         const configuredSettings = new Map<string, unknown>([
             ['diagnostics.enabled', false],
+            ['diagnostics.jags', 'on'],
+            ['diagnostics.stan', 'off'],
             ['diagnostics.maxSyntaxDiagnosticsPerFile', 17],
             ['diagnostics.undefinedVariableSeverity', 'error'],
             ['diagnostics.undefinedVariableInCallArguments', false],
@@ -744,6 +748,8 @@ suite('Settings Transmission Unit Tests', () => {
         const options = getInitializationOptions(mockConfig);
 
         assert.strictEqual(options.diagnostics?.enabled, false);
+        assert.strictEqual(options.diagnostics?.jags, 'on');
+        assert.strictEqual(options.diagnostics?.stan, 'off');
         assert.strictEqual(options.diagnostics?.maxSyntaxDiagnosticsPerFile, 17);
         assert.strictEqual(options.diagnostics?.undefinedVariableSeverity, 'error');
         assert.strictEqual(options.diagnostics?.undefinedVariableInCallArguments, false);
@@ -770,6 +776,8 @@ suite('Settings Transmission Unit Tests', () => {
 
         assert.strictEqual(options.diagnostics?.undefinedVariableInCallArguments, undefined);
         assert.strictEqual(options.diagnostics?.undefinedVariableInBracketIndices, undefined);
+        assert.strictEqual(options.diagnostics?.jags, undefined);
+        assert.strictEqual(options.diagnostics?.stan, undefined);
     });
 
     /**

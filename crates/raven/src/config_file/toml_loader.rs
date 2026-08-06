@@ -381,6 +381,14 @@ enabled = true
     }
 
     #[test]
+    fn parses_model_diagnostic_switches() {
+        let out = load_str("[diagnostics]\njags = \"on\"\nstan = \"off\"\n", "test").unwrap();
+        assert!(out.warnings.is_empty(), "got {:?}", out.warnings);
+        assert_eq!(out.settings["diagnostics"]["jags"], "on");
+        assert_eq!(out.settings["diagnostics"]["stan"], "off");
+    }
+
+    #[test]
     fn parses_overrides_as_array() {
         let toml = r#"
 [linting]

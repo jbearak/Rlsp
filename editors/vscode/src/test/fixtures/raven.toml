@@ -2,6 +2,9 @@
 # It applies to ALL .R files in this directory tree. Tests that assert exact
 # diagnostic counts should filter by source (e.g., d.source !== 'raven (lint)')
 # to avoid coupling to lint output.
+[diagnostics]
+stan = "on"
+
 [linting]
 enabled = true
 lineLengthSeverity = "warning"

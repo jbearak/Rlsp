@@ -1389,8 +1389,13 @@ the stable offline check present, expands to full validation on conservative
 relevant paths and `main`, and release builds require full validation before any
 platform build.
 
-Stan and JAGS dispatch through the same native-syntax collector limit from the
-diagnostics snapshot. `maxSyntaxDiagnosticsPerFile = 0` maps to unlimited;
+Stan and JAGS diagnostic enablement is enforced at the shared diagnostics-
+snapshot dispatch seam before either collector runs. The per-language switches
+do not affect document identity, parsing, target discovery, completion, hover,
+or navigation; a disabled diagnostic branch returns a successful empty result so
+live reconfiguration can clear stale publications. Both languages then dispatch
+through the same native-syntax collector limit from the diagnostics snapshot.
+`maxSyntaxDiagnosticsPerFile = 0` maps to unlimited;
 every finite value retains at most that many unique candidates in an ordered
 vector while the traversal continues to check cancellation. The observable
 result removes exact duplicates before applying stable source-order truncation.

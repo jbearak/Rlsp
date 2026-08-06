@@ -40,7 +40,7 @@ raven check [OPTIONS] [PATHS...]
 
 Diagnostics reported (subject to configured severities — see [diagnostics.md](diagnostics.md)):
 
-- R syntax errors and semantic checks (e.g. assignment-in-condition, mixed logical operators), syntax-only diagnostics for standalone `.jags`, `.bugs`, and `.bug` programs, and syntax plus conservative undeclared-variable diagnostics for complete standalone `.stan` programs.
+- R syntax errors and semantic checks (e.g. assignment-in-condition, mixed logical operators). Standalone JAGS/BUGS and Stan diagnostics are available when opted in through `[diagnostics] jags = "on"` and/or `stan = "on"` in `raven.toml`.
 - The native style lints (when enabled via `raven.toml` / `.lintr`).
 - Cross-file diagnostics: missing sourced files, circular dependencies, exceeded max source-chain depth, redundant directives, out-of-scope usage, and case-only path mismatches (in `source()` calls, forward directives, and backward `# raven: sourced-by`-style directives). On a case-sensitive CI filesystem a case-only mismatch (e.g. `source("scripts/templates.r")` for an on-disk `templates.R`) is a **warning**, so it exceeds the default `--max-severity info` and fails the build — surfacing a portability bug that, for a forward `source()`, would also break it at runtime on Linux. See [Diagnostics → Source path case mismatch](diagnostics.md#source-path-case-mismatch).
 - Static `{box}` and `{import}` selective-import scope, missing-module, package, and authoritative missing-export diagnostics use the same analysis as the language server.
@@ -54,13 +54,18 @@ The workspace is indexed, except for paths matched by `[workspace].exclude`, so 
 - With no `PATHS`, every included R file and standalone `.jags`, `.bugs`, `.bug`, or `.stan` program in the workspace is reported.
 - With `PATHS`, explicit files are reported as named, while directories are walked recursively for included R files and standalone `.jags`, `.bugs`, `.bug`, or `.stan` programs. Extension matching is case-insensitive. `.stanfunctions` files are excluded because they are include fragments rather than standalone programs. Indexing still covers the included workspace, so a reported R file's `source()` targets resolve even when they aren't named.
 
-JAGS checking is syntax-only. Stan also checks clear undeclared-variable uses
-when the file contains at least one real top-level Stan program block. A file
-with no real block—including an assembler fragment organized with `//--- data`
-or similar section comments—gets syntax diagnostics only. Missing one optional
-block does not suppress checking, so values supplied by R still require a Stan
-`data` declaration. Any `#include` suppresses Stan semantic findings for the
-whole file because Raven does not preprocess or resolve includes.
+Model files remain discoverable targets even though their diagnostics default
+to off. Enable `[diagnostics] jags = "on"` for syntax-only JAGS/BUGS
+checking and `[diagnostics] stan = "on"` for Stan syntax plus conservative
+undeclared-variable checking. Stan semantic checking runs when the file contains
+at least one real top-level program block. A file with no real block—including
+an assembler fragment organized with `//--- data` or similar section
+comments—gets syntax diagnostics only. Missing one optional block does not
+suppress checking, so values supplied by R still require a Stan `data`
+declaration. Any `#include` suppresses Stan semantic findings for the whole file
+because Raven does not preprocess or resolve includes. Setting
+`undefinedVariableSeverity = "off"` suppresses only Stan semantic findings while
+leaving opted-in syntax diagnostics active.
 
 Raven does not run JAGS or `stanc`, validate dimensions, types, or distribution
 signatures, or apply R lint, package, or cross-file analysis to model source.
@@ -97,7 +102,7 @@ revalidation continue to use one URI-global graph edge per source entry.
 
 - `--workspace DIR` — workspace root to index (default: current directory).
 - `--config PATH` — explicit path to a `raven.toml` or `.lintr` (default: walk upward from the workspace root, discovering a `raven.toml` or non-home `.lintr`; literal `~/.lintr` is not auto-discovered, but can be used with `--config ~/.lintr`).
-- `--no-config` — ignore `raven.toml` and `.lintr`; use Raven's built-in defaults.
+- `--no-config` — ignore `raven.toml` and `.lintr`; use Raven's built-in defaults. JAGS and Stan diagnostics remain disabled because both model-language defaults are `"off"`.
 - `--format text|json|sarif` — default `text`.
 - `--max-severity off|hint|info|warning|error` — highest severity that does **not** fail the build (default `info`). With the built-in defaults, undefined-variable and missing-file diagnostics are `warning` and circular dependencies are `error`, so they fail the build at the default threshold. Native style lints default to `information` (below `warning`), so they pass at `info` but gate at `--max-severity hint` or `off`.
 - `--report-uninstalled` (see [Missing-package reporting in CI](#missing-package-reporting-in-ci)) — re-enable missing-package warnings, which `raven check` otherwise suppresses by default.
