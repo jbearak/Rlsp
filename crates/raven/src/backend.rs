@@ -340,28 +340,47 @@ fn parse_diagnostics_switch(raw: Option<&serde_json::Value>) -> Option<bool> {
     }
 }
 
-/// Warn about `diagnostics.jags` / `diagnostics.stan` values that fail closed.
+/// Describe every `diagnostics.jags` / `diagnostics.stan` value that fails closed.
 ///
 /// Call this ONCE per config recompute, on the MERGED settings — the layer that
 /// actually decides the effective value. `parse_diagnostics_switch` stays silent
-/// precisely so this can be the single warning site: warning inside the parser
+/// precisely so this can be the single reporting site: warning inside the parser
 /// fired twice per `did_change_configuration` (validation pass plus recompute)
 /// and could contradict itself, complaining about a client typo that a project
 /// `raven.toml` override had already superseded.
-pub(crate) fn warn_invalid_model_switches(merged: &serde_json::Value) {
+///
+/// Returns the messages rather than only logging them so callers can surface
+/// them where the user will actually see them. `log::warn!` alone is filtered
+/// out under the default CLI and editor logging configuration, which makes a
+/// typo like `"On"` indistinguishable from the built-in `"off"` default:
+/// diagnostics simply never appear and nothing says why.
+///
+/// Every message asserts "Defaulting to 'off'", so this returns nothing when
+/// `merged` fails `parse_cross_file_config` — a rejected update leaves the
+/// PREVIOUS `CrossFileConfig` in place (see `recompute_parsed_configs`), so no
+/// fallback was applied and claiming one would be a lie. Concretely: with Stan
+/// already on, a reload carrying both `crossFile: false` and `stan: "On"` is
+/// rejected wholesale and Stan stays on. The rejection has its own toast on the
+/// `did_change_configuration` path, so the user is still told something is
+/// wrong — just not the wrong thing.
+pub(crate) fn invalid_model_switch_messages(merged: &serde_json::Value) -> Vec<String> {
     use serde_json::Value;
 
+    let mut messages = Vec::new();
+    if cross_file_sections_are_malformed(merged) {
+        return messages;
+    }
     let Some(diagnostics) = merged.get("diagnostics") else {
-        return;
+        return messages;
     };
     for name in ["jags", "stan"] {
         match diagnostics.get(name) {
             None | Some(Value::Null) => {}
             Some(Value::String(value)) => {
                 if value != "on" && value != "off" {
-                    log::warn!(
-                        "Unrecognized diagnostics.{name} value '{value}'; defaulting to 'off'."
-                    );
+                    messages.push(format!(
+                        "Unrecognized diagnostics.{name} value '{value}'; expected \"on\" or \"off\". Defaulting to 'off'."
+                    ));
                 }
             }
             Some(other) => {
@@ -372,11 +391,24 @@ pub(crate) fn warn_invalid_model_switches(merged: &serde_json::Value) {
                     Value::Object(_) => "object",
                     _ => "value",
                 };
-                log::warn!(
+                messages.push(format!(
                     "diagnostics.{name} must be string \"on|off\"; got {kind}. Defaulting to 'off'."
-                );
+                ));
             }
         }
+    }
+    messages
+}
+
+/// Log every message from [`invalid_model_switch_messages`].
+///
+/// The recompute-path entry point: `recompute_parsed_configs` has no client
+/// handle, so it can only log. Surfaces that DO have a user-visible channel
+/// (`did_change_configuration`'s toast, the CLI's stderr) call
+/// `invalid_model_switch_messages` directly and route the strings there.
+pub(crate) fn warn_invalid_model_switches(merged: &serde_json::Value) {
+    for message in invalid_model_switch_messages(merged) {
+        log::warn!("{message}");
     }
 }
 
@@ -436,6 +468,20 @@ pub(crate) fn warn_invalid_model_switches(merged: &serde_json::Value) {
 /// assert!(cfg.jags_diagnostics_enabled);
 /// assert!(cfg.stan_diagnostics_enabled);
 /// ```
+/// Whether [`parse_cross_file_config`] would reject `settings` outright.
+///
+/// The whole of that parser's error surface: every other malformed value is
+/// absorbed by an `as_u64()`/`as_str()` guard and falls back to the default.
+/// Split out so callers that only need the accept/reject answer can get it
+/// without running the parser, which logs a full multi-line configuration
+/// summary at info level — calling it a second time per config load would
+/// duplicate that summary in the log.
+fn cross_file_sections_are_malformed(settings: &serde_json::Value) -> bool {
+    ["crossFile", "diagnostics", "packages"]
+        .iter()
+        .any(|name| settings.get(name).is_some_and(|v| !v.is_object()))
+}
+
 pub(crate) fn parse_cross_file_config(
     settings: &serde_json::Value,
 ) -> std::result::Result<Option<crate::cross_file::CrossFileConfig>, String> {
@@ -450,7 +496,9 @@ pub(crate) fn parse_cross_file_config(
         return Ok(None);
     }
 
-    // Validate that present sections are objects (not scalars/arrays)
+    // Validate that present sections are objects (not scalars/arrays).
+    // `cross_file_sections_are_malformed` is the predicate-only twin of this
+    // check; keep the two in step if a section is ever added or removed.
     fn ensure_object_section(
         value: Option<&serde_json::Value>,
         name: &str,
@@ -16877,7 +16925,10 @@ struct ReconciliationDecisions {
     scope_changed: bool,
     package_settings_changed: bool,
     watch_settings_changed: bool,
-    only_watch_changed: bool,
+    /// Nothing that can change a finding moved, so the workspace-wide
+    /// republish is skipped. Shares its predicate with the worker-retirement
+    /// decision in `recompute_parsed_configs`, so the two cannot drift.
+    only_non_analysis_changed: bool,
     diagnostics_enabled_changed: bool,
     old_diagnostics_enabled: bool,
     new_diagnostics_enabled: bool,
@@ -17693,6 +17744,26 @@ impl LanguageServer for Backend {
         let loaded_path = self.state.read().await.project_config_path.clone();
         if let Some(path) = &loaded_path {
             self.notify_project_config_loaded(Some(path.as_path()));
+        }
+
+        // Startup is where a bad model switch is most likely to sit: a typo in
+        // `raven.toml` or in the client's initialization options is already in
+        // effect by the time `initialize` returns, and VS Code sends no
+        // `workspace/didChangeConfiguration` at startup. Without this, the only
+        // signal is a `log::warn!` that the default logging configuration
+        // filters out, so `stan = "On"` is indistinguishable from the built-in
+        // `"off"` default — diagnostics never appear and nothing says why.
+        //
+        // Emitted from `initialized` rather than `initialize` because LSP
+        // forbids sending notifications before the handshake completes.
+        let model_switch_warnings = {
+            let state = self.state.read().await;
+            invalid_model_switch_messages(&crate::config_file::merged_settings(&state))
+        };
+        for message in model_switch_warnings {
+            self.client
+                .show_message(MessageType::WARNING, message)
+                .await;
         }
 
         // Get workspace folders and config under brief lock
@@ -19222,7 +19293,6 @@ impl LanguageServer for Backend {
         if let Err(err) = parse_cross_file_config(&params.settings) {
             self.client.show_message(MessageType::WARNING, err).await;
         }
-
         let new_raw_client = params.settings.clone();
         let (project_root, previous_project_config_path, workspace_folders, old_raw_client): (
             Option<std::path::PathBuf>,
@@ -19281,7 +19351,7 @@ impl LanguageServer for Backend {
         // marker WHILE an old-config worker holds the publish lock, so the
         // marker is in place by the time that worker's gate commit runs and
         // correctly refuses it.
-        let (snapshot, project_config_path) = {
+        let (snapshot, project_config_path, model_switch_warnings) = {
             let mut state = self.state.write().await;
 
             let prev = ConfigChangeSnapshot::capture(&state);
@@ -19302,8 +19372,26 @@ impl LanguageServer for Backend {
             // exists.
             state.notify_library_routing_reconcile();
 
-            (prev, state.project_config_path.clone())
+            // Collect from the MERGED layer, after recompute — the layer that
+            // decides the effective value. Reading `params.settings` instead
+            // would both over- and under-report: a client typo superseded by
+            // `raven.toml` would toast "Defaulting to 'off'" while the setting
+            // is actually on, and a typo living only in `raven.toml` would
+            // never toast at all.
+            let warnings =
+                invalid_model_switch_messages(&crate::config_file::merged_settings(&state));
+
+            (prev, state.project_config_path.clone(), warnings)
         };
+
+        // A model switch that fails closed is otherwise invisible: the log is
+        // filtered out by default, so a typo like "On" looks exactly like the
+        // built-in "off" default — no diagnostics, no explanation. Toast it.
+        for message in model_switch_warnings {
+            self.client
+                .show_message(MessageType::WARNING, message)
+                .await;
+        }
 
         // Helper drives change detection, package rebuilds, watcher
         // restart, completion re-registration, and force-republish
@@ -19439,7 +19527,7 @@ impl LanguageServer for Backend {
             // raw project settings, recompute parsed configs, recompile
             // overrides. The shared reconciliation helper drives every
             // downstream action outside the lock.
-            let snapshot = {
+            let (snapshot, model_switch_warnings) = {
                 let mut state = self.state.write().await;
                 let prev = ConfigChangeSnapshot::capture(&state);
 
@@ -19451,8 +19539,20 @@ impl LanguageServer for Backend {
                 // `state.lint_overrides` from the merged settings.
                 crate::config_file::recompute_parsed_configs(&mut state);
 
-                prev
+                // An invalid switch that arrived via `raven.toml` needs the same
+                // user-visible signal as one typed into editor settings. This is
+                // the only path that sees a project-file edit, so without this
+                // the toast would depend on which layer the typo lives in.
+                let warnings =
+                    invalid_model_switch_messages(&crate::config_file::merged_settings(&state));
+
+                (prev, warnings)
             };
+            for message in model_switch_warnings {
+                self.client
+                    .show_message(MessageType::WARNING, message)
+                    .await;
+            }
             // Helper drives change detection, package rebuilds, watcher
             // restart, completion re-registration, and force-republish
             // marking. Returns the URIs to publish (empty when only the
@@ -20593,19 +20693,26 @@ impl Backend {
             });
             let workspace_exclusion_package_reseed = workspace_exclusion_package_reseed.flatten();
 
-            let only_watch_changed = watch_settings_changed
+            // Suppress the workspace-wide republish when nothing that can change
+            // a finding moved. `analysis_settings_changed` is the same predicate
+            // `recompute_parsed_configs` uses to decide whether to retire
+            // in-flight workers, so the two cannot disagree: a setting that is
+            // cheap enough to skip cancellation is also cheap enough to skip
+            // recomputing every open document.
+            //
+            // Without this, a scheduling-only knob like
+            // `maxRevalidationsPerTrigger` would leave existing workers running
+            // (correctly) while ALSO force-marking every open URI and starting a
+            // replacement batch — so both sets race for the same force marker,
+            // and every open document is recomputed for a knob that cannot alter
+            // any of their findings.
+            let only_non_analysis_changed = !state
+                .cross_file_config
+                .analysis_settings_changed(&prev.prev_cross_file)
                 && !lint_config_changed
                 && !linting_section_changed
                 && !indentation_producer_policy_changed
-                && !workspace_exclusions_changed
-                && {
-                    let mut probe = state.cross_file_config.clone();
-                    probe.packages_watch_library_paths =
-                        prev.prev_cross_file.packages_watch_library_paths;
-                    probe.packages_watch_debounce_ms =
-                        prev.prev_cross_file.packages_watch_debounce_ms;
-                    probe == prev.prev_cross_file
-                };
+                && !workspace_exclusions_changed;
 
             // If `package_mode` changed, apply the setting change via the
             // event-driven path. For Disabled: translate immediately
@@ -20694,7 +20801,7 @@ impl Backend {
                 scope_changed,
                 package_settings_changed,
                 watch_settings_changed,
-                only_watch_changed,
+                only_non_analysis_changed,
                 diagnostics_enabled_changed,
                 old_diagnostics_enabled,
                 new_diagnostics_enabled,
@@ -20714,7 +20821,7 @@ impl Backend {
             scope_changed,
             package_settings_changed,
             watch_settings_changed,
-            only_watch_changed,
+            only_non_analysis_changed,
             diagnostics_enabled_changed,
             old_diagnostics_enabled,
             new_diagnostics_enabled,
@@ -21240,7 +21347,7 @@ impl Backend {
             return Vec::new();
         }
 
-        if only_watch_changed && deferred_post_seed.is_none() {
+        if only_non_analysis_changed && deferred_post_seed.is_none() {
             return Vec::new();
         }
         if workspace_scan_transfer.is_some()
@@ -31551,6 +31658,67 @@ mod tests {
             }
         }
 
+        /// Every message claims "Defaulting to 'off'", so a settings value that
+        /// `parse_cross_file_config` rejects wholesale must produce none: the
+        /// rejection leaves the PREVIOUS config in place, so nothing defaulted
+        /// and the claim would be false.
+        #[test]
+        fn invalid_model_switch_messages_are_silent_when_the_config_is_rejected() {
+            let rejected = json!({ "crossFile": false, "diagnostics": { "stan": "On" } });
+            assert!(
+                crate::backend::parse_cross_file_config(&rejected).is_err(),
+                "test premise: a non-object crossFile section must be rejected"
+            );
+            // The guard uses the predicate-only twin so it does not re-run the
+            // parser's info-level config summary. Pin the equivalence, or the
+            // two can drift as sections are added.
+            assert!(crate::backend::cross_file_sections_are_malformed(&rejected));
+            assert!(
+                crate::backend::invalid_model_switch_messages(&rejected).is_empty(),
+                "a rejected update applies no fallback, so it must not claim one"
+            );
+
+            // The same typo in an ACCEPTED update still reports — the guard
+            // must not swallow the ordinary case.
+            let accepted = json!({ "diagnostics": { "stan": "On" } });
+            let messages = crate::backend::invalid_model_switch_messages(&accepted);
+            assert_eq!(messages.len(), 1, "{messages:?}");
+            assert!(messages[0].contains("diagnostics.stan") && messages[0].contains("'On'"));
+        }
+
+        /// `cross_file_sections_are_malformed` must agree with
+        /// `parse_cross_file_config` on every section, in both directions —
+        /// it exists only to answer the same question without the parser's
+        /// logging side effect.
+        #[test]
+        fn malformed_section_predicate_matches_the_parser_verdict() {
+            for section in ["crossFile", "diagnostics", "packages"] {
+                for bad in [json!(false), json!(1), json!("x"), json!([])] {
+                    let settings = json!({ section: bad.clone() });
+                    assert!(
+                        crate::backend::cross_file_sections_are_malformed(&settings),
+                        "{section} = {bad} must read as malformed"
+                    );
+                    assert!(
+                        crate::backend::parse_cross_file_config(&settings).is_err(),
+                        "{section} = {bad} must be rejected by the parser"
+                    );
+                }
+
+                let settings = json!({ section: {} });
+                assert!(
+                    !crate::backend::cross_file_sections_are_malformed(&settings),
+                    "an empty {section} object is well-formed"
+                );
+                assert!(crate::backend::parse_cross_file_config(&settings).is_ok());
+            }
+
+            // Absent sections are well-formed, not malformed.
+            assert!(!crate::backend::cross_file_sections_are_malformed(&json!(
+                {}
+            )));
+        }
+
         /// An explicit JSON `null` means "not configured" and must leave the
         /// built-in default in place, matching an absent key.
         #[test]
@@ -33205,6 +33373,54 @@ mod refresh_packages_tests {
                 .force_republish_count_for_test(&uri)
                 > 0,
             "the combined reload must force a same-version diagnostic republish"
+        );
+    }
+
+    /// A scheduling-only knob must NOT republish open documents.
+    ///
+    /// `maxRevalidationsPerTrigger` is a fan-out cap applied by `truncate` when
+    /// building a candidate list: it decides which documents get scheduled for a
+    /// future revalidation, never what any document's findings contain. Because
+    /// `recompute_parsed_configs` deliberately keeps in-flight workers alive for
+    /// this setting, force-marking every open URI here would let the surviving
+    /// workers and a fresh replacement batch race for the same force marker —
+    /// and recompute every open document for a knob that cannot change any of
+    /// their findings. The republish gate and the retirement gate share one
+    /// predicate (`analysis_settings_changed`) so they cannot drift apart.
+    #[tokio::test]
+    async fn revalidation_cap_only_reload_skips_the_open_document_republish() {
+        let backend = make_test_backend();
+        let uri = Url::parse("file:///cap-only.R").unwrap();
+        let snapshot = {
+            let mut state = backend.state.write().await;
+            state.raw_client_settings = serde_json::json!({
+                "crossFile": { "maxRevalidationsPerTrigger": 10 }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            state.open_document(uri.clone(), "x <- 1\n", Some(1));
+
+            let snapshot = ConfigChangeSnapshot::capture(&state);
+            state.raw_client_settings = serde_json::json!({
+                "crossFile": { "maxRevalidationsPerTrigger": 25 }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            snapshot
+        };
+
+        let to_publish = backend.reconcile_after_config_recompute(snapshot).await;
+        assert!(
+            to_publish.is_empty(),
+            "a fan-out cap cannot change any finding, so nothing should republish"
+        );
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.cross_file_config.max_revalidations_per_trigger, 25,
+            "the new cap must still be installed"
+        );
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            0,
+            "no force marker may be minted for a scheduling-only change"
         );
     }
 
@@ -34933,6 +35149,144 @@ mod project_config_initialize_tests {
         }
 
         registrations
+    }
+
+    /// Drive `initialize` + `initialized` and collect every `window/showMessage`
+    /// the server emits.
+    ///
+    /// Shaped like [`initialized_registrations_with_home`] — the socket must be
+    /// drained and every request answered, or `initialized` blocks on its own
+    /// dynamic registrations and never reaches the code under test.
+    async fn initialized_show_messages(initialize_params: InitializeParams) -> Vec<String> {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::{Request, Response};
+        use tower_lsp::lsp_types::{InitializedParams, ShowMessageParams};
+
+        let (mut svc, socket) = tower_lsp::LspService::new(Backend::new);
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(serde_json::to_value(initialize_params).unwrap())
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+
+        let (mut request_stream, mut response_sink) = socket.split();
+        let initialized = svc.inner().initialized(InitializedParams {});
+        tokio::pin!(initialized);
+        let mut messages = Vec::new();
+        let mut initialized_done = false;
+
+        loop {
+            let request = if initialized_done {
+                match tokio::time::timeout(Duration::from_millis(100), request_stream.next()).await
+                {
+                    Ok(request) => request,
+                    Err(_) => break,
+                }
+            } else {
+                tokio::select! {
+                    () = &mut initialized => {
+                        initialized_done = true;
+                        continue;
+                    }
+                    request = tokio::time::timeout(Duration::from_secs(5), request_stream.next()) => {
+                        request.expect("initialized should drive the client socket")
+                    }
+                }
+            }
+            .expect("client socket should remain open");
+
+            if request.method() == "window/showMessage" {
+                let params: ShowMessageParams =
+                    serde_json::from_value(request.params().expect("message params").clone())
+                        .unwrap();
+                messages.push(params.message);
+            }
+
+            if let Some(id) = request.id().cloned() {
+                response_sink
+                    .send(Response::from_ok(id, serde_json::Value::Null))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        messages
+    }
+
+    /// A `raven.toml` typo is in effect the moment the server starts, and VS Code
+    /// sends no `workspace/didChangeConfiguration` at startup — so without a
+    /// toast from `initialized` the only signal is a `log::warn!` the default
+    /// logging configuration filters out, leaving `"On"` indistinguishable from
+    /// the built-in `"off"` default.
+    #[tokio::test]
+    async fn initialized_toasts_invalid_model_switch_from_project_config() {
+        use serde_json::json;
+
+        let workspace = TempDir::new().unwrap();
+        fs::write(
+            workspace.path().join("raven.toml"),
+            "[diagnostics]\nstan = \"On\"\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(workspace.path()).unwrap();
+
+        let messages = initialized_show_messages(InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "t".into(),
+            }]),
+            initialization_options: Some(json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("diagnostics.stan") && message.contains("'On'")),
+            "startup must toast a raven.toml model-switch typo, got {messages:?}"
+        );
+    }
+
+    /// The complement: a valid config must stay silent, so the toast cannot
+    /// become background noise every session.
+    #[tokio::test]
+    async fn initialized_does_not_toast_a_valid_model_switch() {
+        use serde_json::json;
+
+        let workspace = TempDir::new().unwrap();
+        fs::write(
+            workspace.path().join("raven.toml"),
+            "[diagnostics]\nstan = \"on\"\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(workspace.path()).unwrap();
+
+        let messages = initialized_show_messages(InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "t".into(),
+            }]),
+            initialization_options: Some(json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("diagnostics.stan")),
+            "a valid switch must not toast, got {messages:?}"
+        );
     }
 
     fn watcher_options(registration: Registration) -> DidChangeWatchedFilesRegistrationOptions {

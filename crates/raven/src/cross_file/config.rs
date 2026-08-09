@@ -322,6 +322,31 @@ impl CrossFileConfig {
             }
     }
 
+    /// Whether this language is a model language the user has left switched off.
+    ///
+    /// Narrower than [`Self::diagnostics_enabled_for_file_type`] on purpose, and
+    /// the two are not interchangeable. Use this one for work that must be
+    /// skipped *before touching the file at all* — a default-off `.stan` target
+    /// should produce nothing, not an encoding finding and not an exit-2
+    /// operator error from an unreadable path.
+    ///
+    /// The global master switch is deliberately excluded. `diagnostics.enabled =
+    /// false` suppresses *findings*; it does not make an unreadable path stop
+    /// being an operator error, and `raven check` documents exit 2 for that
+    /// regardless of which findings are switched on. Gating a pre-read skip on
+    /// the master switch would turn an unreadable explicit target into a
+    /// successful run.
+    pub(crate) fn model_language_switched_off(
+        &self,
+        file_type: crate::file_type::FileType,
+    ) -> bool {
+        match file_type {
+            crate::file_type::FileType::R => false,
+            crate::file_type::FileType::Jags => !self.jags_diagnostics_enabled,
+            crate::file_type::FileType::Stan => !self.stan_diagnostics_enabled,
+        }
+    }
+
     /// Whether analysis-affecting settings changed between two configs.
     ///
     /// The caller uses this to decide whether to cancel every in-flight
@@ -344,12 +369,19 @@ impl CrossFileConfig {
     ///   debounce slider should not cancel every worker mid-flight and force a
     ///   whole-workspace recompute; the next ticket picks the new value up on
     ///   its own.
+    /// - `max_revalidations_per_trigger` — a fan-out cap. Every read of it is a
+    ///   `truncate` on an already-built candidate list, so it decides which
+    ///   documents get *scheduled* for a future revalidation, never what any
+    ///   individual document's diagnostics contain. Cancelling all in-flight
+    ///   work to apply a new cap is strictly counterproductive: the cap only
+    ///   takes effect on subsequent triggers anyway.
     pub(crate) fn analysis_settings_changed(&self, other: &Self) -> bool {
         let mut probe = self.clone();
         probe.packages_watch_library_paths = other.packages_watch_library_paths;
         probe.packages_watch_debounce_ms = other.packages_watch_debounce_ms;
         probe.revalidation_debounce_ms = other.revalidation_debounce_ms;
         probe.edited_file_debounce_ms = other.edited_file_debounce_ms;
+        probe.max_revalidations_per_trigger = other.max_revalidations_per_trigger;
         probe != *other
     }
 

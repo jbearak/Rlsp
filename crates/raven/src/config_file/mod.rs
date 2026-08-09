@@ -113,6 +113,18 @@ pub(crate) fn lintr_path_opts_in(
     ConfigFileKind::is_lintr_path(path) && lintr_expresses_linting(raw_project)
 }
 
+/// The effective `(client, project)` settings view, exactly as
+/// [`recompute_parsed_configs`] computes it.
+///
+/// Exposed so surfaces with a user-visible channel can report on the layer that
+/// actually decides a value. A client-layer typo superseded by `raven.toml` is
+/// not worth complaining about, and a typo that exists only in `raven.toml`
+/// must still be reported — neither is visible from one raw layer alone.
+pub fn merged_settings(state: &crate::state::WorldState) -> serde_json::Value {
+    let normalized_project = strip_project_auto_enabled(state.raw_project_settings.as_ref());
+    merge_settings(&state.raw_client_settings, normalized_project.as_ref())
+}
+
 pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     let previous_cross_file = state.cross_file_config.clone();
     let previous_lint = state.lint_config.clone();
@@ -135,11 +147,11 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     // indentation lint reports and must retire workers.
     let previous_indentation_producer_policy = state.indentation_producer_policy;
 
-    let normalized_project = strip_project_auto_enabled(state.raw_project_settings.as_ref());
-    let merged = merge_settings(&state.raw_client_settings, normalized_project.as_ref());
+    let merged = merged_settings(state);
     // Single warning site for the model-diagnostics switches: one call, on the
     // merged layer that actually decides the effective value. See
-    // `warn_invalid_model_switches`.
+    // `warn_invalid_model_switches`. Callers with a user-visible channel
+    // additionally toast/print from `merged_settings` after this returns.
     crate::backend::warn_invalid_model_switches(&merged);
 
     match crate::backend::parse_cross_file_config(&merged) {
@@ -465,6 +477,36 @@ mod tests {
             state.analysis_config_generation_for_test(),
             before,
             "scheduling-only knobs must not retire in-flight workers"
+        );
+    }
+
+    /// `maxRevalidationsPerTrigger` is a fan-out cap applied by `truncate` when
+    /// building a candidate list. It selects which documents get scheduled next,
+    /// never what any document's findings are, so it must not cancel in-flight
+    /// work — which would be counterproductive anyway, since the new cap only
+    /// applies to subsequent triggers.
+    #[test]
+    fn revalidation_cap_change_keeps_the_analysis_config_generation() {
+        let mut state = WorldState::new();
+        state.raw_client_settings = json!({
+            "crossFile": { "maxRevalidationsPerTrigger": 10 }
+        });
+        recompute_parsed_configs(&mut state);
+        let before = state.analysis_config_generation_for_test();
+
+        state.raw_client_settings = json!({
+            "crossFile": { "maxRevalidationsPerTrigger": 25 }
+        });
+        recompute_parsed_configs(&mut state);
+
+        assert_eq!(
+            state.cross_file_config.max_revalidations_per_trigger, 25,
+            "the new cap must still be installed"
+        );
+        assert_eq!(
+            state.analysis_config_generation_for_test(),
+            before,
+            "a fan-out cap must not retire in-flight workers"
         );
     }
 

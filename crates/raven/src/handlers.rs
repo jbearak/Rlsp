@@ -6599,6 +6599,17 @@ pub fn diagnostics(state: &WorldState, uri: &Url, cancel: &DiagCancelToken) -> V
         return Vec::new();
     };
 
+    // Same per-language gate the snapshot path applies, checked here too so
+    // this wrapper agrees with `diagnostics_from_snapshot` instead of doing
+    // the snapshot work first and discarding the result. Needs the document
+    // for its file type, so it cannot move above the lookup.
+    if !state
+        .cross_file_config
+        .diagnostics_enabled_for_file_type(doc.file_type)
+    {
+        return Vec::new();
+    }
+
     if doc.tree.is_none() {
         return Vec::new();
     }

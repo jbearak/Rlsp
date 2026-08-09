@@ -672,6 +672,21 @@ fn build_indexed_state(
     // its auto-enable (which, for the CLI's empty client layer, defaults on).
     crate::config_file::recompute_parsed_configs(&mut state);
 
+    // A model switch that fails closed is otherwise silent here: the recompute
+    // logs it, but the CLI runs without a logger by default, so `stan = "On"`
+    // in `raven.toml` reads exactly like the built-in "off" — an empty report
+    // with no explanation. Put it on stderr so it cannot be mistaken for a
+    // clean run, and keep it off stdout so `--format json|sarif` output stays
+    // machine-parsable.
+    for message in crate::backend::invalid_model_switch_messages(
+        state
+            .raw_project_settings
+            .as_ref()
+            .unwrap_or(&serde_json::Value::Null),
+    ) {
+        eprintln!("raven check: {message}");
+    }
+
     // Index the workspace exactly as the LSP server does on startup. This is
     // rayon-parallel internally; there's no lock contention here since the CLI
     // owns `state` exclusively.
@@ -1562,6 +1577,17 @@ fn compute_file_diagnostics_sync(
     Option<DiagnosticSeverity>,
     crate::cross_file::CaseMismatchSeverity,
 )> {
+    // Gate before building the snapshot, not after. `diagnostics_from_snapshot`
+    // applies the same per-language check and returns empty, but only once the
+    // text has been cloned and the whole cross-file snapshot assembled — so a
+    // repository of default-off Stan or JAGS files still paid full parse and
+    // snapshot cost per file to produce nothing.
+    if !state
+        .cross_file_config
+        .diagnostics_enabled_for_file_type(crate::file_type::file_type_from_uri(uri))
+    {
+        return None;
+    }
     let snapshot =
         crate::handlers::DiagnosticsSnapshot::build_with_open_documents_and_extra_providers(
             state,
@@ -1779,6 +1805,24 @@ async fn collect_target_diagnostics(
         if state.workspace_index.contains(&uri) {
             continue; // already handled in the parallel phase
         }
+        // Apply the per-language gate BEFORE touching the file. A default-off
+        // model target must produce nothing at all — not an encoding finding,
+        // and not an operator error from an unreadable path. Reading first and
+        // gating later let a disabled `.stan` file fail the run on a property
+        // of a file whose diagnostics the user switched off.
+        //
+        // `model_language_switched_off`, NOT
+        // `diagnostics_enabled_for_file_type`: the latter also folds in the
+        // global master switch, which would make `diagnostics.enabled = false`
+        // skip the read for R and Rmd targets too and exit 0 on an unreadable
+        // path, against the documented exit-2 contract. The master switch
+        // suppresses findings; it does not un-break a file the operator named.
+        if state
+            .cross_file_config
+            .model_language_switched_off(crate::file_type::file_type_from_uri(&uri))
+        {
+            continue;
+        }
         let text = match crate::state::read_source(path) {
             Ok(t) => t,
             Err(crate::state::SourceReadError::Io(e)) => {
@@ -1975,6 +2019,66 @@ mod tests {
         let mut args = base_args(workspace);
         args.no_config = false;
         args
+    }
+
+    /// The pre-read gate must not swallow I/O errors when the GLOBAL switch is
+    /// off. `diagnostics.enabled = false` suppresses findings; an unreadable
+    /// path the operator explicitly named is still exit 2 (docs/cli.md).
+    ///
+    /// The target is an `.Rmd` so it takes the phase-3 disk-fallback path where
+    /// the gate lives — the R-only workspace scan does not index it.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_target_is_still_an_operator_error_when_diagnostics_are_off() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("unreadable.Rmd");
+        fs::write(&path, "```{r}\nx <- 1\n```\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root defeats the permission bits entirely; skip rather
+        // than assert something the environment cannot produce.
+        if fs::read(&path).is_ok() {
+            return;
+        }
+
+        let mut args = model_diagnostic_args(tmp.path(), "enabled = false\n");
+        args.paths = vec![path.clone()];
+        let code = run_blocking(args);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            code, 2,
+            "an unreadable explicit target must stay an operator error even with diagnostics off"
+        );
+    }
+
+    /// The complement, and the reason the gate exists: a default-off `.stan`
+    /// target must produce nothing at all — not a finding, and not exit 2 from
+    /// a path the user switched off.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_default_off_stan_target_is_not_an_operator_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("unreadable.stan");
+        fs::write(&path, "model { target += ; }\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&path).is_ok() {
+            return;
+        }
+
+        let mut args = base_args(tmp.path());
+        args.paths = vec![path.clone()];
+        let code = run_blocking(args);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            code, 0,
+            "a switched-off model target must not fail the run on a property of a file \
+             whose diagnostics the user disabled"
+        );
     }
 
     #[test]
