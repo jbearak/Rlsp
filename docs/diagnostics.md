@@ -6,7 +6,7 @@ In the bundled VS Code extension, editor diagnostics are tab scoped. Indexed or 
 
 Diagnostics are deferred until the workspace scan completes (in `auto` backward dependency mode), so cross-file warnings reflect the full project.
 
-Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, undefined variables, package and cross-file issues, assignment-target errors, and semantic warnings — are on by default whenever `raven.diagnostics.enabled` is true. Most categories expose a severity setting that can raise, lower, or silence them (set to `"off"`); a few (parse errors, assignment-target errors) have no per-category knob and respond only to the master switch. **Style lints** are subjective formatting rules gated by the tri-state `raven.linting.enabled` switch (default `"auto"` — on when a `.lintr` or `raven.toml` opts in, though the literal home-directory `~/.lintr` is ignored unless the VS Code/LSP-client setting `raven.linting.readHomeLintr` is true or the CLI receives `--config ~/.lintr`, and a `.lintr` is ignored when REditorSupport's `lintr` path is live or you're in Positron; see the [behavior matrix](linting.md#behavior-matrix)). If you're looking for a specific check, scan the categories below before reaching for [Linting](linting.md), which covers the style group in depth.
+Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, undefined variables, package and cross-file issues, assignment-target errors, and semantic warnings — are on by default whenever `raven.diagnostics.enabled` is true, except that standalone JAGS/BUGS and Stan diagnostics are separately opt-in with `raven.diagnostics.jags` and `raven.diagnostics.stan` (both default `"off"`). Most categories expose a severity setting that can raise, lower, or silence them (set to `"off"`); a few (R parse errors, assignment-target errors) have no per-category knob and respond only to the master switch. **Style lints** are subjective formatting rules gated by the tri-state `raven.linting.enabled` switch (default `"auto"` — on when a `.lintr` or `raven.toml` opts in, though the literal home-directory `~/.lintr` is ignored unless the VS Code/LSP-client setting `raven.linting.readHomeLintr` is true or the CLI receives `--config ~/.lintr`, and a `.lintr` is ignored when REditorSupport's `lintr` path is live or you're in Positron; see the [behavior matrix](linting.md#behavior-matrix)). If you're looking for a specific check, scan the categories below before reaching for [Linting](linting.md), which covers the style group in depth.
 
 ## Quick Reference
 
@@ -16,6 +16,7 @@ Diagnostics fall into two groups. **Correctness diagnostics** — parse errors, 
 - **Bring a parent file's symbols into scope** — usually nothing to do (auto mode infers relationships). Add `# raven: sourced-by` only when auto-discovery can't see the link. See [Cross-File Awareness](cross-file.md)
 - **Account for project startup helpers** — Raven models a workspace-root `.Rprofile` for ordinary script scope. See [`.Rprofile` Startup Prelude](rprofile.md)
 - **Turn a category off globally** — set the matching severity to `"off"` (see [Configuration](configuration.md))
+- **Opt into model diagnostics** — set `raven.diagnostics.jags` and/or `raven.diagnostics.stan` to `"on"`
 - **Disable everything** — set `raven.diagnostics.enabled` to `false`
 
 ## Diagnostic codes
@@ -94,15 +95,21 @@ The `Mismatched brackets` message also covers wrong-closer typos where the user 
 
 ### JAGS and Stan Parse Errors
 
-Raven reports syntax errors in `.jags`, `.bugs`, `.bug`, and `.stan` files, both in the
-editor and from `raven check`. Untitled buffers whose language ID is `jags` are
-checked as JAGS too. JAGS checking is deliberately syntax-only. Stan also gets
-the conservative undeclared-variable pass described below. Raven does not
-validate dimensions or distribution signatures, type-check Stan, or run JAGS,
-`stanc`, R, or any network process. Other syntactically well-formed semantic
-errors therefore remain silent. Findings use the same
-non-suppressible `syntax-error` code and obey only the master
-`raven.diagnostics.enabled` switch.
+Raven can report syntax errors in `.jags`, `.bugs`, `.bug`, and `.stan` files, both in the
+editor and from `raven check`. Model-language diagnostics are opt-in: enable
+`raven.diagnostics.jags` for JAGS/BUGS or
+`raven.diagnostics.stan` for Stan. Both default to `"off"`, and the
+`raven.diagnostics.enabled` master switch still takes precedence. Untitled
+buffers whose language ID is `jags` or `stan` use the corresponding setting too.
+JAGS checking is deliberately syntax-only. Stan also gets the conservative
+undeclared-variable pass described below. Raven does not validate dimensions or
+distribution signatures, type-check Stan, or run JAGS, `stanc`, R, or any
+network process. Other syntactically well-formed semantic errors therefore
+remain silent. Syntax findings use the same non-suppressible `syntax-error` code.
+
+Disabling these diagnostic settings does not disable language registration,
+parsing, completion, hover, navigation, syntax highlighting, or CLI target
+discovery for model files. It only makes their native diagnostic result empty.
 
 Native Stan and JAGS syntax findings share
 `raven.diagnostics.maxSyntaxDiagnosticsPerFile` (default `500`). Raven removes
@@ -173,9 +180,12 @@ comment spans lines.
 
 ### Stan Undeclared Variables
 
-For a structurally complete Stan program, Raven reports clear undeclared
-variable references with the existing `undefined-variable` code and configured
-`raven.diagnostics.undefinedVariableSeverity` (warning by default). The native
+When `raven.diagnostics.stan` is `"on"`, a structurally complete Stan
+program gets clear undeclared-variable findings with the existing
+`undefined-variable` code and configured
+`raven.diagnostics.undefinedVariableSeverity` (warning by default). Setting
+that severity to `"off"` suppresses only this semantic pass; Stan syntax
+findings remain enabled. The native
 pass models declaration order; data → transformed data → parameters →
 transformed parameters → model → generated quantities visibility; function
 parameters and locals; statement-block locals; and `for` loop variables. It

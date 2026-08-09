@@ -311,6 +311,75 @@ fn normalize_document_indent_unit(unit: u32) -> u32 {
     unit.clamp(1, 8)
 }
 
+/// Parse one `"on"` / `"off"` model-language diagnostics switch.
+///
+/// Returns `None` when the key is absent (leave the layered value alone) and
+/// `Some(enabled)` when it is present. Unrecognized strings and non-string
+/// types fail closed to `Some(false)` rather than being silently ignored: a
+/// typo like `"true"` or `"On"` would otherwise read as "off" with no signal,
+/// which is indistinguishable from the default.
+///
+/// Deliberately SILENT. This runs on whichever layer its caller happens to
+/// hold, and is called more than once per config change — `parse_cross_file_config`
+/// runs both for `did_change_configuration`'s validation toast and again inside
+/// `recompute_parsed_configs`. Warning here would emit the same complaint twice,
+/// and would complain about a client-layer typo that an effective project
+/// `raven.toml` override makes irrelevant. `warn_invalid_model_switches` owns
+/// the diagnostic instead: one call, on the merged settings, per recompute.
+fn parse_diagnostics_switch(raw: Option<&serde_json::Value>) -> Option<bool> {
+    use serde_json::Value;
+
+    match raw {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => match value.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => Some(false),
+        },
+        Some(_) => Some(false),
+    }
+}
+
+/// Warn about `diagnostics.jags` / `diagnostics.stan` values that fail closed.
+///
+/// Call this ONCE per config recompute, on the MERGED settings — the layer that
+/// actually decides the effective value. `parse_diagnostics_switch` stays silent
+/// precisely so this can be the single warning site: warning inside the parser
+/// fired twice per `did_change_configuration` (validation pass plus recompute)
+/// and could contradict itself, complaining about a client typo that a project
+/// `raven.toml` override had already superseded.
+pub(crate) fn warn_invalid_model_switches(merged: &serde_json::Value) {
+    use serde_json::Value;
+
+    let Some(diagnostics) = merged.get("diagnostics") else {
+        return;
+    };
+    for name in ["jags", "stan"] {
+        match diagnostics.get(name) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(value)) => {
+                if value != "on" && value != "off" {
+                    log::warn!(
+                        "Unrecognized diagnostics.{name} value '{value}'; defaulting to 'off'."
+                    );
+                }
+            }
+            Some(other) => {
+                let kind = match other {
+                    Value::Bool(_) => "boolean",
+                    Value::Number(_) => "number",
+                    Value::Array(_) => "array",
+                    Value::Object(_) => "object",
+                    _ => "value",
+                };
+                log::warn!(
+                    "diagnostics.{name} must be string \"on|off\"; got {kind}. Defaulting to 'off'."
+                );
+            }
+        }
+    }
+}
+
 /// Parse cross-file configuration from LSP settings.
 ///
 /// Reads the top-level `crossFile`, `diagnostics`, and `packages` sections from a
@@ -349,7 +418,12 @@ fn normalize_document_indent_unit(unit: u32) -> u32 {
 ///         "rPath": "/usr/bin/R",
 ///         "missingPackageSeverity": "information"
 ///     },
-///     "diagnostics": { "enabled": true, "undefinedVariableSeverity": "warning" }
+///     "diagnostics": {
+///         "enabled": true,
+///         "jags": "on",
+///         "stan": "on",
+///         "undefinedVariableSeverity": "warning"
+///     }
 /// });
 ///
 /// let cfg = raven::backend::parse_cross_file_config(&settings).unwrap();
@@ -359,6 +433,8 @@ fn normalize_document_indent_unit(unit: u32) -> u32 {
 /// assert!(cfg.index_workspace);
 /// assert!(cfg.packages_enabled);
 /// assert!(cfg.diagnostics_enabled);
+/// assert!(cfg.jags_diagnostics_enabled);
+/// assert!(cfg.stan_diagnostics_enabled);
 /// ```
 pub(crate) fn parse_cross_file_config(
     settings: &serde_json::Value,
@@ -540,6 +616,12 @@ pub(crate) fn parse_cross_file_config(
         // Parse diagnostics.enabled (master switch)
         if let Some(v) = diag.get("enabled").and_then(|v| v.as_bool()) {
             config.diagnostics_enabled = v;
+        }
+        if let Some(enabled) = parse_diagnostics_switch(diag.get("jags")) {
+            config.jags_diagnostics_enabled = enabled;
+        }
+        if let Some(enabled) = parse_diagnostics_switch(diag.get("stan")) {
+            config.stan_diagnostics_enabled = enabled;
         }
         // Parse diagnostics.maxSyntaxDiagnosticsPerFile. Zero deliberately
         // means unlimited; unlike cache sizes, it must not be clamped upward.
@@ -16175,9 +16257,10 @@ async fn run_debounced_diagnostics(
     traversal_truncation: Option<Arc<TraversalTruncationState>>,
 ) {
     // Schedule with cancellation token, gated on the trigger still matching
-    // the document's current (version, revision, epoch) under the same read
-    // lock. A mismatched worker is already obsolete (a newer edit's worker
-    // owns the current state) or belongs to a retired lifecycle (spawned
+    // the document's current (version, revision, epoch, config generation)
+    // under the same read lock. A mismatched worker is already obsolete (a
+    // newer edit or configuration owns the current state) or belongs to a
+    // retired lifecycle (spawned
     // before a close+reopen or tab removal, which did_close's cancel cannot
     // reach because the worker had not scheduled yet — the epoch comparison
     // is what catches it even when version and revision coincide). Letting
@@ -16286,45 +16369,65 @@ async fn run_debounced_diagnostics(
             return;
         }
 
-        // Build the snapshot (captures all state needed for diagnostics)
-        let snapshot = handlers::DiagnosticsSnapshot::build(&state, &affected_uri);
+        let file_type = state
+            .documents
+            .get(&affected_uri)
+            .map(|document| document.file_type)
+            .unwrap_or_else(|| crate::file_type::file_type_from_uri(&affected_uri));
+        let diagnostics_enabled = state
+            .cross_file_config
+            .diagnostics_enabled_for_file_type(file_type);
+        let snapshot = if diagnostics_enabled {
+            let Some(snapshot) = handlers::DiagnosticsSnapshot::build(&state, &affected_uri) else {
+                state
+                    .cross_file_revalidation
+                    .complete(&affected_uri, generation);
+                return;
+            };
+            Some(snapshot)
+        } else {
+            None
+        };
         let workspace_folder = state.workspace_folders.first().cloned();
         let missing_file_severity = state.cross_file_config.missing_file_severity;
-
         let coherence_generation = state.diagnostics_coherence.generation();
-        snapshot.map(|s| {
-            (
-                s,
-                workspace_folder,
-                missing_file_severity,
-                coherence_generation,
-            )
-        })
+
+        (
+            snapshot,
+            diagnostics_enabled,
+            workspace_folder,
+            missing_file_severity,
+            coherence_generation,
+        )
     }; // Read lock released here
 
-    let Some((snapshot, workspace_folder, missing_file_severity, coherence_generation)) =
-        snapshot_data
-    else {
-        let state = state_arc.read().await;
-        state
-            .cross_file_revalidation
-            .complete(&affected_uri, generation);
-        return;
-    };
+    let (
+        snapshot,
+        diagnostics_enabled,
+        workspace_folder,
+        missing_file_severity,
+        coherence_generation,
+    ) = snapshot_data;
 
     if let Some(traversal_truncation) = traversal_truncation.as_deref() {
         check_and_warn_traversal_truncation(&state_arc, &client, traversal_truncation).await;
     }
 
-    // Compute diagnostics WITHOUT holding any lock
-    let sync_diagnostics =
-        match handlers::diagnostics_from_snapshot(&snapshot, &affected_uri, &cancel) {
-            Some(diags) => diags,
-            None => {
-                log::trace!("Diagnostics cancelled for {}", affected_uri);
-                return;
+    // Compute diagnostics WITHOUT holding any lock. A disabled model language
+    // deliberately carries no snapshot and reaches the publish tail with an
+    // empty result so a live config change can clear earlier findings cheaply.
+    let sync_diagnostics = match snapshot.as_ref() {
+        Some(snapshot) => {
+            match handlers::diagnostics_from_snapshot(snapshot, &affected_uri, &cancel) {
+                Some(diags) => diags,
+                None => {
+                    log::trace!("Diagnostics cancelled for {}", affected_uri);
+                    return;
+                }
             }
-        };
+        }
+        None => Vec::new(),
+    };
 
     if cancel.is_cancelled() {
         log::trace!(
@@ -16335,7 +16438,9 @@ async fn run_debounced_diagnostics(
     }
 
     // Perform async missing file existence checks (non-blocking I/O)
-    let diagnostics = if snapshot.file_type == crate::file_type::FileType::R {
+    let diagnostics = if let Some(snapshot) = snapshot.as_ref()
+        && snapshot.file_type == crate::file_type::FileType::R
+    {
         handlers::diagnostics_async_standalone(
             &affected_uri,
             sync_diagnostics,
@@ -16345,8 +16450,10 @@ async fn run_debounced_diagnostics(
             snapshot.cross_file_config.case_mismatch_severity,
         )
         .await
-    } else {
+    } else if diagnostics_enabled {
         sync_diagnostics
+    } else {
+        Vec::new()
     };
 
     if cancel.is_cancelled() {
@@ -19157,6 +19264,23 @@ impl LanguageServer for Backend {
         // client settings, recompute parsed configs, recompile lint
         // overrides. NO I/O — the helper handles every blocking action
         // outside the lock.
+        //
+        // Deliberately does NOT take `diagnostics_publish_lock`. A recurring
+        // review suggestion is to hold it across the generation advance, on the
+        // theory that a worker could pass its `trigger.is_stale` re-check,
+        // release the state lock, and then send stale findings after this
+        // handler moves `analysis_config_generation`. That window does not
+        // exist: `publish_diagnostics_inner` holds the publish lock from before
+        // its `is_stale` re-check all the way through
+        // `client.publish_diagnostics`, so a worker that has passed the check
+        // has not yet released the lock and this handler's own state write
+        // cannot interleave with its send. Taking the lock here would only add
+        // a second, redundant ordering — and it would break the deliberate
+        // design that `config_reload_rejects_model_worker_captured_before_disable`
+        // pins: the reload must be able to install its empty-publication force
+        // marker WHILE an old-config worker holds the publish lock, so the
+        // marker is in place by the time that worker's gate commit runs and
+        // correctly refuses it.
         let (snapshot, project_config_path) = {
             let mut state = self.state.write().await;
 
@@ -19204,9 +19328,15 @@ impl LanguageServer for Backend {
             }
         }
 
-        for uri in to_publish {
-            self.publish_diagnostics(&uri).await;
-        }
+        // Reuse the bounded-parallelism helper the watched-file reload path
+        // uses. A serial loop here made a settings change cost one full
+        // diagnostic computation per open document, back to back.
+        self.publish_config_reload_diagnostics(
+            to_publish,
+            #[cfg(test)]
+            None,
+        )
+        .await;
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -20144,7 +20274,30 @@ fn help_html_to_json(
     }
 }
 
+/// What one config-reload publish task returns on success.
+///
+/// The URI is carried only under `cfg(test)`, where the scheduled-vs-completed
+/// capture needs to know which document each finished task belonged to.
+#[cfg(test)]
+type ConfigReloadPublishOutcome = Url;
+#[cfg(not(test))]
+type ConfigReloadPublishOutcome = ();
+
 impl Backend {
+    /// Republish diagnostics for a config-reload set with bounded parallelism.
+    ///
+    /// Concurrency is [`DIAGNOSTIC_FANOUT_CONCURRENCY`], shared with the other
+    /// diagnostic fan-outs rather than set independently here. Each in-flight
+    /// publish holds its own analysis snapshot, so the bound is what caps peak
+    /// snapshot memory for the batch; keeping the two fan-outs on one constant
+    /// means a future tuning pass moves them together instead of leaving this
+    /// path at a stale value.
+    ///
+    /// Warns about cross-file traversal truncation once for the whole batch,
+    /// after every publish has landed. The per-URI [`Backend::publish_diagnostics`]
+    /// wrapper does this per document; batching it here is equivalent — the
+    /// truncation counters accumulate and `consume_delta` reports their sum —
+    /// and avoids taking the state read lock once per document.
     async fn publish_config_reload_diagnostics(
         &self,
         to_publish: Vec<Url>,
@@ -20152,18 +20305,20 @@ impl Backend {
             crate::state::FinalHandoffCaptureClaim<crate::state::ConfigReloadPublishForTest>,
         >,
     ) {
-        const MAX_CONCURRENT_PUBLISHES: usize = 8;
         let mut join_set = tokio::task::JoinSet::new();
         #[cfg(test)]
         let mut completed = Vec::with_capacity(to_publish.len());
         #[cfg(test)]
         let mut scheduled = to_publish.clone();
+        let had_work = !to_publish.is_empty();
         for uri in to_publish {
-            while join_set.len() >= MAX_CONCURRENT_PUBLISHES {
-                let _joined = join_set.join_next().await;
-                #[cfg(test)]
-                if let Some(Ok(uri)) = _joined {
-                    completed.push(uri);
+            while join_set.len() >= DIAGNOSTIC_FANOUT_CONCURRENCY {
+                if let Some(_joined) = join_set.join_next().await {
+                    Self::record_config_reload_publish(
+                        _joined,
+                        #[cfg(test)]
+                        &mut completed,
+                    );
                 }
             }
             let state_arc = self.state.clone();
@@ -20177,10 +20332,14 @@ impl Backend {
             });
         }
         while let Some(_joined) = join_set.join_next().await {
-            #[cfg(test)]
-            if let Ok(uri) = _joined {
-                completed.push(uri);
-            }
+            Self::record_config_reload_publish(
+                _joined,
+                #[cfg(test)]
+                &mut completed,
+            );
+        }
+        if had_work {
+            self.check_and_warn_traversal_truncation().await;
         }
         #[cfg(test)]
         if let Some(capture) = capture {
@@ -20194,6 +20353,33 @@ impl Backend {
                 .await;
             if let Some(completion) = completion {
                 completion.finish();
+            }
+        }
+    }
+
+    /// Account for one finished config-reload publish task.
+    ///
+    /// A `JoinError` means the publish task panicked or was aborted, so its
+    /// document was NOT republished. Discarding it silently would have let a
+    /// panicked task read as complete: the URI's force-republish marker is
+    /// already spent, so nothing reschedules it and the document keeps stale
+    /// diagnostics until the next edit. Log it, and in tests deliberately leave
+    /// the URI out of `completed` so the scheduled-vs-completed capture shows
+    /// the gap rather than hiding it.
+    fn record_config_reload_publish(
+        joined: std::result::Result<ConfigReloadPublishOutcome, tokio::task::JoinError>,
+        #[cfg(test)] completed: &mut Vec<Url>,
+    ) {
+        match joined {
+            Ok(_uri) => {
+                #[cfg(test)]
+                completed.push(_uri);
+            }
+            Err(err) => {
+                log::error!(
+                    "config reload diagnostic publish task did not complete ({err}); \
+                     that document keeps its previous diagnostics until the next edit"
+                );
             }
         }
     }
@@ -20485,6 +20671,23 @@ impl Backend {
 
             // Snapshot candidates now; marker ownership is transferred only
             // after every config/package/scan reconciliation step converges.
+            //
+            // Deliberately NOT narrowed to the languages whose model switch
+            // moved, even though an R document's findings cannot change when
+            // only `diagnostics.stan`/`jags` did.
+            //
+            // `recompute_parsed_configs` responds to any analysis-affecting
+            // change — a model switch included — by calling `cancel_all()` and
+            // advancing `analysis_config_generation`. That generation is a
+            // single global counter compared by `DiagnosticsTrigger::is_stale`,
+            // so the reload retires EVERY in-flight worker, not just the model
+            // languages' ones. Republishing a narrowed set would therefore drop
+            // an R document's only scheduled recomputation on the floor and
+            // strand whatever it last published until the user next edits it.
+            //
+            // Narrowing can only return once cancellation and the generation
+            // are themselves scoped; until then the sets must match, and the
+            // cancelled set is "everything".
             let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
 
             ReconciliationDecisions {
@@ -23303,11 +23506,11 @@ pub(crate) async fn publish_diagnostics_inner(
         coherence_generation,
     ) = {
         let state = state_arc.read().await;
-        // Full trigger capture (version + revision + epoch): the direct
-        // path has no cancellation token, so the commit-time comparison
-        // against this snapshot is its only defense against a lifecycle
-        // reuse (close+reopen) or a same-version edit racing the off-lock
-        // compute below.
+        // Full trigger capture (version + revision + epoch + config
+        // generation): the direct path has no cancellation token, so the
+        // commit-time comparison against this snapshot is its only defense
+        // against a lifecycle reuse (close+reopen), a same-version edit, or a
+        // configuration reload racing the off-lock compute below.
         let trigger = DiagnosticsTrigger::capture(&state, uri);
 
         if !state.diagnostics_publish_allowed(uri) {
@@ -23346,21 +23549,21 @@ pub(crate) async fn publish_diagnostics_inner(
             }
         }
 
-        // Capture the diagnostics master switch under the read lock so
-        // it gates BOTH the sync snapshot build AND the async
-        // missing-file checks below — without this, a config reload
-        // that flips `diagnostics.enabled` to `false` could still
-        // publish missing-file diagnostics from the async phase.
-        let diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
-
-        // Skip the snapshot build entirely when the master switch is
-        // off — saves the snapshot's metadata clone + neighborhood walk.
-        // Mirrors the early-exit in `handlers::diagnostics`.
-        let snapshot = if diagnostics_enabled {
-            handlers::DiagnosticsSnapshot::build(&state, uri)
-        } else {
-            None
-        };
+        // Capture the language-specific diagnostics gate under the read lock so
+        // it controls BOTH snapshot construction and the async missing-file
+        // phase. Disabled model languages still publish an explicit empty result,
+        // but avoid the snapshot's text clone and neighborhood preparation.
+        let file_type = state
+            .documents
+            .get(uri)
+            .map(|document| document.file_type)
+            .unwrap_or_else(|| crate::file_type::file_type_from_uri(uri));
+        let diagnostics_enabled = state
+            .cross_file_config
+            .diagnostics_enabled_for_file_type(file_type);
+        let snapshot = diagnostics_enabled
+            .then(|| handlers::DiagnosticsSnapshot::build(&state, uri))
+            .flatten();
 
         // Metadata for async missing-file checks. Reuse the snapshot's
         // `directive_meta`, which is `extract_metadata` (not just directives):
@@ -27389,8 +27592,10 @@ mod tests {
         use tower::{Service, ServiceExt};
         use tower_lsp::jsonrpc::Request;
         use tower_lsp::lsp_types::{
-            Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams,
-            PublishDiagnosticsParams, Range, TextDocumentIdentifier, TextDocumentItem, Url,
+            Diagnostic, DidChangeConfigurationParams, DidChangeTextDocumentParams,
+            DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams,
+            PublishDiagnosticsParams, Range, TextDocumentContentChangeEvent,
+            TextDocumentIdentifier, TextDocumentItem, Url, VersionedTextDocumentIdentifier,
         };
         use tower_lsp::{ClientSocket, LanguageServer, LspService};
 
@@ -27462,6 +27667,152 @@ mod tests {
                     },
                 })
                 .await;
+        }
+
+        /// A model worker computed under the previous parsed configuration must
+        /// not consume the same-version force marker that belongs to the config
+        /// reload's empty publication. Otherwise stale findings can survive a
+        /// live switch from `"on"` to `"off"` until another edit or reload.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn config_reload_rejects_model_worker_captured_before_disable() {
+            async fn next_publish(
+                socket: &mut ClientSocket,
+                uri: &Url,
+            ) -> PublishDiagnosticsParams {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let message = socket.next().await.expect("client socket remains open");
+                        if message.method() != "textDocument/publishDiagnostics" {
+                            continue;
+                        }
+                        let params: PublishDiagnosticsParams =
+                            serde_json::from_value(message.params().unwrap().clone()).unwrap();
+                        if params.uri == *uri {
+                            return params;
+                        }
+                    }
+                })
+                .await
+                .expect("diagnostic publication must arrive")
+            }
+
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("config-race.stan");
+            let invalid = "model { target += ; }\n";
+            std::fs::write(&path, invalid).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+            let (svc, mut socket) = lifecycle_service(std::slice::from_ref(&uri)).await;
+            let backend = svc.inner();
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "crossFile": {
+                            "indexWorkspace": false,
+                            "revalidationDebounceMs": 60_000
+                        },
+                        "diagnostics": { "stan": "on" },
+                        "packages": { "enabled": false }
+                    }),
+                })
+                .await;
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "stan".into(),
+                        version: 1,
+                        text: invalid.into(),
+                    },
+                })
+                .await;
+            backend.publish_diagnostics(&uri).await;
+            let initial = next_publish(&mut socket, &uri).await;
+            assert!(!initial.diagnostics.is_empty());
+
+            backend
+                .did_change(DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version: 2,
+                    },
+                    content_changes: vec![TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: invalid.into(),
+                    }],
+                })
+                .await;
+
+            let old_worker_pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_post_publish_lock_test_pause
+                .arm(uri.clone());
+            let stale_backend = (*backend).clone();
+            let stale_uri = uri.clone();
+            let stale_worker = tokio::spawn(async move {
+                stale_backend.publish_diagnostics(&stale_uri).await;
+            });
+            tokio::time::timeout(Duration::from_secs(5), old_worker_pause.wait_arrived())
+                .await
+                .expect("old-config worker must hold the diagnostics publish lock");
+
+            let reload_backend = (*backend).clone();
+            let reload = tokio::spawn(async move {
+                reload_backend
+                    .did_change_configuration(DidChangeConfigurationParams {
+                        settings: serde_json::json!({
+                            "crossFile": {
+                                "indexWorkspace": false,
+                                "revalidationDebounceMs": 60_000
+                            },
+                            "diagnostics": { "stan": "off" },
+                            "packages": { "enabled": false }
+                        }),
+                    })
+                    .await;
+            });
+            // Sleep rather than `yield_now()`: on a 2-worker runtime a tight
+            // spin here can starve the reload task this loop is waiting for.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    {
+                        let state = backend.state.read().await;
+                        if !state.cross_file_config.stan_diagnostics_enabled
+                            && state.diagnostics_gate.force_republish_count_for_test(&uri) > 0
+                        {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("config reload must install its empty-publication force marker");
+
+            old_worker_pause.release();
+            stale_worker.await.unwrap();
+            reload.await.unwrap();
+
+            let cleared = next_publish(&mut socket, &uri).await;
+            assert!(cleared.diagnostics.is_empty());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err(),
+                "the stale old-config worker must not publish"
+            );
+            assert_eq!(
+                backend
+                    .state
+                    .read()
+                    .await
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&uri),
+                0
+            );
         }
 
         /// A receipt-owned successor may cancel an older diagnostic after the
@@ -28935,6 +29286,7 @@ mod tests {
                 state.cross_file_config.packages_enabled = false;
                 state.cross_file_config.on_demand_indexing_enabled = false;
                 state.cross_file_config.revalidation_debounce_ms = 60_000;
+                state.cross_file_config.stan_diagnostics_enabled = true;
             }
 
             backend
@@ -29042,6 +29394,7 @@ mod tests {
                 state.cross_file_config.packages_enabled = false;
                 state.cross_file_config.on_demand_indexing_enabled = false;
                 state.cross_file_config.revalidation_debounce_ms = 60_000;
+                state.cross_file_config.jags_diagnostics_enabled = true;
             }
 
             backend
@@ -31137,6 +31490,81 @@ mod tests {
         }
 
         #[test]
+        fn parse_cross_file_config_reads_independent_model_diagnostic_switches() {
+            for (jags, stan, expected_jags, expected_stan) in [
+                (None, None, false, false),
+                (Some("off"), None, false, false),
+                (Some("on"), None, true, false),
+                (None, Some("on"), false, true),
+                (Some("on"), Some("off"), true, false),
+                (Some("off"), Some("on"), false, true),
+                (Some("on"), Some("on"), true, true),
+            ] {
+                let mut diagnostics = serde_json::Map::new();
+                if let Some(jags) = jags {
+                    diagnostics.insert("jags".to_string(), json!(jags));
+                }
+                if let Some(stan) = stan {
+                    diagnostics.insert("stan".to_string(), json!(stan));
+                }
+                let config = crate::backend::parse_cross_file_config(&json!({
+                    "diagnostics": diagnostics
+                }))
+                .unwrap()
+                .unwrap();
+
+                assert_eq!(config.jags_diagnostics_enabled, expected_jags);
+                assert_eq!(config.stan_diagnostics_enabled, expected_stan);
+            }
+        }
+
+        /// A misspelled or wrongly-typed model switch must fail closed to
+        /// "off" rather than being silently ignored — silently ignoring it
+        /// would leave the previous layered value in place, which reads as the
+        /// user's `"on"` still being honored.
+        #[test]
+        fn parse_cross_file_config_rejects_invalid_model_switch_values() {
+            for invalid in [
+                json!("true"),
+                json!("On"),
+                json!("enabled"),
+                json!(""),
+                json!(true),
+                json!(1),
+                json!([]),
+                json!({}),
+            ] {
+                let config = crate::backend::parse_cross_file_config(&json!({
+                    "diagnostics": { "jags": invalid.clone(), "stan": invalid.clone() }
+                }))
+                .unwrap()
+                .unwrap();
+
+                assert!(
+                    !config.jags_diagnostics_enabled,
+                    "invalid jags value {invalid} must fail closed"
+                );
+                assert!(
+                    !config.stan_diagnostics_enabled,
+                    "invalid stan value {invalid} must fail closed"
+                );
+            }
+        }
+
+        /// An explicit JSON `null` means "not configured" and must leave the
+        /// built-in default in place, matching an absent key.
+        #[test]
+        fn parse_cross_file_config_treats_null_model_switch_as_absent() {
+            let config = crate::backend::parse_cross_file_config(&json!({
+                "diagnostics": { "jags": null, "stan": null }
+            }))
+            .unwrap()
+            .unwrap();
+            assert!(!config.jags_diagnostics_enabled);
+            assert!(!config.stan_diagnostics_enabled);
+        }
+
+        #[test]
         fn parse_cross_file_config_rprofile_prelude_defaults_on_and_reads_explicit() {
             // Default-on: a client that omits `packages.rprofilePrelude` still
             // gets the `.Rprofile` prelude — `CrossFileConfig::default()` has
@@ -32777,6 +33205,61 @@ mod refresh_packages_tests {
                 .force_republish_count_for_test(&uri)
                 > 0,
             "the combined reload must force a same-version diagnostic republish"
+        );
+    }
+
+    /// A model-language switch must republish EVERY open document, including R
+    /// ones whose findings cannot have changed.
+    ///
+    /// Narrowing the set to the switched language looks like a free win, but
+    /// `recompute_parsed_configs` treats a model switch as analysis-affecting:
+    /// it calls `cancel_all()` and advances the global
+    /// `analysis_config_generation`, which `DiagnosticsTrigger::is_stale`
+    /// compares. Every in-flight worker is therefore retired, R included. A
+    /// narrowed republish would leave an R document with its pending
+    /// recomputation cancelled and no replacement scheduled, stranding its
+    /// last-published diagnostics until the next edit.
+    #[tokio::test]
+    async fn model_switch_republishes_r_documents_it_cancelled() {
+        let backend = make_test_backend();
+        let r_uri = Url::parse("file:///cancelled-by-model-switch.R").unwrap();
+        let stan_uri = Url::parse("file:///cancelled-by-model-switch.stan").unwrap();
+        let snapshot = {
+            let mut state = backend.state.write().await;
+            state.raw_client_settings = serde_json::json!({
+                "diagnostics": { "stan": "off" }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            state.open_document(r_uri.clone(), "x <- 1\n", Some(1));
+            state.open_document_with_language_id(
+                stan_uri.clone(),
+                "model { target += ; }\n",
+                Some(1),
+                Some("stan"),
+            );
+
+            let snapshot = ConfigChangeSnapshot::capture(&state);
+            let before = state.analysis_config_generation_for_test();
+            state.raw_client_settings = serde_json::json!({
+                "diagnostics": { "stan": "on" }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            assert_ne!(
+                state.analysis_config_generation_for_test(),
+                before,
+                "a model switch must retire in-flight workers; the republish set \
+                 below has to cover everything it retired"
+            );
+            snapshot
+        };
+
+        let mut to_publish = backend.reconcile_after_config_recompute(snapshot).await;
+        to_publish.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        let mut expected = vec![r_uri, stan_uri];
+        expected.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(
+            to_publish, expected,
+            "the R document's worker was cancelled too, so it must be republished"
         );
     }
 
@@ -51520,6 +52003,7 @@ lineLength = 200
                     initialization_options: Some(serde_json::json!({
                         "diagnosticUris": [uri.to_string()],
                         "crossFile": { "indexWorkspace": false },
+                        "diagnostics": { "stan": "on" },
                         "packages": { "enabled": false }
                     })),
                     ..Default::default()
@@ -51649,6 +52133,7 @@ lineLength = 200
         };
         let mut diagnostic_state = super::WorldState::new();
         diagnostic_state.workspace_scan_complete = true;
+        diagnostic_state.cross_file_config.stan_diagnostics_enabled = true;
         diagnostic_state.documents.insert(uri.clone(), document);
         assert!(!snapshot_diagnostics(&diagnostic_state, &uri).is_empty());
     }
@@ -51682,7 +52167,10 @@ lineLength = 200
                     initialization_options: Some(serde_json::json!({
                         "diagnosticUris": [uri.to_string()],
                         "crossFile": { "indexWorkspace": false },
-                        "diagnostics": { "maxSyntaxDiagnosticsPerFile": 3 },
+                        "diagnostics": {
+                            "jags": "on",
+                            "maxSyntaxDiagnosticsPerFile": 3
+                        },
                         "packages": { "enabled": false }
                     })),
                     ..Default::default()
@@ -51868,6 +52356,7 @@ lineLength = 200
                             "indexWorkspace": false,
                             "revalidationDebounceMs": 60_000
                         },
+                        "diagnostics": { "jags": "on", "stan": "on" },
                         "packages": { "enabled": false }
                     })),
                     ..Default::default()
@@ -51918,7 +52407,11 @@ lineLength = 200
                     "indexWorkspace": false,
                     "revalidationDebounceMs": 60_000
                 },
-                "diagnostics": { "maxSyntaxDiagnosticsPerFile": 7 },
+                "diagnostics": {
+                    "jags": "on",
+                    "stan": "on",
+                    "maxSyntaxDiagnosticsPerFile": 7
+                },
                 "packages": { "enabled": false }
             }),
         });
@@ -51931,24 +52424,59 @@ lineLength = 200
                     "indexWorkspace": false,
                     "revalidationDebounceMs": 60_000
                 },
+                "diagnostics": { "jags": "on", "stan": "on" },
                 "packages": { "enabled": false }
             }),
         });
         let ((), reset) = tokio::join!(reset_cap, next_publish_batch(&mut socket, &expected_uris));
         assert_batch(&reset, &expected_uris, 500);
 
+        let disable_models = backend.did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({
+                "crossFile": {
+                    "indexWorkspace": false,
+                    "revalidationDebounceMs": 60_000
+                },
+                "diagnostics": { "jags": "off", "stan": "off" },
+                "packages": { "enabled": false }
+            }),
+        });
+        let ((), disabled) = tokio::join!(
+            disable_models,
+            next_publish_batch(&mut socket, &expected_uris)
+        );
+        assert_batch(&disabled, &expected_uris, 0);
+
+        let reenable_models = backend.did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({
+                "crossFile": {
+                    "indexWorkspace": false,
+                    "revalidationDebounceMs": 60_000
+                },
+                "diagnostics": { "jags": "on", "stan": "on" },
+                "packages": { "enabled": false }
+            }),
+        });
+        let ((), reenabled) = tokio::join!(
+            reenable_models,
+            next_publish_batch(&mut socket, &expected_uris)
+        );
+        assert_batch(&reenabled, &expected_uris, 500);
+
         let state = backend.state.read().await;
         assert_eq!(
             state.cross_file_config.max_syntax_diagnostics_per_file,
             crate::cross_file::config::DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE
         );
+        assert!(state.cross_file_config.jags_diagnostics_enabled);
+        assert!(state.cross_file_config.stan_diagnostics_enabled);
         assert!(
             expected_uris.iter().all(|uri| {
                 state
                     .get_document(uri)
                     .is_some_and(|document| document.version == Some(1))
             }),
-            "all three publish batches must occur without an edit; the latter two require the force-republish gate"
+            "all publish batches must occur without an edit; configuration changes require the force-republish gate"
         );
         assert!(
             expected_uris
@@ -51997,6 +52525,7 @@ lineLength = 200
                     initialization_options: Some(serde_json::json!({
                         "diagnosticUris": diagnostic_uris,
                         "crossFile": { "indexWorkspace": false },
+                        "diagnostics": { "jags": "on" },
                         "packages": { "enabled": false }
                     })),
                     ..Default::default()
@@ -52086,6 +52615,12 @@ lineLength = 200
 
         let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
         let backend = svc.inner();
+        backend
+            .state
+            .write()
+            .await
+            .cross_file_config
+            .stan_diagnostics_enabled = true;
         let uri = Url::parse("untitled:stan-buffer").unwrap();
         backend
             .did_open(DidOpenTextDocumentParams {

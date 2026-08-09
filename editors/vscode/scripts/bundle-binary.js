@@ -17,22 +17,36 @@ if (!fs.existsSync(binDir)) {
 // install, so Tier 1 resolves their installed packages directly — they don't
 // need the broad CRAN/Bioconductor floor, and it would only bloat the VSIX.
 
-// In CI mode, the binary is pre-placed by the workflow. Check for both names
-// since cross-platform CI (e.g. packaging win32 on Linux) means
-// process.platform won't match the target platform.
-if (fs.existsSync(destBinary) || fs.existsSync(path.join(binDir, 'raven')) || fs.existsSync(path.join(binDir, 'raven.exe'))) {
-    console.log('raven binary already present (CI mode)');
+function copyAndChmod(message = 'Bundled raven binary') {
+    fs.copyFileSync(srcBinary, destBinary);
+    fs.chmodSync(destBinary, 0o755);
+    console.log(message);
+}
+
+// When target/release is available, refresh the bundled binary if it is newer.
+// Use size as a tie-breaker for rebuilds on filesystems with coarse timestamps.
+if (fs.existsSync(srcBinary)) {
+    if (fs.existsSync(destBinary)) {
+        const srcStat = fs.statSync(srcBinary);
+        const destStat = fs.statSync(destBinary);
+        const sourceIsNewer = srcStat.mtimeMs > destStat.mtimeMs;
+        const tiedTimestampChangedSize =
+            srcStat.mtimeMs === destStat.mtimeMs && srcStat.size !== destStat.size;
+        if (!sourceIsNewer && !tiedTimestampChangedSize) {
+            console.log('Bundled raven binary is already current');
+            process.exit(0);
+        }
+        copyAndChmod('Refreshed stale raven binary');
+    } else {
+        copyAndChmod();
+    }
     process.exit(0);
 }
 
-function copyAndChmod() {
-    fs.copyFileSync(srcBinary, destBinary);
-    fs.chmodSync(destBinary, 0o755);
-    console.log('Bundled raven binary');
-}
-
-if (fs.existsSync(srcBinary)) {
-    copyAndChmod();
+// Without a matching target/release binary, preserve either pre-placed name.
+// Cross-platform packaging (e.g. win32 on Linux) may not match process.platform.
+if (fs.existsSync(path.join(binDir, 'raven')) || fs.existsSync(path.join(binDir, 'raven.exe'))) {
+    console.log('Preserving pre-placed raven binary; no matching target/release binary found');
     process.exit(0);
 }
 

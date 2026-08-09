@@ -35,6 +35,7 @@ fn fixtures(source: &str) -> Vec<Fixture> {
 fn analyze(fixture: &Fixture) -> (WorldState, Url, Vec<tower_lsp::lsp_types::Diagnostic>) {
     let uri = Url::parse(&format!("untitled:stan-fixture-{}", fixture.name)).unwrap();
     let mut state = WorldState::new();
+    state.cross_file_config.stan_diagnostics_enabled = true;
     state.open_document_with_language_id(uri.clone(), &fixture.code, Some(1), Some("stan"));
     let findings = diagnostics(&state, &uri, &DiagCancelToken::never());
     (state, uri, findings)
@@ -733,6 +734,7 @@ fn stan_semantic_severity_off_and_syntax_cap_independence() {
     let analyze_with = |syntax_cap: usize, severity: Option<DiagnosticSeverity>| {
         let uri = Url::parse(&format!("untitled:stan-semantic-cap-{syntax_cap}")).unwrap();
         let mut state = WorldState::new();
+        state.cross_file_config.stan_diagnostics_enabled = true;
         state.cross_file_config.max_syntax_diagnostics_per_file = syntax_cap;
         state.cross_file_config.undefined_variable_severity = severity;
         state.open_document_with_language_id(uri.clone(), &code, Some(1), Some("stan"));
@@ -793,12 +795,17 @@ fn raven_check_stan_undefined_variable_matches_text_json_and_sarif() {
         "data { int N; }\nmodel {\n  target += N + supplied_from_r;\n  target += another_missing;\n}\n",
     )
     .unwrap();
+    std::fs::write(
+        workspace.path().join("raven.toml"),
+        "[diagnostics]\nstan = \"on\"\n",
+    )
+    .unwrap();
 
     for format in ["text", "json", "sarif"] {
         let output = Command::new(env!("CARGO_BIN_EXE_raven"))
             .args(["check", "--workspace"])
             .arg(workspace.path())
-            .args(["--no-config", "--format", format, "--quiet", "--no-color"])
+            .args(["--format", format, "--quiet", "--no-color"])
             .output()
             .expect("run raven check for Stan undefined variable");
         assert_eq!(

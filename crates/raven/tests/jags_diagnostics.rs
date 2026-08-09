@@ -40,6 +40,7 @@ struct InvalidExpectation {
 }
 
 fn analyze(state: &mut WorldState, uri: &Url, source: &str, language_id: &str) -> Vec<Diagnostic> {
+    state.cross_file_config.jags_diagnostics_enabled = true;
     state.open_document_with_language_id(uri.clone(), source, Some(1), Some(language_id));
     diagnostics(state, uri, &DiagCancelToken::never())
 }
@@ -314,6 +315,7 @@ fn jags_extensions_mixed_case_and_untitled_jags_are_strict() {
 fn cancelled_jags_diagnostics_fail_closed() {
     let uri = Url::parse("untitled:cancelled-jags").unwrap();
     let mut state = WorldState::new();
+    state.cross_file_config.jags_diagnostics_enabled = true;
     state.open_document_with_language_id(
         uri.clone(),
         "model { x <- * 1 }\n",
@@ -765,12 +767,17 @@ fn malformed_jags_diagnostics_use_the_shared_default_cap() {
 fn raven_check_bug_text_json_and_sarif_outputs_fail_with_syntax_error() {
     let workspace = tempfile::TempDir::new().unwrap();
     std::fs::write(workspace.path().join("invalid.BUG"), "model { x <- * 1 }\n").unwrap();
+    std::fs::write(
+        workspace.path().join("raven.toml"),
+        "[diagnostics]\njags = \"on\"\n",
+    )
+    .unwrap();
 
     for format in ["text", "json", "sarif"] {
         let output = Command::new(env!("CARGO_BIN_EXE_raven"))
             .args(["check", "--workspace"])
             .arg(workspace.path())
-            .args(["--no-config", "--format", format, "--quiet", "--no-color"])
+            .args(["--format", format, "--quiet", "--no-color"])
             .output()
             .expect("run raven check for a singular BUG syntax error");
         assert_eq!(
@@ -815,6 +822,68 @@ fn raven_check_bug_text_json_and_sarif_outputs_fail_with_syntax_error() {
 }
 
 #[test]
+fn raven_check_no_config_keeps_model_diagnostics_off() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        workspace.path().join("invalid.jags"),
+        "model { x <- * 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("invalid.stan"), "data { int N }\n").unwrap();
+    std::fs::write(
+        workspace.path().join("raven.toml"),
+        "[diagnostics]\njags = \"on\"\nstan = \"on\"\n",
+    )
+    .unwrap();
+
+    let run = |extra: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_raven"));
+        command
+            .args(["check", "--workspace"])
+            .arg(workspace.path())
+            .args(["--format", "json", "--quiet", "--no-color"])
+            .args(extra);
+        command.output().expect("run raven check")
+    };
+
+    // Precondition: with the project config honored, these fixtures DO report.
+    // Without this the empty `--no-config` result below would also pass if
+    // model diagnostics were broken outright.
+    let configured = run(&[]);
+    assert_eq!(
+        configured.status.code(),
+        Some(1),
+        "fixture must report findings when raven.toml enables both languages: {}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    let configured_findings: serde_json::Value =
+        serde_json::from_slice(&configured.stdout).unwrap();
+    let configured_paths: std::collections::BTreeSet<String> = configured_findings
+        .as_array()
+        .expect("json findings array")
+        .iter()
+        .map(|finding| finding["path"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        configured_paths.contains("invalid.jags") && configured_paths.contains("invalid.stan"),
+        "both model languages must report when enabled: {configured_paths:?}"
+    );
+
+    // `--no-config` ignores raven.toml, so both switches fall back to "off".
+    let output = run(&["--no-config"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "model diagnostics should use their built-in off defaults: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!([])
+    );
+}
+
+#[test]
 fn raven_check_applies_one_project_cap_to_stan_and_jags_in_every_format() {
     use std::collections::BTreeMap;
 
@@ -830,7 +899,7 @@ fn raven_check_applies_one_project_cap_to_stan_and_jags_in_every_format() {
     std::fs::write(workspace.path().join("invalid.stan"), stan).unwrap();
     std::fs::write(
         workspace.path().join("raven.toml"),
-        "[diagnostics]\nmaxSyntaxDiagnosticsPerFile = 3\n",
+        "[diagnostics]\njags = \"on\"\nstan = \"on\"\nmaxSyntaxDiagnosticsPerFile = 3\n",
     )
     .unwrap();
     let expected_paths = ["invalid.jags", "invalid.stan"];
@@ -897,7 +966,9 @@ fn raven_check_applies_one_project_cap_to_stan_and_jags_in_every_format() {
     let run_json_with_cap = |configured_cap: usize| {
         std::fs::write(
             workspace.path().join("raven.toml"),
-            format!("[diagnostics]\nmaxSyntaxDiagnosticsPerFile = {configured_cap}\n"),
+            format!(
+                "[diagnostics]\njags = \"on\"\nstan = \"on\"\nmaxSyntaxDiagnosticsPerFile = {configured_cap}\n"
+            ),
         )
         .unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_raven"))

@@ -114,15 +114,17 @@ pub fn print_help() {
 
 Usage: raven check [OPTIONS] [PATHS...]
 
-Indexes the workspace, then reports the full diagnostic set for the requested
-files (or every R / R Markdown / Quarto / JAGS / Stan file in the workspace when no PATHS are
-given): syntax errors, semantic checks, style lints, cross-file diagnostics
+Indexes the workspace, then reports diagnostics for the requested files (or
+every R / R Markdown / Quarto / JAGS / Stan file in the workspace when no PATHS
+are given): syntax errors, semantic checks, style lints, cross-file diagnostics
 (missing source files, circular dependencies, out-of-scope usage),
 missing-package warnings, and undefined-variable diagnostics. For .Rmd /
 .Rmarkdown / .qmd the R code inside chunks is analyzed; prose and non-R chunks
-are ignored. JAGS `.jags` / `.bugs` / `.bug` and Stan `.stan` programs receive
-native syntax checks; complete Stan programs also receive conservative
-undeclared-variable checks.
+are ignored. JAGS `.jags` / `.bugs` / `.bug` and Stan `.stan` files are always
+discovered, but their diagnostics are opt-in: set `jags = \"on\"` and/or `stan =
+\"on\"` under `[diagnostics]` in raven.toml. JAGS receives native syntax checks;
+complete Stan programs also receive conservative undeclared-variable checks.
+`--no-config` therefore leaves model diagnostics disabled.
 Honors raven.toml / .lintr.
 
 Options:
@@ -1964,6 +1966,17 @@ mod tests {
         }
     }
 
+    fn model_diagnostic_args(workspace: &Path, settings: &str) -> CheckArgs {
+        fs::write(
+            workspace.join("raven.toml"),
+            format!("[diagnostics]\n{settings}"),
+        )
+        .unwrap();
+        let mut args = base_args(workspace);
+        args.no_config = false;
+        args
+    }
+
     #[test]
     fn parse_report_uninstalled_flag() {
         let args = parse_args(["--report-uninstalled".to_string()].into_iter()).unwrap();
@@ -3310,7 +3323,7 @@ infixContinuationStyle = "indented"
         )
         .unwrap();
 
-        let args = base_args(tmp.path());
+        let args = model_diagnostic_args(tmp.path(), "stan = \"on\"\n");
         let findings = collect_diagnostics_blocking(&args);
         assert!(!findings.is_empty());
         assert_eq!(findings.len(), 2, "{findings:#?}");
@@ -3346,7 +3359,7 @@ infixContinuationStyle = "indented"
         .unwrap();
         fs::write(tmp.path().join("near-miss.bugx"), "model { w <- * 1 }\n").unwrap();
 
-        let args = base_args(tmp.path());
+        let args = model_diagnostic_args(tmp.path(), "jags = \"on\"\n");
         let findings = collect_diagnostics_blocking(&args);
         assert!(!findings.is_empty());
         assert!(findings.iter().all(|(path, diagnostic)| {
@@ -3366,7 +3379,7 @@ infixContinuationStyle = "indented"
         let tmp = TempDir::new().unwrap();
         let model = tmp.path().join("model.JaGs");
         fs::write(&model, "model { x <- * 1 }\n").unwrap();
-        let mut args = base_args(tmp.path());
+        let mut args = model_diagnostic_args(tmp.path(), "jags = \"on\"\n");
         args.paths = vec![model.clone()];
         let findings = collect_diagnostics_blocking(&args);
         assert!(!findings.is_empty());
@@ -3383,7 +3396,7 @@ infixContinuationStyle = "indented"
         let tmp = TempDir::new().unwrap();
         let model = tmp.path().join("model.BuGs");
         fs::write(&model, "model { x <- * 1 }\n").unwrap();
-        let mut args = base_args(tmp.path());
+        let mut args = model_diagnostic_args(tmp.path(), "jags = \"on\"\n");
         args.paths = vec![model.clone()];
         let findings = collect_diagnostics_blocking(&args);
         assert!(!findings.is_empty());
@@ -3400,7 +3413,7 @@ infixContinuationStyle = "indented"
         let tmp = TempDir::new().unwrap();
         let model = tmp.path().join("model.BuG");
         fs::write(&model, "model { x <- * 1 }\n").unwrap();
-        let mut args = base_args(tmp.path());
+        let mut args = model_diagnostic_args(tmp.path(), "jags = \"on\"\n");
         args.paths = vec![model.clone()];
         let findings = collect_diagnostics_blocking(&args);
         assert!(!findings.is_empty());
@@ -3431,7 +3444,7 @@ infixContinuationStyle = "indented"
             bytes.extend_from_slice(b"model { x <- 1 }\n");
             fs::write(tmp.path().join(name), bytes).unwrap();
         }
-        let args = base_args(tmp.path());
+        let args = model_diagnostic_args(tmp.path(), "jags = \"on\"\n");
         assert!(collect_diagnostics_blocking(&args).is_empty());
         assert_eq!(run_blocking(args), EXIT_OK);
     }
@@ -3441,7 +3454,7 @@ infixContinuationStyle = "indented"
         let tmp = TempDir::new().unwrap();
         let model = tmp.path().join("model.STAN");
         fs::write(&model, "model { target += ; }\n").unwrap();
-        let mut args = base_args(tmp.path());
+        let mut args = model_diagnostic_args(tmp.path(), "stan = \"on\"\n");
         args.paths = vec![model.clone()];
         let findings = collect_diagnostics_blocking(&args);
         assert!(!findings.is_empty());
@@ -3458,7 +3471,7 @@ infixContinuationStyle = "indented"
         let tmp = TempDir::new().unwrap();
         let model = tmp.path().join("model.stan");
         fs::write(&model, "# raven: source missing.R\nmodel {}\n").unwrap();
-        let mut args = base_args(tmp.path());
+        let mut args = model_diagnostic_args(tmp.path(), "stan = \"on\"\n");
         args.paths = vec![model];
         assert!(collect_diagnostics_blocking(&args).is_empty());
         assert_eq!(run_blocking(args), EXIT_OK);
@@ -3484,6 +3497,7 @@ infixContinuationStyle = "indented"
         let mut state = crate::state::WorldState::new();
         state.workspace_scan_complete = true;
         state.workspace_folders = vec![workspace_root.clone()];
+        state.cross_file_config.stan_diagnostics_enabled = true;
         assert!(materialize_cli_contextual_provider(
             &mut state,
             &execution,

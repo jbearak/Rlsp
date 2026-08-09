@@ -79,6 +79,14 @@ pub struct CrossFileConfig {
     /// Master switch for all diagnostics
     /// When false, all diagnostics are suppressed regardless of individual severity settings
     pub diagnostics_enabled: bool,
+    /// Whether native JAGS diagnostics are enabled.
+    ///
+    /// The global [`Self::diagnostics_enabled`] switch still takes precedence.
+    pub jags_diagnostics_enabled: bool,
+    /// Whether native Stan syntax and semantic diagnostics are enabled.
+    ///
+    /// The global [`Self::diagnostics_enabled`] switch still takes precedence.
+    pub stan_diagnostics_enabled: bool,
     /// Maximum native Tree-sitter syntax diagnostics retained for one Stan or
     /// JAGS file after exact deduplication and source ordering. `0` is
     /// unlimited. This does not cap R diagnostics.
@@ -252,6 +260,8 @@ impl Default for CrossFileConfig {
     fn default() -> Self {
         Self {
             diagnostics_enabled: true,
+            jags_diagnostics_enabled: false,
+            stan_diagnostics_enabled: false,
             max_syntax_diagnostics_per_file: DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE,
             max_backward_depth: 10,
             max_forward_depth: 10,
@@ -296,6 +306,53 @@ impl Default for CrossFileConfig {
 }
 
 impl CrossFileConfig {
+    /// Whether diagnostics are enabled for one document language.
+    ///
+    /// This centralizes the global-master and model-language gates so callers can
+    /// skip snapshot construction without duplicating the default-off policy.
+    pub(crate) fn diagnostics_enabled_for_file_type(
+        &self,
+        file_type: crate::file_type::FileType,
+    ) -> bool {
+        self.diagnostics_enabled
+            && match file_type {
+                crate::file_type::FileType::R => true,
+                crate::file_type::FileType::Jags => self.jags_diagnostics_enabled,
+                crate::file_type::FileType::Stan => self.stan_diagnostics_enabled,
+            }
+    }
+
+    /// Whether analysis-affecting settings changed between two configs.
+    ///
+    /// The caller uses this to decide whether to cancel every in-flight
+    /// diagnostic worker and advance the global analysis-config generation, so
+    /// a `true` here costs a full recompute of every open document. Only
+    /// settings that can change a *finding* belong in the comparison.
+    ///
+    /// Implemented as a whole-struct compare with the known-exempt fields
+    /// reverted onto a probe, so coverage is automatic: any new field added to
+    /// `CrossFileConfig` counts as analysis-affecting until someone deliberately
+    /// exempts it here. Exempt today:
+    ///
+    /// - `packages_watch_library_paths` / `packages_watch_debounce_ms` — libpath
+    ///   watcher lifecycle. They control whether and how often the watcher fires,
+    ///   never what an analysis snapshot contains.
+    /// - `revalidation_debounce_ms` / `edited_file_debounce_ms` — scheduling
+    ///   delays. They are read at ticket-construction time into
+    ///   `AnalysisRevalidationTicket::debounce_ms` and decide only *when* a
+    ///   recomputation runs, never its inputs or its result. A user nudging a
+    ///   debounce slider should not cancel every worker mid-flight and force a
+    ///   whole-workspace recompute; the next ticket picks the new value up on
+    ///   its own.
+    pub(crate) fn analysis_settings_changed(&self, other: &Self) -> bool {
+        let mut probe = self.clone();
+        probe.packages_watch_library_paths = other.packages_watch_library_paths;
+        probe.packages_watch_debounce_ms = other.packages_watch_debounce_ms;
+        probe.revalidation_debounce_ms = other.revalidation_debounce_ms;
+        probe.edited_file_debounce_ms = other.edited_file_debounce_ms;
+        probe != *other
+    }
+
     /// Check if scope-affecting settings changed between two configs
     pub fn scope_settings_changed(&self, other: &Self) -> bool {
         self.assume_call_site != other.assume_call_site
@@ -325,6 +382,8 @@ mod tests {
         assert_eq!(config.max_revalidations_per_trigger, 10);
         assert_eq!(config.revalidation_debounce_ms, 200);
         assert_eq!(config.edited_file_debounce_ms, 50);
+        assert!(!config.jags_diagnostics_enabled);
+        assert!(!config.stan_diagnostics_enabled);
         assert_eq!(
             config.max_syntax_diagnostics_per_file,
             DEFAULT_MAX_SYNTAX_DIAGNOSTICS_PER_FILE
@@ -411,6 +470,14 @@ mod tests {
         assert!(!config1.scope_settings_changed(&config2));
 
         config2.undefined_variable_severity = None;
+        assert!(!config1.scope_settings_changed(&config2));
+
+        config2 = CrossFileConfig::default();
+        config2.jags_diagnostics_enabled = true;
+        assert!(!config1.scope_settings_changed(&config2));
+
+        config2 = CrossFileConfig::default();
+        config2.stan_diagnostics_enabled = true;
         assert!(!config1.scope_settings_changed(&config2));
 
         // Non-None -> non-None transitions (e.g. WARNING -> ERROR) also do not

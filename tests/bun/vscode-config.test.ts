@@ -40,6 +40,8 @@ test("initialization options forward explicitly configured settings", () => {
   const options = getInitializationOptions(
     createMockConfig(
       new Map<string, unknown>([
+        ["diagnostics.jags", "on"],
+        ["diagnostics.stan", "off"],
         ["crossFile.backwardDependencies", "explicit"],
         ["crossFile.maxChainDepth", 42],
         ["completion.triggerOnOpenParen", false],
@@ -49,6 +51,7 @@ test("initialization options forward explicitly configured settings", () => {
     ),
   );
 
+  expect(options.diagnostics).toMatchObject({ jags: "on", stan: "off" });
   expect(options.crossFile).toMatchObject({
     backwardDependencies: "explicit",
     maxChainDepth: 42,

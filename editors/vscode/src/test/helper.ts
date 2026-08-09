@@ -72,6 +72,37 @@ export async function waitForDiagnostics(uri: vscode.Uri, timeout = 10000): Prom
     return vscode.languages.getDiagnostics(uri);
 }
 
+/**
+ * Poll a URI's diagnostics until `predicate` holds or `timeout` elapses,
+ * returning the most-recently observed set either way so the caller can assert
+ * against it (and produce a useful failure message) on timeout.
+ *
+ * Prefer this over `waitForDiagnostics` whenever the expected set depends on a
+ * setting the test just changed. `waitForDiagnostics` returns on the first
+ * *non-empty* batch, but `config.update()` resolves before the extension has
+ * pushed the new settings to the server and the server has re-published — so
+ * the first batch observed can still reflect the pre-change configuration. For
+ * an opt-in diagnostic stream the pre-change state is "no findings", which is
+ * indistinguishable from "not computed yet" unless you poll for the expected
+ * shape.
+ */
+export async function waitForDiagnosticsMatching(
+    uri: vscode.Uri,
+    predicate: (diagnostics: vscode.Diagnostic[]) => boolean,
+    timeout = 10000,
+): Promise<vscode.Diagnostic[]> {
+    const start = Date.now();
+    let diagnostics = vscode.languages.getDiagnostics(uri);
+    while (Date.now() - start < timeout) {
+        diagnostics = vscode.languages.getDiagnostics(uri);
+        if (predicate(diagnostics)) {
+            return diagnostics;
+        }
+        await sleep(200);
+    }
+    return diagnostics;
+}
+
 export function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -160,5 +191,45 @@ export async function awaitActive(
             }
         }
         await sleep(25);
+    }
+}
+
+/**
+ * Delete the fixture workspace's `.vscode/settings.json` when it holds no
+ * keys, plus the `.vscode` directory when that leaves it empty.
+ *
+ * `config.update(key, undefined, Workspace)` clears the key but VS Code
+ * leaves the file on disk, possibly as a bare `{}`. Any test that writes a
+ * workspace-scoped setting must sweep it, or the fixture tree ends up dirty
+ * in `git status`. A file with real content is left untouched.
+ */
+export async function removeEmptyWorkspaceSettings(): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return;
+    // VS Code's write after `update(key, undefined)` is best-effort and
+    // asynchronous; give the pending write a moment to land before we look.
+    await sleep(200);
+    const dotVscode = vscode.Uri.joinPath(folder.uri, '.vscode');
+    const settings = vscode.Uri.joinPath(dotVscode, 'settings.json');
+    const remove = async (uri: vscode.Uri): Promise<void> => {
+        try {
+            await vscode.workspace.fs.delete(uri);
+        } catch {
+            // best-effort cleanup
+        }
+    };
+    try {
+        const bytes = await vscode.workspace.fs.readFile(settings);
+        const text = Buffer.from(bytes).toString('utf8').trim();
+        if (text !== '' && text !== '{}' && text !== '{\n}') return;
+        await remove(settings);
+        try {
+            const entries = await vscode.workspace.fs.readDirectory(dotVscode);
+            if (entries.length === 0) await remove(dotVscode);
+        } catch {
+            // .vscode missing — nothing else to clean.
+        }
+    } catch {
+        // No settings.json — nothing to clean.
     }
 }

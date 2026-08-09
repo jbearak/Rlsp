@@ -76,6 +76,7 @@ mod stan_syntax_diagnostic_tests {
     fn diagnostics_for(code: &str) -> Vec<Diagnostic> {
         let uri = Url::parse("untitled:stan-syntax-test").unwrap();
         let mut state = WorldState::new();
+        state.cross_file_config.stan_diagnostics_enabled = true;
         state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
         let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("Stan snapshot");
         diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
@@ -89,6 +90,11 @@ mod stan_syntax_diagnostic_tests {
     ) -> Vec<Diagnostic> {
         let uri = Url::parse(&format!("untitled:{language_id}-syntax-cap-test")).unwrap();
         let mut state = WorldState::new();
+        match crate::file_type::file_type_from_language_id(language_id) {
+            Some(FileType::Stan) => state.cross_file_config.stan_diagnostics_enabled = true,
+            Some(FileType::Jags) => state.cross_file_config.jags_diagnostics_enabled = true,
+            _ => {}
+        }
         state.cross_file_config.max_syntax_diagnostics_per_file = cap;
         state.open_document_with_language_id(uri.clone(), code, Some(1), Some(language_id));
         diagnostics(&state, &uri, &DiagCancelToken::never())
@@ -501,6 +507,7 @@ model {
         let code = "data { int N }\nmodel { target += ; }\n";
         let uri = Url::parse("untitled:cancelled-stan-syntax-test").unwrap();
         let mut state = WorldState::new();
+        state.cross_file_config.stan_diagnostics_enabled = true;
         state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
         let snapshot = DiagnosticsSnapshot::build(&state, &uri).expect("Stan snapshot");
         let token = tokio_util::sync::CancellationToken::new();
@@ -1058,13 +1065,61 @@ model {
     }
 
     #[test]
-    fn master_diagnostics_switch_disables_stan_syntax_diagnostics() {
-        let code = "data { int N }\n";
-        let uri = Url::parse("untitled:disabled-stan-syntax-test").unwrap();
+    fn model_diagnostics_default_off_and_enable_independently() {
+        let stan_uri = Url::parse("untitled:model-diagnostic-switch-stan").unwrap();
+        let jags_uri = Url::parse("untitled:model-diagnostic-switch-jags").unwrap();
         let mut state = WorldState::new();
+        state.open_document_with_language_id(
+            stan_uri.clone(),
+            "data { int N }\n",
+            Some(1),
+            Some("stan"),
+        );
+        state.open_document_with_language_id(
+            jags_uri.clone(),
+            "model { x <- * 1 }\n",
+            Some(1),
+            Some("jags"),
+        );
+
+        assert!(diagnostics(&state, &stan_uri, &DiagCancelToken::never()).is_empty());
+        assert!(diagnostics(&state, &jags_uri, &DiagCancelToken::never()).is_empty());
+
+        state.cross_file_config.stan_diagnostics_enabled = true;
+        assert!(!diagnostics(&state, &stan_uri, &DiagCancelToken::never()).is_empty());
+        assert!(diagnostics(&state, &jags_uri, &DiagCancelToken::never()).is_empty());
+
+        state.cross_file_config.stan_diagnostics_enabled = false;
+        state.cross_file_config.jags_diagnostics_enabled = true;
+        assert!(diagnostics(&state, &stan_uri, &DiagCancelToken::never()).is_empty());
+        assert!(!diagnostics(&state, &jags_uri, &DiagCancelToken::never()).is_empty());
+    }
+
+    #[test]
+    fn master_diagnostics_switch_disables_enabled_model_diagnostics() {
+        let stan_uri = Url::parse("untitled:disabled-stan-syntax-test").unwrap();
+        let jags_uri = Url::parse("untitled:disabled-jags-syntax-test").unwrap();
+        let mut state = WorldState::new();
+        state.cross_file_config.stan_diagnostics_enabled = true;
+        state.cross_file_config.jags_diagnostics_enabled = true;
+        state.open_document_with_language_id(
+            stan_uri.clone(),
+            "data { int N }\n",
+            Some(1),
+            Some("stan"),
+        );
+        state.open_document_with_language_id(
+            jags_uri.clone(),
+            "model { x <- * 1 }\n",
+            Some(1),
+            Some("jags"),
+        );
+        assert!(!diagnostics(&state, &stan_uri, &DiagCancelToken::never()).is_empty());
+        assert!(!diagnostics(&state, &jags_uri, &DiagCancelToken::never()).is_empty());
+
         state.cross_file_config.diagnostics_enabled = false;
-        state.open_document_with_language_id(uri.clone(), code, Some(1), Some("stan"));
-        assert!(diagnostics(&state, &uri, &DiagCancelToken::never()).is_empty());
+        assert!(diagnostics(&state, &stan_uri, &DiagCancelToken::never()).is_empty());
+        assert!(diagnostics(&state, &jags_uri, &DiagCancelToken::never()).is_empty());
     }
 
     #[test]
@@ -2218,7 +2273,10 @@ pub(crate) fn diagnostics_from_snapshot(
 ) -> Option<Vec<Diagnostic>> {
     let start = std::time::Instant::now();
 
-    if !snapshot.cross_file_config.diagnostics_enabled {
+    if !snapshot
+        .cross_file_config
+        .diagnostics_enabled_for_file_type(snapshot.file_type)
+    {
         return Some(Vec::new());
     }
 
@@ -75087,6 +75145,7 @@ mod file_type_tests {
             let uri = Url::parse(&format!("file:///test/model.{extension}")).unwrap();
             let mut state = crate::state::WorldState::new();
             state.workspace_scan_complete = true;
+            state.cross_file_config.jags_diagnostics_enabled = true;
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = diagnostics(&state, &uri, &DiagCancelToken::never());
@@ -75111,6 +75170,7 @@ mod file_type_tests {
             let uri = Url::parse(uri_str).unwrap();
             let mut state = crate::state::WorldState::new();
             state.workspace_scan_complete = true;
+            state.cross_file_config.stan_diagnostics_enabled = true;
             let doc = crate::state::Document::new_with_uri(&content, None, &uri);
             state.documents.insert(uri.clone(), doc);
             let result = diagnostics(&state, &uri, &DiagCancelToken::never());

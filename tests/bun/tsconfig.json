@@ -38,6 +38,7 @@
     }
   },
   "include": [
+    "bundle-binary.test.ts",
     "r-expression.test.ts",
     "r-expression-chunk-opts.test.ts",
     "open-exported-file.test.ts",
