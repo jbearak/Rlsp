@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -31,12 +32,20 @@ type BundleCase = {
   sourceTime?: Date;
   destinationTime: Date;
   destinationName?: string;
+  prePlaced?: boolean;
+  /**
+   * When set, also read back `bin/<hostBinaryName>` after the run. Use it to
+   * assert whether the host copy happened, which matters when the pre-placed
+   * artifact under test carries the OTHER platform's filename.
+   */
+  hostBinaryName?: string;
 };
 
 function runBundleCase(testCase: BundleCase): {
   status: number | null;
   output: string;
   destinationContent: string;
+  hostBinaryContent: string | undefined;
   beforeMtimeMs: number;
   afterMtimeMs: number;
 } {
@@ -72,12 +81,20 @@ function runBundleCase(testCase: BundleCase): {
       env: {
         ...process.env,
         RAVEN_BUNDLE_NO_BUILD: "1",
+        ...(testCase.prePlaced ? { RAVEN_BUNDLE_PREPLACED: "1" } : {}),
       },
     });
+    const hostBinaryPath = testCase.hostBinaryName
+      ? path.join(binDir, testCase.hostBinaryName)
+      : undefined;
     return {
       status: result.status,
       output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
       destinationContent: readFileSync(destinationPath, "utf8"),
+      hostBinaryContent:
+        hostBinaryPath && existsSync(hostBinaryPath)
+          ? readFileSync(hostBinaryPath, "utf8")
+          : undefined,
       beforeMtimeMs,
       afterMtimeMs: statSync(destinationPath).mtimeMs,
     };
@@ -125,6 +142,76 @@ test("bundle-binary refreshes a size mismatch when mtimes are equal", () => {
   expect(result.status, result.output).toBe(0);
   expect(result.destinationContent).toBe("fresh binary");
   expect(result.output).toContain("Refreshed stale raven binary");
+});
+
+// Release packaging cross-compiles, unzips the TARGET binary into bin/, then
+// runs this script. A runner that also has a host `target/release/raven` (warm
+// cache, self-hosted runner, local `vsce package` after a dev build) must not
+// have that host binary overwrite the cross-compiled one — the VSIX would ship
+// a server that cannot execute on the platform it claims to target. Freshness
+// cannot catch this: the host binary is legitimately newer.
+test("bundle-binary preserves a pre-placed binary even when target/release is newer", () => {
+  const result = runBundleCase({
+    sourceContent: "host binary for the wrong platform",
+    destinationContent: "cross-compiled target binary",
+    sourceTime: new Date("2021-01-01T00:00:00Z"),
+    destinationTime: new Date("2020-01-01T00:00:00Z"),
+    prePlaced: true,
+  });
+
+  expect(result.status, result.output).toBe(0);
+  expect(result.destinationContent).toBe("cross-compiled target binary");
+  expect(result.afterMtimeMs).toBe(result.beforeMtimeMs);
+  expect(result.output).toContain(
+    "Preserving pre-placed raven binary (RAVEN_BUNDLE_PREPLACED=1)",
+  );
+});
+
+// A foreign-named artifact left in bin/ (e.g. raven.exe after packaging a
+// Windows target on Linux) must NOT suppress the host copy. `copy-binary` also
+// runs from `pretest` and ordinary dev builds; skipping the copy there would
+// report success while leaving the extension — which resolves bin/raven from
+// process.platform — with no runnable server. The foreign file is untouched
+// regardless, because the copy writes to this host's filename.
+test("bundle-binary still creates the host binary alongside a foreign-target one", () => {
+  const result = runBundleCase({
+    sourceContent: "host binary",
+    destinationContent: "foreign target binary",
+    sourceTime: new Date("2021-01-01T00:00:00Z"),
+    destinationTime: new Date("2020-01-01T00:00:00Z"),
+    destinationName: alternateBinaryName,
+    hostBinaryName: binaryName,
+  });
+
+  expect(result.status, result.output).toBe(0);
+  // The foreign artifact survives untouched...
+  expect(result.destinationContent).toBe("foreign target binary");
+  expect(result.afterMtimeMs).toBe(result.beforeMtimeMs);
+  // ...and the host binary is created, so pretest/dev runs have a server.
+  expect(result.hostBinaryContent).toBe("host binary");
+  expect(result.output).toContain("Bundled raven binary");
+});
+
+// Release packaging still preserves a foreign-named artifact when it is marked
+// pre-placed — that is the env-var guard's job, and it must win over the copy.
+test("bundle-binary preserves a foreign-target binary when marked pre-placed", () => {
+  const result = runBundleCase({
+    sourceContent: "host binary",
+    destinationContent: "cross-compiled target binary",
+    sourceTime: new Date("2021-01-01T00:00:00Z"),
+    destinationTime: new Date("2020-01-01T00:00:00Z"),
+    destinationName: alternateBinaryName,
+    hostBinaryName: binaryName,
+    prePlaced: true,
+  });
+
+  expect(result.status, result.output).toBe(0);
+  expect(result.destinationContent).toBe("cross-compiled target binary");
+  expect(result.afterMtimeMs).toBe(result.beforeMtimeMs);
+  expect(result.hostBinaryContent).toBeUndefined();
+  expect(result.output).toContain(
+    "Preserving pre-placed raven binary (RAVEN_BUNDLE_PREPLACED=1)",
+  );
 });
 
 test("bundle-binary preserves an alternate-platform binary when the source is missing", () => {

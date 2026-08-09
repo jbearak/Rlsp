@@ -267,6 +267,11 @@ jobs:
           esac
 
       - name: Package extension
+        env:
+          # The step above unzipped the cross-compiled binary for this target
+          # into bin/. `vsce package` runs copy-binary, which must preserve it
+          # rather than compare it against any host target/release build.
+          RAVEN_BUNDLE_PREPLACED: '1'
         run: |
           cd editors/vscode
           npm run copy-notice
