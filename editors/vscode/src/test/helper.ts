@@ -72,6 +72,37 @@ export async function waitForDiagnostics(uri: vscode.Uri, timeout = 10000): Prom
     return vscode.languages.getDiagnostics(uri);
 }
 
+/**
+ * Poll a URI's diagnostics until `predicate` holds or `timeout` elapses,
+ * returning the most-recently observed set either way so the caller can assert
+ * against it (and produce a useful failure message) on timeout.
+ *
+ * Prefer this over `waitForDiagnostics` whenever the expected set depends on a
+ * setting the test just changed. `waitForDiagnostics` returns on the first
+ * *non-empty* batch, but `config.update()` resolves before the extension has
+ * pushed the new settings to the server and the server has re-published — so
+ * the first batch observed can still reflect the pre-change configuration. For
+ * an opt-in diagnostic stream the pre-change state is "no findings", which is
+ * indistinguishable from "not computed yet" unless you poll for the expected
+ * shape.
+ */
+export async function waitForDiagnosticsMatching(
+    uri: vscode.Uri,
+    predicate: (diagnostics: vscode.Diagnostic[]) => boolean,
+    timeout = 10000,
+): Promise<vscode.Diagnostic[]> {
+    const start = Date.now();
+    let diagnostics = vscode.languages.getDiagnostics(uri);
+    while (Date.now() - start < timeout) {
+        diagnostics = vscode.languages.getDiagnostics(uri);
+        if (predicate(diagnostics)) {
+            return diagnostics;
+        }
+        await sleep(200);
+    }
+    return diagnostics;
+}
+
 export function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }

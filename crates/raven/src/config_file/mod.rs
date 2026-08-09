@@ -114,6 +114,12 @@ pub(crate) fn lintr_path_opts_in(
 }
 
 pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
+    let previous_cross_file = state.cross_file_config.clone();
+    let previous_lint = state.lint_config.clone();
+    let previous_linting_section = state.merged_linting_section.clone();
+    let previous_indentation = state.indentation_config.clone();
+    let previous_exclusions = state.workspace_exclusions.patterns().to_vec();
+
     let normalized_project = strip_project_auto_enabled(state.raw_project_settings.as_ref());
     let merged = merge_settings(&state.raw_client_settings, normalized_project.as_ref());
 
@@ -188,11 +194,23 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         cache.clear();
     }
     state.workspace_exclusions = compile_workspace_exclusions(&merged, workspace_roots);
+
     // This is the sole parsed-config writer. Advance the typed authority only
     // after every parsed analysis field and compiled exclusion has been
     // installed, so detached transactions observe either the complete old
-    // configuration or the complete new one.
-    state.advance_analysis_config_generation();
+    // configuration or the complete new one. Watcher-lifecycle-only changes do
+    // not invalidate diagnostic workers because they cannot change a finding.
+    let analysis_changed = state
+        .cross_file_config
+        .analysis_settings_changed(&previous_cross_file)
+        || state.lint_config != previous_lint
+        || state.merged_linting_section != previous_linting_section
+        || state.indentation_config != previous_indentation
+        || state.workspace_exclusions.patterns() != previous_exclusions;
+    if analysis_changed {
+        state.cross_file_revalidation.cancel_all();
+        state.advance_analysis_config_generation();
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +281,96 @@ mod tests {
         recompute_parsed_configs(&mut state);
         assert!(!state.cross_file_config.jags_diagnostics_enabled);
         assert!(!state.cross_file_config.stan_diagnostics_enabled);
+    }
+
+    /// The VS Code extension omits an unconfigured model switch entirely (it
+    /// never serializes a default `"off"`), and `did_change_configuration`
+    /// REPLACES the client layer wholesale. So a "Reset Setting" must fall back
+    /// to the built-in default — and a project `raven.toml` must still be able
+    /// to pin the key that the client no longer sends.
+    #[test]
+    fn omitted_client_model_switch_resets_to_default_and_yields_to_project() {
+        let mut state = WorldState::new();
+        state.raw_client_settings = json!({ "diagnostics": { "stan": "on", "jags": "on" } });
+        recompute_parsed_configs(&mut state);
+        assert!(state.cross_file_config.stan_diagnostics_enabled);
+        assert!(state.cross_file_config.jags_diagnostics_enabled);
+
+        // User resets both settings: the client sends a payload with the keys
+        // absent, not an explicit "off".
+        state.raw_client_settings = json!({ "diagnostics": {} });
+        recompute_parsed_configs(&mut state);
+        assert!(
+            !state.cross_file_config.stan_diagnostics_enabled,
+            "omitting the key must reset to the built-in off default"
+        );
+        assert!(!state.cross_file_config.jags_diagnostics_enabled);
+
+        // With the client silent, the project layer is authoritative.
+        state.raw_project_settings = Some(json!({ "diagnostics": { "stan": "on" } }));
+        recompute_parsed_configs(&mut state);
+        assert!(
+            state.cross_file_config.stan_diagnostics_enabled,
+            "raven.toml must still pin a key the client no longer sends"
+        );
+        assert!(!state.cross_file_config.jags_diagnostics_enabled);
+    }
+
+    /// A model switch is analysis-affecting: it must retire workers captured
+    /// under the old configuration, or a computation started while Stan was
+    /// `"on"` could publish its findings after the switch to `"off"`.
+    #[test]
+    fn model_switch_advances_the_analysis_config_generation() {
+        let mut state = WorldState::new();
+        state.raw_client_settings = json!({ "diagnostics": { "stan": "off" } });
+        recompute_parsed_configs(&mut state);
+        let before = state.analysis_config_generation_for_test();
+
+        state.raw_client_settings = json!({ "diagnostics": { "stan": "on" } });
+        recompute_parsed_configs(&mut state);
+
+        assert_ne!(
+            state.analysis_config_generation_for_test(),
+            before,
+            "a model switch must retire in-flight diagnostic workers"
+        );
+    }
+
+    /// Libpath watcher settings control only watcher lifecycle. Advancing the
+    /// analysis generation for them would cancel in-flight diagnostics that
+    /// nothing replaces, leaving open documents without a republish.
+    #[test]
+    fn watcher_only_reload_keeps_the_analysis_config_generation() {
+        let mut state = WorldState::new();
+        state.raw_client_settings = json!({
+            "packages": { "watchLibraryPaths": true, "watchDebounceMs": 250 }
+        });
+        recompute_parsed_configs(&mut state);
+        let before = state.analysis_config_generation_for_test();
+
+        state.raw_client_settings = json!({
+            "packages": { "watchLibraryPaths": false, "watchDebounceMs": 750 }
+        });
+        recompute_parsed_configs(&mut state);
+
+        assert_eq!(
+            state.analysis_config_generation_for_test(),
+            before,
+            "watcher-lifecycle settings cannot change a finding"
+        );
+    }
+
+    /// A reload that changes nothing must not retire in-flight work either.
+    #[test]
+    fn idempotent_reload_keeps_the_analysis_config_generation() {
+        let mut state = WorldState::new();
+        state.raw_client_settings = json!({ "diagnostics": { "stan": "on" } });
+        recompute_parsed_configs(&mut state);
+        let before = state.analysis_config_generation_for_test();
+
+        recompute_parsed_configs(&mut state);
+
+        assert_eq!(state.analysis_config_generation_for_test(), before);
     }
 
     /// The per-URI resolved-config cache serves repeated lookups, evicts a

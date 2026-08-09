@@ -313,6 +313,42 @@ fn normalize_document_indent_unit(unit: u32) -> u32 {
 
 /// Parse cross-file configuration from LSP settings.
 ///
+/// Parse one `"on"` / `"off"` model-language diagnostics switch.
+///
+/// Returns `None` when the key is absent (leave the layered value alone) and
+/// `Some(enabled)` when it is present. Unrecognized strings and non-string
+/// types warn and fail closed to `Some(false)` rather than being silently
+/// ignored: a typo like `"true"` or `"On"` would otherwise read as "off" with
+/// no signal, which is indistinguishable from the default.
+fn parse_diagnostics_switch(raw: Option<&serde_json::Value>, name: &str) -> Option<bool> {
+    use serde_json::Value;
+
+    match raw {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => match value.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            other => {
+                log::warn!("Unrecognized diagnostics.{name} value '{other}'; defaulting to 'off'.");
+                Some(false)
+            }
+        },
+        Some(other) => {
+            let kind = match other {
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+                _ => "value",
+            };
+            log::warn!(
+                "diagnostics.{name} must be string \"on|off\"; got {kind}. Defaulting to 'off'."
+            );
+            Some(false)
+        }
+    }
+}
+
 /// Reads the top-level `crossFile`, `diagnostics`, and `packages` sections from a
 /// serde_json::Value and constructs a populated `CrossFileConfig`. Only fields
 /// present in the provided JSON are applied; absent fields retain their defaults
@@ -548,11 +584,11 @@ pub(crate) fn parse_cross_file_config(
         if let Some(v) = diag.get("enabled").and_then(|v| v.as_bool()) {
             config.diagnostics_enabled = v;
         }
-        if let Some(v) = diag.get("jags").and_then(|v| v.as_str()) {
-            config.jags_diagnostics_enabled = v == "on";
+        if let Some(enabled) = parse_diagnostics_switch(diag.get("jags"), "jags") {
+            config.jags_diagnostics_enabled = enabled;
         }
-        if let Some(v) = diag.get("stan").and_then(|v| v.as_str()) {
-            config.stan_diagnostics_enabled = v == "on";
+        if let Some(enabled) = parse_diagnostics_switch(diag.get("stan"), "stan") {
+            config.stan_diagnostics_enabled = enabled;
         }
         // Parse diagnostics.maxSyntaxDiagnosticsPerFile. Zero deliberately
         // means unlimited; unlike cache sizes, it must not be clamped upward.
@@ -16300,45 +16336,65 @@ async fn run_debounced_diagnostics(
             return;
         }
 
-        // Build the snapshot (captures all state needed for diagnostics)
-        let snapshot = handlers::DiagnosticsSnapshot::build(&state, &affected_uri);
+        let file_type = state
+            .documents
+            .get(&affected_uri)
+            .map(|document| document.file_type)
+            .unwrap_or_else(|| crate::file_type::file_type_from_uri(&affected_uri));
+        let diagnostics_enabled = state
+            .cross_file_config
+            .diagnostics_enabled_for_file_type(file_type);
+        let snapshot = if diagnostics_enabled {
+            let Some(snapshot) = handlers::DiagnosticsSnapshot::build(&state, &affected_uri) else {
+                state
+                    .cross_file_revalidation
+                    .complete(&affected_uri, generation);
+                return;
+            };
+            Some(snapshot)
+        } else {
+            None
+        };
         let workspace_folder = state.workspace_folders.first().cloned();
         let missing_file_severity = state.cross_file_config.missing_file_severity;
-
         let coherence_generation = state.diagnostics_coherence.generation();
-        snapshot.map(|s| {
-            (
-                s,
-                workspace_folder,
-                missing_file_severity,
-                coherence_generation,
-            )
-        })
+
+        (
+            snapshot,
+            diagnostics_enabled,
+            workspace_folder,
+            missing_file_severity,
+            coherence_generation,
+        )
     }; // Read lock released here
 
-    let Some((snapshot, workspace_folder, missing_file_severity, coherence_generation)) =
-        snapshot_data
-    else {
-        let state = state_arc.read().await;
-        state
-            .cross_file_revalidation
-            .complete(&affected_uri, generation);
-        return;
-    };
+    let (
+        snapshot,
+        diagnostics_enabled,
+        workspace_folder,
+        missing_file_severity,
+        coherence_generation,
+    ) = snapshot_data;
 
     if let Some(traversal_truncation) = traversal_truncation.as_deref() {
         check_and_warn_traversal_truncation(&state_arc, &client, traversal_truncation).await;
     }
 
-    // Compute diagnostics WITHOUT holding any lock
-    let sync_diagnostics =
-        match handlers::diagnostics_from_snapshot(&snapshot, &affected_uri, &cancel) {
-            Some(diags) => diags,
-            None => {
-                log::trace!("Diagnostics cancelled for {}", affected_uri);
-                return;
+    // Compute diagnostics WITHOUT holding any lock. A disabled model language
+    // deliberately carries no snapshot and reaches the publish tail with an
+    // empty result so a live config change can clear earlier findings cheaply.
+    let sync_diagnostics = match snapshot.as_ref() {
+        Some(snapshot) => {
+            match handlers::diagnostics_from_snapshot(snapshot, &affected_uri, &cancel) {
+                Some(diags) => diags,
+                None => {
+                    log::trace!("Diagnostics cancelled for {}", affected_uri);
+                    return;
+                }
             }
-        };
+        }
+        None => Vec::new(),
+    };
 
     if cancel.is_cancelled() {
         log::trace!(
@@ -16349,7 +16405,9 @@ async fn run_debounced_diagnostics(
     }
 
     // Perform async missing file existence checks (non-blocking I/O)
-    let diagnostics = if snapshot.file_type == crate::file_type::FileType::R {
+    let diagnostics = if let Some(snapshot) = snapshot.as_ref()
+        && snapshot.file_type == crate::file_type::FileType::R
+    {
         handlers::diagnostics_async_standalone(
             &affected_uri,
             sync_diagnostics,
@@ -16359,8 +16417,10 @@ async fn run_debounced_diagnostics(
             snapshot.cross_file_config.case_mismatch_severity,
         )
         .await
-    } else {
+    } else if diagnostics_enabled {
         sync_diagnostics
+    } else {
+        Vec::new()
     };
 
     if cancel.is_cancelled() {
@@ -19218,9 +19278,15 @@ impl LanguageServer for Backend {
             }
         }
 
-        for uri in to_publish {
-            self.publish_diagnostics(&uri).await;
-        }
+        // Reuse the bounded-parallelism helper the watched-file reload path
+        // uses. A serial loop here made a settings change cost one full
+        // diagnostic computation per open document, back to back.
+        self.publish_config_reload_diagnostics(
+            to_publish,
+            #[cfg(test)]
+            None,
+        )
+        .await;
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -20499,7 +20565,40 @@ impl Backend {
 
             // Snapshot candidates now; marker ownership is transferred only
             // after every config/package/scan reconciliation step converges.
-            let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
+            //
+            // When the ONLY thing that moved is a model-language switch, an R
+            // document's findings cannot have changed, so restrict the set to
+            // the affected languages. `None` keeps the full open set.
+            //
+            // `model_only_diagnostic_changes` only sees `CrossFileConfig`, so
+            // the config structs that live outside it must be checked here too
+            // — otherwise a lint-only change (whose `CrossFileConfig` is
+            // untouched) would filter to an empty set and drop its republish
+            // entirely. Same set of out-of-struct guards as `only_watch_changed`.
+            //
+            // Filtering here — before the set is both marked for
+            // force-republish and returned to the caller — keeps the marked and
+            // published sets identical, so no marker is left unconsumed.
+            let model_only_languages = if lint_config_changed
+                || linting_section_changed
+                || indentation_producer_policy_changed
+                || workspace_exclusions_changed
+            {
+                None
+            } else {
+                prev.prev_cross_file
+                    .model_only_diagnostic_changes(&state.cross_file_config)
+                    .filter(|languages| !languages.is_empty())
+            };
+            let open_uris: Vec<Url> = state
+                .documents
+                .iter()
+                .filter(|(_, document)| match model_only_languages.as_deref() {
+                    Some(languages) => languages.contains(&document.file_type),
+                    None => true,
+                })
+                .map(|(uri, _)| uri.clone())
+                .collect();
 
             ReconciliationDecisions {
                 scope_changed,
@@ -23360,21 +23459,21 @@ pub(crate) async fn publish_diagnostics_inner(
             }
         }
 
-        // Capture the diagnostics master switch under the read lock so
-        // it gates BOTH the sync snapshot build AND the async
-        // missing-file checks below — without this, a config reload
-        // that flips `diagnostics.enabled` to `false` could still
-        // publish missing-file diagnostics from the async phase.
-        let diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
-
-        // Skip the snapshot build entirely when the master switch is
-        // off — saves the snapshot's metadata clone + neighborhood walk.
-        // Mirrors the early-exit in `handlers::diagnostics`.
-        let snapshot = if diagnostics_enabled {
-            handlers::DiagnosticsSnapshot::build(&state, uri)
-        } else {
-            None
-        };
+        // Capture the language-specific diagnostics gate under the read lock so
+        // it controls BOTH snapshot construction and the async missing-file
+        // phase. Disabled model languages still publish an explicit empty result,
+        // but avoid the snapshot's text clone and neighborhood preparation.
+        let file_type = state
+            .documents
+            .get(uri)
+            .map(|document| document.file_type)
+            .unwrap_or_else(|| crate::file_type::file_type_from_uri(uri));
+        let diagnostics_enabled = state
+            .cross_file_config
+            .diagnostics_enabled_for_file_type(file_type);
+        let snapshot = diagnostics_enabled
+            .then(|| handlers::DiagnosticsSnapshot::build(&state, uri))
+            .flatten();
 
         // Metadata for async missing-file checks. Reuse the snapshot's
         // `directive_meta`, which is `extract_metadata` (not just directives):
@@ -27585,16 +27684,19 @@ mod tests {
                     })
                     .await;
             });
+            // Sleep rather than `yield_now()`: on a 2-worker runtime a tight
+            // spin here can starve the reload task this loop is waiting for.
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    let state = backend.state.read().await;
-                    if !state.cross_file_config.stan_diagnostics_enabled
-                        && state.diagnostics_gate.force_republish_count_for_test(&uri) > 0
                     {
-                        break;
+                        let state = backend.state.read().await;
+                        if !state.cross_file_config.stan_diagnostics_enabled
+                            && state.diagnostics_gate.force_republish_count_for_test(&uri) > 0
+                        {
+                            break;
+                        }
                     }
-                    drop(state);
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
@@ -31326,6 +31428,52 @@ mod tests {
             }
         }
 
+        /// A misspelled or wrongly-typed model switch must fail closed to
+        /// "off" rather than being silently ignored — silently ignoring it
+        /// would leave the previous layered value in place, which reads as the
+        /// user's `"on"` still being honored.
+        #[test]
+        fn parse_cross_file_config_rejects_invalid_model_switch_values() {
+            for invalid in [
+                json!("true"),
+                json!("On"),
+                json!("enabled"),
+                json!(""),
+                json!(true),
+                json!(1),
+                json!([]),
+                json!({}),
+            ] {
+                let config = crate::backend::parse_cross_file_config(&json!({
+                    "diagnostics": { "jags": invalid.clone(), "stan": invalid.clone() }
+                }))
+                .unwrap()
+                .unwrap();
+
+                assert!(
+                    !config.jags_diagnostics_enabled,
+                    "invalid jags value {invalid} must fail closed"
+                );
+                assert!(
+                    !config.stan_diagnostics_enabled,
+                    "invalid stan value {invalid} must fail closed"
+                );
+            }
+        }
+
+        /// An explicit JSON `null` means "not configured" and must leave the
+        /// built-in default in place, matching an absent key.
+        #[test]
+        fn parse_cross_file_config_treats_null_model_switch_as_absent() {
+            let config = crate::backend::parse_cross_file_config(&json!({
+                "diagnostics": { "jags": null, "stan": null }
+            }))
+            .unwrap()
+            .unwrap();
+            assert!(!config.jags_diagnostics_enabled);
+            assert!(!config.stan_diagnostics_enabled);
+        }
+
         #[test]
         fn parse_cross_file_config_rprofile_prelude_defaults_on_and_reads_explicit() {
             // Default-on: a client that omits `packages.rprofilePrelude` still
@@ -32967,6 +33115,140 @@ mod refresh_packages_tests {
                 .force_republish_count_for_test(&uri)
                 > 0,
             "the combined reload must force a same-version diagnostic republish"
+        );
+    }
+
+    /// Flipping only `diagnostics.stan` cannot change an R document's findings,
+    /// so the reload must republish the Stan buffer alone. The marked and
+    /// returned sets must match exactly, or an R document keeps an unconsumed
+    /// force-republish marker that a later same-version publish would spend.
+    #[tokio::test]
+    async fn model_only_switch_republishes_only_that_language() {
+        let backend = make_test_backend();
+        let r_uri = Url::parse("file:///model-only.R").unwrap();
+        let stan_uri = Url::parse("file:///model-only.stan").unwrap();
+        let jags_uri = Url::parse("file:///model-only.jags").unwrap();
+        let snapshot = {
+            let mut state = backend.state.write().await;
+            state.raw_client_settings = serde_json::json!({
+                "diagnostics": { "stan": "off" }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            state.open_document(r_uri.clone(), "x <- 1\n", Some(1));
+            state.open_document_with_language_id(
+                stan_uri.clone(),
+                "model { target += ; }\n",
+                Some(1),
+                Some("stan"),
+            );
+            state.open_document_with_language_id(
+                jags_uri.clone(),
+                "model { x <- * 1 }\n",
+                Some(1),
+                Some("jags"),
+            );
+
+            let snapshot = ConfigChangeSnapshot::capture(&state);
+            state.raw_client_settings = serde_json::json!({
+                "diagnostics": { "stan": "on" }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            snapshot
+        };
+
+        let to_publish = backend.reconcile_after_config_recompute(snapshot).await;
+        assert_eq!(
+            to_publish,
+            vec![stan_uri.clone()],
+            "only the Stan buffer's findings can have changed"
+        );
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&stan_uri)
+                > 0,
+            "the Stan buffer must be marked for a same-version republish"
+        );
+        for untouched in [&r_uri, &jags_uri] {
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(untouched),
+                0,
+                "{untouched} must not retain an unconsumed force-republish marker"
+            );
+        }
+    }
+
+    /// A model switch that moves together with a non-model setting must fall
+    /// back to the full open set: the other setting can change R findings.
+    #[tokio::test]
+    async fn model_switch_with_other_change_republishes_every_document() {
+        let backend = make_test_backend();
+        let r_uri = Url::parse("file:///model-plus-other.R").unwrap();
+        let stan_uri = Url::parse("file:///model-plus-other.stan").unwrap();
+        let snapshot = {
+            let mut state = backend.state.write().await;
+            state.raw_client_settings = serde_json::json!({
+                "diagnostics": { "stan": "off", "undefinedVariableSeverity": "warning" }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            state.open_document(r_uri.clone(), "x <- 1\n", Some(1));
+            state.open_document_with_language_id(
+                stan_uri.clone(),
+                "model { target += ; }\n",
+                Some(1),
+                Some("stan"),
+            );
+
+            let snapshot = ConfigChangeSnapshot::capture(&state);
+            state.raw_client_settings = serde_json::json!({
+                "diagnostics": { "stan": "on", "undefinedVariableSeverity": "error" }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            snapshot
+        };
+
+        let mut to_publish = backend.reconcile_after_config_recompute(snapshot).await;
+        to_publish.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        let mut expected = vec![r_uri, stan_uri];
+        expected.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(
+            to_publish, expected,
+            "a severity change alongside the model switch still affects R findings"
+        );
+    }
+
+    /// `model_only_diagnostic_changes` only inspects `CrossFileConfig`. A
+    /// lint-only reload leaves that struct untouched, so the model filter must
+    /// not mistake it for "no model change" and drop the republish entirely.
+    #[tokio::test]
+    async fn lint_only_change_still_republishes_open_documents() {
+        let backend = make_test_backend();
+        let uri = Url::parse("file:///lint-only.R").unwrap();
+        let snapshot = {
+            let mut state = backend.state.write().await;
+            state.raw_client_settings = serde_json::json!({
+                "linting": { "enabled": true, "lineLength": 80 }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            state.open_document(uri.clone(), "x <- 1\n", Some(1));
+
+            let snapshot = ConfigChangeSnapshot::capture(&state);
+            state.raw_client_settings = serde_json::json!({
+                "linting": { "enabled": true, "lineLength": 40 }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            snapshot
+        };
+
+        let to_publish = backend.reconcile_after_config_recompute(snapshot).await;
+        assert_eq!(
+            to_publish,
+            vec![uri],
+            "a lint-only reload must still republish open documents"
         );
     }
 

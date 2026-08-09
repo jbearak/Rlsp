@@ -137,7 +137,7 @@ impl Default for CompletionConfig {
 }
 
 /// Indentation configuration settings.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndentationSettings {
     /// Whether Tier 2 AST-aware indentation is enabled.
     pub enabled: bool,
@@ -6305,6 +6305,14 @@ impl WorldState {
     /// configuration recompute.
     pub(crate) fn advance_analysis_config_generation(&mut self) {
         self.analysis_config_generation.0 = self.analysis_config_generation.0.wrapping_add(1);
+    }
+
+    /// Read the current analysis-config generation counter, so tests can assert
+    /// which reloads retire in-flight diagnostic workers and which leave them
+    /// alone. Returns the raw counter rather than the private generation type.
+    #[cfg(test)]
+    pub(crate) fn analysis_config_generation_for_test(&self) -> u64 {
+        self.analysis_config_generation.0
     }
 
     /// Retire detached scan candidates captured before a closed-file or

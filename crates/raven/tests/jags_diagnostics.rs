@@ -836,12 +836,41 @@ fn raven_check_no_config_keeps_model_diagnostics_off() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_raven"))
-        .args(["check", "--workspace"])
-        .arg(workspace.path())
-        .args(["--no-config", "--format", "json", "--quiet", "--no-color"])
-        .output()
-        .expect("run raven check without project configuration");
+    let run = |extra: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_raven"));
+        command
+            .args(["check", "--workspace"])
+            .arg(workspace.path())
+            .args(["--format", "json", "--quiet", "--no-color"])
+            .args(extra);
+        command.output().expect("run raven check")
+    };
+
+    // Precondition: with the project config honored, these fixtures DO report.
+    // Without this the empty `--no-config` result below would also pass if
+    // model diagnostics were broken outright.
+    let configured = run(&[]);
+    assert_eq!(
+        configured.status.code(),
+        Some(1),
+        "fixture must report findings when raven.toml enables both languages: {}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    let configured_findings: serde_json::Value =
+        serde_json::from_slice(&configured.stdout).unwrap();
+    let configured_paths: std::collections::BTreeSet<String> = configured_findings
+        .as_array()
+        .expect("json findings array")
+        .iter()
+        .map(|finding| finding["path"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        configured_paths.contains("invalid.jags") && configured_paths.contains("invalid.stan"),
+        "both model languages must report when enabled: {configured_paths:?}"
+    );
+
+    // `--no-config` ignores raven.toml, so both switches fall back to "off".
+    let output = run(&["--no-config"]);
     assert_eq!(
         output.status.code(),
         Some(0),

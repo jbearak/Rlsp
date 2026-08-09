@@ -90,7 +90,7 @@ Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rprofi
 The two model-language switches layer per key like every other project setting:
 a value in `raven.toml` overrides the corresponding editor/LSP-client value,
 while an unpinned key continues to use the client value or its built-in `"off"`
-default. The global `enabled` switch is always dominant.
+default.
 
 ## Cross-File Settings
 

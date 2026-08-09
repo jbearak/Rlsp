@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { activate, openDocument, waitForDiagnostics, getFixtureUri, sleep } from './helper';
+import { activate, openDocument, waitForDiagnostics, waitForDiagnosticsMatching, getFixtureUri, sleep } from './helper';
 
 suite('Ark LSP Extension', () => {
     suiteSetup(async () => {
@@ -19,39 +19,59 @@ suite('Ark LSP Extension', () => {
     });
 
     test('Stan diagnostics report variables but not call or distribution names', async () => {
-        const doc = await openDocument('stan_undefined.stan');
-        const diagnostics = await waitForDiagnostics(doc.uri, 15000);
-        const undefinedVariables = diagnostics.filter(
-            diagnostic => diagnostic.code === 'undefined-variable',
-        );
-        assert.strictEqual(
-            undefinedVariables.length,
-            2,
-            `Expected two Stan undefined variables, got: ${diagnostics.map(d => d.message).join('; ')}`,
-        );
-        assert.deepStrictEqual(
-            undefinedVariables.map(diagnostic => ({
-                message: diagnostic.message,
-                start: [diagnostic.range.start.line, diagnostic.range.start.character],
-                end: [diagnostic.range.end.line, diagnostic.range.end.character],
-            })),
-            [
-                {
-                    message: 'supplied_from_r is not defined',
-                    start: [4, 16],
-                    end: [4, 31],
-                },
-                {
-                    message: 'another_missing is not defined',
-                    start: [5, 12],
-                    end: [5, 27],
-                },
-            ],
-        );
-        assert.ok(
-            !diagnostics.some(diagnostic => /normal|theta|N is not defined/.test(diagnostic.message)),
-            `Stan declarations and distribution names must resolve: ${diagnostics.map(d => d.message).join('; ')}`,
-        );
+        const config = vscode.workspace.getConfiguration('raven');
+        await config.update('diagnostics.stan', 'on', vscode.ConfigurationTarget.Workspace);
+        await sleep(100);
+
+        try {
+            const doc = await openDocument('stan_undefined.stan');
+            // `config.update()` resolves before the extension's
+            // `onDidChangeConfiguration` handler has pushed the new settings to
+            // the server and the server has re-published. Until then the file
+            // legitimately has zero findings (Stan defaults to "off"), so
+            // `waitForDiagnostics` — which returns on the first *non-empty*
+            // batch — can observe the pre-opt-in empty set and return early.
+            // Poll for the opt-in to actually take effect instead.
+            const undefinedVariables = await waitForDiagnosticsMatching(
+                doc.uri,
+                diagnostics =>
+                    diagnostics.filter(d => d.code === 'undefined-variable').length === 2,
+                15000,
+            ).then(diagnostics =>
+                diagnostics.filter(d => d.code === 'undefined-variable'),
+            );
+            const diagnostics = vscode.languages.getDiagnostics(doc.uri);
+            assert.strictEqual(
+                undefinedVariables.length,
+                2,
+                `Expected two Stan undefined variables, got: ${diagnostics.map(d => d.message).join('; ')}`,
+            );
+            assert.deepStrictEqual(
+                undefinedVariables.map(diagnostic => ({
+                    message: diagnostic.message,
+                    start: [diagnostic.range.start.line, diagnostic.range.start.character],
+                    end: [diagnostic.range.end.line, diagnostic.range.end.character],
+                })),
+                [
+                    {
+                        message: 'supplied_from_r is not defined',
+                        start: [4, 16],
+                        end: [4, 31],
+                    },
+                    {
+                        message: 'another_missing is not defined',
+                        start: [5, 12],
+                        end: [5, 27],
+                    },
+                ],
+            );
+            assert.ok(
+                !diagnostics.some(diagnostic => /normal|theta|N is not defined/.test(diagnostic.message)),
+                `Stan declarations and distribution names must resolve: ${diagnostics.map(d => d.message).join('; ')}`,
+            );
+        } finally {
+            await config.update('diagnostics.stan', undefined, vscode.ConfigurationTarget.Workspace);
+        }
     });
 
     test('go-to-definition works for function calls', async () => {

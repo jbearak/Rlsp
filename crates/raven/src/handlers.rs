@@ -90,9 +90,9 @@ mod stan_syntax_diagnostic_tests {
     ) -> Vec<Diagnostic> {
         let uri = Url::parse(&format!("untitled:{language_id}-syntax-cap-test")).unwrap();
         let mut state = WorldState::new();
-        match language_id {
-            "stan" => state.cross_file_config.stan_diagnostics_enabled = true,
-            "jags" => state.cross_file_config.jags_diagnostics_enabled = true,
+        match crate::file_type::file_type_from_language_id(language_id) {
+            Some(FileType::Stan) => state.cross_file_config.stan_diagnostics_enabled = true,
+            Some(FileType::Jags) => state.cross_file_config.jags_diagnostics_enabled = true,
             _ => {}
         }
         state.cross_file_config.max_syntax_diagnostics_per_file = cap;
@@ -2273,7 +2273,10 @@ pub(crate) fn diagnostics_from_snapshot(
 ) -> Option<Vec<Diagnostic>> {
     let start = std::time::Instant::now();
 
-    if !snapshot.cross_file_config.diagnostics_enabled {
+    if !snapshot
+        .cross_file_config
+        .diagnostics_enabled_for_file_type(snapshot.file_type)
+    {
         return Some(Vec::new());
     }
 
@@ -2281,9 +2284,6 @@ pub(crate) fn diagnostics_from_snapshot(
     // untitled model buffers carry their type only through `languageId`.
     match snapshot.file_type {
         FileType::Stan => {
-            if !snapshot.cross_file_config.stan_diagnostics_enabled {
-                return Some(Vec::new());
-            }
             let mut diagnostics = collect_stan_syntax_errors(
                 snapshot.tree.root_node(),
                 &snapshot.text,
@@ -2332,9 +2332,6 @@ pub(crate) fn diagnostics_from_snapshot(
             return Some(unique);
         }
         FileType::Jags => {
-            if !snapshot.cross_file_config.jags_diagnostics_enabled {
-                return Some(Vec::new());
-            }
             return collect_jags_syntax_errors(
                 snapshot.tree.root_node(),
                 &snapshot.text,
