@@ -16897,7 +16897,10 @@ struct ReconciliationDecisions {
     scope_changed: bool,
     package_settings_changed: bool,
     watch_settings_changed: bool,
-    only_watch_changed: bool,
+    /// Nothing that can change a finding moved, so the workspace-wide
+    /// republish is skipped. Shares its predicate with the worker-retirement
+    /// decision in `recompute_parsed_configs`, so the two cannot drift.
+    only_non_analysis_changed: bool,
     diagnostics_enabled_changed: bool,
     old_diagnostics_enabled: bool,
     new_diagnostics_enabled: bool,
@@ -19242,20 +19245,6 @@ impl LanguageServer for Backend {
         if let Err(err) = parse_cross_file_config(&params.settings) {
             self.client.show_message(MessageType::WARNING, err).await;
         }
-        // A model switch that fails closed is otherwise invisible: the log is
-        // filtered out by default, so a typo like "On" looks exactly like the
-        // built-in "off" default — no diagnostics, no explanation. Toast it.
-        //
-        // Reported against the client payload specifically, because that is
-        // what the user just edited. The merged-layer pass inside
-        // `recompute_parsed_configs` still logs, and it is the one that knows
-        // whether a project override supersedes the typo.
-        for message in invalid_model_switch_messages(&params.settings) {
-            self.client
-                .show_message(MessageType::WARNING, message)
-                .await;
-        }
-
         let new_raw_client = params.settings.clone();
         let (project_root, previous_project_config_path, workspace_folders, old_raw_client): (
             Option<std::path::PathBuf>,
@@ -19314,7 +19303,7 @@ impl LanguageServer for Backend {
         // marker WHILE an old-config worker holds the publish lock, so the
         // marker is in place by the time that worker's gate commit runs and
         // correctly refuses it.
-        let (snapshot, project_config_path) = {
+        let (snapshot, project_config_path, model_switch_warnings) = {
             let mut state = self.state.write().await;
 
             let prev = ConfigChangeSnapshot::capture(&state);
@@ -19335,8 +19324,26 @@ impl LanguageServer for Backend {
             // exists.
             state.notify_library_routing_reconcile();
 
-            (prev, state.project_config_path.clone())
+            // Collect from the MERGED layer, after recompute — the layer that
+            // decides the effective value. Reading `params.settings` instead
+            // would both over- and under-report: a client typo superseded by
+            // `raven.toml` would toast "Defaulting to 'off'" while the setting
+            // is actually on, and a typo living only in `raven.toml` would
+            // never toast at all.
+            let warnings =
+                invalid_model_switch_messages(&crate::config_file::merged_settings(&state));
+
+            (prev, state.project_config_path.clone(), warnings)
         };
+
+        // A model switch that fails closed is otherwise invisible: the log is
+        // filtered out by default, so a typo like "On" looks exactly like the
+        // built-in "off" default — no diagnostics, no explanation. Toast it.
+        for message in model_switch_warnings {
+            self.client
+                .show_message(MessageType::WARNING, message)
+                .await;
+        }
 
         // Helper drives change detection, package rebuilds, watcher
         // restart, completion re-registration, and force-republish
@@ -19472,7 +19479,7 @@ impl LanguageServer for Backend {
             // raw project settings, recompute parsed configs, recompile
             // overrides. The shared reconciliation helper drives every
             // downstream action outside the lock.
-            let snapshot = {
+            let (snapshot, model_switch_warnings) = {
                 let mut state = self.state.write().await;
                 let prev = ConfigChangeSnapshot::capture(&state);
 
@@ -19484,8 +19491,20 @@ impl LanguageServer for Backend {
                 // `state.lint_overrides` from the merged settings.
                 crate::config_file::recompute_parsed_configs(&mut state);
 
-                prev
+                // An invalid switch that arrived via `raven.toml` needs the same
+                // user-visible signal as one typed into editor settings. This is
+                // the only path that sees a project-file edit, so without this
+                // the toast would depend on which layer the typo lives in.
+                let warnings =
+                    invalid_model_switch_messages(&crate::config_file::merged_settings(&state));
+
+                (prev, warnings)
             };
+            for message in model_switch_warnings {
+                self.client
+                    .show_message(MessageType::WARNING, message)
+                    .await;
+            }
             // Helper drives change detection, package rebuilds, watcher
             // restart, completion re-registration, and force-republish
             // marking. Returns the URIs to publish (empty when only the
@@ -20626,19 +20645,26 @@ impl Backend {
             });
             let workspace_exclusion_package_reseed = workspace_exclusion_package_reseed.flatten();
 
-            let only_watch_changed = watch_settings_changed
+            // Suppress the workspace-wide republish when nothing that can change
+            // a finding moved. `analysis_settings_changed` is the same predicate
+            // `recompute_parsed_configs` uses to decide whether to retire
+            // in-flight workers, so the two cannot disagree: a setting that is
+            // cheap enough to skip cancellation is also cheap enough to skip
+            // recomputing every open document.
+            //
+            // Without this, a scheduling-only knob like
+            // `maxRevalidationsPerTrigger` would leave existing workers running
+            // (correctly) while ALSO force-marking every open URI and starting a
+            // replacement batch — so both sets race for the same force marker,
+            // and every open document is recomputed for a knob that cannot alter
+            // any of their findings.
+            let only_non_analysis_changed = !state
+                .cross_file_config
+                .analysis_settings_changed(&prev.prev_cross_file)
                 && !lint_config_changed
                 && !linting_section_changed
                 && !indentation_producer_policy_changed
-                && !workspace_exclusions_changed
-                && {
-                    let mut probe = state.cross_file_config.clone();
-                    probe.packages_watch_library_paths =
-                        prev.prev_cross_file.packages_watch_library_paths;
-                    probe.packages_watch_debounce_ms =
-                        prev.prev_cross_file.packages_watch_debounce_ms;
-                    probe == prev.prev_cross_file
-                };
+                && !workspace_exclusions_changed;
 
             // If `package_mode` changed, apply the setting change via the
             // event-driven path. For Disabled: translate immediately
@@ -20727,7 +20753,7 @@ impl Backend {
                 scope_changed,
                 package_settings_changed,
                 watch_settings_changed,
-                only_watch_changed,
+                only_non_analysis_changed,
                 diagnostics_enabled_changed,
                 old_diagnostics_enabled,
                 new_diagnostics_enabled,
@@ -20747,7 +20773,7 @@ impl Backend {
             scope_changed,
             package_settings_changed,
             watch_settings_changed,
-            only_watch_changed,
+            only_non_analysis_changed,
             diagnostics_enabled_changed,
             old_diagnostics_enabled,
             new_diagnostics_enabled,
@@ -21273,7 +21299,7 @@ impl Backend {
             return Vec::new();
         }
 
-        if only_watch_changed && deferred_post_seed.is_none() {
+        if only_non_analysis_changed && deferred_post_seed.is_none() {
             return Vec::new();
         }
         if workspace_scan_transfer.is_some()
@@ -33238,6 +33264,54 @@ mod refresh_packages_tests {
                 .force_republish_count_for_test(&uri)
                 > 0,
             "the combined reload must force a same-version diagnostic republish"
+        );
+    }
+
+    /// A scheduling-only knob must NOT republish open documents.
+    ///
+    /// `maxRevalidationsPerTrigger` is a fan-out cap applied by `truncate` when
+    /// building a candidate list: it decides which documents get scheduled for a
+    /// future revalidation, never what any document's findings contain. Because
+    /// `recompute_parsed_configs` deliberately keeps in-flight workers alive for
+    /// this setting, force-marking every open URI here would let the surviving
+    /// workers and a fresh replacement batch race for the same force marker —
+    /// and recompute every open document for a knob that cannot change any of
+    /// their findings. The republish gate and the retirement gate share one
+    /// predicate (`analysis_settings_changed`) so they cannot drift apart.
+    #[tokio::test]
+    async fn revalidation_cap_only_reload_skips_the_open_document_republish() {
+        let backend = make_test_backend();
+        let uri = Url::parse("file:///cap-only.R").unwrap();
+        let snapshot = {
+            let mut state = backend.state.write().await;
+            state.raw_client_settings = serde_json::json!({
+                "crossFile": { "maxRevalidationsPerTrigger": 10 }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            state.open_document(uri.clone(), "x <- 1\n", Some(1));
+
+            let snapshot = ConfigChangeSnapshot::capture(&state);
+            state.raw_client_settings = serde_json::json!({
+                "crossFile": { "maxRevalidationsPerTrigger": 25 }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            snapshot
+        };
+
+        let to_publish = backend.reconcile_after_config_recompute(snapshot).await;
+        assert!(
+            to_publish.is_empty(),
+            "a fan-out cap cannot change any finding, so nothing should republish"
+        );
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.cross_file_config.max_revalidations_per_trigger, 25,
+            "the new cap must still be installed"
+        );
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            0,
+            "no force marker may be minted for a scheduling-only change"
         );
     }
 
