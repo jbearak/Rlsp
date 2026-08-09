@@ -2487,7 +2487,7 @@
     "@types/react-dom": "^18.3.1",
     "@types/vscode": "^1.82.0",
     "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.3.9",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.1",
     "esbuild-svelte": "^0.9.0",

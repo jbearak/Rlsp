@@ -1244,6 +1244,24 @@ pub struct WorldState {
     pub completion_config: CompletionConfig,
     /// Indentation configuration
     pub indentation_config: IndentationSettings,
+    /// The derived indentation producer policy as of the last
+    /// `recompute_parsed_configs`.
+    ///
+    /// Cached rather than recomputed on demand because
+    /// `handlers::base_indentation_producer_policy` reads `raw_client_settings`
+    /// and `raw_project_settings` alongside `indentation_config`, and every
+    /// caller of `recompute_parsed_configs` overwrites those raw layers BEFORE
+    /// calling it. By the time the recompute runs, the old policy's inputs are
+    /// already gone, so it has no way to ask "what was the policy before?"
+    /// unless the answer was stored. `recompute_parsed_configs` compares
+    /// against this value and then refreshes it; nothing else writes it.
+    ///
+    /// The comparison must be against the DERIVED policy, not
+    /// `indentation_config`: the raw struct both over-reports (distinct configs
+    /// collapse to one policy) and under-reports (the policy can go `None` ->
+    /// `Some(..)` purely because client settings became non-empty, with
+    /// `indentation_config` untouched).
+    pub(crate) indentation_producer_policy: Option<crate::linting::IndentationProducerPolicy>,
     /// Style/lint configuration.
     /// Master switch is tri-state (`"auto" | true | false`); default `"auto"`
     /// resolves to on when a `.lintr` is discovered (see #281 and
@@ -7292,6 +7310,10 @@ impl WorldState {
             symbol_config: SymbolConfig::default(),
             completion_config: CompletionConfig::default(),
             indentation_config: IndentationSettings::default(),
+            // Matches `base_indentation_producer_policy` on a fresh state:
+            // `raw_client_settings` is empty and `raw_project_settings` is
+            // `None`, so no producer policy is available yet.
+            indentation_producer_policy: None,
             lint_config: crate::linting::LintConfig::default(),
             raw_client_settings: serde_json::Value::Object(serde_json::Map::new()),
             raw_project_settings: None,

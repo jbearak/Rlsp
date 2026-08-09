@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { activate, openDocument, waitForDiagnostics, waitForDiagnosticsMatching, getFixtureUri, sleep } from './helper';
+import { activate, openDocument, waitForDiagnostics, waitForDiagnosticsMatching, removeEmptyWorkspaceSettings, getFixtureUri, sleep } from './helper';
 
 suite('Ark LSP Extension', () => {
     suiteSetup(async () => {
@@ -70,7 +70,26 @@ suite('Ark LSP Extension', () => {
                 `Stan declarations and distribution names must resolve: ${diagnostics.map(d => d.message).join('; ')}`,
             );
         } finally {
+            const doc = await openDocument('stan_undefined.stan');
             await config.update('diagnostics.stan', undefined, vscode.ConfigurationTarget.Workspace);
+            // `config.update()` resolving does NOT mean the server has seen the
+            // reset: the extension still has to forward it and the server still
+            // has to re-publish. Leaving the suite while that round-trip is in
+            // flight lets a later test observe Stan diagnostics that this test
+            // was supposed to have turned off. Wait for the findings to actually
+            // clear — the same asymmetry the opt-in above works around, in
+            // reverse.
+            await waitForDiagnosticsMatching(
+                doc.uri,
+                diagnostics =>
+                    !diagnostics.some(d => d.code === 'undefined-variable'),
+                15000,
+            );
+            // Clearing the key leaves an empty `.vscode/settings.json` behind.
+            // Sweep it here rather than relying on another suite's teardown to
+            // do it: suites run in isolation under `--grep`, and a stray empty
+            // settings file pollutes `git status` in the fixture workspace.
+            await removeEmptyWorkspaceSettings();
         }
     });
 

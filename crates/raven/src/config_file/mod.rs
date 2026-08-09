@@ -117,11 +117,30 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     let previous_cross_file = state.cross_file_config.clone();
     let previous_lint = state.lint_config.clone();
     let previous_linting_section = state.merged_linting_section.clone();
-    let previous_indentation = state.indentation_config.clone();
     let previous_exclusions = state.workspace_exclusions.patterns().to_vec();
+    // Read the CACHED derived policy, not a fresh derivation, and not the raw
+    // `indentation_config`.
+    //
+    // Not a fresh derivation: `base_indentation_producer_policy` reads the raw
+    // settings layers, and every caller overwrites those before calling us — so
+    // deriving here would just recompute the NEW policy twice and always
+    // compare equal. `WorldState::indentation_producer_policy` holds the value
+    // from the previous recompute, which is the only surviving record of the
+    // old one.
+    //
+    // Not the raw struct: it both over-reports (distinct indentation configs
+    // collapse to the same policy) and under-reports (the policy moves
+    // `None` -> `Some(..)` when client settings become non-empty, with
+    // `indentation_config` byte-identical). That second case changes what the
+    // indentation lint reports and must retire workers.
+    let previous_indentation_producer_policy = state.indentation_producer_policy;
 
     let normalized_project = strip_project_auto_enabled(state.raw_project_settings.as_ref());
     let merged = merge_settings(&state.raw_client_settings, normalized_project.as_ref());
+    // Single warning site for the model-diagnostics switches: one call, on the
+    // merged layer that actually decides the effective value. See
+    // `warn_invalid_model_switches`.
+    crate::backend::warn_invalid_model_switches(&merged);
 
     match crate::backend::parse_cross_file_config(&merged) {
         Ok(Some(cfg)) => {
@@ -200,12 +219,16 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     // installed, so detached transactions observe either the complete old
     // configuration or the complete new one. Watcher-lifecycle-only changes do
     // not invalidate diagnostic workers because they cannot change a finding.
+    // Refresh the cached derived policy now that every raw layer and parsed
+    // config it reads has been installed. This is the sole writer.
+    state.indentation_producer_policy = crate::handlers::base_indentation_producer_policy(state);
+
     let analysis_changed = state
         .cross_file_config
         .analysis_settings_changed(&previous_cross_file)
         || state.lint_config != previous_lint
         || state.merged_linting_section != previous_linting_section
-        || state.indentation_config != previous_indentation
+        || state.indentation_producer_policy != previous_indentation_producer_policy
         || state.workspace_exclusions.patterns() != previous_exclusions;
     if analysis_changed {
         state.cross_file_revalidation.cancel_all();
@@ -371,6 +394,78 @@ mod tests {
         recompute_parsed_configs(&mut state);
 
         assert_eq!(state.analysis_config_generation_for_test(), before);
+    }
+
+    /// The derived indentation producer policy can move from `None` to
+    /// `Some(..)` with `indentation_config` byte-identical, because
+    /// `base_indentation_producer_policy` also gates on whether any client
+    /// settings exist at all. That transition changes what the indentation lint
+    /// reports, so it must advance the analysis generation; comparing the raw
+    /// `indentation_config` struct would miss it entirely.
+    #[test]
+    fn producer_policy_becoming_available_advances_the_analysis_config_generation() {
+        let mut state = WorldState::new();
+        // Empty client settings: the producer policy is unavailable, so the
+        // derived policy is `None` whatever `indentation_config` says.
+        state.raw_client_settings = json!({});
+        recompute_parsed_configs(&mut state);
+        assert_eq!(
+            crate::handlers::base_indentation_producer_policy(&state),
+            None,
+            "no client settings → no producer policy"
+        );
+        let indentation_before = state.indentation_config.clone();
+        let before = state.analysis_config_generation_for_test();
+
+        // A client settings payload that leaves every parsed indentation field
+        // at its default. `indentation_config` is unchanged; only the derived
+        // policy moves.
+        state.raw_client_settings = json!({ "indentation": {} });
+        recompute_parsed_configs(&mut state);
+
+        assert_eq!(
+            state.indentation_config, indentation_before,
+            "this test is only meaningful while the raw struct stays put"
+        );
+        assert!(
+            crate::handlers::base_indentation_producer_policy(&state).is_some(),
+            "non-empty client settings make the producer policy available"
+        );
+        assert_ne!(
+            state.analysis_config_generation_for_test(),
+            before,
+            "a None -> Some producer-policy transition changes indentation \
+             findings and must retire workers"
+        );
+    }
+
+    /// Debounce knobs decide only *when* a revalidation runs, never its inputs
+    /// or its result. Treating them as content changes made a slider nudge
+    /// cancel every in-flight worker and recompute the whole workspace.
+    #[test]
+    fn debounce_only_change_keeps_the_analysis_config_generation() {
+        let mut state = WorldState::new();
+        state.raw_client_settings = json!({
+            "crossFile": { "revalidationDebounceMs": 200, "editedFileDebounceMs": 50 }
+        });
+        recompute_parsed_configs(&mut state);
+        let before = state.analysis_config_generation_for_test();
+
+        state.raw_client_settings = json!({
+            "crossFile": { "revalidationDebounceMs": 400, "editedFileDebounceMs": 25 }
+        });
+        recompute_parsed_configs(&mut state);
+
+        assert_eq!(
+            state.cross_file_config.revalidation_debounce_ms, 400,
+            "the new debounce must still be installed"
+        );
+        assert_eq!(state.cross_file_config.edited_file_debounce_ms, 25);
+        assert_eq!(
+            state.analysis_config_generation_for_test(),
+            before,
+            "scheduling-only knobs must not retire in-flight workers"
+        );
     }
 
     /// The per-URI resolved-config cache serves repeated lookups, evicts a

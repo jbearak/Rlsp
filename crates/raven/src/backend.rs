@@ -311,16 +311,22 @@ fn normalize_document_indent_unit(unit: u32) -> u32 {
     unit.clamp(1, 8)
 }
 
-/// Parse cross-file configuration from LSP settings.
-///
 /// Parse one `"on"` / `"off"` model-language diagnostics switch.
 ///
 /// Returns `None` when the key is absent (leave the layered value alone) and
 /// `Some(enabled)` when it is present. Unrecognized strings and non-string
-/// types warn and fail closed to `Some(false)` rather than being silently
-/// ignored: a typo like `"true"` or `"On"` would otherwise read as "off" with
-/// no signal, which is indistinguishable from the default.
-fn parse_diagnostics_switch(raw: Option<&serde_json::Value>, name: &str) -> Option<bool> {
+/// types fail closed to `Some(false)` rather than being silently ignored: a
+/// typo like `"true"` or `"On"` would otherwise read as "off" with no signal,
+/// which is indistinguishable from the default.
+///
+/// Deliberately SILENT. This runs on whichever layer its caller happens to
+/// hold, and is called more than once per config change — `parse_cross_file_config`
+/// runs both for `did_change_configuration`'s validation toast and again inside
+/// `recompute_parsed_configs`. Warning here would emit the same complaint twice,
+/// and would complain about a client-layer typo that an effective project
+/// `raven.toml` override makes irrelevant. `warn_invalid_model_switches` owns
+/// the diagnostic instead: one call, on the merged settings, per recompute.
+fn parse_diagnostics_switch(raw: Option<&serde_json::Value>) -> Option<bool> {
     use serde_json::Value;
 
     match raw {
@@ -328,27 +334,54 @@ fn parse_diagnostics_switch(raw: Option<&serde_json::Value>, name: &str) -> Opti
         Some(Value::String(value)) => match value.as_str() {
             "on" => Some(true),
             "off" => Some(false),
-            other => {
-                log::warn!("Unrecognized diagnostics.{name} value '{other}'; defaulting to 'off'.");
-                Some(false)
-            }
+            _ => Some(false),
         },
-        Some(other) => {
-            let kind = match other {
-                Value::Bool(_) => "boolean",
-                Value::Number(_) => "number",
-                Value::Array(_) => "array",
-                Value::Object(_) => "object",
-                _ => "value",
-            };
-            log::warn!(
-                "diagnostics.{name} must be string \"on|off\"; got {kind}. Defaulting to 'off'."
-            );
-            Some(false)
+        Some(_) => Some(false),
+    }
+}
+
+/// Warn about `diagnostics.jags` / `diagnostics.stan` values that fail closed.
+///
+/// Call this ONCE per config recompute, on the MERGED settings — the layer that
+/// actually decides the effective value. `parse_diagnostics_switch` stays silent
+/// precisely so this can be the single warning site: warning inside the parser
+/// fired twice per `did_change_configuration` (validation pass plus recompute)
+/// and could contradict itself, complaining about a client typo that a project
+/// `raven.toml` override had already superseded.
+pub(crate) fn warn_invalid_model_switches(merged: &serde_json::Value) {
+    use serde_json::Value;
+
+    let Some(diagnostics) = merged.get("diagnostics") else {
+        return;
+    };
+    for name in ["jags", "stan"] {
+        match diagnostics.get(name) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(value)) => {
+                if value != "on" && value != "off" {
+                    log::warn!(
+                        "Unrecognized diagnostics.{name} value '{value}'; defaulting to 'off'."
+                    );
+                }
+            }
+            Some(other) => {
+                let kind = match other {
+                    Value::Bool(_) => "boolean",
+                    Value::Number(_) => "number",
+                    Value::Array(_) => "array",
+                    Value::Object(_) => "object",
+                    _ => "value",
+                };
+                log::warn!(
+                    "diagnostics.{name} must be string \"on|off\"; got {kind}. Defaulting to 'off'."
+                );
+            }
         }
     }
 }
 
+/// Parse cross-file configuration from LSP settings.
+///
 /// Reads the top-level `crossFile`, `diagnostics`, and `packages` sections from a
 /// serde_json::Value and constructs a populated `CrossFileConfig`. Only fields
 /// present in the provided JSON are applied; absent fields retain their defaults
@@ -584,10 +617,10 @@ pub(crate) fn parse_cross_file_config(
         if let Some(v) = diag.get("enabled").and_then(|v| v.as_bool()) {
             config.diagnostics_enabled = v;
         }
-        if let Some(enabled) = parse_diagnostics_switch(diag.get("jags"), "jags") {
+        if let Some(enabled) = parse_diagnostics_switch(diag.get("jags")) {
             config.jags_diagnostics_enabled = enabled;
         }
-        if let Some(enabled) = parse_diagnostics_switch(diag.get("stan"), "stan") {
+        if let Some(enabled) = parse_diagnostics_switch(diag.get("stan")) {
             config.stan_diagnostics_enabled = enabled;
         }
         // Parse diagnostics.maxSyntaxDiagnosticsPerFile. Zero deliberately
@@ -20224,7 +20257,30 @@ fn help_html_to_json(
     }
 }
 
+/// What one config-reload publish task returns on success.
+///
+/// The URI is carried only under `cfg(test)`, where the scheduled-vs-completed
+/// capture needs to know which document each finished task belonged to.
+#[cfg(test)]
+type ConfigReloadPublishOutcome = Url;
+#[cfg(not(test))]
+type ConfigReloadPublishOutcome = ();
+
 impl Backend {
+    /// Republish diagnostics for a config-reload set with bounded parallelism.
+    ///
+    /// Concurrency is [`DIAGNOSTIC_FANOUT_CONCURRENCY`], shared with the other
+    /// diagnostic fan-outs rather than set independently here. Each in-flight
+    /// publish holds its own analysis snapshot, so the bound is what caps peak
+    /// snapshot memory for the batch; keeping the two fan-outs on one constant
+    /// means a future tuning pass moves them together instead of leaving this
+    /// path at a stale value.
+    ///
+    /// Warns about cross-file traversal truncation once for the whole batch,
+    /// after every publish has landed. The per-URI [`Backend::publish_diagnostics`]
+    /// wrapper does this per document; batching it here is equivalent — the
+    /// truncation counters accumulate and `consume_delta` reports their sum —
+    /// and avoids taking the state read lock once per document.
     async fn publish_config_reload_diagnostics(
         &self,
         to_publish: Vec<Url>,
@@ -20232,18 +20288,20 @@ impl Backend {
             crate::state::FinalHandoffCaptureClaim<crate::state::ConfigReloadPublishForTest>,
         >,
     ) {
-        const MAX_CONCURRENT_PUBLISHES: usize = 8;
         let mut join_set = tokio::task::JoinSet::new();
         #[cfg(test)]
         let mut completed = Vec::with_capacity(to_publish.len());
         #[cfg(test)]
         let mut scheduled = to_publish.clone();
+        let had_work = !to_publish.is_empty();
         for uri in to_publish {
-            while join_set.len() >= MAX_CONCURRENT_PUBLISHES {
-                let _joined = join_set.join_next().await;
-                #[cfg(test)]
-                if let Some(Ok(uri)) = _joined {
-                    completed.push(uri);
+            while join_set.len() >= DIAGNOSTIC_FANOUT_CONCURRENCY {
+                if let Some(_joined) = join_set.join_next().await {
+                    Self::record_config_reload_publish(
+                        _joined,
+                        #[cfg(test)]
+                        &mut completed,
+                    );
                 }
             }
             let state_arc = self.state.clone();
@@ -20257,10 +20315,14 @@ impl Backend {
             });
         }
         while let Some(_joined) = join_set.join_next().await {
-            #[cfg(test)]
-            if let Ok(uri) = _joined {
-                completed.push(uri);
-            }
+            Self::record_config_reload_publish(
+                _joined,
+                #[cfg(test)]
+                &mut completed,
+            );
+        }
+        if had_work {
+            self.check_and_warn_traversal_truncation().await;
         }
         #[cfg(test)]
         if let Some(capture) = capture {
@@ -20274,6 +20336,33 @@ impl Backend {
                 .await;
             if let Some(completion) = completion {
                 completion.finish();
+            }
+        }
+    }
+
+    /// Account for one finished config-reload publish task.
+    ///
+    /// A `JoinError` means the publish task panicked or was aborted, so its
+    /// document was NOT republished. Discarding it silently would have let a
+    /// panicked task read as complete: the URI's force-republish marker is
+    /// already spent, so nothing reschedules it and the document keeps stale
+    /// diagnostics until the next edit. Log it, and in tests deliberately leave
+    /// the URI out of `completed` so the scheduled-vs-completed capture shows
+    /// the gap rather than hiding it.
+    fn record_config_reload_publish(
+        joined: std::result::Result<ConfigReloadPublishOutcome, tokio::task::JoinError>,
+        #[cfg(test)] completed: &mut Vec<Url>,
+    ) {
+        match joined {
+            Ok(_uri) => {
+                #[cfg(test)]
+                completed.push(_uri);
+            }
+            Err(err) => {
+                log::error!(
+                    "config reload diagnostic publish task did not complete ({err}); \
+                     that document keeps its previous diagnostics until the next edit"
+                );
             }
         }
     }
@@ -20566,39 +20655,23 @@ impl Backend {
             // Snapshot candidates now; marker ownership is transferred only
             // after every config/package/scan reconciliation step converges.
             //
-            // When the ONLY thing that moved is a model-language switch, an R
-            // document's findings cannot have changed, so restrict the set to
-            // the affected languages. `None` keeps the full open set.
+            // Deliberately NOT narrowed to the languages whose model switch
+            // moved, even though an R document's findings cannot change when
+            // only `diagnostics.stan`/`jags` did.
             //
-            // `model_only_diagnostic_changes` only sees `CrossFileConfig`, so
-            // the config structs that live outside it must be checked here too
-            // — otherwise a lint-only change (whose `CrossFileConfig` is
-            // untouched) would filter to an empty set and drop its republish
-            // entirely. Same set of out-of-struct guards as `only_watch_changed`.
+            // `recompute_parsed_configs` responds to any analysis-affecting
+            // change — a model switch included — by calling `cancel_all()` and
+            // advancing `analysis_config_generation`. That generation is a
+            // single global counter compared by `DiagnosticsTrigger::is_stale`,
+            // so the reload retires EVERY in-flight worker, not just the model
+            // languages' ones. Republishing a narrowed set would therefore drop
+            // an R document's only scheduled recomputation on the floor and
+            // strand whatever it last published until the user next edits it.
             //
-            // Filtering here — before the set is both marked for
-            // force-republish and returned to the caller — keeps the marked and
-            // published sets identical, so no marker is left unconsumed.
-            let model_only_languages = if lint_config_changed
-                || linting_section_changed
-                || indentation_producer_policy_changed
-                || workspace_exclusions_changed
-            {
-                None
-            } else {
-                prev.prev_cross_file
-                    .model_only_diagnostic_changes(&state.cross_file_config)
-                    .filter(|languages| !languages.is_empty())
-            };
-            let open_uris: Vec<Url> = state
-                .documents
-                .iter()
-                .filter(|(_, document)| match model_only_languages.as_deref() {
-                    Some(languages) => languages.contains(&document.file_type),
-                    None => true,
-                })
-                .map(|(uri, _)| uri.clone())
-                .collect();
+            // Narrowing can only return once cancellation and the generation
+            // are themselves scoped; until then the sets must match, and the
+            // cancelled set is "everything".
+            let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
 
             ReconciliationDecisions {
                 scope_changed,
@@ -33118,16 +33191,22 @@ mod refresh_packages_tests {
         );
     }
 
-    /// Flipping only `diagnostics.stan` cannot change an R document's findings,
-    /// so the reload must republish the Stan buffer alone. The marked and
-    /// returned sets must match exactly, or an R document keeps an unconsumed
-    /// force-republish marker that a later same-version publish would spend.
+    /// A model-language switch must republish EVERY open document, including R
+    /// ones whose findings cannot have changed.
+    ///
+    /// Narrowing the set to the switched language looks like a free win, but
+    /// `recompute_parsed_configs` treats a model switch as analysis-affecting:
+    /// it calls `cancel_all()` and advances the global
+    /// `analysis_config_generation`, which `DiagnosticsTrigger::is_stale`
+    /// compares. Every in-flight worker is therefore retired, R included. A
+    /// narrowed republish would leave an R document with its pending
+    /// recomputation cancelled and no replacement scheduled, stranding its
+    /// last-published diagnostics until the next edit.
     #[tokio::test]
-    async fn model_only_switch_republishes_only_that_language() {
+    async fn model_switch_republishes_r_documents_it_cancelled() {
         let backend = make_test_backend();
-        let r_uri = Url::parse("file:///model-only.R").unwrap();
-        let stan_uri = Url::parse("file:///model-only.stan").unwrap();
-        let jags_uri = Url::parse("file:///model-only.jags").unwrap();
+        let r_uri = Url::parse("file:///cancelled-by-model-switch.R").unwrap();
+        let stan_uri = Url::parse("file:///cancelled-by-model-switch.stan").unwrap();
         let snapshot = {
             let mut state = backend.state.write().await;
             state.raw_client_settings = serde_json::json!({
@@ -33141,73 +33220,19 @@ mod refresh_packages_tests {
                 Some(1),
                 Some("stan"),
             );
-            state.open_document_with_language_id(
-                jags_uri.clone(),
-                "model { x <- * 1 }\n",
-                Some(1),
-                Some("jags"),
-            );
 
             let snapshot = ConfigChangeSnapshot::capture(&state);
+            let before = state.analysis_config_generation_for_test();
             state.raw_client_settings = serde_json::json!({
                 "diagnostics": { "stan": "on" }
             });
             crate::config_file::recompute_parsed_configs(&mut state);
-            snapshot
-        };
-
-        let to_publish = backend.reconcile_after_config_recompute(snapshot).await;
-        assert_eq!(
-            to_publish,
-            vec![stan_uri.clone()],
-            "only the Stan buffer's findings can have changed"
-        );
-
-        let state = backend.state.read().await;
-        assert!(
-            state
-                .diagnostics_gate
-                .force_republish_count_for_test(&stan_uri)
-                > 0,
-            "the Stan buffer must be marked for a same-version republish"
-        );
-        for untouched in [&r_uri, &jags_uri] {
-            assert_eq!(
-                state
-                    .diagnostics_gate
-                    .force_republish_count_for_test(untouched),
-                0,
-                "{untouched} must not retain an unconsumed force-republish marker"
+            assert_ne!(
+                state.analysis_config_generation_for_test(),
+                before,
+                "a model switch must retire in-flight workers; the republish set \
+                 below has to cover everything it retired"
             );
-        }
-    }
-
-    /// A model switch that moves together with a non-model setting must fall
-    /// back to the full open set: the other setting can change R findings.
-    #[tokio::test]
-    async fn model_switch_with_other_change_republishes_every_document() {
-        let backend = make_test_backend();
-        let r_uri = Url::parse("file:///model-plus-other.R").unwrap();
-        let stan_uri = Url::parse("file:///model-plus-other.stan").unwrap();
-        let snapshot = {
-            let mut state = backend.state.write().await;
-            state.raw_client_settings = serde_json::json!({
-                "diagnostics": { "stan": "off", "undefinedVariableSeverity": "warning" }
-            });
-            crate::config_file::recompute_parsed_configs(&mut state);
-            state.open_document(r_uri.clone(), "x <- 1\n", Some(1));
-            state.open_document_with_language_id(
-                stan_uri.clone(),
-                "model { target += ; }\n",
-                Some(1),
-                Some("stan"),
-            );
-
-            let snapshot = ConfigChangeSnapshot::capture(&state);
-            state.raw_client_settings = serde_json::json!({
-                "diagnostics": { "stan": "on", "undefinedVariableSeverity": "error" }
-            });
-            crate::config_file::recompute_parsed_configs(&mut state);
             snapshot
         };
 
@@ -33217,38 +33242,7 @@ mod refresh_packages_tests {
         expected.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
         assert_eq!(
             to_publish, expected,
-            "a severity change alongside the model switch still affects R findings"
-        );
-    }
-
-    /// `model_only_diagnostic_changes` only inspects `CrossFileConfig`. A
-    /// lint-only reload leaves that struct untouched, so the model filter must
-    /// not mistake it for "no model change" and drop the republish entirely.
-    #[tokio::test]
-    async fn lint_only_change_still_republishes_open_documents() {
-        let backend = make_test_backend();
-        let uri = Url::parse("file:///lint-only.R").unwrap();
-        let snapshot = {
-            let mut state = backend.state.write().await;
-            state.raw_client_settings = serde_json::json!({
-                "linting": { "enabled": true, "lineLength": 80 }
-            });
-            crate::config_file::recompute_parsed_configs(&mut state);
-            state.open_document(uri.clone(), "x <- 1\n", Some(1));
-
-            let snapshot = ConfigChangeSnapshot::capture(&state);
-            state.raw_client_settings = serde_json::json!({
-                "linting": { "enabled": true, "lineLength": 40 }
-            });
-            crate::config_file::recompute_parsed_configs(&mut state);
-            snapshot
-        };
-
-        let to_publish = backend.reconcile_after_config_recompute(snapshot).await;
-        assert_eq!(
-            to_publish,
-            vec![uri],
-            "a lint-only reload must still republish open documents"
+            "the R document's worker was cancelled too, so it must be republished"
         );
     }
 

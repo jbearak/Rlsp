@@ -324,47 +324,33 @@ impl CrossFileConfig {
 
     /// Whether analysis-affecting settings changed between two configs.
     ///
-    /// Libpath watcher enablement and debounce control only watcher lifecycle;
-    /// they do not change an analysis snapshot or its diagnostic result.
+    /// The caller uses this to decide whether to cancel every in-flight
+    /// diagnostic worker and advance the global analysis-config generation, so
+    /// a `true` here costs a full recompute of every open document. Only
+    /// settings that can change a *finding* belong in the comparison.
+    ///
+    /// Implemented as a whole-struct compare with the known-exempt fields
+    /// reverted onto a probe, so coverage is automatic: any new field added to
+    /// `CrossFileConfig` counts as analysis-affecting until someone deliberately
+    /// exempts it here. Exempt today:
+    ///
+    /// - `packages_watch_library_paths` / `packages_watch_debounce_ms` — libpath
+    ///   watcher lifecycle. They control whether and how often the watcher fires,
+    ///   never what an analysis snapshot contains.
+    /// - `revalidation_debounce_ms` / `edited_file_debounce_ms` — scheduling
+    ///   delays. They are read at ticket-construction time into
+    ///   `AnalysisRevalidationTicket::debounce_ms` and decide only *when* a
+    ///   recomputation runs, never its inputs or its result. A user nudging a
+    ///   debounce slider should not cancel every worker mid-flight and force a
+    ///   whole-workspace recompute; the next ticket picks the new value up on
+    ///   its own.
     pub(crate) fn analysis_settings_changed(&self, other: &Self) -> bool {
         let mut probe = self.clone();
         probe.packages_watch_library_paths = other.packages_watch_library_paths;
         probe.packages_watch_debounce_ms = other.packages_watch_debounce_ms;
+        probe.revalidation_debounce_ms = other.revalidation_debounce_ms;
+        probe.edited_file_debounce_ms = other.edited_file_debounce_ms;
         probe != *other
-    }
-
-    /// The model languages whose diagnostic switch differs from `other`, but
-    /// only when the model switches are the *sole* difference between the two
-    /// configs.
-    ///
-    /// `None` means "some other field also moved", which makes a
-    /// language-scoped republish unsound — the caller must fall back to
-    /// republishing every open document. An empty set is never returned as
-    /// `Some`: identical configs yield `Some(&[])` only in the degenerate
-    /// no-change case, which callers treat as "nothing to republish".
-    ///
-    /// Deliberately compares the whole struct with the model fields reverted,
-    /// so a newly added `CrossFileConfig` field is conservatively treated as a
-    /// non-model change without touching this function.
-    pub(crate) fn model_only_diagnostic_changes(
-        &self,
-        other: &Self,
-    ) -> Option<Vec<crate::file_type::FileType>> {
-        let mut probe = self.clone();
-        probe.jags_diagnostics_enabled = other.jags_diagnostics_enabled;
-        probe.stan_diagnostics_enabled = other.stan_diagnostics_enabled;
-        if probe != *other {
-            return None;
-        }
-
-        let mut changed = Vec::new();
-        if self.jags_diagnostics_enabled != other.jags_diagnostics_enabled {
-            changed.push(crate::file_type::FileType::Jags);
-        }
-        if self.stan_diagnostics_enabled != other.stan_diagnostics_enabled {
-            changed.push(crate::file_type::FileType::Stan);
-        }
-        Some(changed)
     }
 
     /// Check if scope-affecting settings changed between two configs

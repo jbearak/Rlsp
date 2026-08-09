@@ -193,3 +193,43 @@ export async function awaitActive(
         await sleep(25);
     }
 }
+
+/**
+ * Delete the fixture workspace's `.vscode/settings.json` when it holds no
+ * keys, plus the `.vscode` directory when that leaves it empty.
+ *
+ * `config.update(key, undefined, Workspace)` clears the key but VS Code
+ * leaves the file on disk, possibly as a bare `{}`. Any test that writes a
+ * workspace-scoped setting must sweep it, or the fixture tree ends up dirty
+ * in `git status`. A file with real content is left untouched.
+ */
+export async function removeEmptyWorkspaceSettings(): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return;
+    // VS Code's write after `update(key, undefined)` is best-effort and
+    // asynchronous; give the pending write a moment to land before we look.
+    await sleep(200);
+    const dotVscode = vscode.Uri.joinPath(folder.uri, '.vscode');
+    const settings = vscode.Uri.joinPath(dotVscode, 'settings.json');
+    const remove = async (uri: vscode.Uri): Promise<void> => {
+        try {
+            await vscode.workspace.fs.delete(uri);
+        } catch {
+            // best-effort cleanup
+        }
+    };
+    try {
+        const bytes = await vscode.workspace.fs.readFile(settings);
+        const text = Buffer.from(bytes).toString('utf8').trim();
+        if (text !== '' && text !== '{}' && text !== '{\n}') return;
+        await remove(settings);
+        try {
+            const entries = await vscode.workspace.fs.readDirectory(dotVscode);
+            if (entries.length === 0) await remove(dotVscode);
+        } catch {
+            // .vscode missing — nothing else to clean.
+        }
+    } catch {
+        // No settings.json — nothing to clean.
+    }
+}
