@@ -1810,9 +1810,16 @@ async fn collect_target_diagnostics(
         // and not an operator error from an unreadable path. Reading first and
         // gating later let a disabled `.stan` file fail the run on a property
         // of a file whose diagnostics the user switched off.
-        if !state
+        //
+        // `model_language_switched_off`, NOT
+        // `diagnostics_enabled_for_file_type`: the latter also folds in the
+        // global master switch, which would make `diagnostics.enabled = false`
+        // skip the read for R and Rmd targets too and exit 0 on an unreadable
+        // path, against the documented exit-2 contract. The master switch
+        // suppresses findings; it does not un-break a file the operator named.
+        if state
             .cross_file_config
-            .diagnostics_enabled_for_file_type(crate::file_type::file_type_from_uri(&uri))
+            .model_language_switched_off(crate::file_type::file_type_from_uri(&uri))
         {
             continue;
         }
@@ -2012,6 +2019,66 @@ mod tests {
         let mut args = base_args(workspace);
         args.no_config = false;
         args
+    }
+
+    /// The pre-read gate must not swallow I/O errors when the GLOBAL switch is
+    /// off. `diagnostics.enabled = false` suppresses findings; an unreadable
+    /// path the operator explicitly named is still exit 2 (docs/cli.md).
+    ///
+    /// The target is an `.Rmd` so it takes the phase-3 disk-fallback path where
+    /// the gate lives — the R-only workspace scan does not index it.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_target_is_still_an_operator_error_when_diagnostics_are_off() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("unreadable.Rmd");
+        fs::write(&path, "```{r}\nx <- 1\n```\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root defeats the permission bits entirely; skip rather
+        // than assert something the environment cannot produce.
+        if fs::read(&path).is_ok() {
+            return;
+        }
+
+        let mut args = model_diagnostic_args(tmp.path(), "enabled = false\n");
+        args.paths = vec![path.clone()];
+        let code = run_blocking(args);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            code, 2,
+            "an unreadable explicit target must stay an operator error even with diagnostics off"
+        );
+    }
+
+    /// The complement, and the reason the gate exists: a default-off `.stan`
+    /// target must produce nothing at all — not a finding, and not exit 2 from
+    /// a path the user switched off.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_default_off_stan_target_is_not_an_operator_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("unreadable.stan");
+        fs::write(&path, "model { target += ; }\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&path).is_ok() {
+            return;
+        }
+
+        let mut args = base_args(tmp.path());
+        args.paths = vec![path.clone()];
+        let code = run_blocking(args);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            code, 0,
+            "a switched-off model target must not fail the run on a property of a file \
+             whose diagnostics the user disabled"
+        );
     }
 
     #[test]

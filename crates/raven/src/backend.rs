@@ -354,10 +354,22 @@ fn parse_diagnostics_switch(raw: Option<&serde_json::Value>) -> Option<bool> {
 /// out under the default CLI and editor logging configuration, which makes a
 /// typo like `"On"` indistinguishable from the built-in `"off"` default:
 /// diagnostics simply never appear and nothing says why.
+///
+/// Every message asserts "Defaulting to 'off'", so this returns nothing when
+/// `merged` fails `parse_cross_file_config` — a rejected update leaves the
+/// PREVIOUS `CrossFileConfig` in place (see `recompute_parsed_configs`), so no
+/// fallback was applied and claiming one would be a lie. Concretely: with Stan
+/// already on, a reload carrying both `crossFile: false` and `stan: "On"` is
+/// rejected wholesale and Stan stays on. The rejection has its own toast on the
+/// `did_change_configuration` path, so the user is still told something is
+/// wrong — just not the wrong thing.
 pub(crate) fn invalid_model_switch_messages(merged: &serde_json::Value) -> Vec<String> {
     use serde_json::Value;
 
     let mut messages = Vec::new();
+    if parse_cross_file_config(merged).is_err() {
+        return messages;
+    }
     let Some(diagnostics) = merged.get("diagnostics") else {
         return messages;
     };
@@ -31628,6 +31640,30 @@ mod tests {
                     "invalid stan value {invalid} must fail closed"
                 );
             }
+        }
+
+        /// Every message claims "Defaulting to 'off'", so a settings value that
+        /// `parse_cross_file_config` rejects wholesale must produce none: the
+        /// rejection leaves the PREVIOUS config in place, so nothing defaulted
+        /// and the claim would be false.
+        #[test]
+        fn invalid_model_switch_messages_are_silent_when_the_config_is_rejected() {
+            let rejected = json!({ "crossFile": false, "diagnostics": { "stan": "On" } });
+            assert!(
+                crate::backend::parse_cross_file_config(&rejected).is_err(),
+                "test premise: a non-object crossFile section must be rejected"
+            );
+            assert!(
+                crate::backend::invalid_model_switch_messages(&rejected).is_empty(),
+                "a rejected update applies no fallback, so it must not claim one"
+            );
+
+            // The same typo in an ACCEPTED update still reports — the guard
+            // must not swallow the ordinary case.
+            let accepted = json!({ "diagnostics": { "stan": "On" } });
+            let messages = crate::backend::invalid_model_switch_messages(&accepted);
+            assert_eq!(messages.len(), 1, "{messages:?}");
+            assert!(messages[0].contains("diagnostics.stan") && messages[0].contains("'On'"));
         }
 
         /// An explicit JSON `null` means "not configured" and must leave the

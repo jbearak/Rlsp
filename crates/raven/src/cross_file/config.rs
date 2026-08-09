@@ -322,6 +322,31 @@ impl CrossFileConfig {
             }
     }
 
+    /// Whether this language is a model language the user has left switched off.
+    ///
+    /// Narrower than [`Self::diagnostics_enabled_for_file_type`] on purpose, and
+    /// the two are not interchangeable. Use this one for work that must be
+    /// skipped *before touching the file at all* — a default-off `.stan` target
+    /// should produce nothing, not an encoding finding and not an exit-2
+    /// operator error from an unreadable path.
+    ///
+    /// The global master switch is deliberately excluded. `diagnostics.enabled =
+    /// false` suppresses *findings*; it does not make an unreadable path stop
+    /// being an operator error, and `raven check` documents exit 2 for that
+    /// regardless of which findings are switched on. Gating a pre-read skip on
+    /// the master switch would turn an unreadable explicit target into a
+    /// successful run.
+    pub(crate) fn model_language_switched_off(
+        &self,
+        file_type: crate::file_type::FileType,
+    ) -> bool {
+        match file_type {
+            crate::file_type::FileType::R => false,
+            crate::file_type::FileType::Jags => !self.jags_diagnostics_enabled,
+            crate::file_type::FileType::Stan => !self.stan_diagnostics_enabled,
+        }
+    }
+
     /// Whether analysis-affecting settings changed between two configs.
     ///
     /// The caller uses this to decide whether to cancel every in-flight
