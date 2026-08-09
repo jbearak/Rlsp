@@ -19264,6 +19264,23 @@ impl LanguageServer for Backend {
         // client settings, recompute parsed configs, recompile lint
         // overrides. NO I/O — the helper handles every blocking action
         // outside the lock.
+        //
+        // Deliberately does NOT take `diagnostics_publish_lock`. A recurring
+        // review suggestion is to hold it across the generation advance, on the
+        // theory that a worker could pass its `trigger.is_stale` re-check,
+        // release the state lock, and then send stale findings after this
+        // handler moves `analysis_config_generation`. That window does not
+        // exist: `publish_diagnostics_inner` holds the publish lock from before
+        // its `is_stale` re-check all the way through
+        // `client.publish_diagnostics`, so a worker that has passed the check
+        // has not yet released the lock and this handler's own state write
+        // cannot interleave with its send. Taking the lock here would only add
+        // a second, redundant ordering — and it would break the deliberate
+        // design that `config_reload_rejects_model_worker_captured_before_disable`
+        // pins: the reload must be able to install its empty-publication force
+        // marker WHILE an old-config worker holds the publish lock, so the
+        // marker is in place by the time that worker's gate commit runs and
+        // correctly refuses it.
         let (snapshot, project_config_path) = {
             let mut state = self.state.write().await;
 
