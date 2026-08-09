@@ -306,3 +306,27 @@ test("VS Code package metadata exposes send method setting", () => {
   expect(setting.enumDescriptions).toHaveLength(3);
   expect(setting.description).toContain("Controls how Raven sends code to R");
 });
+
+test("cross-target packaging preserves only deliberately pre-placed binaries", () => {
+  const extensionRoot = path.join(import.meta.dir, "..", "..", "editors", "vscode");
+  const packageTargetPath = path.join(
+    extensionRoot,
+    "scripts",
+    "package-target.js",
+  );
+  const pkg = JSON.parse(
+    fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8"),
+  );
+  const wrapper = fs.readFileSync(packageTargetPath, "utf8");
+  const { targetNeedsPreplaced } = require(packageTargetPath) as {
+    targetNeedsPreplaced(target: string, platform: string, arch: string): boolean;
+  };
+
+  expect(pkg.scripts["package:target"]).toBe("node scripts/package-target.js");
+  expect(targetNeedsPreplaced("linux-x64", "linux", "x64")).toBe(false);
+  expect(targetNeedsPreplaced("linux-arm64", "linux", "x64")).toBe(true);
+  expect(targetNeedsPreplaced("alpine-x64", "linux", "x64")).toBe(true);
+  expect(targetNeedsPreplaced("win32-x64", "win32", "x64")).toBe(false);
+  expect(wrapper).toContain("run(process.execPath");
+  expect(wrapper).toContain("env.RAVEN_BUNDLE_PREPLACED = '1'");
+});

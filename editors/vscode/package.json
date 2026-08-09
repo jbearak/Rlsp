@@ -2454,7 +2454,7 @@
     "pretest": "bun run compile:test && bun run bundle && bun run bundle:webview-test && bun run copy-binary",
     "test": "vscode-test",
     "package": "bun run bundle && bun run copy-binary && bun run copy-notice && vsce package --allow-missing-repository",
-    "package:target": "bun run bundle && bun run copy-binary && bun run copy-notice && vsce package --target",
+    "package:target": "node scripts/package-target.js",
     "typecheck": "tsc --noEmit && tsc --noEmit -p src/plot/webview && tsc --noEmit -p src/help/webview && tsc --noEmit -p src/data-viewer/webview"
   },
   "dependencies": {

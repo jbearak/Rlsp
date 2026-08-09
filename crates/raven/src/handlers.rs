@@ -5611,7 +5611,7 @@ pub fn folding_range(state: &WorldState, uri: &Url) -> Option<Vec<FoldingRange>>
     let tree = doc.tree.as_ref()?;
     let mut ranges = Vec::new();
 
-    collect_folding_ranges(tree.root_node(), &mut ranges);
+    collect_folding_ranges(tree.root_node(), doc.file_type, &mut ranges);
 
     // A Stan top-level block and its `block_statement` share a range. Keep the
     // existing R/JAGS ordering untouched and remove only these Stan duplicates.
@@ -5635,26 +5635,28 @@ pub fn folding_range(state: &WorldState, uri: &Url) -> Option<Vec<FoldingRange>>
     Some(ranges)
 }
 
-fn collect_folding_ranges(node: Node, ranges: &mut Vec<FoldingRange>) {
+fn collect_folding_ranges(node: Node, file_type: FileType, ranges: &mut Vec<FoldingRange>) {
     let kind = node.kind();
 
-    // Fold braced expressions, function definitions, and control structures
+    // Keep model-language node names scoped to their grammar: `parameters` is
+    // also the R grammar's function-formals node, where folding it competes
+    // with the existing function-body range.
     let should_fold = matches!(
         kind,
-        "brace_list"
-            | "block_statement"
-            | "function_definition"
-            | "if_statement"
-            | "for_statement"
-            | "while_statement"
-            | "functions"
-            | "data"
-            | "transformed_data"
-            | "parameters"
-            | "transformed_parameters"
-            | "model"
-            | "generated_quantities"
-    );
+        "brace_list" | "function_definition" | "if_statement" | "for_statement" | "while_statement"
+    ) || (file_type == FileType::Stan
+        && matches!(
+            kind,
+            "block_statement"
+                | "functions"
+                | "data"
+                | "transformed_data"
+                | "parameters"
+                | "transformed_parameters"
+                | "model"
+                | "generated_quantities"
+        ))
+        || (file_type == FileType::Jags && kind == "block_statement");
 
     if should_fold && node.start_position().row != node.end_position().row {
         ranges.push(FoldingRange {
@@ -5670,7 +5672,7 @@ fn collect_folding_ranges(node: Node, ranges: &mut Vec<FoldingRange>) {
     // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_folding_ranges(child, ranges);
+        collect_folding_ranges(child, file_type, ranges);
     }
 }
 
@@ -44043,6 +44045,32 @@ result <- data %>% filter(x > 0)
             .documents
             .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
         (state, uri)
+    }
+
+    #[test]
+    fn test_r_folding_does_not_treat_function_parameters_as_stan_block() {
+        use crate::state::{Document, WorldState};
+
+        let code = "f <- function(\n  a,\n  b\n) {\n  a + b\n}\n";
+        let uri = Url::parse("file:///folding.R").unwrap();
+        let mut state = WorldState::new();
+        state
+            .documents
+            .insert(uri.clone(), Document::new_with_uri(code, None, &uri));
+
+        let folds = super::folding_range(&state, &uri).expect("folding_range Some");
+        assert!(
+            folds
+                .iter()
+                .any(|fold| fold.start_line == 0 && fold.end_line == 5),
+            "the complete function must remain foldable, got {folds:?}"
+        );
+        assert!(
+            !folds
+                .iter()
+                .any(|fold| fold.start_line == 0 && fold.end_line == 3),
+            "R function formals must not produce a competing model-language fold, got {folds:?}"
+        );
     }
 
     #[test]
