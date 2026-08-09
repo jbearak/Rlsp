@@ -468,6 +468,36 @@ mod tests {
         );
     }
 
+    /// `maxRevalidationsPerTrigger` is a fan-out cap applied by `truncate` when
+    /// building a candidate list. It selects which documents get scheduled next,
+    /// never what any document's findings are, so it must not cancel in-flight
+    /// work — which would be counterproductive anyway, since the new cap only
+    /// applies to subsequent triggers.
+    #[test]
+    fn revalidation_cap_change_keeps_the_analysis_config_generation() {
+        let mut state = WorldState::new();
+        state.raw_client_settings = json!({
+            "crossFile": { "maxRevalidationsPerTrigger": 10 }
+        });
+        recompute_parsed_configs(&mut state);
+        let before = state.analysis_config_generation_for_test();
+
+        state.raw_client_settings = json!({
+            "crossFile": { "maxRevalidationsPerTrigger": 25 }
+        });
+        recompute_parsed_configs(&mut state);
+
+        assert_eq!(
+            state.cross_file_config.max_revalidations_per_trigger, 25,
+            "the new cap must still be installed"
+        );
+        assert_eq!(
+            state.analysis_config_generation_for_test(),
+            before,
+            "a fan-out cap must not retire in-flight workers"
+        );
+    }
+
     /// The per-URI resolved-config cache serves repeated lookups, evicts a
     /// closed document, and is cleared by `recompute_parsed_configs`, so no
     /// stale value survives either lifecycle transition.

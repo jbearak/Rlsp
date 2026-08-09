@@ -344,12 +344,19 @@ impl CrossFileConfig {
     ///   debounce slider should not cancel every worker mid-flight and force a
     ///   whole-workspace recompute; the next ticket picks the new value up on
     ///   its own.
+    /// - `max_revalidations_per_trigger` — a fan-out cap. Every read of it is a
+    ///   `truncate` on an already-built candidate list, so it decides which
+    ///   documents get *scheduled* for a future revalidation, never what any
+    ///   individual document's diagnostics contain. Cancelling all in-flight
+    ///   work to apply a new cap is strictly counterproductive: the cap only
+    ///   takes effect on subsequent triggers anyway.
     pub(crate) fn analysis_settings_changed(&self, other: &Self) -> bool {
         let mut probe = self.clone();
         probe.packages_watch_library_paths = other.packages_watch_library_paths;
         probe.packages_watch_debounce_ms = other.packages_watch_debounce_ms;
         probe.revalidation_debounce_ms = other.revalidation_debounce_ms;
         probe.edited_file_debounce_ms = other.edited_file_debounce_ms;
+        probe.max_revalidations_per_trigger = other.max_revalidations_per_trigger;
         probe != *other
     }
 

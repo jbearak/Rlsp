@@ -340,28 +340,35 @@ fn parse_diagnostics_switch(raw: Option<&serde_json::Value>) -> Option<bool> {
     }
 }
 
-/// Warn about `diagnostics.jags` / `diagnostics.stan` values that fail closed.
+/// Describe every `diagnostics.jags` / `diagnostics.stan` value that fails closed.
 ///
 /// Call this ONCE per config recompute, on the MERGED settings — the layer that
 /// actually decides the effective value. `parse_diagnostics_switch` stays silent
-/// precisely so this can be the single warning site: warning inside the parser
+/// precisely so this can be the single reporting site: warning inside the parser
 /// fired twice per `did_change_configuration` (validation pass plus recompute)
 /// and could contradict itself, complaining about a client typo that a project
 /// `raven.toml` override had already superseded.
-pub(crate) fn warn_invalid_model_switches(merged: &serde_json::Value) {
+///
+/// Returns the messages rather than only logging them so callers can surface
+/// them where the user will actually see them. `log::warn!` alone is filtered
+/// out under the default CLI and editor logging configuration, which makes a
+/// typo like `"On"` indistinguishable from the built-in `"off"` default:
+/// diagnostics simply never appear and nothing says why.
+pub(crate) fn invalid_model_switch_messages(merged: &serde_json::Value) -> Vec<String> {
     use serde_json::Value;
 
+    let mut messages = Vec::new();
     let Some(diagnostics) = merged.get("diagnostics") else {
-        return;
+        return messages;
     };
     for name in ["jags", "stan"] {
         match diagnostics.get(name) {
             None | Some(Value::Null) => {}
             Some(Value::String(value)) => {
                 if value != "on" && value != "off" {
-                    log::warn!(
-                        "Unrecognized diagnostics.{name} value '{value}'; defaulting to 'off'."
-                    );
+                    messages.push(format!(
+                        "Unrecognized diagnostics.{name} value '{value}'; expected \"on\" or \"off\". Defaulting to 'off'."
+                    ));
                 }
             }
             Some(other) => {
@@ -372,11 +379,24 @@ pub(crate) fn warn_invalid_model_switches(merged: &serde_json::Value) {
                     Value::Object(_) => "object",
                     _ => "value",
                 };
-                log::warn!(
+                messages.push(format!(
                     "diagnostics.{name} must be string \"on|off\"; got {kind}. Defaulting to 'off'."
-                );
+                ));
             }
         }
+    }
+    messages
+}
+
+/// Log every message from [`invalid_model_switch_messages`].
+///
+/// The recompute-path entry point: `recompute_parsed_configs` has no client
+/// handle, so it can only log. Surfaces that DO have a user-visible channel
+/// (`did_change_configuration`'s toast, the CLI's stderr) call
+/// `invalid_model_switch_messages` directly and route the strings there.
+pub(crate) fn warn_invalid_model_switches(merged: &serde_json::Value) {
+    for message in invalid_model_switch_messages(merged) {
+        log::warn!("{message}");
     }
 }
 
@@ -19221,6 +19241,19 @@ impl LanguageServer for Backend {
         // log::warn!, so we don't need the value — only the side effect.
         if let Err(err) = parse_cross_file_config(&params.settings) {
             self.client.show_message(MessageType::WARNING, err).await;
+        }
+        // A model switch that fails closed is otherwise invisible: the log is
+        // filtered out by default, so a typo like "On" looks exactly like the
+        // built-in "off" default — no diagnostics, no explanation. Toast it.
+        //
+        // Reported against the client payload specifically, because that is
+        // what the user just edited. The merged-layer pass inside
+        // `recompute_parsed_configs` still logs, and it is the one that knows
+        // whether a project override supersedes the typo.
+        for message in invalid_model_switch_messages(&params.settings) {
+            self.client
+                .show_message(MessageType::WARNING, message)
+                .await;
         }
 
         let new_raw_client = params.settings.clone();

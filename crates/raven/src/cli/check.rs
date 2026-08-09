@@ -672,6 +672,21 @@ fn build_indexed_state(
     // its auto-enable (which, for the CLI's empty client layer, defaults on).
     crate::config_file::recompute_parsed_configs(&mut state);
 
+    // A model switch that fails closed is otherwise silent here: the recompute
+    // logs it, but the CLI runs without a logger by default, so `stan = "On"`
+    // in `raven.toml` reads exactly like the built-in "off" — an empty report
+    // with no explanation. Put it on stderr so it cannot be mistaken for a
+    // clean run, and keep it off stdout so `--format json|sarif` output stays
+    // machine-parsable.
+    for message in crate::backend::invalid_model_switch_messages(
+        state
+            .raw_project_settings
+            .as_ref()
+            .unwrap_or(&serde_json::Value::Null),
+    ) {
+        eprintln!("raven check: {message}");
+    }
+
     // Index the workspace exactly as the LSP server does on startup. This is
     // rayon-parallel internally; there's no lock contention here since the CLI
     // owns `state` exclusively.
@@ -1562,6 +1577,17 @@ fn compute_file_diagnostics_sync(
     Option<DiagnosticSeverity>,
     crate::cross_file::CaseMismatchSeverity,
 )> {
+    // Gate before building the snapshot, not after. `diagnostics_from_snapshot`
+    // applies the same per-language check and returns empty, but only once the
+    // text has been cloned and the whole cross-file snapshot assembled — so a
+    // repository of default-off Stan or JAGS files still paid full parse and
+    // snapshot cost per file to produce nothing.
+    if !state
+        .cross_file_config
+        .diagnostics_enabled_for_file_type(crate::file_type::file_type_from_uri(uri))
+    {
+        return None;
+    }
     let snapshot =
         crate::handlers::DiagnosticsSnapshot::build_with_open_documents_and_extra_providers(
             state,
@@ -1778,6 +1804,17 @@ async fn collect_target_diagnostics(
         };
         if state.workspace_index.contains(&uri) {
             continue; // already handled in the parallel phase
+        }
+        // Apply the per-language gate BEFORE touching the file. A default-off
+        // model target must produce nothing at all — not an encoding finding,
+        // and not an operator error from an unreadable path. Reading first and
+        // gating later let a disabled `.stan` file fail the run on a property
+        // of a file whose diagnostics the user switched off.
+        if !state
+            .cross_file_config
+            .diagnostics_enabled_for_file_type(crate::file_type::file_type_from_uri(&uri))
+        {
+            continue;
         }
         let text = match crate::state::read_source(path) {
             Ok(t) => t,
