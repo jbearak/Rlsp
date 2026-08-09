@@ -23,8 +23,50 @@ function copyAndChmod(message = 'Bundled raven binary') {
     console.log(message);
 }
 
-// When target/release is available, refresh the bundled binary if it is newer.
-// Use size as a tie-breaker for rebuilds on filesystems with coarse timestamps.
+// A deliberately pre-placed binary always wins, and is never compared against
+// `target/release`.
+//
+// The release workflow cross-compiles for every target, unzips the correct
+// artifact into `bin/`, and only then runs `vsce package` (which triggers this
+// script). On a runner that also has a host `target/release/raven` — a warm
+// cache, a self-hosted runner, a local `vsce package` after a dev build — a
+// freshness comparison would happily overwrite the cross-compiled binary with
+// the host one, shipping a VSIX whose server cannot execute on the platform it
+// claims to target. Content freshness cannot distinguish that case: the host
+// binary is legitimately newer.
+//
+// `RAVEN_BUNDLE_PREPLACED=1` marks the pre-placed case explicitly. Both target
+// names are checked because cross-platform packaging (e.g. win32 on Linux)
+// means `process.platform` does not match the target.
+if (
+    process.env.RAVEN_BUNDLE_PREPLACED === '1' &&
+    (fs.existsSync(path.join(binDir, 'raven')) || fs.existsSync(path.join(binDir, 'raven.exe')))
+) {
+    console.log('Preserving pre-placed raven binary (RAVEN_BUNDLE_PREPLACED=1)');
+    process.exit(0);
+}
+
+// A pre-placed binary for a DIFFERENT target than this host also wins: there is
+// no host build that could legitimately replace it.
+if (!fs.existsSync(destBinary)) {
+    const foreign = [path.join(binDir, 'raven'), path.join(binDir, 'raven.exe')].find(candidate =>
+        fs.existsSync(candidate),
+    );
+    if (foreign) {
+        console.log(`Preserving pre-placed ${path.basename(foreign)}; it is not this host's target name`);
+        process.exit(0);
+    }
+}
+
+// Otherwise refresh from target/release when it is newer. Size is a tie-breaker
+// for rebuilds on filesystems with coarse timestamps.
+//
+// Neither mtime nor size is a content hash, so a rebuild that produces
+// different bytes at the same length AND the same timestamp is not detected.
+// That is vanishingly unlikely for a compiled binary (both must collide), and
+// the cost of being wrong here is a stale dev/test binary, not a bad release —
+// releases take the pre-placed path above. `cargo build` also updates mtime on
+// every relink, so the normal rebuild path is always caught.
 if (fs.existsSync(srcBinary)) {
     if (fs.existsSync(destBinary)) {
         const srcStat = fs.statSync(srcBinary);
@@ -43,8 +85,7 @@ if (fs.existsSync(srcBinary)) {
     process.exit(0);
 }
 
-// Without a matching target/release binary, preserve either pre-placed name.
-// Cross-platform packaging (e.g. win32 on Linux) may not match process.platform.
+// No matching target/release binary — preserve whatever is already bundled.
 if (fs.existsSync(path.join(binDir, 'raven')) || fs.existsSync(path.join(binDir, 'raven.exe'))) {
     console.log('Preserving pre-placed raven binary; no matching target/release binary found');
     process.exit(0);
