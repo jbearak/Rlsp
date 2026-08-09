@@ -17718,6 +17718,26 @@ impl LanguageServer for Backend {
             self.notify_project_config_loaded(Some(path.as_path()));
         }
 
+        // Startup is where a bad model switch is most likely to sit: a typo in
+        // `raven.toml` or in the client's initialization options is already in
+        // effect by the time `initialize` returns, and VS Code sends no
+        // `workspace/didChangeConfiguration` at startup. Without this, the only
+        // signal is a `log::warn!` that the default logging configuration
+        // filters out, so `stan = "On"` is indistinguishable from the built-in
+        // `"off"` default — diagnostics never appear and nothing says why.
+        //
+        // Emitted from `initialized` rather than `initialize` because LSP
+        // forbids sending notifications before the handshake completes.
+        let model_switch_warnings = {
+            let state = self.state.read().await;
+            invalid_model_switch_messages(&crate::config_file::merged_settings(&state))
+        };
+        for message in model_switch_warnings {
+            self.client
+                .show_message(MessageType::WARNING, message)
+                .await;
+        }
+
         // Get workspace folders and config under brief lock
         let (
             folders,
@@ -35040,6 +35060,144 @@ mod project_config_initialize_tests {
         }
 
         registrations
+    }
+
+    /// Drive `initialize` + `initialized` and collect every `window/showMessage`
+    /// the server emits.
+    ///
+    /// Shaped like [`initialized_registrations_with_home`] — the socket must be
+    /// drained and every request answered, or `initialized` blocks on its own
+    /// dynamic registrations and never reaches the code under test.
+    async fn initialized_show_messages(initialize_params: InitializeParams) -> Vec<String> {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::{Request, Response};
+        use tower_lsp::lsp_types::{InitializedParams, ShowMessageParams};
+
+        let (mut svc, socket) = tower_lsp::LspService::new(Backend::new);
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(serde_json::to_value(initialize_params).unwrap())
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+
+        let (mut request_stream, mut response_sink) = socket.split();
+        let initialized = svc.inner().initialized(InitializedParams {});
+        tokio::pin!(initialized);
+        let mut messages = Vec::new();
+        let mut initialized_done = false;
+
+        loop {
+            let request = if initialized_done {
+                match tokio::time::timeout(Duration::from_millis(100), request_stream.next()).await
+                {
+                    Ok(request) => request,
+                    Err(_) => break,
+                }
+            } else {
+                tokio::select! {
+                    () = &mut initialized => {
+                        initialized_done = true;
+                        continue;
+                    }
+                    request = tokio::time::timeout(Duration::from_secs(5), request_stream.next()) => {
+                        request.expect("initialized should drive the client socket")
+                    }
+                }
+            }
+            .expect("client socket should remain open");
+
+            if request.method() == "window/showMessage" {
+                let params: ShowMessageParams =
+                    serde_json::from_value(request.params().expect("message params").clone())
+                        .unwrap();
+                messages.push(params.message);
+            }
+
+            if let Some(id) = request.id().cloned() {
+                response_sink
+                    .send(Response::from_ok(id, serde_json::Value::Null))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        messages
+    }
+
+    /// A `raven.toml` typo is in effect the moment the server starts, and VS Code
+    /// sends no `workspace/didChangeConfiguration` at startup — so without a
+    /// toast from `initialized` the only signal is a `log::warn!` the default
+    /// logging configuration filters out, leaving `"On"` indistinguishable from
+    /// the built-in `"off"` default.
+    #[tokio::test]
+    async fn initialized_toasts_invalid_model_switch_from_project_config() {
+        use serde_json::json;
+
+        let workspace = TempDir::new().unwrap();
+        fs::write(
+            workspace.path().join("raven.toml"),
+            "[diagnostics]\nstan = \"On\"\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(workspace.path()).unwrap();
+
+        let messages = initialized_show_messages(InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "t".into(),
+            }]),
+            initialization_options: Some(json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("diagnostics.stan") && message.contains("'On'")),
+            "startup must toast a raven.toml model-switch typo, got {messages:?}"
+        );
+    }
+
+    /// The complement: a valid config must stay silent, so the toast cannot
+    /// become background noise every session.
+    #[tokio::test]
+    async fn initialized_does_not_toast_a_valid_model_switch() {
+        use serde_json::json;
+
+        let workspace = TempDir::new().unwrap();
+        fs::write(
+            workspace.path().join("raven.toml"),
+            "[diagnostics]\nstan = \"on\"\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(workspace.path()).unwrap();
+
+        let messages = initialized_show_messages(InitializeParams {
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: "t".into(),
+            }]),
+            initialization_options: Some(json!({
+                "crossFile": { "indexWorkspace": false },
+                "packages": { "enabled": false }
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("diagnostics.stan")),
+            "a valid switch must not toast, got {messages:?}"
+        );
     }
 
     fn watcher_options(registration: Registration) -> DidChangeWatchedFilesRegistrationOptions {
