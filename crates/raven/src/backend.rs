@@ -367,7 +367,7 @@ pub(crate) fn invalid_model_switch_messages(merged: &serde_json::Value) -> Vec<S
     use serde_json::Value;
 
     let mut messages = Vec::new();
-    if parse_cross_file_config(merged).is_err() {
+    if cross_file_sections_are_malformed(merged) {
         return messages;
     }
     let Some(diagnostics) = merged.get("diagnostics") else {
@@ -468,6 +468,20 @@ pub(crate) fn warn_invalid_model_switches(merged: &serde_json::Value) {
 /// assert!(cfg.jags_diagnostics_enabled);
 /// assert!(cfg.stan_diagnostics_enabled);
 /// ```
+/// Whether [`parse_cross_file_config`] would reject `settings` outright.
+///
+/// The whole of that parser's error surface: every other malformed value is
+/// absorbed by an `as_u64()`/`as_str()` guard and falls back to the default.
+/// Split out so callers that only need the accept/reject answer can get it
+/// without running the parser, which logs a full multi-line configuration
+/// summary at info level — calling it a second time per config load would
+/// duplicate that summary in the log.
+fn cross_file_sections_are_malformed(settings: &serde_json::Value) -> bool {
+    ["crossFile", "diagnostics", "packages"]
+        .iter()
+        .any(|name| settings.get(name).is_some_and(|v| !v.is_object()))
+}
+
 pub(crate) fn parse_cross_file_config(
     settings: &serde_json::Value,
 ) -> std::result::Result<Option<crate::cross_file::CrossFileConfig>, String> {
@@ -482,7 +496,9 @@ pub(crate) fn parse_cross_file_config(
         return Ok(None);
     }
 
-    // Validate that present sections are objects (not scalars/arrays)
+    // Validate that present sections are objects (not scalars/arrays).
+    // `cross_file_sections_are_malformed` is the predicate-only twin of this
+    // check; keep the two in step if a section is ever added or removed.
     fn ensure_object_section(
         value: Option<&serde_json::Value>,
         name: &str,
@@ -31653,6 +31669,10 @@ mod tests {
                 crate::backend::parse_cross_file_config(&rejected).is_err(),
                 "test premise: a non-object crossFile section must be rejected"
             );
+            // The guard uses the predicate-only twin so it does not re-run the
+            // parser's info-level config summary. Pin the equivalence, or the
+            // two can drift as sections are added.
+            assert!(crate::backend::cross_file_sections_are_malformed(&rejected));
             assert!(
                 crate::backend::invalid_model_switch_messages(&rejected).is_empty(),
                 "a rejected update applies no fallback, so it must not claim one"
@@ -31664,6 +31684,39 @@ mod tests {
             let messages = crate::backend::invalid_model_switch_messages(&accepted);
             assert_eq!(messages.len(), 1, "{messages:?}");
             assert!(messages[0].contains("diagnostics.stan") && messages[0].contains("'On'"));
+        }
+
+        /// `cross_file_sections_are_malformed` must agree with
+        /// `parse_cross_file_config` on every section, in both directions —
+        /// it exists only to answer the same question without the parser's
+        /// logging side effect.
+        #[test]
+        fn malformed_section_predicate_matches_the_parser_verdict() {
+            for section in ["crossFile", "diagnostics", "packages"] {
+                for bad in [json!(false), json!(1), json!("x"), json!([])] {
+                    let settings = json!({ section: bad.clone() });
+                    assert!(
+                        crate::backend::cross_file_sections_are_malformed(&settings),
+                        "{section} = {bad} must read as malformed"
+                    );
+                    assert!(
+                        crate::backend::parse_cross_file_config(&settings).is_err(),
+                        "{section} = {bad} must be rejected by the parser"
+                    );
+                }
+
+                let settings = json!({ section: {} });
+                assert!(
+                    !crate::backend::cross_file_sections_are_malformed(&settings),
+                    "an empty {section} object is well-formed"
+                );
+                assert!(crate::backend::parse_cross_file_config(&settings).is_ok());
+            }
+
+            // Absent sections are well-formed, not malformed.
+            assert!(!crate::backend::cross_file_sections_are_malformed(&json!(
+                {}
+            )));
         }
 
         /// An explicit JSON `null` means "not configured" and must leave the
