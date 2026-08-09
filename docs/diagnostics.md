@@ -111,6 +111,13 @@ Disabling these diagnostic settings does not disable language registration,
 parsing, completion, hover, navigation, syntax highlighting, or CLI target
 discovery for model files. It only makes their native diagnostic result empty.
 
+A switched-off model file is skipped without being opened, so naming an
+unreadable one on the `raven check` command line exits `0` rather than the usual
+operator-error `2` — Raven does not fail a run on a property of a file whose
+language you disabled. The `raven.diagnostics.enabled` master switch behaves
+differently here: it suppresses findings, but unreadable paths still exit `2`.
+See [Exit codes](cli.md#exit-codes).
+
 Native Stan and JAGS syntax findings share
 `raven.diagnostics.maxSyntaxDiagnosticsPerFile` (default `500`). Raven removes
 exact duplicate recovery findings, orders the unique findings by source

@@ -144,6 +144,8 @@ Source files must be UTF-8. A UTF-8 byte-order mark is stripped and BOM-marked U
 - `1` — at least one diagnostic exceeded `--max-severity`. An unknown flag is a usage error and also exits `1`. A reported file that isn't valid UTF-8 is an error diagnostic, so it also exits `1`.
 - `2` — operator error detected while running (config parse failure, an I/O failure reading a path, invalid workspace). A *readable* but mis-encoded file is a finding (exit `1`), not an operator error.
 
+One exception to the I/O case: a named `.stan` or JAGS file whose language is switched off (`diagnostics.stan` / `diagnostics.jags`, both off by default — see [JAGS and Stan](diagnostics.md#jags-and-stan)) is skipped without being opened, so an unreadable one does not exit `2`. Raven reports nothing at all for a language you disabled, and that includes not failing the run on a property of a file it was told to ignore. Switching the language on restores the normal exit-`2` behavior. The global `diagnostics.enabled` switch does **not** do this — it suppresses findings, so an unreadable path still exits `2`.
+
 ## CI examples
 
 Use `raven check` in CI as a static gate for pull requests and pushes. If you want a beginner-friendly overview before the command reference, see [Automated checks in CI](ci.md). The important setup choice is package metadata: Raven does not need to execute your R code, and CI usually does not need to install every package just to resolve exports. Installing R itself is not the expensive part; restoring and compiling the package dependency tree is.
