@@ -46,20 +46,15 @@ if (
     process.exit(0);
 }
 
-// A pre-placed binary for a DIFFERENT target than this host also wins: there is
-// no host build that could legitimately replace it.
-if (!fs.existsSync(destBinary)) {
-    const foreign = [path.join(binDir, 'raven'), path.join(binDir, 'raven.exe')].find(candidate =>
-        fs.existsSync(candidate),
-    );
-    if (foreign) {
-        console.log(`Preserving pre-placed ${path.basename(foreign)}; it is not this host's target name`);
-        process.exit(0);
-    }
-}
-
-// Otherwise refresh from target/release when it is newer. Size is a tie-breaker
-// for rebuilds on filesystems with coarse timestamps.
+// Note there is deliberately NO guard here for a pre-placed binary under the
+// OTHER platform's filename. It would be redundant — the copy below writes to
+// `destBinary`, this host's name, so a foreign-named artifact is untouched
+// either way — and actively harmful: `copy-binary` also runs from `pretest` and
+// ordinary dev builds, where exiting early would skip creating the host binary
+// and leave the extension with no runnable server while reporting success.
+//
+// Refresh from target/release when it is newer. Size is a tie-breaker for
+// rebuilds on filesystems with coarse timestamps.
 //
 // Neither mtime nor size is a content hash, so a rebuild that produces
 // different bytes at the same length AND the same timestamp is not detected.
