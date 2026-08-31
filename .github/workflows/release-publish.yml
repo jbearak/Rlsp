@@ -68,6 +68,7 @@ jobs:
           fetch-depth: 0
 
       - name: Check build workflow status
+        id: build_run
         run: |
           COMMIT_SHA="${{ needs.validate.outputs.tag_sha }}"
           echo "Checking workflow status for commit: $COMMIT_SHA"
@@ -90,29 +91,29 @@ jobs:
 
           if [ "$CONCLUSION" = "success" ]; then
             echo "Build workflow completed successfully"
-            exit 0
+          else
+            # The fallback exists to recover when publishing fails after every
+            # release artifact has been built. Reject failures in any other job,
+            # because those runs may have incomplete artifacts.
+            FAILED_JOBS=$(gh run view "$RUN_ID" --json jobs --jq \
+              '[.jobs[] | select(.conclusion == "failure") | .name]')
+            if [ "$FAILED_JOBS" != '["publish-marketplace"]' ]; then
+              echo "ERROR: release-build.yml has non-publishing failures for tag ${{ inputs.tag }}"
+              echo "Failed jobs: $FAILED_JOBS"
+              exit 1
+            fi
+
+            echo "Build artifacts completed; recovering the failed marketplace publish"
           fi
 
-          # The fallback exists to recover when publishing fails after every
-          # release artifact has been built. Reject failures in any other job,
-          # because those runs may have incomplete artifacts.
-          FAILED_JOBS=$(gh run view "$RUN_ID" --json jobs --jq \
-            '[.jobs[] | select(.conclusion == "failure") | .name]')
-          if [ "$FAILED_JOBS" != '["publish-marketplace"]' ]; then
-            echo "ERROR: release-build.yml has non-publishing failures for tag ${{ inputs.tag }}"
-            echo "Failed jobs: $FAILED_JOBS"
-            exit 1
-          fi
-
-          echo "Build artifacts completed; recovering the failed marketplace publish"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download artifacts from build workflow
         uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151 # v21
         with:
-          workflow: release-build.yml
-          commit: ${{ needs.validate.outputs.tag_sha }}
+          run_id: ${{ steps.build_run.outputs.run_id }}
           path: artifacts
 
       - name: List artifacts

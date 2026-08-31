@@ -112,6 +112,9 @@ describe("apt packaging release integration", () => {
     expect(releasePublish).toContain(
       'if [ "$FAILED_JOBS" != \'["publish-marketplace"]\' ]; then',
     );
+    expect(releasePublish).toContain(
+      "run_id: ${{ steps.build_run.outputs.run_id }}",
+    );
   });
 
   test("Bitbucket Pipelines example installs Raven through the signed apt repo", () => {
