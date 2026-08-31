@@ -137,6 +137,12 @@ fn declaration_policy(declaration: &FunctionDeclaration) -> Option<ArgPolicy> {
         "named-arguments" => Some(ArgPolicy::NamedArguments),
         "per-formal" => {
             let captured_dots = declaration.captured_dots.unwrap_or(false);
+            // R allows at most one `...`, and `per_formal_mask` stops at the
+            // first one, so a second is unreachable. Reject rather than carry
+            // a formal list that cannot describe a real signature.
+            if declaration.formals.iter().filter(|f| *f == "...").count() > 1 {
+                return None;
+            }
             // `...` is matched via `captured_dots`, not by naming it in
             // `captured`, so it is excluded from the subset check.
             let known: HashSet<&str> = declaration.formals.iter().map(String::as_str).collect();
@@ -284,5 +290,33 @@ mod tests {
         let dir = std::env::temp_dir().join("raven-nse-decl-absent");
         std::fs::create_dir_all(&dir).unwrap();
         assert!(load_declared_policies(&dir, &exports(&["gen"])).is_empty());
+    }
+
+    #[test]
+    fn rejects_more_than_one_dots_formal() {
+        let two_dots = r#"
+            [[function]]
+            name = "gen"
+            formals = ["data", "...", "..."]
+            captured_dots = true
+        "#;
+        assert!(parse_declarations(two_dots, &exports(&["gen"])).is_empty());
+    }
+
+    #[test]
+    fn a_captured_dots_name_is_inert_rather_than_rejected() {
+        // `per_formal_mask` skips `...` in both passes before consulting
+        // `captured`, so naming it there is dead data. Pinned so a future
+        // reader does not mistake it for a suppression path.
+        let named_dots = r#"
+            [[function]]
+            name = "gen"
+            formals = ["data", "..."]
+            captured = ["..."]
+        "#;
+        assert_eq!(
+            parse_declarations(named_dots, &exports(&["gen"])).get("gen"),
+            Some(&ArgPolicy::per_formal(&["data", "..."], &["..."], false))
+        );
     }
 }
