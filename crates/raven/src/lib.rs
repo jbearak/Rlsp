@@ -43,6 +43,7 @@ pub mod linting;
 pub mod namespace_completion;
 pub mod namespace_parser;
 pub mod nse;
+pub(crate) mod nse_declarations;
 pub(crate) mod open_document_store;
 pub mod package_db;
 pub mod package_library;

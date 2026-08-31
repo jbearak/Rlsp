@@ -307,6 +307,19 @@ pub struct PackageInfo {
     /// `Unknown` (never absence-authoritative) via every constructor; production
     /// load paths stamp the real value. See `namespace_member_status_sync`.
     pub exports_completeness: MemberCompleteness,
+    /// NSE policies the package declares for its own exports in
+    /// `raven/nse.toml` (installed from `inst/raven/nse.toml`). Empty for the
+    /// overwhelming majority of packages, which ship no sidecar.
+    ///
+    /// Populated by `package_info_from_dir`, the same on-disk chokepoint that
+    /// fills `lazy_data`; base packages never carry declarations. Consulted by
+    /// the NSE resolver only *after* the built-in table misses, so a package
+    /// can add coverage but never weaken Raven's own modeling — see
+    /// [`crate::nse_declarations`].
+    ///
+    /// `Arc` so the per-read `PackageInfo` clones stay cheap for the packages
+    /// that do declare policies.
+    pub(crate) nse_policies: Arc<crate::nse_declarations::DeclaredPolicies>,
 }
 
 impl PackageInfo {
@@ -323,6 +336,7 @@ impl PackageInfo {
             lazy_data: Vec::new(),
             data_aliases: HashMap::new(),
             exports_completeness: MemberCompleteness::Unknown,
+            nse_policies: Arc::default(),
         }
     }
 
@@ -344,6 +358,7 @@ impl PackageInfo {
             lazy_data,
             data_aliases: HashMap::new(),
             exports_completeness: MemberCompleteness::Unknown,
+            nse_policies: Arc::default(),
         }
     }
 }
@@ -363,7 +378,23 @@ async fn package_info_from_dir(
     depends: Vec<String>,
 ) -> PackageInfo {
     let lazy_data = parse_data_symbols(pkg_dir).await;
-    PackageInfo::with_details(name, exports, depends, lazy_data)
+    // One small `read` on the package directory Raven has already stat'd for
+    // NAMESPACE/DESCRIPTION. Joined with the dataset walk's `spawn_blocking`
+    // discipline so neither touches the synchronous diagnostic hot path.
+    let declared = {
+        let dir = pkg_dir.to_path_buf();
+        let exports = exports.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::nse_declarations::load_declared_policies(&dir, &exports)
+        })
+        .await
+        .unwrap_or_default()
+    };
+    let mut info = PackageInfo::with_details(name, exports, depends, lazy_data);
+    if !declared.is_empty() {
+        info.nse_policies = Arc::new(declared);
+    }
+    info
 }
 
 /// Collect borrowed symbol names into a sorted, de-duplicated owned `Vec`.
@@ -1973,6 +2004,25 @@ impl PackageLibrary {
             }
         }
         None
+    }
+
+    /// The NSE policy `package` declares for its export `name` in
+    /// `raven/nse.toml` (synchronous, cached-only).
+    ///
+    /// Cached-only on purpose: this runs inside the undefined-variable
+    /// collector, which cannot block on a package load. An uncached package
+    /// simply yields `None` — the same false positives the caller had before
+    /// the sidecar existed — and the policy applies once the normal load path
+    /// warms the entry.
+    pub(crate) fn declared_nse_policy(
+        &self,
+        package: &str,
+        name: &str,
+    ) -> Option<crate::nse::ArgPolicy> {
+        self.packages
+            .load()
+            .get(package)
+            .and_then(|info| info.nse_policies.get(name).cloned())
     }
 
     /// Find which package exports a symbol (synchronous, cached-only)

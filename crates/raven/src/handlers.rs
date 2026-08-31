@@ -21271,6 +21271,30 @@ fn callee_leaf_name<'t>(func: Node<'t>, text: &'t str) -> Option<&'t str> {
     }
 }
 
+/// The NSE policy for `pkg::name`: Raven's curated table first, then any
+/// policy the installed package declares for that export in `raven/nse.toml`
+/// (issue: package-declared NSE metadata).
+///
+/// Built-in wins on a collision, deliberately. The curated entries are verified
+/// against the real packages, and a declaration file is data Raven reads from
+/// the library path — letting one override a built-in would let an installed
+/// package silence diagnostics Raven is confident about. The sidecar's job is
+/// to *extend* coverage to packages the table was never going to enumerate.
+///
+/// Every `package_policy` consumer in this module routes through here so a new
+/// resolution path can't silently skip declared policies.
+fn package_arg_policy(
+    pkg: &str,
+    name: &str,
+    analysis: &NseAnalysis,
+) -> Option<crate::nse::ArgPolicy> {
+    crate::nse::package_policy(pkg, name).or_else(|| {
+        analysis
+            .package_library
+            .and_then(|lib| lib.declared_nse_policy(pkg, name))
+    })
+}
+
 /// The value node of a call's first positional argument, if any.
 fn first_positional_arg_value(args: Node) -> Option<Node> {
     let mut cursor = args.walk();
@@ -21302,7 +21326,7 @@ fn table_verb_policy(
         // policy; `namespace_parts` does not strip backticks. The package
         // qualifier is left as-is.
         return namespace_parts(func, text).and_then(|(pkg, name)| {
-            crate::nse::package_policy(pkg, crate::r_names::canonical_use_name(name))
+            package_arg_policy(pkg, crate::r_names::canonical_use_name(name), analysis)
         });
     }
     if func.kind() != "identifier" {
@@ -21314,7 +21338,7 @@ fn table_verb_policy(
 
     // 2. A loaded/imported package's NSE policy shadows base.
     for pkg in &analysis.in_play_packages {
-        if let Some(policy) = crate::nse::package_policy(pkg, name) {
+        if let Some(policy) = package_arg_policy(pkg, name, analysis) {
             return Some(policy);
         }
     }
@@ -21328,7 +21352,7 @@ fn table_verb_policy(
     //     verb with no known policy stays conservatively arg-suppressed (the
     //     prior behavior), rather than newly checking its data-masked columns.
     if let Some(self_pkg) = &analysis.self_nse_package
-        && let Some(policy) = crate::nse::package_policy(self_pkg, name)
+        && let Some(policy) = package_arg_policy(self_pkg, name, analysis)
     {
         return Some(policy);
     }
@@ -21347,7 +21371,7 @@ fn table_verb_policy(
     if let Some(lib) = analysis.package_library
         && let Some(owner) = lib.find_package_owner_for_symbol(name, &analysis.in_play_packages)
         && !crate::package_library::is_load_all_sentinel(&owner)
-        && let Some(policy) = crate::nse::package_policy(&owner, name)
+        && let Some(policy) = package_arg_policy(&owner, name, analysis)
     {
         return Some(policy);
     }
@@ -21857,7 +21881,7 @@ fn resolve_call_arg_policy(
                 name: target,
             } => {
                 let policy =
-                    crate::nse::package_policy(package, target).unwrap_or(ArgPolicy::Standard);
+                    package_arg_policy(package, target, analysis).unwrap_or(ArgPolicy::Standard);
                 upgrade_plyr_ply_dots(call_node, target, text, analysis, policy)
             }
             // An opaque callable whose policy we cannot prove: suppress
@@ -22040,7 +22064,7 @@ fn fun_resolves_to_data_masking_verb(value: Node, text: &str, analysis: &NseAnal
             } else if let Some(alias) = analysis.local_callee_aliases.get(key) {
                 match alias {
                     LocalCalleeAlias::Qualified { package, name } => {
-                        crate::nse::package_policy(package, name).unwrap_or(ArgPolicy::Standard)
+                        package_arg_policy(package, name, analysis).unwrap_or(ArgPolicy::Standard)
                     }
                     // Opaque callable whose policy we cannot prove.
                     LocalCalleeAlias::Unknown => return false,
@@ -31234,6 +31258,171 @@ mod tests {
         let mut used = Vec::new();
         collect_with_packages(tree.root_node(), code, &["dplyr"], &mut used);
         assert!(was_collected(&used, "df"));
+        assert!(!was_collected(&used, "col"));
+    }
+
+    // ---- Package-declared NSE policies (`inst/raven/nse.toml`) ----
+
+    /// Install a fake package into a fresh temp library, optionally with a
+    /// `raven/nse.toml` sidecar, and return a warmed `PackageLibrary`.
+    ///
+    /// The `tempfile::TempDir` is returned alongside the library because
+    /// dropping it deletes the library root; the caller must hold it for the
+    /// lifetime of the test.
+    async fn library_with_declaring_package(
+        pkg: &str,
+        exports: &[&str],
+        sidecar: Option<&str>,
+    ) -> (tempfile::TempDir, crate::package_library::PackageLibrary) {
+        let lib_root = tempfile::tempdir().unwrap();
+        let pkg_dir = lib_root.path().join(pkg);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            format!("Package: {pkg}\nVersion: 0.1.0\n"),
+        )
+        .unwrap();
+        let namespace: String = exports
+            .iter()
+            .map(|name| format!("export({name})\n"))
+            .collect();
+        std::fs::write(pkg_dir.join("NAMESPACE"), namespace).unwrap();
+        if let Some(toml) = sidecar {
+            let raven_dir = pkg_dir.join("raven");
+            std::fs::create_dir_all(&raven_dir).unwrap();
+            std::fs::write(raven_dir.join("nse.toml"), toml).unwrap();
+        }
+
+        let mut lib = crate::package_library::PackageLibrary::with_subprocess(None);
+        lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
+        // Warm the cache: `declared_nse_policy` is cached-only by design.
+        lib.get_package(pkg).await;
+        (lib_root, lib)
+    }
+
+    const DTATOOLS_SIDECAR: &str = r#"
+        schema = 1
+        [[function]]
+        name = "gen"
+        formals = ["data", "variable", "values", "where"]
+        captured = ["variable", "values", "where"]
+    "#;
+
+    /// The declared policy reaches the undefined-variable collector: `gen`'s
+    /// captured `variable`/`values` are suppressed while the ordinary `data`
+    /// argument is still checked.
+    #[tokio::test]
+    async fn declared_package_policy_suppresses_captured_arguments() {
+        let (_root, lib) =
+            library_with_declaring_package("dtatools", &["gen"], Some(DTATOOLS_SIDECAR)).await;
+        let code = "gen(survey, adjusted, income + 5)";
+        let tree = parse_r_code(code);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            vec!["dtatools".to_string()],
+            None,
+            Some(&lib),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(was_collected(&used, "survey"), "`data` stays checked");
+        assert!(!was_collected(&used, "adjusted"));
+        assert!(!was_collected(&used, "income"));
+    }
+
+    /// Without the sidecar the same call is unchanged, which is what makes the
+    /// test above evidence that the declaration — not some other resolution
+    /// path — did the suppressing.
+    #[tokio::test]
+    async fn absent_sidecar_leaves_the_call_unchanged() {
+        let (_root, lib) = library_with_declaring_package("dtatools", &["gen"], None).await;
+        let code = "gen(survey, adjusted, income + 5)";
+        let tree = parse_r_code(code);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            vec!["dtatools".to_string()],
+            None,
+            Some(&lib),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(was_collected(&used, "adjusted"));
+    }
+
+    /// A sidecar cannot weaken a built-in policy. A package claiming
+    /// `filter` is whole-call NSE must not stop Raven from checking dplyr's
+    /// ordinary `.data` argument.
+    #[tokio::test]
+    async fn a_declaration_cannot_override_the_built_in_table() {
+        let sidecar = r#"
+            [[function]]
+            name = "filter"
+            policy = "whole-call"
+        "#;
+        let (_root, lib) =
+            library_with_declaring_package("dplyr", &["filter"], Some(sidecar)).await;
+        let code = "dplyr::filter(df, col)";
+        let tree = parse_r_code(code);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            vec!["dplyr".to_string()],
+            None,
+            Some(&lib),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(
+            was_collected(&used, "df"),
+            "built-in dplyr policy still checks `.data`"
+        );
         assert!(!was_collected(&used, "col"));
     }
 
