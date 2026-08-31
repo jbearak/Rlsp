@@ -103,6 +103,17 @@ describe("apt packaging release integration", () => {
     expect(fallbackMarketplaceJob).toContain("environment: marketplace");
   });
 
+  test("marketplace publishing can recover after a partial release", () => {
+    const releaseBuild = readRepoFile(".github", "workflows", "release-build.yml");
+    const releasePublish = readRepoFile(".github", "workflows", "release-publish.yml");
+
+    expect(releaseBuild).toContain("vsce publish --skip-duplicate");
+    expect(releasePublish).toContain("vsce publish --skip-duplicate");
+    expect(releasePublish).toContain(
+      'if [ "$FAILED_JOBS" != \'["publish-marketplace"]\' ]; then',
+    );
+  });
+
   test("Bitbucket Pipelines example installs Raven through the signed apt repo", () => {
     const example = readRepoFile("docs", "examples", "ci", "bitbucket-pipelines.yml");
     expect(example).toContain("image: ubuntu:24.04");

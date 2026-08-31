@@ -72,7 +72,7 @@ jobs:
           COMMIT_SHA="${{ needs.validate.outputs.tag_sha }}"
           echo "Checking workflow status for commit: $COMMIT_SHA"
 
-          RUN_INFO=$(gh run list --workflow=release-build.yml --commit="$COMMIT_SHA" --limit=1 --json status,conclusion --jq '.[0]')
+          RUN_INFO=$(gh run list --workflow=release-build.yml --commit="$COMMIT_SHA" --limit=1 --json databaseId,status,conclusion --jq '.[0]')
           if [ -z "$RUN_INFO" ] || [ "$RUN_INFO" = "null" ]; then
             echo "ERROR: No release-build.yml workflow run found for commit $COMMIT_SHA"
             exit 1
@@ -80,14 +80,31 @@ jobs:
 
           STATUS=$(echo "$RUN_INFO" | jq -r '.status')
           CONCLUSION=$(echo "$RUN_INFO" | jq -r '.conclusion')
+          RUN_ID=$(echo "$RUN_INFO" | jq -r '.databaseId')
 
-          if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
-            echo "ERROR: release-build.yml has not completed successfully for tag ${{ inputs.tag }}"
-            echo "Status: $STATUS, Conclusion: $CONCLUSION"
+          if [ "$STATUS" != "completed" ]; then
+            echo "ERROR: release-build.yml has not completed for tag ${{ inputs.tag }}"
+            echo "Status: $STATUS"
             exit 1
           fi
 
-          echo "Build workflow completed successfully"
+          if [ "$CONCLUSION" = "success" ]; then
+            echo "Build workflow completed successfully"
+            exit 0
+          fi
+
+          # The fallback exists to recover when publishing fails after every
+          # release artifact has been built. Reject failures in any other job,
+          # because those runs may have incomplete artifacts.
+          FAILED_JOBS=$(gh run view "$RUN_ID" --json jobs --jq \
+            '[.jobs[] | select(.conclusion == "failure") | .name]')
+          if [ "$FAILED_JOBS" != '["publish-marketplace"]' ]; then
+            echo "ERROR: release-build.yml has non-publishing failures for tag ${{ inputs.tag }}"
+            echo "Failed jobs: $FAILED_JOBS"
+            exit 1
+          fi
+
+          echo "Build artifacts completed; recovering the failed marketplace publish"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -189,7 +206,7 @@ jobs:
           shopt -s globstar
           for vsix in vscode-artifacts/**/*.vsix; do
             echo "Publishing $vsix to VS Code Marketplace..."
-            vsce publish --packagePath "$vsix"
+            vsce publish --skip-duplicate --packagePath "$vsix"
           done
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
@@ -200,7 +217,7 @@ jobs:
           shopt -s globstar
           for vsix in vscode-artifacts/**/*.vsix; do
             echo "Publishing $vsix to Open VSX..."
-            ovsx publish "$vsix"
+            ovsx publish --skip-duplicate "$vsix"
           done
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}

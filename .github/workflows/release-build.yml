@@ -374,7 +374,7 @@ jobs:
         run: |
           for vsix in $(find vscode-artifacts -name '*.vsix' | sort); do
             echo "Publishing $vsix to VS Code Marketplace..."
-            vsce publish --packagePath "$vsix"
+            vsce publish --skip-duplicate --packagePath "$vsix"
           done
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
@@ -384,7 +384,7 @@ jobs:
         run: |
           for vsix in $(find vscode-artifacts -name '*.vsix' | sort); do
             echo "Publishing $vsix to Open VSX..."
-            ovsx publish "$vsix"
+            ovsx publish --skip-duplicate "$vsix"
           done
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
