@@ -112,6 +112,59 @@ declare a helper's policy once in a setup file and use it in connected files. Se
 [NSE directive propagation](cross-file.md#nse-directive-propagation) for the
 cross-file rules.
 
+## Declaring NSE From a Package
+
+`# raven: nse` describes a helper from the *calling* side, which suits a helper
+defined in your own project. A package author can instead ship the policy with
+the package, so every user of the package gets it without writing directives.
+
+Put the declarations in `inst/raven/nse.toml`. `R CMD INSTALL` copies `inst/` to
+the package root, so Raven reads the installed file at
+`<libpath>/<pkg>/raven/nse.toml` alongside `NAMESPACE`.
+
+```toml
+schema = 1
+
+[[function]]
+name = "gen"
+formals = ["data", "variable", "values", "where"]
+captured = ["variable", "values", "where"]
+```
+
+With that installed, `gen(survey, adjusted, income + 5)` suppresses `adjusted`
+and `income` while still checking `survey`.
+
+Each `[[function]]` entry takes:
+
+| Key | Meaning |
+| --- | --- |
+| `name` | The exported function. A name the package does not export is ignored. |
+| `policy` | `"per-formal"` (the default), `"whole-call"`, or `"named-arguments"` — the three policy kinds Raven's built-in table uses. |
+| `formals` | The function's formal arguments **in declaration order**. Raven matches positional arguments against this list, so a stale order shifts which argument is suppressed. |
+| `captured` | The formals whose argument is captured, data-masked, or tidy-selected. Every name must appear in `formals`. |
+| `captured_dots` | `true` when arguments absorbed by `...` are captured too. |
+
+`formals` and `captured` apply to `policy = "per-formal"` only; the other two
+kinds need just a `name`.
+
+Three rules keep a declaration file from making diagnostics worse:
+
+- **Built-ins win.** A declaration is consulted only after Raven's own table
+  misses, so an installed package cannot silence a diagnostic Raven models
+  itself.
+- **Exports only.** Declarations are intersected with the package's export set,
+  so an entry for an internal helper is dropped rather than applied to an
+  unrelated call.
+- **Failure is silent and safe.** A missing, malformed, or newer-schema file
+  yields no policies — the false positives you had before it, never fewer
+  checks.
+
+Because Raven reads the file from the installed package directory, a declaration
+takes effect once the package is installed and Raven has loaded it. Policies are
+not yet carried in `.raven/packages.json`, so a CI run that relies on
+[`raven packages freeze`](package-database.md) rather than an installed library
+does not see them.
+
 ## Choosing the Right Escape Hatch
 
 Use `# raven: nse` when the false positive comes from a function argument being
@@ -156,13 +209,17 @@ many false positives but can miss a real undefined index in ambiguous code.
 
 ## Toward NSE Metadata
 
-Ideally, packages could include lightweight metadata for exported function
-signatures: function names, formal argument names, and which arguments are
-evaluated non-standardly. Today, R package metadata exposes exported symbols,
-including function names, but not a machine-readable table of function
-signatures or argument-evaluation policy.
+R package metadata exposes exported symbols, including function names, but not a
+machine-readable table of function signatures or argument-evaluation policy.
+[`inst/raven/nse.toml`](#declaring-nse-from-a-package) is Raven's version of that
+table: lightweight metadata for exported function signatures — function names,
+formal argument names, and which arguments are evaluated non-standardly — that a
+package can author and ship today. It is Raven-specific by necessity, not by
+preference; the shape is deliberately simple enough to be worth proposing as a
+convention other R tooling could read.
 
-Raven could experiment with generating this metadata itself from package source,
+That only covers packages whose authors opt in. Raven could also experiment with
+generating the same metadata itself from package source,
 including across public package repositories such as CRAN and Bioconductor. That
 kind of corpus-derived table could improve Raven's own diagnostics; it could
 also serve as a starting point for discussion about including such data in the R
