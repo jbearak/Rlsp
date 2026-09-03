@@ -2499,15 +2499,21 @@ impl Backend {
             // rescan (#748). Only when no watcher is attached (a stale or
             // expired build, or a winner that could not attach) start one for
             // the current owner without reviving the startup routing intent.
-            let watcher_attached = self.state.read().await.has_active_libpath_watcher();
-            if watcher_attached {
+            // The "no watcher attached" predicate is folded into the swap's
+            // basis capture and enforced by its CAS (the basis pins the watcher
+            // lifecycle signature), so a watcher installed by a routing commit
+            // between our check and the swap makes the swap lose, not replace.
+            if !swap_libpath_watcher_if_none_attached(
+                &self.state,
+                &self.client,
+                &self.routing_tasks,
+            )
+            .await
+            {
                 log::trace!(
                     "Startup package-library build: current library already has a libpath \
-                     watcher; not re-swapping"
+                     watcher (or one was attached concurrently); not re-swapping"
                 );
-            } else {
-                swap_current_libpath_watcher(&self.state, &self.client, &self.routing_tasks, true)
-                    .await;
             }
         }
 
@@ -15872,6 +15878,11 @@ async fn run_watched_resync_batch_owned(
             }
 
             for item in &uris_to_update {
+                if item.package_input_only {
+                    // Same contract as the batch path: carried for the package
+                    // reseed only, never read or indexed as a workspace entry.
+                    continue;
+                }
                 if invocation_owned {
                     if !resync_invocation_fallback_item(
                         &state_arc,
@@ -16391,6 +16402,7 @@ fn enrich_box_candidate_importers(
 ///   (the seed harvests them rather than indexing them), and their update is
 ///   what lets the reseed run. Dropping it would leave package-derived
 ///   symbols stale until some other package event.
+///
 /// How `collect_watched_resync` treats a CREATED/CHANGED event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchedChangeAdmission {
@@ -24633,21 +24645,77 @@ async fn swap_current_libpath_watcher(
     allow_recovery: bool,
 ) -> bool {
     debug_assert!(allow_recovery);
-    swap_current_libpath_watcher_owned(state_arc, client, routing_tasks, None).await
+    swap_current_libpath_watcher_owned(
+        state_arc,
+        client,
+        routing_tasks,
+        LibpathWatcherSwapRequest::Unconditional,
+    )
+    .await
+}
+
+/// [`swap_current_libpath_watcher`] that attaches a watcher only when none is
+/// attached at capture time *and* still none at commit time.
+///
+/// The basis pins the watcher lifecycle signature, so a watcher a routing
+/// commit installs between the capture and the CAS makes this swap lose
+/// rather than tear that watcher down and re-seed a full rescan (#748).
+/// Returns whether a watcher swap committed.
+async fn swap_libpath_watcher_if_none_attached(
+    state_arc: &Arc<RwLock<WorldState>>,
+    client: &Client,
+    routing_tasks: &RoutingTaskOwner,
+) -> bool {
+    swap_current_libpath_watcher_owned(
+        state_arc,
+        client,
+        routing_tasks,
+        LibpathWatcherSwapRequest::OnlyIfNoneAttached,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibpathWatcherSwapRequest {
+    /// Retire whatever is attached and install for the current library.
+    Unconditional,
+    /// Install only if no watcher is attached; otherwise do nothing.
+    OnlyIfNoneAttached,
+    /// Consume the exact `AwaitingRecovery` owner token.
+    Recovery(crate::state::LibpathWatcherOwner),
 }
 
 fn swap_current_libpath_watcher_owned<'a>(
     state_arc: &'a Arc<RwLock<WorldState>>,
     client: &'a Client,
     routing_tasks: &'a RoutingTaskOwner,
-    recovery_owner: Option<crate::state::LibpathWatcherOwner>,
+    request: LibpathWatcherSwapRequest,
 ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
     Box::pin(async move {
+        let recovery_owner = match request {
+            LibpathWatcherSwapRequest::Recovery(owner) => Some(owner),
+            LibpathWatcherSwapRequest::Unconditional
+            | LibpathWatcherSwapRequest::OnlyIfNoneAttached => None,
+        };
         let basis = {
             let state = state_arc.read().await;
-            match recovery_owner {
-                Some(owner) => state.capture_libpath_watcher_recovery_basis(owner),
-                None => state.capture_libpath_watcher_swap_basis(),
+            match request {
+                LibpathWatcherSwapRequest::Recovery(owner) => {
+                    state.capture_libpath_watcher_recovery_basis(owner)
+                }
+                LibpathWatcherSwapRequest::Unconditional => {
+                    state.capture_libpath_watcher_swap_basis()
+                }
+                // The captured lifecycle signature is what the commit CAS
+                // compares; capturing only while no watcher is attached makes
+                // "still none attached" part of the CAS.
+                LibpathWatcherSwapRequest::OnlyIfNoneAttached => {
+                    if state.has_active_libpath_watcher() {
+                        None
+                    } else {
+                        state.capture_libpath_watcher_swap_basis()
+                    }
+                }
             }
         };
         let Some(basis) = basis else {
@@ -24754,7 +24822,7 @@ fn schedule_libpath_watcher_recovery(
             &task_state,
             &task_client,
             &task_routing,
-            Some(owner),
+            LibpathWatcherSwapRequest::Recovery(owner),
         )
         .await;
     }) {
@@ -52704,6 +52772,22 @@ mod project_config_initialize_tests {
             state.libpath_watcher_owner_is_current(owner),
             "the Ready path must not retire the watcher the winning commit installed"
         );
+        drop(state);
+
+        // The conditional swap on its own: with a watcher attached it must
+        // decline (and the CAS pins the lifecycle, so a watcher attached
+        // between capture and commit is equally safe).
+        assert!(
+            !swap_libpath_watcher_if_none_attached(
+                &backend.state,
+                &backend.client,
+                &backend.routing_tasks
+            )
+            .await,
+            "the conditional swap must not replace an attached watcher"
+        );
+        let state = backend.state.read().await;
+        assert!(state.libpath_watcher_owner_is_current(owner));
         assert!(
             !backend.startup_package_build_active.load(Ordering::Acquire),
             "the startup flag is cleared when the task exits"
