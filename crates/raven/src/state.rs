@@ -2694,6 +2694,7 @@ impl PendingLibraryReplacementGuard {
     /// intent and both Drop owners are therefore resolved under one lifecycle
     /// mutex, with no partial-take window that can manufacture phantom
     /// reconciliation. A newer intent is never cleared.
+    #[cfg(test)]
     pub(crate) fn retire_bundle_without_reconcile(
         mut self,
         mut preserved: Option<LibraryRoutingPreSealDeposit>,

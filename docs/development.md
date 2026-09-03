@@ -445,13 +445,29 @@ fresh final capture reserves the complete union once. `.Rprofile` and testthat
 scans overlay all authoritative buffers plus only package routes the candidate
 will authoritatively own, and reduce with its package `DidOpen` event into one
 package state. Package-library initialization precedes every derivation that
-can resolve `system.file()`. Each on-demand library build owns an exact key
-(R path, additional paths, workspace root, and package-input generation) plus
-the package-config generation and not-ready state it observed. Its final swap
-is a CAS on that basis; stale builds are discarded and `didOpen` performs one
-bounded fresh-key retry. A stable degraded/unavailable build is remembered by
-its winning key so opening continues fail-closed with unresolved package
-sources instead of looping. After commit, direct and converged-scope inherited
+can resolve `system.file()`. Each library build owns an exact construction
+key (R path, additional paths, and workspace root — deliberately *not* the
+package-input or open-record generations, which change while R is running
+without changing what the build would produce) plus the package-config
+generation and not-ready state it observed. Its final swap is a CAS on that
+basis; a build whose *construction* inputs changed is discarded and `didOpen`
+performs one bounded fresh-key retry, while a build whose *routing* basis
+merely drifted (a package seed or open/close landed during the ~10–15 s R
+spawn) re-captures the routing basis and installs the same library
+(`install_built_package_library`) instead of throwing it away. A stable
+degraded/unavailable build is remembered by its winning key so opening
+continues fail-closed with unresolved package sources instead of looping.
+
+Startup does not build the library inline. `initialized` returns immediately
+after scheduling the workspace scan and `run_startup_package_library_build`,
+which goes through the same `package_init_coordinator` mutex as `didOpen`'s
+on-demand path, so at most one R child runs for the initial build and the
+first `didOpen` simply waits on it. Because tower-lsp runs with
+`concurrency_level(1)`, anything awaited inside `initialized` stalls every
+queued request; on a renv project this cost ~20 s before the first
+references/definition response and used to spawn R twice.
+
+After commit, direct and converged-scope inherited
 packages are warmed synchronously before any diagnostic ticket starts. A
 bounded convergence overflow clears foreign Rprofile/preamble provenance and
 commits only candidate-local facts; there is no delayed stabilization publish.

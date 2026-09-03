@@ -2095,6 +2095,13 @@ impl TraversalTruncationState {
     }
 }
 
+/// Construction identity of a package library: the inputs that determine
+/// what `try_build_package_library` produces. Deliberately excludes
+/// package-input and open-record authority — a `DESCRIPTION` edit or the
+/// startup package seed changes routing derivation, not the library, so a
+/// build that finishes after such a change is still the right library and
+/// `install_built_package_library` re-captures its routing basis instead of
+/// discarding it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PackageInitKey {
     enabled: bool,
@@ -2102,7 +2109,6 @@ struct PackageInitKey {
     additional_paths: Vec<std::path::PathBuf>,
     workspace_root: Option<std::path::PathBuf>,
     workspace_folders: Vec<Url>,
-    package_input_generation: u64,
 }
 
 impl PackageInitKey {
@@ -2119,7 +2125,6 @@ impl PackageInitKey {
                 .first()
                 .and_then(|url| url.to_file_path().ok()),
             workspace_folders: state.workspace_folders.clone(),
-            package_input_generation: state.package_input_generation(),
         }
     }
 }
@@ -2288,7 +2293,9 @@ impl Backend {
                 None,
             )
         } else {
-            log::trace!("Initializing PackageLibrary on demand (not yet ready)");
+            log::trace!("Initializing PackageLibrary (not yet ready)");
+            let pkg_start = std::time::Instant::now();
+            let r_calls_before = crate::perf::get_r_subprocess_calls();
             // R discovery and provider loading stay off-lock in the shared
             // builder. The exact inputs came from `basis.key`.
             let build = crate::package_library::try_build_package_library(
@@ -2330,6 +2337,16 @@ impl Backend {
                     None
                 };
             let ready = outcome.consumer_ready();
+            crate::perf::record_package_init(
+                pkg_start.elapsed(),
+                crate::perf::get_r_subprocess_calls() - r_calls_before,
+            );
+            log::info!(
+                "PackageLibrary initialized: {} lib_paths, {} base_packages, {} base_exports",
+                outcome.library.lib_paths().len(),
+                outcome.library.base_packages().len(),
+                outcome.library.base_exports().len()
+            );
             (outcome.library, ready, outcome.load_notes, init_error)
         };
         if let Some(error) = init_error {
@@ -2350,51 +2367,23 @@ impl Backend {
             }
         }
 
-        // The build owns no state until this exact compare-and-swap. A
-        // concurrent settings/workspace/package-input change or another
-        // readiness transition rejects it without replacing newer state.
-        let exact_init_intent = {
-            let state = self.state.read().await;
-            !state.package_library_ready
-                && state.package_config_generation == basis.package_config_generation
-                && PackageInitKey::capture(&state) == basis.key
-        };
-        let routing_effects = if exact_init_intent {
-            if let Some((routing_basis, replacement_guard, pre_seal)) =
-                routing_basis.take().map(CapturedLibraryRouting::into_parts)
-                && let Some(driver) = prepare_library_routing_driver(
-                    &self.state,
-                    routing_basis,
-                    replacement_guard,
-                    Some(pre_seal),
-                    library,
-                    LibraryRoutingDriverOptions {
-                        ready,
-                        only_packages: None,
-                        warm_open_packages: true,
-                        refresh_cache_epoch: true,
-                        attempt_limit: 2,
-                        deadline,
-                        watcher_runtime: Some(LibpathWatcherRuntime {
-                            client: self.client.clone(),
-                            routing_tasks: self.routing_tasks.clone(),
-                        }),
-                        watcher_recovery: false,
-                    },
-                )
-                .await
-            {
-                match complete_library_routing_driver(&self.state, driver).await {
-                    LibraryRoutingTransactionOutcome::Committed(effects) => Some(effects),
-                    LibraryRoutingTransactionOutcome::Superseded => None,
-                    LibraryRoutingTransactionOutcome::RetryExhausted(_driver) => None,
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // The build owns no state until its compare-and-swap. A concurrent
+        // settings/workspace change or another readiness transition rejects it
+        // without replacing newer state; package-input drift alone does not
+        // (see `install_built_package_library`).
+        let routing_effects = self
+            .install_built_package_library(
+                routing_basis.take(),
+                library,
+                ready,
+                deadline,
+                |state| {
+                    !state.package_library_ready
+                        && state.package_config_generation == basis.package_config_generation
+                        && PackageInitKey::capture(state) == basis.key
+                },
+            )
+            .await;
         let Some(routing_effects) = routing_effects else {
             log::trace!("Discarding stale on-demand PackageLibrary build");
             return PackageInitAttempt::Stale {
@@ -2429,6 +2418,162 @@ impl Backend {
             key: basis.key,
             ready,
         }
+    }
+
+    /// Startup package-library build (historically "Task B" of `initialized`).
+    ///
+    /// Runs detached from the `initialized` handler. Building the library
+    /// spawns R to read `.libPaths()` and expand `exportPattern` exports, and
+    /// on a project whose `renv/activate.R` is slow that spawn alone takes
+    /// 10–15 s. tower-lsp dispatches Raven's messages in order (see
+    /// `concurrency_level(1)`), so while `initialized` awaited this build every
+    /// request the editor sent — hover, references, completion — sat in the
+    /// queue behind it. Handlers already tolerate a not-ready library
+    /// (`package_library_ready` gates every package-aware path), so nothing
+    /// in `initialized` needs to wait for the result.
+    ///
+    /// The build itself is the ordinary coordinated initialization
+    /// (`coordinated_package_library_initialization`), not a parallel copy of
+    /// it. That matters now that startup no longer blocks the queue: the first
+    /// `did_open` arrives while this build is in flight and needs the library,
+    /// and before this shared path it started a second R build of its own —
+    /// two concurrent renv activations contending for CPU, the startup one
+    /// timing out, and the reconcile coordinator spawning a third. Behind the
+    /// coordinator mutex `did_open` simply waits for this build and then sees
+    /// `Ready`.
+    async fn run_startup_package_library_build(self) {
+        let attempt = self
+            .coordinated_package_library_initialization(LibraryRoutingDeadline::foreground())
+            .await;
+        let committed = match attempt {
+            Some(PackageInitAttempt::Disabled) => {
+                log::info!("Package function awareness disabled");
+                false
+            }
+            Some(PackageInitAttempt::Committed { .. }) => true,
+            // Another owner (a `did_open` that raced ahead) already committed a
+            // library; nothing to install, but the watcher below still needs to
+            // be attached to that current owner.
+            Some(PackageInitAttempt::Ready) => false,
+            Some(PackageInitAttempt::Stale { attempted_key }) => {
+                log::warn!(
+                    "Startup package-library build did not commit; the reconcile coordinator \
+                     retries it (attempted key {attempted_key:?})"
+                );
+                false
+            }
+            None => {
+                log::warn!("Startup package-library build coordinator deadline expired");
+                false
+            }
+        };
+
+        if !committed {
+            // A didOpen initialization may have won while the startup build was
+            // running. Start a watcher for that current owner without reviving
+            // the startup routing intent.
+            swap_current_libpath_watcher(&self.state, &self.client, &self.routing_tasks, true)
+                .await;
+        }
+
+        // R fallback for sysdata: when the AST scan found nothing AND
+        // R/sysdata.rda exists, try loading via an R subprocess.
+        schedule_current_sysdata_fallback(PackageSeedTaskHandles::from_backend(&self)).await;
+    }
+
+    /// Install a freshly built package library under a Replacement routing
+    /// CAS, tolerating routing-authority drift that happened during the build.
+    ///
+    /// The routing basis is captured before the build so a concurrent
+    /// replacement is detected, but the build itself spawns R and can take
+    /// many seconds. Package-input authority routinely moves in that window:
+    /// the startup package seed lands, a `DESCRIPTION` edit commits, a live
+    /// package buffer opens. None of that changes the library's *construction*
+    /// inputs (R path, additional library paths, workspace root, enablement),
+    /// yet it makes `prospective_library_routing` reject the pre-build basis.
+    /// Discarding the build over that drift handed the work to the reconcile
+    /// coordinator, which respawned R from scratch — on the project that
+    /// motivated this, a second 15 s stall on every startup.
+    ///
+    /// When the pre-build basis is stale but `still_current` confirms the
+    /// construction inputs and readiness intent are unchanged, this
+    /// re-captures a fresh Replacement basis and retries the routing
+    /// derivation with the same library. Dropping the stale bundle deposits its
+    /// reconcile currency and pre-seal ledger into the lifecycle; the fresh
+    /// capture adopts both, so no reconcile request is left behind and the
+    /// commit clears it. A `still_current` failure returns `None` and leaves
+    /// the deposited currency for the coordinator, exactly as before.
+    async fn install_built_package_library(
+        &self,
+        mut captured: Option<CapturedLibraryRouting>,
+        library: Arc<crate::package_library::PackageLibrary>,
+        ready: bool,
+        deadline: LibraryRoutingDeadline,
+        still_current: impl Fn(&WorldState) -> bool,
+    ) -> Option<crate::state::LibraryRoutingTransferredEffects> {
+        const ROUTING_ATTEMPTS: usize = 2;
+        for attempt in 0..ROUTING_ATTEMPTS {
+            {
+                let state = deadline
+                    .wait("built package library currency check", self.state.read())
+                    .await
+                    .ok()?;
+                if !still_current(&state) {
+                    // Dropping `captured` (if any) deposits its reconcile
+                    // currency for the coordinator.
+                    return None;
+                }
+            }
+            let bundle = match captured.take() {
+                Some(bundle) => bundle,
+                None => {
+                    capture_library_routing_basis(
+                        &self.state,
+                        crate::state::LibraryRoutingMutation::Replacement,
+                        None,
+                        crate::state::LibraryReplacementAbortPolicy::Reconcile,
+                        deadline,
+                    )
+                    .await?
+                }
+            };
+            let (basis, replacement_guard, pre_seal) = bundle.into_parts();
+            let Some(driver) = prepare_library_routing_driver(
+                &self.state,
+                basis,
+                replacement_guard,
+                Some(pre_seal),
+                Arc::clone(&library),
+                LibraryRoutingDriverOptions {
+                    ready,
+                    only_packages: None,
+                    warm_open_packages: true,
+                    refresh_cache_epoch: true,
+                    attempt_limit: 2,
+                    deadline,
+                    watcher_runtime: Some(LibpathWatcherRuntime {
+                        client: self.client.clone(),
+                        routing_tasks: self.routing_tasks.clone(),
+                    }),
+                    watcher_recovery: false,
+                },
+            )
+            .await
+            else {
+                log::debug!(
+                    "package-library routing basis went stale during the build \
+                     (attempt {}/{ROUTING_ATTEMPTS}); re-capturing for the same library",
+                    attempt + 1
+                );
+                continue;
+            };
+            match complete_library_routing_driver(&self.state, driver).await {
+                LibraryRoutingTransactionOutcome::Committed(effects) => return Some(effects),
+                LibraryRoutingTransactionOutcome::Superseded => continue,
+                LibraryRoutingTransactionOutcome::RetryExhausted(_driver) => return None,
+            }
+        }
+        None
     }
 
     async fn ensure_package_library_initialized(&self) -> bool {
@@ -5105,6 +5250,7 @@ impl LibraryRoutingPreSealObligation {
     /// Fresh vacuous payload is discarded. Adopted currency or concrete
     /// ledger content is returned for the guard to preserve under the same
     /// lifecycle mutex used to retire its exact intent.
+    #[cfg(test)]
     fn take_for_bundle_retirement(mut self) -> Option<crate::state::LibraryRoutingPreSealDeposit> {
         let deposit = self
             .deposit
@@ -5147,8 +5293,11 @@ impl CapturedLibraryRouting {
         )
     }
 
-    /// Retire a startup replacement made redundant by an already-ready
-    /// package library.
+    /// Retire a replacement bundle made redundant by an already-ready package
+    /// library. Production startup no longer captures a bundle before checking
+    /// readiness (`try_initialize_package_library` returns `Ready` first), so
+    /// this exercises the lifecycle primitive for the routing tests only.
+    #[cfg(test)]
     fn retire_bundle_without_reconcile(mut self) {
         let guard = self
             .replacement_guard
@@ -17831,23 +17980,10 @@ impl LanguageServer for Backend {
         }
 
         // Get workspace folders and config under brief lock
-        let (
-            folders,
-            packages_enabled,
-            packages_r_path,
-            additional_paths,
-            index_workspace,
-            workspace_exclusions,
-        ) = {
+        let (folders, index_workspace, workspace_exclusions) = {
             let state = self.state.read().await;
             (
                 state.workspace_folders.clone(),
-                state.cross_file_config.packages_enabled,
-                state.cross_file_config.packages_r_path.clone(),
-                state
-                    .cross_file_config
-                    .packages_additional_library_paths
-                    .clone(),
                 state.cross_file_config.index_workspace,
                 state.workspace_exclusions.clone(),
             )
@@ -18113,201 +18249,16 @@ impl LanguageServer for Backend {
             .await;
         }
 
-        // Task B: Initialize PackageLibrary (await this - diagnostics need it)
-        // This is fast (~100ms) due to batched R subprocess calls.
-        let startup_routing_deadline = LibraryRoutingDeadline::foreground();
-        let mut startup_routing_basis = capture_library_routing_basis(
-            &self.state,
-            crate::state::LibraryRoutingMutation::Replacement,
-            None,
-            crate::state::LibraryReplacementAbortPolicy::Reconcile,
-            startup_routing_deadline,
-        )
-        .await;
-        let (new_package_library, package_library_ready, load_notes) = 'package_build: {
-            let pkg_start = std::time::Instant::now();
-            let r_calls_before = crate::perf::get_r_subprocess_calls();
-
-            // Get workspace root from folders (if available) for R working
-            // directory (e.g. for renv).
-            let workspace_root = folders.first().and_then(|url| url.to_file_path().ok());
-
-            // The shared helper self-gates on `packages_enabled` (returning
-            // `Disabled` with an empty library and no R discovery), moves R
-            // discovery into kill-on-drop async probes, provider opening onto
-            // dedicated capacity-bounded threads, and computes readiness after
-            // applying additional paths. The helper logs provider-load notes;
-            // perf metrics, the count log, and the "disabled" status log stay
-            // owned by this startup caller.
-            let build = crate::package_library::try_build_package_library(
-                packages_r_path,
-                &additional_paths,
-                workspace_root,
-                packages_enabled,
-                // Startup Task B is passive initialization and may share a
-                // provider generation already started for these exact inputs.
-                crate::package_library::ProviderLoadPolicy::Share,
-            );
-            let outcome = match startup_routing_deadline
-                .wait(
-                    "startup package build",
-                    crate::r_subprocess::with_outer_r_deadline(startup_routing_deadline.at, build),
-                )
-                .await
-            {
-                Ok(Ok(outcome)) => outcome,
-                Ok(Err(error)) => {
-                    log::warn!("Startup package build failed before commit: {error}");
-                    let state = self.state.read().await;
-                    break 'package_build (
-                        state.package_library.clone(),
-                        state.package_library_ready,
-                        Vec::new(),
-                    );
-                }
-                Err(LibraryRoutingDeadlineElapsed(phase)) => {
-                    log::warn!("Startup package build deadline expired during {phase}");
-                    let state = self.state.read().await;
-                    break 'package_build (
-                        state.package_library.clone(),
-                        state.package_library_ready,
-                        Vec::new(),
-                    );
-                }
-            };
-
-            // Captured here before `outcome` is destructured; surfaced after the
-            // commit below, and only if this path wins the race.
-            let package_library_ready = outcome.consumer_ready();
-            let load_notes = outcome.load_notes;
-
-            use crate::package_library::PackageLibraryStatus;
-            let status = outcome.status;
-            let library = outcome.library;
-            if status == PackageLibraryStatus::Disabled {
-                log::info!("Package function awareness disabled");
-                (library, false, load_notes)
-            } else {
-                if let PackageLibraryStatus::InitFailed(e) = &status {
-                    log::warn!("Failed to initialize PackageLibrary: {}", e);
-                }
-                let pkg_duration = pkg_start.elapsed();
-                let r_calls = crate::perf::get_r_subprocess_calls() - r_calls_before;
-                crate::perf::record_package_init(pkg_duration, r_calls);
-
-                log::info!(
-                    "PackageLibrary initialized: {} lib_paths, {} base_packages, {} base_exports",
-                    library.lib_paths().len(),
-                    library.base_packages().len(),
-                    library.base_exports().len()
-                );
-                (library, package_library_ready, load_notes)
-            }
-        };
-
-        // Apply PackageLibrary only if not already initialized.
-        // `ensure_package_library_initialized` (called from `did_open`) may have raced
-        // ahead and already written a library with prefetched package caches.
-        // Overwriting it would discard those caches and cause false-positive
-        // "Package is not installed" diagnostics until the next prefetch.
-        if startup_routing_basis
-            .as_ref()
-            .is_some_and(|captured| captured.basis.ready)
-        {
-            startup_routing_basis
-                .take()
-                .expect("ready startup routing capture remains whole")
-                .retire_bundle_without_reconcile();
+        // Task B: build the PackageLibrary in the background. It spawns R,
+        // which can take 10–15 s on a slow-`renv` project; awaiting it here
+        // held every queued request behind startup (tower-lsp dispatches in
+        // order). See `run_startup_package_library_build`.
+        let startup_backend = self.clone();
+        if !self.routing_tasks.spawn_root(async move {
+            startup_backend.run_startup_package_library_build().await;
+        }) {
+            log::debug!("Shutdown drain retired the startup package-library build before spawn");
         }
-        let routing_effects = if let Some((basis, replacement_guard, pre_seal)) =
-            startup_routing_basis
-                .take()
-                .map(CapturedLibraryRouting::into_parts)
-            && let Some(driver) = prepare_library_routing_driver(
-                &self.state,
-                basis,
-                replacement_guard,
-                Some(pre_seal),
-                new_package_library,
-                LibraryRoutingDriverOptions {
-                    ready: package_library_ready,
-                    only_packages: None,
-                    warm_open_packages: true,
-                    refresh_cache_epoch: true,
-                    attempt_limit: 2,
-                    deadline: startup_routing_deadline,
-                    watcher_runtime: Some(LibpathWatcherRuntime {
-                        client: self.client.clone(),
-                        routing_tasks: self.routing_tasks.clone(),
-                    }),
-                    watcher_recovery: false,
-                },
-            )
-            .await
-        {
-            match complete_library_routing_driver(&self.state, driver).await {
-                LibraryRoutingTransactionOutcome::Committed(effects) => Some(effects),
-                LibraryRoutingTransactionOutcome::Superseded => None,
-                LibraryRoutingTransactionOutcome::RetryExhausted(_driver) => None,
-            }
-        } else {
-            None
-        };
-        let committed = routing_effects.is_some();
-        // Surface Tier 2/3 load notes only if this path committed the library,
-        // so the did_open race (`ensure_package_library_initialized`) doesn't
-        // double-toast the same notes.
-        if committed {
-            self.surface_load_notes(&load_notes).await;
-        }
-
-        // Re-resolve system.file() sources now that lib_paths are available.
-        // The workspace scan (Task A) may have completed before the library
-        // was ready, leaving branch-2 (installed-package) targets unresolved.
-        // This detached convergence pass picks them up.
-        if let Some(transfer) = routing_effects {
-            let fallback = self.state.read().await.documents.keys().cloned().collect();
-            let tickets = finalize_library_routing_effects(
-                PackageSeedTaskHandles::from_backend(self),
-                transfer,
-                Vec::new(),
-                fallback,
-            )
-            .await;
-            // Package initialization previously let diagnostics fanout run in
-            // the background; preserving that timing avoids serializing the
-            // `initialized` handler on debounce or a slow diagnostic pass.
-            self.routing_tasks
-                .spawn_root(crate::r_subprocess::with_outer_r_deadline(
-                    startup_routing_deadline.at,
-                    Backend::publish_diagnostics_for_tickets_bounded(
-                        self.state.clone(),
-                        self.client.clone(),
-                        tickets,
-                        Some(self.traversal_truncation.clone()),
-                    ),
-                ));
-        }
-
-        // Start the libpath watcher if enabled and we have a real package
-        // library. `lib_paths` is captured here as a one-time snapshot — if the
-        // user later changes `.libPaths()` mid-session (e.g. `renv` switches
-        // projects, `.Rprofile` is edited, or `.libPaths(new=...)` is called),
-        // the watcher keeps watching the originally-captured directories. The
-        // documented workaround is the `raven.refreshPackages` command, which
-        // rebuilds `PackageLibrary` (re-running `.libPaths()`) and restarts the
-        // watcher over the newly-discovered paths. See `docs/packages.md`.
-        if !committed {
-            // A didOpen initialization may have won while Task B was building.
-            // Start a watcher for that current owner without reviving Task B's
-            // superseded routing intent.
-            swap_current_libpath_watcher(&self.state, &self.client, &self.routing_tasks, true)
-                .await;
-        }
-
-        // R fallback for sysdata: when the AST scan found nothing AND
-        // R/sysdata.rda exists, try loading via an R subprocess.
-        schedule_current_sysdata_fallback(PackageSeedTaskHandles::from_backend(self)).await;
 
         // Register dynamic file watches for raven.toml / .lintr along the
         // same workspace-root/ancestor paths that project-config discovery
@@ -18349,7 +18300,9 @@ impl LanguageServer for Backend {
                 m.log_summary()
             }
         }
-        log::info!("Initialization complete (workspace scan running in background)");
+        log::info!(
+            "Initialization complete (workspace scan and package-library build running in background)"
+        );
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -57658,6 +57611,103 @@ infixContinuationStyle = "aligned"
             committed_after_baseline,
             std::slice::from_ref(&fresh_key),
             "exactly one fresh key and no stale key must win the library CAS"
+        );
+    }
+
+    /// Package-input drift during the R build (a package seed, an open/close,
+    /// a manifest edit) must not discard the built library: the build's
+    /// construction inputs are unchanged, so `install_built_package_library`
+    /// re-captures its routing basis and commits the same library. Before
+    /// this, the startup build on a renv project was routinely thrown away
+    /// and rebuilt, spawning R twice.
+    #[tokio::test]
+    async fn package_input_drift_during_build_does_not_discard_library() {
+        let tmp = TempDir::new().unwrap();
+        let subject = Url::from_file_path(tmp.path().join("subject.R")).unwrap();
+        let pause_uri = Url::parse("raven-test://package-library-init").unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let install_key_baseline = backend
+            .package_library_install_keys_for_test
+            .lock()
+            .unwrap()
+            .len();
+        let (pause, original_library, original_key) = {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = false;
+            state.force_package_library_not_ready_for_test = true;
+            (
+                state
+                    .package_init_pre_commit_test_pause
+                    .arm(pause_uri.clone()),
+                state.package_library.clone(),
+                PackageInitKey::capture(&state),
+            )
+        };
+
+        let handler = open_doc(backend, &subject, "r", 1, "subject <- 1\n");
+        tokio::pin!(handler);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut handler => panic!("package initialization skipped the CAS barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("package initialization did not reach the CAS barrier")
+            }
+        }
+        // Drift that changes the routing basis but not the construction key.
+        let generation_before = {
+            let mut state = backend.state.write().await;
+            let before = state.package_input_generation();
+            state.record_package_input_mutation();
+            assert_eq!(
+                PackageInitKey::capture(&state),
+                original_key,
+                "package-input drift must not change the construction key"
+            );
+            before
+        };
+        pause.release();
+        handler.await;
+
+        let state = backend.state.read().await;
+        assert!(
+            !Arc::ptr_eq(&state.package_library, &original_library),
+            "the single build must commit despite package-input drift"
+        );
+        assert!(
+            state.package_input_generation() > generation_before,
+            "the drift must have been observed by the build"
+        );
+        assert!(state.documents.contains_key(&subject));
+        drop(state);
+
+        assert_eq!(
+            backend
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire),
+            1,
+            "drift alone must not trigger a rebuild"
+        );
+        let install_keys = backend
+            .package_library_install_keys_for_test
+            .lock()
+            .unwrap();
+        assert_eq!(
+            &install_keys[install_key_baseline..],
+            std::slice::from_ref(&original_key),
+            "exactly the one drifted build must win the library CAS"
         );
     }
 
