@@ -4536,11 +4536,19 @@ where
         {
             return WorkspaceScanRunOutcome::Superseded;
         }
-        log::debug!(
-            "Workspace scan attempt {}/{} lost its authority race; retrying",
-            attempt + 1,
-            WORKSPACE_SCAN_ATTEMPT_LIMIT
-        );
+        if attempt + 1 < WORKSPACE_SCAN_ATTEMPT_LIMIT {
+            log::debug!(
+                "Workspace scan attempt {}/{} lost its authority race; retrying",
+                attempt + 1,
+                WORKSPACE_SCAN_ATTEMPT_LIMIT
+            );
+        } else {
+            log::debug!(
+                "Workspace scan attempt {}/{} lost its authority race; no attempts remain",
+                attempt + 1,
+                WORKSPACE_SCAN_ATTEMPT_LIMIT
+            );
+        }
         tokio::task::yield_now().await;
     }
     WorkspaceScanRunOutcome::RetryExhausted
@@ -18275,7 +18283,8 @@ impl LanguageServer for Backend {
                     }
                     WorkspaceScanRunOutcome::RetryExhausted => {
                         log::warn!(
-                            "Background workspace scan exhausted its two authority attempts"
+                            "Background workspace scan exhausted all {} authority attempts",
+                            WORKSPACE_SCAN_ATTEMPT_LIMIT
                         );
                     }
                     WorkspaceScanRunOutcome::ScanFailed => {
@@ -21030,7 +21039,8 @@ impl Backend {
                     }
                     WorkspaceScanRunOutcome::RetryExhausted => {
                         log::warn!(
-                            "Workspace exclusion reload scan exhausted its two authority attempts"
+                            "Workspace exclusion reload scan exhausted all {} authority attempts",
+                            WORKSPACE_SCAN_ATTEMPT_LIMIT
                         );
                         workspace_scan_fallback_affected = affected;
                     }
@@ -21105,7 +21115,10 @@ impl Backend {
                     log::debug!("Configuration workspace scan was superseded");
                 }
                 WorkspaceScanRunOutcome::RetryExhausted => {
-                    log::warn!("Configuration workspace scan exhausted its two authority attempts");
+                    log::warn!(
+                        "Configuration workspace scan exhausted all {} authority attempts",
+                        WORKSPACE_SCAN_ATTEMPT_LIMIT
+                    );
                 }
                 WorkspaceScanRunOutcome::ScanFailed => {
                     log::error!("Configuration workspace scan failed");

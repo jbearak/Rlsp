@@ -114,12 +114,13 @@ impl PerfMetrics {
             );
         }
 
-        if let Some(d) = self.package_init_duration {
-            log::info!(
+        match self.package_init_duration {
+            Some(d) => log::info!(
                 "[PERF] Package init: {:?} ({} R calls)",
                 d,
                 self.r_subprocess_calls
-            );
+            ),
+            None => log::info!("[PERF] Package init: still running (logged on completion)"),
         }
 
         if let Some(d) = self.r_subprocess_total_duration {
@@ -147,11 +148,17 @@ pub fn record_workspace_scan(duration: Duration, files_scanned: usize) {
     }
 }
 
-/// Record package initialization completion
+/// Record package initialization completion.
+///
+/// Also logs the timing directly. The package library builds on a task
+/// detached from `initialized`, so it usually finishes *after*
+/// [`PerfMetrics::log_summary`] has already printed the startup summary; the
+/// stored metric alone would then never be seen.
 pub fn record_package_init(duration: Duration, r_calls: usize) {
     if !is_enabled() {
         return;
     }
+    log::info!("[PERF] Package init: {duration:?} ({r_calls} R calls)");
     if let Ok(mut metrics) = startup_metrics().lock() {
         metrics.package_init_duration = Some(duration);
         metrics.r_subprocess_calls = r_calls;
