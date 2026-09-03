@@ -4610,15 +4610,20 @@ enum WorkspaceScanDriverMode {
 ///
 /// Retries reuse the previous attempt's scan result when the *scan inputs*
 /// (folders, depth, exclusions, and their generations) are still current at
-/// the next capture: the common lost race is a `did_change` invalidating the
-/// derivation basis, which is not an input to the disk walk. Rescanning then
-/// re-reads and re-parses every file for nothing, and on the multi-second
-/// workspaces that lose races at all it turned a retry into a second full
-/// scan. The cache costs one clone of the result per attempt (ropes, trees
-/// and artifacts are reference-counted, so it is cheap relative to the walk).
-/// Disk edits that land between attempts without moving any scan generation
-/// are picked up by the file watcher, exactly as they would be after a
-/// single-attempt scan.
+/// the next capture *and* the workspace index has not changed since the
+/// result was produced: the common lost race is a `did_change` invalidating
+/// the derivation basis, which touches neither the disk walk's inputs nor
+/// the closed index. Rescanning then re-reads and re-parses every file for
+/// nothing, and on the multi-second workspaces that lose races at all it
+/// turned a retry into a second full scan. The index-version check is what
+/// makes reuse safe: a watched-file resync that updates or deletes a closed
+/// file after the scan read it bumps the index version without touching any
+/// scan-input generation, and `prepare_workspace_scan` lets scanned entries
+/// overwrite retained dynamic ones — so reusing the stale payload would
+/// reinstall old contents or resurrect a deleted file over an event the
+/// watcher already consumed. Such a retry rescans. The cache costs one clone
+/// of the result per attempt (ropes, trees and artifacts are
+/// reference-counted, so it is cheap relative to the walk).
 async fn run_workspace_scan_transaction_with<F, Fut>(
     state_arc: &Arc<RwLock<WorldState>>,
     mode: WorkspaceScanDriverMode,
@@ -4629,18 +4634,21 @@ where
     Fut: Future<Output = Option<crate::state::WorkspaceScanResult>>,
 {
     let intent = state_arc.write().await.begin_workspace_scan_intent();
-    let mut cached: Option<(WorkspaceScanInputs, crate::state::WorkspaceScanResult)> = None;
+    // (inputs the result was scanned under, index version at that capture, result)
+    let mut cached: Option<(WorkspaceScanInputs, u64, crate::state::WorkspaceScanResult)> = None;
     for attempt in 0..WORKSPACE_SCAN_ATTEMPT_LIMIT {
         if mode == WorkspaceScanDriverMode::Detached && attempt >= WORKSPACE_SCAN_EAGER_ATTEMPTS {
             wait_for_workspace_scan_quiet_window(state_arc).await;
         }
-        let (inputs, reuse_cached) = {
+        let (inputs, index_version, reuse_cached) = {
             let state = state_arc.read().await;
             let inputs = WorkspaceScanInputs::capture(&state, intent);
-            let reuse_cached = cached.as_ref().is_some_and(|(previous, _)| {
-                state.workspace_scan_input_basis_is_current(&previous.basis)
+            let index_version = state.workspace_index.version();
+            let reuse_cached = cached.as_ref().is_some_and(|(previous, version, _)| {
+                *version == index_version
+                    && state.workspace_scan_input_basis_is_current(&previous.basis)
             });
-            (inputs, reuse_cached)
+            (inputs, index_version, reuse_cached)
         };
         let Some(inputs) = inputs else {
             let state = state_arc.read().await;
@@ -4651,9 +4659,10 @@ where
             };
         };
         let result = match cached.as_ref() {
-            Some((_, previous)) if reuse_cached => {
+            Some((_, _, previous)) if reuse_cached => {
                 log::debug!(
-                    "Workspace scan attempt {}/{} reuses the previous scan result (scan inputs unchanged)",
+                    "Workspace scan attempt {}/{} reuses the previous scan result \
+                     (scan inputs and closed index unchanged)",
                     attempt + 1,
                     WORKSPACE_SCAN_ATTEMPT_LIMIT
                 );
@@ -4664,7 +4673,7 @@ where
                     return WorkspaceScanRunOutcome::ScanFailed;
                 };
                 if attempt + 1 < WORKSPACE_SCAN_ATTEMPT_LIMIT {
-                    cached = Some((inputs.clone(), result.clone()));
+                    cached = Some((inputs.clone(), index_version, result.clone()));
                 }
                 result
             }
@@ -36910,6 +36919,20 @@ mod project_config_initialize_tests {
     /// advanced (as any closed/open commit would), and the attempt released so
     /// its CAS fails. Returns the driver outcome and the attempt count.
     async fn run_scan_losing_races(lost_races: usize) -> (WorkspaceScanRunOutcome, usize) {
+        run_scan_losing_races_by(lost_races, |state| {
+            state.advance_workspace_scan_generation()
+        })
+        .await
+    }
+
+    /// [`run_scan_losing_races`] with the per-loss invalidation chosen by the
+    /// caller, so tests can distinguish a loss that changes the *scan inputs*
+    /// (must rescan) from one that changes only the derivation basis (may
+    /// reuse the cached scan result).
+    async fn run_scan_losing_races_by(
+        lost_races: usize,
+        mut invalidate: impl FnMut(&mut WorldState),
+    ) -> (WorkspaceScanRunOutcome, usize) {
         let tmp = TempDir::new().unwrap();
         let state = Arc::new(RwLock::new(WorldState::new()));
         state.write().await.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
@@ -36935,7 +36958,7 @@ mod project_config_initialize_tests {
                 .unwrap_or_else(|_| panic!("attempt {} never reached precommit", lost + 1));
             let next_pause = {
                 let mut current = state.write().await;
-                current.advance_workspace_scan_generation();
+                invalidate(&mut current);
                 current
                     .workspace_scan_pre_commit_test_pause
                     .arm(pause_uri.clone())
@@ -36973,6 +36996,68 @@ mod project_config_initialize_tests {
             "third attempt must commit"
         );
         assert_eq!(attempts, 3);
+    }
+
+    /// A lost race caused only by a derivation-basis change (the common case:
+    /// a `did_change` advancing graph authority) leaves the scan inputs and
+    /// the closed index untouched, so the retry reuses the cached disk-scan
+    /// result instead of walking the workspace again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_retry_reuses_scan_result_when_only_derivation_moved() {
+        let (outcome, scans) = run_scan_losing_races_by(2, |state| {
+            state.advance_workspace_graph_authority_generation()
+        })
+        .await;
+        assert!(matches!(outcome, WorkspaceScanRunOutcome::Committed(_)));
+        assert_eq!(
+            scans, 1,
+            "two derivation-only losses must not rescan the disk"
+        );
+    }
+
+    /// A closed-index change between attempts (a watched-file resync updating
+    /// or deleting a file the scan already read) invalidates the cached scan
+    /// result: reusing it would reinstall stale contents or resurrect a
+    /// deleted file over an event the watcher already consumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_retry_rescans_when_closed_index_changed() {
+        let (outcome, scans) = run_scan_losing_races_by(2, |state| {
+            state.advance_workspace_graph_authority_generation();
+            // Any index mutation bumps its version; a synthetic closed entry
+            // stands in for a watched resync landing mid-scan.
+            let uri = Url::parse(&format!(
+                "file:///resync-{}.R",
+                state.workspace_index.version()
+            ))
+            .unwrap();
+            let text = "x <- 1\n";
+            let tree = crate::parser_pool::with_parser(|p| p.parse(text, None));
+            state.workspace_index.insert(
+                uri,
+                crate::workspace_index::IndexEntry {
+                    contents: ropey::Rope::from_str(text),
+                    tree,
+                    loaded_packages: Vec::new(),
+                    data_packages: vec![],
+                    snapshot: crate::cross_file::file_cache::FileSnapshot {
+                        mtime: std::time::SystemTime::UNIX_EPOCH,
+                        size: text.len() as u64,
+                        content_hash: None,
+                    },
+                    metadata: std::sync::Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                    artifacts: std::sync::Arc::new(
+                        crate::cross_file::scope::ScopeArtifacts::default(),
+                    ),
+                    indexed_at_version: 0,
+                },
+            );
+        })
+        .await;
+        assert!(matches!(outcome, WorkspaceScanRunOutcome::Committed(_)));
+        assert_eq!(
+            scans, 3,
+            "each closed-index change must force a fresh disk scan"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

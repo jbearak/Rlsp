@@ -110,13 +110,15 @@ impl PerfMetrics {
         if !is_enabled() {
             return;
         }
-        let reporting = {
-            let mut reporting = package_init_reporting()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            reporting.summary_logged = true;
-            *reporting
-        };
+        // Held for the whole summary so a concurrent `record_package_init`
+        // either lands before this (and is printed here) or after (and prints
+        // itself), never both. Lock order everywhere is metrics → reporting:
+        // callers hold `STARTUP_METRICS` while calling this, and the
+        // `record_*` functions take metrics first too.
+        let mut reporting = package_init_reporting()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reporting.summary_logged = true;
 
         log::info!("[PERF] === Startup Performance Summary ===");
 
@@ -192,15 +194,19 @@ pub fn record_package_init(duration: Duration, r_calls: usize) {
     if !is_enabled() {
         return;
     }
-    if let Ok(mut metrics) = startup_metrics().lock() {
-        metrics.package_init_duration = Some(duration);
-        metrics.r_subprocess_calls = r_calls;
-    }
-    let summary_logged = package_init_reporting()
-        .lock()
-        .map(|reporting| reporting.summary_logged)
-        .unwrap_or(false);
-    if summary_logged {
+    // Metric update and log-once decision under one critical section
+    // (metrics → reporting, the same order `log_summary`'s callers use), so a
+    // summary racing this call cannot print the completion *and* leave
+    // `summary_logged` set for this call to print it again.
+    let Ok(mut metrics) = startup_metrics().lock() else {
+        return;
+    };
+    let Ok(reporting) = package_init_reporting().lock() else {
+        return;
+    };
+    metrics.package_init_duration = Some(duration);
+    metrics.r_subprocess_calls = r_calls;
+    if reporting.summary_logged {
         log::info!("[PERF] Package init: {duration:?} ({r_calls} R calls)");
     }
 }
@@ -211,14 +217,16 @@ pub fn record_package_init_disabled() {
     if !is_enabled() {
         return;
     }
-    let summary_logged = {
-        let Ok(mut reporting) = package_init_reporting().lock() else {
-            return;
-        };
-        reporting.disabled = true;
-        reporting.summary_logged
+    // Same order as `record_package_init`: metrics (held only for ordering),
+    // then reporting; decide and log under both.
+    let Ok(_metrics) = startup_metrics().lock() else {
+        return;
     };
-    if summary_logged {
+    let Ok(mut reporting) = package_init_reporting().lock() else {
+        return;
+    };
+    reporting.disabled = true;
+    if reporting.summary_logged {
         log::info!("[PERF] Package init: disabled");
     }
 }
