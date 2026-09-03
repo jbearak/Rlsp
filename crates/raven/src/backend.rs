@@ -16333,6 +16333,39 @@ fn enrich_box_candidate_importers(
     importers
 }
 
+/// Whether a watched CREATED/CHANGED event for `uri` is bulk discovery of a
+/// file the workspace walk would have pruned, and so must not be admitted.
+///
+/// Incremental discovery obeys the bulk-discovery prune rule: a file under a
+/// hidden or vendored directory that nothing already tracks is not admitted
+/// through the watcher either (VS Code's recursive watcher reports every
+/// create under the workspace, and a dynamic entry admitted that way survives
+/// every later scan). Everything that *does* track the file exempts it:
+///
+/// - an existing index entry or artifact projection (explicit, on-demand);
+/// - a graph dependent — some indexed or open file `source()`s it, so
+///   creating it must index it and clear the importer's missing-file state;
+/// - the package prelude sets — a workspace `.Rprofile` or a testthat/testit
+///   preamble sources it. Such a helper often has no index entry and no graph
+///   dependent (the prelude is harvested, not indexed), and its update is
+///   what lets `watched_items_touch_package_inputs` rescan the prelude.
+///   Dropping it would leave harvested symbols and packages stale.
+fn watched_change_is_bulk_discovery_pruned(state: &WorldState, uri: &Url) -> bool {
+    if state.workspace_index.contains(uri)
+        || state.workspace_index.contains_artifacts(uri)
+        || !state.cross_file_graph.get_dependents(uri).is_empty()
+    {
+        return false;
+    }
+    if let Ok(path) = uri.to_file_path()
+        && (path_in_rprofile_sourced_set(&path, &state.package_inputs.rprofile_sourced_files)
+            || path_in_rprofile_sourced_set(&path, &state.package_inputs.preamble_sourced_files))
+    {
+        return false;
+    }
+    state.is_bulk_discovery_pruned_uri(uri)
+}
+
 /// Reserve one watched generation per closed URI and capture the pre-update
 /// diagnostic fanout. When any event in one normalized notification belongs
 /// to an open source-batch parent, the backend calls this once for the whole
@@ -16446,19 +16479,7 @@ fn collect_watched_resync(
                 if queued_updates.contains(uri) {
                     continue;
                 }
-                // Incremental discovery obeys the bulk-discovery prune rule:
-                // a file under a hidden or vendored directory that the index
-                // has never seen is not admitted through the watcher either.
-                // Entries that already exist (explicit, on-demand) keep
-                // receiving updates.
-                // A file some indexed or open file already `source()`s is an
-                // on-demand target, not bulk discovery: creating it must index
-                // it and clear the importer's missing-file diagnostic.
-                if !state.workspace_index.contains(uri)
-                    && !state.workspace_index.contains_artifacts(uri)
-                    && state.cross_file_graph.get_dependents(uri).is_empty()
-                    && state.is_bulk_discovery_pruned_uri(uri)
-                {
+                if watched_change_is_bulk_discovery_pruned(state, uri) {
                     log::trace!("Ignoring watched change under a pruned directory: {uri}");
                     continue;
                 }
@@ -52616,6 +52637,42 @@ mod project_config_initialize_tests {
         );
         drop(state);
         drop(foreign);
+    }
+
+    /// A helper tracked only by the package prelude sets (`.Rprofile` or a
+    /// testthat preamble `source()`s it; nothing indexes it and no graph edge
+    /// points at it) must survive the hidden-directory prune, or its edits
+    /// never reach the prelude rescan and harvested symbols go stale.
+    #[tokio::test]
+    async fn watched_change_to_prelude_sourced_hidden_helper_is_not_pruned() {
+        let tmp = TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        fs::create_dir_all(tmp.path().join(".scripts")).unwrap();
+        let helper_path = tmp.path().join(".scripts/setup.R");
+        fs::write(&helper_path, "setup_helper <- function() 1\n").unwrap();
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root];
+        assert!(
+            watched_change_is_bulk_discovery_pruned(&state, &helper_uri),
+            "precondition: an untracked hidden helper is pruned"
+        );
+        state
+            .package_inputs
+            .preamble_sourced_files
+            .insert(helper_path.clone());
+        assert!(
+            !watched_change_is_bulk_discovery_pruned(&state, &helper_uri),
+            "a preamble-sourced helper must not be pruned"
+        );
+        state.package_inputs.preamble_sourced_files.clear();
+        state.package_inputs.rprofile_sourced_files.insert(
+            crate::package_state::preamble::canonicalize_for_routing(&helper_path),
+        );
+        assert!(
+            !watched_change_is_bulk_discovery_pruned(&state, &helper_uri),
+            "an .Rprofile-sourced helper must not be pruned (canonical spelling)"
+        );
     }
 
     /// The hidden-directory prune governs bulk discovery only: a file some
