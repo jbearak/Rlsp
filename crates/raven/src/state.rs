@@ -6221,7 +6221,9 @@ impl WorldState {
             graph_revision: self.cross_file_graph.edge_revision(),
             graph_authority_generation: self.workspace_graph_authority_generation,
             open_context_authority_generation: self.open_context_authority_generation,
-            workspace_index_version: self.workspace_index.authority_snapshot().version,
+            // `version()` reads one integer; `authority_snapshot()` would
+            // clone every entry on each 250 ms poll under the read guard.
+            workspace_index_version: self.workspace_index.version(),
             package_input_generation: self.package_input_generation(),
             package_config_generation: self.package_config_generation,
             open_records: self
@@ -6975,6 +6977,53 @@ impl WorldState {
     /// matcher. Empty exclusions are a fast false path.
     pub(crate) fn is_project_excluded_uri(&self, uri: &tower_lsp::lsp_types::Url) -> bool {
         self.workspace_exclusions.is_excluded_uri(uri)
+    }
+
+    /// Whether the workspace walk would never have reached `uri`: some
+    /// directory component of its path *below a workspace folder* is one
+    /// [`should_skip_directory`] prunes (hidden, or the fixed vendored list).
+    ///
+    /// The bulk-discovery rule has to hold for incremental discovery too.
+    /// VS Code's recursive file watcher reports every create/change under the
+    /// workspace, including `.claude/worktrees/<n>/R/foo.R`; if the watched
+    /// resync installed such a file as a dynamic index entry, later scans
+    /// (which retain dynamic entries) would never remove it, and the hidden
+    /// worktrees the scan now skips would trickle back in one edit at a time.
+    /// Callers apply this only to URIs the index has *not* seen: an explicit
+    /// CLI file, an open buffer, or an on-demand `source()` target under a
+    /// hidden directory keeps receiving updates.
+    ///
+    /// Components are judged by their spelled names, as the walk judges
+    /// entries, so a file reached through a visible symlink into a hidden
+    /// target is not pruned here either. A URI outside every workspace folder
+    /// is not pruned (the walk has no opinion about it).
+    pub(crate) fn is_bulk_discovery_pruned_uri(&self, uri: &tower_lsp::lsp_types::Url) -> bool {
+        let Ok(path) = uri.to_file_path() else {
+            return false;
+        };
+        self.workspace_folders
+            .iter()
+            .filter_map(|folder| folder.to_file_path().ok())
+            .filter_map(|root| path.strip_prefix(&root).ok().map(Path::to_path_buf))
+            .any(|relative| {
+                let mut components = relative.components().peekable();
+                let mut pruned = false;
+                while let Some(component) = components.next() {
+                    // The leaf is a file; only directories are pruned.
+                    if components.peek().is_none() {
+                        break;
+                    }
+                    if component
+                        .as_os_str()
+                        .to_str()
+                        .is_some_and(should_skip_directory)
+                    {
+                        pruned = true;
+                        break;
+                    }
+                }
+                pruned
+            })
     }
 
     /// Return metadata suitable for dependency-graph edge construction under
@@ -14868,6 +14917,28 @@ tarchetypes::tar_render(nested, "nested.Rmd")
 
     // Include workspace scanning tests
     include!("state_tests.rs");
+
+    #[test]
+    fn bulk_discovery_pruned_uri_judges_directory_components_under_the_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root];
+        let under = |rel: &str| Url::from_file_path(tmp.path().join(rel)).unwrap();
+        assert!(state.is_bulk_discovery_pruned_uri(&under(".claude/worktrees/w1/R/a.R")));
+        assert!(state.is_bulk_discovery_pruned_uri(&under("node_modules/x/a.R")));
+        assert!(state.is_bulk_discovery_pruned_uri(&under("pkg/.Rproj.user/a.R")));
+        assert!(!state.is_bulk_discovery_pruned_uri(&under("R/a.R")));
+        // Hidden *files* are not directories; the walk's accept filter, not
+        // the prune rule, decides them.
+        assert!(!state.is_bulk_discovery_pruned_uri(&under("R/.hidden.R")));
+        // Outside every workspace folder: no opinion.
+        let outside = Url::from_file_path(
+            std::env::temp_dir().join(".elsewhere/other-root-for-prune-test/a.R"),
+        )
+        .unwrap();
+        assert!(!state.is_bulk_discovery_pruned_uri(&outside));
+    }
 
     #[test]
     fn test_should_skip_directory() {

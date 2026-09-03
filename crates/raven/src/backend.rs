@@ -2448,6 +2448,7 @@ impl Backend {
         let committed = match attempt {
             Some(PackageInitAttempt::Disabled) => {
                 log::info!("Package function awareness disabled");
+                crate::perf::record_package_init_disabled();
                 false
             }
             Some(PackageInitAttempt::Committed { .. }) => true,
@@ -16305,6 +16306,18 @@ fn collect_watched_resync(
                     continue;
                 }
                 if queued_updates.contains(uri) {
+                    continue;
+                }
+                // Incremental discovery obeys the bulk-discovery prune rule:
+                // a file under a hidden or vendored directory that the index
+                // has never seen is not admitted through the watcher either.
+                // Entries that already exist (explicit, on-demand) keep
+                // receiving updates.
+                if !state.workspace_index.contains(uri)
+                    && !state.workspace_index.contains_artifacts(uri)
+                    && state.is_bulk_discovery_pruned_uri(uri)
+                {
+                    log::trace!("Ignoring watched change under a pruned directory: {uri}");
                     continue;
                 }
                 let generation = bump_watched_file_resync_generation(state, uri);
@@ -52152,6 +52165,75 @@ mod project_config_initialize_tests {
         assert!(
             state.workspace_index.get_metadata(&ignored_uri).is_none(),
             "excluded watched-file change must remove stale artifact projection"
+        );
+    }
+
+    /// The scan prunes hidden directories; the watcher must not re-admit
+    /// their files one create/change at a time (dynamic entries survive later
+    /// scans, so one leak would be permanent).
+    #[tokio::test]
+    async fn watched_file_create_under_hidden_directory_is_not_indexed() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[crossFile]\nindexWorkspace = false\n",
+        )
+        .unwrap();
+        let worktree_r = tmp.path().join(".claude/worktrees/w1/R");
+        fs::create_dir_all(&worktree_r).unwrap();
+        let hidden_path = worktree_r.join("helper.R");
+        fs::write(&hidden_path, "helper <- function() 1\n").unwrap();
+        let visible_path = tmp.path().join("visible.R");
+        fs::write(&visible_path, "visible <- function() 2\n").unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let hidden_uri = Url::from_file_path(&hidden_path).unwrap();
+        let visible_uri = Url::from_file_path(&visible_path).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![
+                    FileEvent {
+                        uri: hidden_uri.clone(),
+                        typ: FileChangeType::CREATED,
+                    },
+                    FileEvent {
+                        uri: visible_uri.clone(),
+                        typ: FileChangeType::CREATED,
+                    },
+                ],
+            })
+            .await;
+
+        // The visible file's update lands through the detached watched batch;
+        // once it has, the same batch has also had every chance to admit the
+        // hidden one.
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state.workspace_index.get_metadata(&visible_uri).is_some()
+            })
+            .await,
+            "the same notification's visible file must still be indexed"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            state.workspace_index.get(&hidden_uri).is_none()
+                && state.workspace_index.get_metadata(&hidden_uri).is_none(),
+            "a watched create under a hidden directory must not enter the index"
         );
     }
 

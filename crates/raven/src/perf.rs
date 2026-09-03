@@ -84,6 +84,8 @@ pub struct PerfMetrics {
     pub workspace_scan_duration: Option<Duration>,
     /// Duration of PackageLibrary initialization
     pub package_init_duration: Option<Duration>,
+    /// Package awareness was disabled, so no initialization will run
+    pub package_init_disabled: bool,
     /// Number of files scanned during workspace initialization
     pub files_scanned: usize,
     /// Number of R subprocess calls made
@@ -120,6 +122,9 @@ impl PerfMetrics {
                 d,
                 self.r_subprocess_calls
             ),
+            None if self.package_init_disabled => {
+                log::info!("[PERF] Package init: disabled")
+            }
             None => log::info!("[PERF] Package init: still running (logged on completion)"),
         }
 
@@ -162,6 +167,18 @@ pub fn record_package_init(duration: Duration, r_calls: usize) {
     if let Ok(mut metrics) = startup_metrics().lock() {
         metrics.package_init_duration = Some(duration);
         metrics.r_subprocess_calls = r_calls;
+    }
+}
+
+/// Record that package awareness is disabled, so the summary does not report
+/// an initialization that will never run as "still running".
+pub fn record_package_init_disabled() {
+    if !is_enabled() {
+        return;
+    }
+    log::info!("[PERF] Package init: disabled");
+    if let Ok(mut metrics) = startup_metrics().lock() {
+        metrics.package_init_disabled = true;
     }
 }
 

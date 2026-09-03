@@ -307,7 +307,10 @@ the number of edits a user can land during one scan-plus-derivation. The
 workspace walk itself prunes every hidden directory plus the fixed vendored
 list (`should_skip_directory` in `state.rs`); embedded worktrees under
 `.claude/worktrees/` were multiplying scan time and Find References results
-before that rule existed.
+before that rule existed. The watched-file resync applies the same rule to
+URIs the index has never seen (`WorldState::is_bulk_discovery_pruned_uri`),
+because VS Code's recursive watcher reports every create under the workspace
+and a dynamic entry admitted that way survives every later scan.
 
 Document analysis has one authority per lifecycle state. Open buffers live in
 `OpenDocumentStore`; all closed records live in `WorkspaceIndex`. The closed
