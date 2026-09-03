@@ -155,10 +155,9 @@ fn validated_package_directories(lib_paths: &[PathBuf]) -> HashMap<String, PathB
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
+            // renv project libraries normally contain symlinks into its global
+            // cache, and R follows them when resolving installed packages.
+            if !entry.path().is_dir() {
                 continue;
             }
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -3939,6 +3938,34 @@ mod tests {
                 HashSet::from(["known_plot".to_string()]),
             )])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renv_outside_overlay_recognizes_symlinked_active_packages() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        let active = temp.path().join("active");
+        let cache = temp.path().join("cache");
+        for path in [&project, &outside, &active, &cache] {
+            std::fs::create_dir(path).unwrap();
+        }
+        write_synthetic_package(&outside, "plotpkg", "plotpkg");
+        write_synthetic_package(&cache, "plotpkg", "plotpkg");
+        symlink(cache.join("plotpkg"), active.join("plotpkg")).unwrap();
+
+        let overlay = build_renv_outside_active_overlay(
+            crate::r_subprocess::RenvLibraryPathTransition {
+                project_root: project,
+                outside_paths: vec![outside],
+            },
+            &[active],
+        );
+
+        assert!(overlay.is_none());
     }
 
     #[test]
