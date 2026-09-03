@@ -18636,7 +18636,7 @@ impl LanguageServer for Backend {
         let init_duration = init_start.elapsed();
         if crate::perf::is_enabled() {
             log::info!("[PERF] Total initialization: {:?}", init_duration);
-            if let Ok(mut m) = crate::perf::startup_metrics().lock() {
+            if let Ok(m) = crate::perf::startup_metrics().lock() {
                 m.log_summary()
             }
         }

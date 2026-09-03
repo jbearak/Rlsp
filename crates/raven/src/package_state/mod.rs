@@ -852,9 +852,13 @@ use std::path::Path;
 ///
 /// Rules:
 /// - `<root>/R/*.R` (or `*.r`) → `Source`
-/// - `<root>/R/unix/*.R` and `<root>/R/windows/*.R` → `Source` (the two
-///   OS-specific subdirectories `tools::list_files_with_type(OS_subdirs = )`
+/// - `<root>/R/unix/*.R` and `<root>/R/windows/*.R` (or `*.r`) → `Source`
+///   (the two OS-specific subdirectories that
+///   `tools::list_files_with_type(path_r, "code", OS_subdirs = c("unix", "windows"))`
 ///   loads; matched case-sensitively like R does)
+/// - a `Source` basename must start with an ASCII letter or digit, exactly
+///   as `list_files_with_type(.., "code")` filters: `R/_helper.R`,
+///   `R/.hidden.R`, and `R/unix/_x.R` are not package code and are `None`.
 /// - any other `<root>/R/<sub>/…` → `None`. R does not recurse into `R/`:
 ///   `R CMD INSTALL`, `devtools::load_all()`, and `pkgload` all take the
 ///   non-recursive `list_files_with_type(path_r, "code")` listing, so a script
@@ -885,6 +889,12 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
 
     match first {
         "R" => {
+            // R's code-file listing accepts only basenames that start with an
+            // ASCII letter or digit (`tools::list_files_with_type`, type
+            // "code"). Anything else under `R/` is never part of the namespace.
+            if !has_r_code_basename(path) {
+                return None;
+            }
             let second = comps.next()?.as_os_str().to_str()?;
             if comps.next().is_none() {
                 // Direct child of R/ — the file itself.
@@ -922,6 +932,16 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
         }
         _ => None,
     }
+}
+
+/// Whether `path`'s basename would pass R's code-file name filter: the first
+/// byte is an ASCII letter or digit (`tools::list_files_with_type(.., "code")`
+/// keeps `^[A-Za-z0-9]` only, deliberately avoiding locale-dependent ranges).
+fn has_r_code_basename(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.bytes().next())
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
 }
 
 /// Whether `path` is spelled as an R source file (`.R` or `.r`).
@@ -1285,6 +1305,36 @@ mod path_tests {
             "/work/pkg/R/Unix/x.R", // case-sensitive, like R
         ] {
             assert_eq!(is_r_source_path(Path::new(path), root), None, "{path}");
+        }
+    }
+
+    /// `tools::list_files_with_type(.., "code")` keeps only basenames whose
+    /// first character is an ASCII letter or digit, so `R/_helper.R` and
+    /// `R/.hidden.R` (and the same names under `R/unix`, `R/windows`) are not
+    /// package code even though they carry the `.R` extension.
+    #[test]
+    #[allow(non_snake_case)]
+    fn r_source_path_applies_R_code_basename_filter() {
+        let root = Path::new("/work/pkg");
+        for path in [
+            "/work/pkg/R/_helper.R",
+            "/work/pkg/R/.hidden.R",
+            "/work/pkg/R/-dash.R",
+            "/work/pkg/R/unix/_helper.R",
+            "/work/pkg/R/windows/.hidden.r",
+        ] {
+            assert_eq!(is_r_source_path(Path::new(path), root), None, "{path}");
+        }
+        for path in [
+            "/work/pkg/R/a.R",
+            "/work/pkg/R/0-setup.R",
+            "/work/pkg/R/unix/Zz.r",
+        ] {
+            assert_eq!(
+                is_r_source_path(Path::new(path), root),
+                Some(RFileKind::Source),
+                "{path}"
+            );
         }
     }
 

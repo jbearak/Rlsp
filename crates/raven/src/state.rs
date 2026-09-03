@@ -1816,12 +1816,19 @@ enum OpenLifecycleIntentState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkspaceScanAuthorityStamp {
     scan_generation: u64,
+    tar_source_event_generation: u64,
+    analysis_config_generation: AnalysisConfigGeneration,
+    chunk_override_generation: ChunkOverrideGeneration,
     graph_revision: u64,
     graph_authority_generation: u64,
     open_context_authority_generation: OpenContextAuthorityGeneration,
     workspace_index_version: u64,
     package_input_generation: u64,
     package_config_generation: u64,
+    package_state_record_generation: u64,
+    system_file_routing_owner: SystemFileRoutingOwnerIdentity,
+    package_library_install_id: u64,
+    package_library_content_generation: u64,
 }
 
 /// Latest-arrival ownership for one top-level full workspace scan.
@@ -6234,16 +6241,29 @@ impl WorldState {
         })
     }
 
-    /// Cheap fingerprint of everything that invalidates an in-flight workspace
-    /// scan's derivation basis short of open-record identity: the generations
-    /// compared by `workspace_scan_input_basis_is_current` and
-    /// `workspace_scan_derivation_basis_is_current`, plus the open-record
-    /// tokens (which every `did_change` commit advances). Two equal stamps mean
-    /// no scan-invalidating commit happened between them. Used by the scan
-    /// driver's quiet-window wait; not a substitute for the full CAS.
+    /// Cheap fingerprint of every *generation* that invalidates an in-flight
+    /// workspace scan: those compared by `workspace_scan_input_basis_is_current`
+    /// (scan, tar-source, analysis-config, chunk-override) and by
+    /// `workspace_scan_derivation_basis_is_current` (graph revision and
+    /// authority, index version, package input/config/state-record, routing
+    /// owner, library install and content), plus the open-context generation
+    /// that every open-record install/remove advances. Two equal stamps mean
+    /// no scan-invalidating commit happened between them.
+    ///
+    /// Deliberately omitted are the non-generation inputs those two predicates
+    /// also compare (workspace folders, exclusion patterns, depth/visit limits,
+    /// index config, workspace name/root/library paths): each is only ever
+    /// changed by a commit that also advances one of the stamped generations
+    /// (config recompute bumps `analysis_config_generation`; a library or
+    /// routing commit bumps its install/content/owner identity), so stamping
+    /// the integer is enough and keeps the poll allocation-free. Used by the
+    /// scan driver's quiet-window wait; not a substitute for the full CAS.
     pub(crate) fn workspace_scan_authority_stamp(&self) -> WorkspaceScanAuthorityStamp {
         WorkspaceScanAuthorityStamp {
             scan_generation: self.workspace_scan_generation,
+            tar_source_event_generation: self.tar_source_event_generation,
+            analysis_config_generation: self.analysis_config_generation,
+            chunk_override_generation: self.chunk_override_generation,
             graph_revision: self.cross_file_graph.edge_revision(),
             graph_authority_generation: self.workspace_graph_authority_generation,
             open_context_authority_generation: self.open_context_authority_generation,
@@ -6252,6 +6272,10 @@ impl WorldState {
             workspace_index_version: self.workspace_index.version(),
             package_input_generation: self.package_input_generation(),
             package_config_generation: self.package_config_generation,
+            package_state_record_generation: self.package_state_record_generation,
+            system_file_routing_owner: self.system_file_routing_owner_identity(),
+            package_library_install_id: self.package_library_install_id,
+            package_library_content_generation: self.package_library_content_generation,
         }
     }
 
