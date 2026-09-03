@@ -1809,6 +1809,20 @@ enum OpenLifecycleIntentState {
 ///
 /// The process-wide generation is never reused. Both allowed full attempts
 /// retain the same token; a newer driver permanently supersedes the older one.
+/// Snapshot returned by `WorldState::workspace_scan_authority_stamp`; equality
+/// means no scan-invalidating commit occurred between the two captures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceScanAuthorityStamp {
+    scan_generation: u64,
+    graph_revision: u64,
+    graph_authority_generation: u64,
+    open_context_authority_generation: OpenContextAuthorityGeneration,
+    workspace_index_version: u64,
+    package_input_generation: u64,
+    package_config_generation: u64,
+    open_records: std::collections::BTreeMap<Url, crate::open_document_store::OpenRecordToken>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkspaceScanIntentToken {
     generation: u64,
@@ -6193,7 +6207,34 @@ impl WorldState {
         })
     }
 
-    fn workspace_scan_input_basis_is_current(&self, basis: &WorkspaceScanInputBasis) -> bool {
+    /// Cheap fingerprint of everything that invalidates an in-flight workspace
+    /// scan's derivation basis short of open-record identity: the generations
+    /// compared by `workspace_scan_input_basis_is_current` and
+    /// `workspace_scan_derivation_basis_is_current`, plus the open-record
+    /// tokens (which every `did_change` commit advances). Two equal stamps mean
+    /// no scan-invalidating commit happened between them. Used by the scan
+    /// driver's quiet-window wait; not a substitute for the full CAS.
+    pub(crate) fn workspace_scan_authority_stamp(&self) -> WorkspaceScanAuthorityStamp {
+        WorkspaceScanAuthorityStamp {
+            scan_generation: self.workspace_scan_generation,
+            graph_revision: self.cross_file_graph.edge_revision(),
+            graph_authority_generation: self.workspace_graph_authority_generation,
+            open_context_authority_generation: self.open_context_authority_generation,
+            workspace_index_version: self.workspace_index.authority_snapshot().version,
+            package_input_generation: self.package_input_generation(),
+            package_config_generation: self.package_config_generation,
+            open_records: self
+                .documents
+                .keys()
+                .map(|uri| (uri.clone(), self.documents.record_token(uri)))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn workspace_scan_input_basis_is_current(
+        &self,
+        basis: &WorkspaceScanInputBasis,
+    ) -> bool {
         self.workspace_scan_intent_is_current(basis.intent)
             && self.workspace_scan_generation == basis.scan_generation
             && self.tar_source_event_generation == basis.tar_source_event_generation
@@ -12289,10 +12330,10 @@ struct ProcessedFile {
 
 /// Recursively collect file paths under `dir` whose leaf matches `accept`
 /// (serial walk, fast). Symlinked directories ARE followed, with canonical-path
-/// cycle detection to terminate on loops and avoid double-counting; the
-/// non-source directories in [`should_skip_directory`] (`.git`, `node_modules`,
-/// `renv`, `target`, …) are pruned. Results are unsorted; callers that need
-/// deterministic order sort afterwards.
+/// cycle detection to terminate on loops and avoid double-counting; hidden
+/// directories and the non-source directories in [`should_skip_directory`]
+/// (`.git`, `.claude`, `node_modules`, `renv`, `target`, …) are pruned.
+/// Results are unsorted; callers that need deterministic order sort afterwards.
 ///
 /// This is the single directory walk shared by the workspace indexer (which
 /// passes [`is_stat_model_extension`] to collect
@@ -12381,13 +12422,16 @@ fn collect_files_matching_inner(
                     continue;
                 }
             };
-            // A symlink whose own name isn't skip-listed but whose TARGET is
-            // (e.g. `deps -> node_modules`) must be pruned too, or it pulls the
-            // whole vendored tree back into the scan.
+            // A symlink whose own name isn't skip-listed but whose TARGET is a
+            // vendored directory (e.g. `deps -> node_modules`) must be pruned
+            // too, or it pulls the whole vendored tree back into the scan. Only
+            // the vendored list applies here: a visible symlink into a hidden
+            // target is an intentional mount point, and `tempfile` roots are
+            // themselves hidden (`.tmpXXXX`).
             if canonical
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(should_skip_directory)
+                .is_some_and(is_vendored_directory)
             {
                 log::trace!(
                     "Skipping symlinked directory {} -> {}",
@@ -12761,31 +12805,54 @@ pub fn scan_workspace_with_exclusions(
     entries
 }
 
-/// Directories to skip during workspace scanning.
+/// Non-hidden directories to skip during workspace scanning.
 ///
 /// This is a conservative list of directories that are extremely unlikely to
 /// contain user R source files. The workspace scan runs in the background,
 /// so the primary goal is to avoid wasting time on directories that would
-/// never contain R files.
+/// never contain R files. Hidden directories (leading `.`) are pruned by
+/// [`should_skip_directory`] without being listed here.
 ///
 /// Comparison is case-insensitive. This list is also used by the
 /// `analysis-stats` CLI (via [`should_skip_directory`]).
 const SKIP_DIRECTORIES: &[&str] = &[
-    ".git",         // Git internal files
-    ".github",      // GitHub Actions workflows (not package code)
-    ".svn",         // Subversion internal files
-    ".hg",          // Mercurial internal files
     "node_modules", // JavaScript dependencies (can have 100k+ files)
-    ".Rproj.user",  // RStudio user-local project state
     "renv",         // renv package library cache
     "packrat",      // packrat package library cache
-    ".vscode",      // VS Code settings
-    ".idea",        // JetBrains IDE settings
     "target",       // Rust build artifacts
 ];
 
-/// Check if a directory should be skipped during scanning.
+/// Check if a directory entry should be skipped during scanning, by the name
+/// it is spelled with in the tree.
+///
+/// Every hidden directory (name starting with `.`) is skipped, plus the
+/// vendored/build directories in `SKIP_DIRECTORIES`. Hidden directories hold
+/// VCS internals (`.git`, `.svn`, `.hg`), IDE state (`.vscode`, `.idea`,
+/// `.Rproj.user`), CI config (`.github`), and — the case that motivated the
+/// blanket rule — AI coding agents' embedded git worktrees (`.claude/worktrees/`,
+/// `.codex/…`): dozens of full copies of the repository, each with its own
+/// `R/` and `tests/`, that would otherwise be indexed as workspace sources,
+/// multiply Find References results, and slow the background scan by an order
+/// of magnitude. R itself never reads hidden entries when it loads a package
+/// (`tools::list_files_with_type(all.files = FALSE)`), and the `tar_source()`
+/// expansion walk already skips them, so the workspace walk now matches. The
+/// rule is unconditional — `[workspace].exclude` negations cannot re-include a
+/// hidden tree — but it only governs bulk discovery: an explicit CLI file
+/// argument, an open buffer, and on-demand indexing of a `source()` target
+/// under a hidden directory all still work.
+///
+/// The hidden rule is about the *spelled* entry only. A symlink whose own name
+/// is visible but whose target is a hidden directory (`shared -> ../.cache/lib`,
+/// or a `tempfile` `.tmpXXXX` directory) is a deliberate, visible mount point
+/// and is walked; see [`is_vendored_directory`] for the target-name check.
 pub(crate) fn should_skip_directory(dir_name: &str) -> bool {
+    dir_name.starts_with('.') || is_vendored_directory(dir_name)
+}
+
+/// The vendored/build-directory half of [`should_skip_directory`], applied to
+/// both an entry's own name and a symlink's canonical target name so that
+/// `deps -> node_modules` cannot pull a vendored tree back into the scan.
+pub(crate) fn is_vendored_directory(dir_name: &str) -> bool {
     SKIP_DIRECTORIES
         .iter()
         .any(|skip| dir_name.eq_ignore_ascii_case(skip))
@@ -14810,6 +14877,87 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         assert!(!should_skip_directory("R"));
         assert!(!should_skip_directory("src"));
         assert!(!should_skip_directory("data"));
+    }
+
+    /// Every hidden directory is pruned, not just the handful of well-known
+    /// VCS/IDE names: an AI agent's embedded worktrees under `.claude/` (or any
+    /// other dot-directory) must never reach the workspace index.
+    #[test]
+    fn should_skip_directory_prunes_every_hidden_directory() {
+        for hidden in [
+            ".claude",
+            ".codex",
+            ".Rproj.user",
+            ".vscode",
+            ".idea",
+            ".cache",
+            ".x",
+        ] {
+            assert!(should_skip_directory(hidden), "{hidden} must be pruned");
+        }
+        // A leading dot is the rule; a dot elsewhere is an ordinary name.
+        assert!(!should_skip_directory("my.scripts"));
+        assert!(!should_skip_directory("v1.2"));
+        // The symlink-target check uses only the vendored list.
+        assert!(is_vendored_directory("node_modules"));
+        assert!(is_vendored_directory("RENV"));
+        assert!(!is_vendored_directory(".claude"));
+    }
+
+    /// A visible symlink whose target is a hidden directory is an intentional
+    /// mount point and must be walked (the `tempfile` crate's `.tmpXXXX` roots
+    /// are exactly this shape, so `raven check`'s symlink coverage depends on
+    /// it).
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_matching_follows_visible_symlink_to_hidden_target() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let hidden = tmp.path().join(".cache").join("lib");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::write(hidden.join("mounted.R"), "1\n").unwrap();
+        std::os::unix::fs::symlink(&hidden, tmp.path().join("shared")).unwrap();
+
+        let mut out = Vec::new();
+        collect_files_matching(tmp.path(), &mut out, is_stat_model_extension);
+
+        // Reached once, through the visible `shared` spelling; the direct
+        // `.cache` path is pruned.
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert!(out[0].ends_with("shared/mounted.R"), "got {out:?}");
+    }
+
+    /// End-to-end through the walk: a hidden directory containing an embedded
+    /// worktree copy of the package is skipped, while a dotted-but-not-hidden
+    /// sibling and the real sources are collected.
+    #[test]
+    fn collect_files_matching_skips_hidden_directories() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(tmp.path().join("R").join("real.R"), "1\n").unwrap();
+        let worktree = tmp
+            .path()
+            .join(".claude")
+            .join("worktrees")
+            .join("wt-1")
+            .join("R");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join("real.R"), "1\n").unwrap();
+        fs::create_dir(tmp.path().join("my.scripts")).unwrap();
+        fs::write(tmp.path().join("my.scripts").join("dotted.R"), "1\n").unwrap();
+
+        let mut out = Vec::new();
+        collect_files_matching(tmp.path(), &mut out, is_stat_model_extension);
+        out.sort();
+
+        assert_eq!(out.len(), 2, "got {out:?}");
+        assert!(out[0].ends_with("R/real.R"), "got {out:?}");
+        assert!(out[1].ends_with("my.scripts/dotted.R"), "got {out:?}");
+        assert!(
+            !out.iter().any(|p| p.to_string_lossy().contains(".claude")),
+            "hidden worktree copy leaked into the scan: {out:?}"
+        );
     }
 
     #[test]

@@ -4292,13 +4292,48 @@ async fn apply_workspace_scan_if_current(
         .workspace_scan
 }
 
-/// Run at most two complete attempts for one latest-arrival scan intent.
+/// Attempts (disk scan + derivation + commit CAS) per scan intent before the
+/// driver gives up. Each attempt is a full re-scan, so the ceiling bounds the
+/// worst case for a workspace whose open buffers never stop changing.
+const WORKSPACE_SCAN_ATTEMPT_LIMIT: usize = 6;
+
+/// Attempts that repeat the disk scan the moment the previous CAS fails. From
+/// this attempt on, the driver first waits for the state to go quiet
+/// ([`WORKSPACE_SCAN_QUIET_WINDOW`]) so a steady stream of `did_change`
+/// commits cannot invalidate every attempt.
+const WORKSPACE_SCAN_EAGER_ATTEMPTS: usize = 2;
+
+/// How long the scan inputs must stay unchanged before a non-eager attempt
+/// begins. Long enough to outlast the ~200 ms edit debounce that drives most
+/// open-document commits; short enough that the index still lands within a
+/// second or two of the user pausing.
+const WORKSPACE_SCAN_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Upper bound on waiting for a quiet window before an attempt proceeds anyway.
+const WORKSPACE_SCAN_QUIET_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run up to [`WORKSPACE_SCAN_ATTEMPT_LIMIT`] complete attempts for one
+/// latest-arrival scan intent.
 ///
-/// A CAS rejection discards the whole attempt. Attempt two recaptures the
+/// A CAS rejection discards the whole attempt. Every retry recaptures the
 /// pre-I/O basis and repeats disk scan plus graph/artifact derivation from
 /// scratch, while retaining the same arrival intent. A newer intent
 /// supersedes immediately and can never be mistaken for intentional no-scan
 /// completion.
+///
+/// Why more than two attempts, and why the quiet window: the derivation basis
+/// is invalidated by *any* open-document commit (every `did_change` advances
+/// the open-record token), and a multi-second scan of a large workspace is
+/// almost guaranteed to overlap one when the user is typing. Two back-to-back
+/// attempts against a workspace that took ~30 s to scan and derive both lost
+/// the race on a real project, the driver logged "exhausted" and gave up, and
+/// the editor ran for the rest of the session with no workspace index — Find
+/// References returned only the current file, `# raven: sourced-by` auto-detect
+/// stayed off, and cross-file definitions in closed files never resolved. With
+/// nothing re-arming the scan (only config edits and watched-file events do),
+/// that state persisted until restart. The eager first attempts keep the fast
+/// path fast; later attempts wait for the scan inputs to hold still so they
+/// commit against a basis that is likely to survive.
 async fn run_workspace_scan_transaction_using<F, Fut>(
     state_arc: &Arc<RwLock<WorldState>>,
     mut scan: F,
@@ -4308,7 +4343,10 @@ where
     Fut: Future<Output = Option<crate::state::WorkspaceScanResult>>,
 {
     let intent = state_arc.write().await.begin_workspace_scan_intent();
-    for attempt in 0..2 {
+    for attempt in 0..WORKSPACE_SCAN_ATTEMPT_LIMIT {
+        if attempt >= WORKSPACE_SCAN_EAGER_ATTEMPTS {
+            wait_for_workspace_scan_quiet_window(state_arc).await;
+        }
         let inputs = {
             let state = state_arc.read().await;
             WorkspaceScanInputs::capture(&state, intent)
@@ -4342,12 +4380,38 @@ where
         {
             return WorkspaceScanRunOutcome::Superseded;
         }
-        if attempt == 1 {
-            return WorkspaceScanRunOutcome::RetryExhausted;
-        }
+        log::debug!(
+            "Workspace scan attempt {}/{} lost its authority race; retrying",
+            attempt + 1,
+            WORKSPACE_SCAN_ATTEMPT_LIMIT
+        );
         tokio::task::yield_now().await;
     }
-    unreachable!("the fixed two-attempt loop always returns")
+    WorkspaceScanRunOutcome::RetryExhausted
+}
+
+/// Wait until the scan-input authority has not moved for
+/// [`WORKSPACE_SCAN_QUIET_WINDOW`], or until [`WORKSPACE_SCAN_QUIET_WAIT_LIMIT`]
+/// elapses. Polls a cheap generation snapshot under short read locks; never
+/// holds the lock across a sleep.
+async fn wait_for_workspace_scan_quiet_window(state_arc: &Arc<RwLock<WorldState>>) {
+    let started = tokio::time::Instant::now();
+    let mut last = state_arc.read().await.workspace_scan_authority_stamp();
+    let mut quiet_since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(WORKSPACE_SCAN_QUIET_WINDOW / 3).await;
+        let now = tokio::time::Instant::now();
+        let current = state_arc.read().await.workspace_scan_authority_stamp();
+        if current != last {
+            last = current;
+            quiet_since = now;
+        }
+        if now.duration_since(quiet_since) >= WORKSPACE_SCAN_QUIET_WINDOW
+            || now.duration_since(started) >= WORKSPACE_SCAN_QUIET_WAIT_LIMIT
+        {
+            return;
+        }
+    }
 }
 
 async fn run_workspace_scan_transaction(
@@ -36443,13 +36507,16 @@ mod project_config_initialize_tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn workspace_scan_retry_ceiling_is_two() {
+    /// Drive one scan intent through `lost_races` CAS rejections: each attempt
+    /// is paused at its pre-commit barrier, the scan-input generation is
+    /// advanced (as any closed/open commit would), and the attempt released so
+    /// its CAS fails. Returns the driver outcome and the attempt count.
+    async fn run_scan_losing_races(lost_races: usize) -> (WorkspaceScanRunOutcome, usize) {
         let tmp = TempDir::new().unwrap();
         let state = Arc::new(RwLock::new(WorldState::new()));
         state.write().await.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
         let pause_uri = Url::parse(WORKSPACE_SCAN_PRE_COMMIT_PAUSE_URI).unwrap();
-        let first_pause = state
+        let mut pause = state
             .read()
             .await
             .workspace_scan_pre_commit_test_pause
@@ -36464,36 +36531,53 @@ mod project_config_initialize_tests {
             })
             .await
         });
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            first_pause.wait_arrived(),
-        )
-        .await
-        .expect("first attempt reaches precommit");
-        let second_pause = {
-            let mut current = state.write().await;
-            current.advance_workspace_scan_generation();
-            current.workspace_scan_pre_commit_test_pause.arm(pause_uri)
-        };
-        first_pause.release();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            second_pause.wait_arrived(),
-        )
-        .await
-        .expect("second attempt repeats full derivation");
-        state.write().await.advance_workspace_scan_generation();
-        second_pause.release();
+        for lost in 0..lost_races {
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.wait_arrived())
+                .await
+                .unwrap_or_else(|_| panic!("attempt {} never reached precommit", lost + 1));
+            let next_pause = {
+                let mut current = state.write().await;
+                current.advance_workspace_scan_generation();
+                current
+                    .workspace_scan_pre_commit_test_pause
+                    .arm(pause_uri.clone())
+            };
+            pause.release();
+            pause = next_pause;
+        }
+        // The attempt after the last forced loss (if any) runs to completion
+        // unobstructed.
+        tokio::time::timeout(std::time::Duration::from_secs(30), pause.wait_arrived())
+            .await
+            .ok();
+        pause.release();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), task)
+            .await
+            .expect("scan driver finished")
+            .unwrap();
+        (outcome, attempts.load(Ordering::SeqCst))
+    }
 
-        assert!(matches!(
-            task.await.unwrap(),
-            WorkspaceScanRunOutcome::RetryExhausted
-        ));
-        let state = state.read().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert!(!state.workspace_scan_complete);
-        assert_eq!(state.workspace_index.len(), 0);
-        assert_eq!(state.analysis_revalidation_reservation_count, 0);
+    /// Regression for the real-workspace failure that motivated the raised
+    /// ceiling: two consecutive lost CAS races (a `did_change` landing during
+    /// each multi-second scan) used to exhaust the driver and leave the editor
+    /// with no workspace index for the rest of the session. The third attempt
+    /// must commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_commits_after_two_lost_races() {
+        let (outcome, attempts) = run_scan_losing_races(2).await;
+        assert!(
+            matches!(outcome, WorkspaceScanRunOutcome::Committed(_)),
+            "third attempt must commit"
+        );
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_retry_ceiling_is_attempt_limit() {
+        let (outcome, attempts) = run_scan_losing_races(WORKSPACE_SCAN_ATTEMPT_LIMIT).await;
+        assert!(matches!(outcome, WorkspaceScanRunOutcome::RetryExhausted));
+        assert_eq!(attempts, WORKSPACE_SCAN_ATTEMPT_LIMIT);
     }
 
     #[tokio::test]

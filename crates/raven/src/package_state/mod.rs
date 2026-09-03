@@ -851,7 +851,17 @@ use std::path::Path;
 /// based on the workspace root. Returns `None` otherwise.
 ///
 /// Rules:
-/// - `<root>/R/**/*.R` (or `*.r`) → `Source`
+/// - `<root>/R/*.R` (or `*.r`) → `Source`
+/// - `<root>/R/unix/*.R` and `<root>/R/windows/*.R` → `Source` (the two
+///   OS-specific subdirectories `tools::list_files_with_type(OS_subdirs = )`
+///   loads; matched case-sensitively like R does)
+/// - any other `<root>/R/<sub>/…` → `None`. R does not recurse into `R/`:
+///   `R CMD INSTALL`, `devtools::load_all()`, and `pkgload` all take the
+///   non-recursive `list_files_with_type(path_r, "code")` listing, so a script
+///   under `R/scripts/` is neither part of the namespace nor able to see it
+///   unqualified. Treating it as `Source` would hide genuine undefined-variable
+///   diagnostics in both directions and pull non-package scripts into
+///   mutual visibility.
 /// - `<root>/tests/testthat/**/*.R` (or `*.r`) → `Test`
 /// - `<root>/tests/testit/**/*.R` (or `*.r`) → `Test`
 /// - `<root>/tests/*.R` (direct children only, or `*.r`) → `Test`
@@ -875,7 +885,21 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
     }
 
     match first {
-        "R" => Some(RFileKind::Source),
+        "R" => {
+            let second = comps.next()?.as_os_str().to_str()?;
+            if comps.next().is_none() {
+                // Direct child of R/ — the file itself.
+                return Some(RFileKind::Source);
+            }
+            // `R/unix/x.R`, `R/windows/x.R`: the only subdirectories R loads.
+            // `comps` has consumed the third component; anything deeper
+            // (`R/unix/sub/x.R`) is not loaded either.
+            if (second == "unix" || second == "windows") && comps.next().is_none() {
+                Some(RFileKind::Source)
+            } else {
+                None
+            }
+        }
         "inst" => {
             // Installed test suites run with the package loaded.
             let second = comps.next()?.as_os_str().to_str()?;
@@ -1227,14 +1251,34 @@ mod path_tests {
 
     #[test]
     #[allow(non_snake_case)]
-    fn r_source_path_recognizes_subdirs_in_R() {
+    fn r_source_path_recognizes_os_subdirs_in_R() {
+        let root = Path::new("/work/pkg");
         assert_eq!(
-            is_r_source_path(
-                Path::new("/work/pkg/R/unix/utils.R"),
-                Path::new("/work/pkg")
-            ),
+            is_r_source_path(Path::new("/work/pkg/R/unix/utils.R"), root),
             Some(RFileKind::Source),
         );
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/R/windows/utils.R"), root),
+            Some(RFileKind::Source),
+        );
+    }
+
+    /// R never recurses into `R/`: only `R/*.R` plus the OS-specific
+    /// `R/unix` / `R/windows` are loaded. A script under any other `R/`
+    /// subdirectory (`R/mics/loop.R`, `R/scripts/run.R`) is not package source
+    /// and must not join mutual visibility.
+    #[test]
+    #[allow(non_snake_case)]
+    fn r_source_path_rejects_other_subdirs_in_R() {
+        let root = Path::new("/work/pkg");
+        for path in [
+            "/work/pkg/R/mics/loop.R",
+            "/work/pkg/R/scripts/run.R",
+            "/work/pkg/R/unix/deeper/x.R",
+            "/work/pkg/R/Unix/x.R", // case-sensitive, like R
+        ] {
+            assert_eq!(is_r_source_path(Path::new(path), root), None, "{path}");
+        }
     }
 
     #[test]

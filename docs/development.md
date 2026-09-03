@@ -294,6 +294,21 @@ Keep new scan inputs in the shared two-phase basis so startup, exclusion
 reloads, and package-mode rebuilds cannot drift or introduce blocking
 filesystem work under the state lock.
 
+The scan driver (`run_workspace_scan_transaction_using` in `backend.rs`) makes
+up to `WORKSPACE_SCAN_ATTEMPT_LIMIT` full attempts per intent. The derivation
+basis is invalidated by any open-document commit, so on a large workspace a
+multi-second scan routinely loses its commit CAS to a `did_change`; the first
+`WORKSPACE_SCAN_EAGER_ATTEMPTS` retry immediately, and later attempts first
+wait for `WorldState::workspace_scan_authority_stamp` to hold still for
+`WORKSPACE_SCAN_QUIET_WINDOW` (bounded by `WORKSPACE_SCAN_QUIET_WAIT_LIMIT`).
+Exhaustion is logged at `warn` and leaves the workspace unindexed until the
+next config or watched-file trigger, so the ceiling must stay comfortably above
+the number of edits a user can land during one scan-plus-derivation. The
+workspace walk itself prunes every hidden directory plus the fixed vendored
+list (`should_skip_directory` in `state.rs`); embedded worktrees under
+`.claude/worktrees/` were multiplying scan time and Find References results
+before that rule existed.
+
 Document analysis has one authority per lifecycle state. Open buffers live in
 `OpenDocumentStore`; all closed records live in `WorkspaceIndex`. The closed
 authority has two residency tiers under one lock: metadata/scope artifacts
