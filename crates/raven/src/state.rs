@@ -4765,12 +4765,20 @@ impl WorldState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_active_libpath_watcher_for_test(&self) -> bool {
+    /// Whether a libpath watcher is currently attached (active, possibly with
+    /// an unapplied spec change pending). Used by the startup build's
+    /// non-committing path to avoid re-swapping a watcher a racing commit
+    /// already installed (#748).
+    pub(crate) fn has_active_libpath_watcher(&self) -> bool {
         matches!(
             self.libpath_watcher,
             LibpathWatcherState::Active { .. } | LibpathWatcherState::ActiveUnapplied { .. }
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_libpath_watcher_for_test(&self) -> bool {
+        self.has_active_libpath_watcher()
     }
 
     #[cfg(test)]

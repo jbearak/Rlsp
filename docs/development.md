@@ -471,11 +471,17 @@ continues fail-closed with unresolved package sources instead of looping.
 Startup does not build the library inline. `initialized` returns immediately
 after scheduling the workspace scan and `run_startup_package_library_build`,
 which goes through the same `package_init_coordinator` mutex as `didOpen`'s
-on-demand path, so at most one R child runs for the initial build and the
-first `didOpen` simply waits on it. Because tower-lsp runs with
-`concurrency_level(1)`, anything awaited inside `initialized` stalls every
-queued request; on a renv project this cost ~20 s before the first
-references/definition response and used to spawn R twice.
+on-demand path, `raven.refreshPackages`, and the package-settings rebuild, so
+at most one R child runs for any library build. While the startup task is in
+flight (`Backend::startup_package_build_active`) `didOpen` does *not* wait on
+it: it opens with the not-ready library and the build's commit republishes
+every open document. Because tower-lsp runs with `concurrency_level(1)`,
+anything awaited inside a notification handler stalls every queued request;
+awaiting the build in `initialized` (or in the first `didOpen`) cost ~20 s
+before the first references/definition response on a renv project and used to
+spawn R twice. The startup task's non-committing path keeps a libpath watcher
+that a racing `didOpen` commit already attached instead of re-swapping it,
+which would force a second full libpath rescan.
 
 After commit, direct and converged-scope inherited
 packages are warmed synchronously before any diagnostic ticket starts. A

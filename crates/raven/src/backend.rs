@@ -1841,6 +1841,18 @@ pub struct Backend {
     /// waiter rechecks readiness/current inputs after the winning transaction
     /// releases the gate, so one key never launches duplicate R/provider work.
     package_init_coordinator: Arc<tokio::sync::Mutex<()>>,
+    /// True while the detached startup package-library build
+    /// (`run_startup_package_library_build`) is in flight.
+    ///
+    /// `did_open` consults this before deciding to initialize the library
+    /// itself. tower-lsp dispatches one notification at a time, so a
+    /// `did_open` that awaited the coordinator (or ran the build) would hold
+    /// the only dispatch slot for the whole R spawn — moving the startup stall
+    /// from `initialized` to the first open. While this is set, opens proceed
+    /// with the not-ready library; the startup build's commit republishes
+    /// every open document (`finalize_library_routing_effects` with the open
+    /// set as fallback), so nothing is lost.
+    startup_package_build_active: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     test_home_dir: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     #[cfg(test)]
@@ -2442,6 +2454,16 @@ impl Backend {
     /// coordinator mutex `did_open` simply waits for this build and then sees
     /// `Ready`.
     async fn run_startup_package_library_build(self) {
+        // Cleared on every exit path below (including a coordinator deadline
+        // expiry) so `did_open` falls back to on-demand initialization once
+        // this task is no longer working on its behalf.
+        struct ClearOnExit(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ClearOnExit {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _clear = ClearOnExit(Arc::clone(&self.startup_package_build_active));
         let attempt = self
             .coordinated_package_library_initialization(LibraryRoutingDeadline::foreground())
             .await;
@@ -2471,10 +2493,22 @@ impl Backend {
 
         if !committed {
             // A didOpen initialization may have won while the startup build was
-            // running. Start a watcher for that current owner without reviving
-            // the startup routing intent.
-            swap_current_libpath_watcher(&self.state, &self.client, &self.routing_tasks, true)
-                .await;
+            // running. If its routing commit already attached a watcher for the
+            // current library, keep it: swapping would tear it down and attach
+            // a seeded replacement whose journal forces a second full libpath
+            // rescan (#748). Only when no watcher is attached (a stale or
+            // expired build, or a winner that could not attach) start one for
+            // the current owner without reviving the startup routing intent.
+            let watcher_attached = self.state.read().await.has_active_libpath_watcher();
+            if watcher_attached {
+                log::trace!(
+                    "Startup package-library build: current library already has a libpath \
+                     watcher; not re-swapping"
+                );
+            } else {
+                swap_current_libpath_watcher(&self.state, &self.client, &self.routing_tasks, true)
+                    .await;
+            }
         }
 
         // R fallback for sysdata: when the AST scan found nothing AND
@@ -2825,6 +2859,7 @@ impl Backend {
                 OpenTarSourceRefreshCompletions::default(),
             ),
             package_init_coordinator: Arc::new(tokio::sync::Mutex::new(())),
+            startup_package_build_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             test_home_dir: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -13037,7 +13072,9 @@ enum WatchedResyncBatchMode {
 enum WatchedResyncCompletion {
     Detached,
     InvocationOwned {
-        post_commit: Option<OpenSourceBatchPostCommit>,
+        /// Boxed: it carries a whole `Backend` by value, and the enum is
+        /// moved through several batch structs alongside a dataless variant.
+        post_commit: Option<Box<OpenSourceBatchPostCommit>>,
         receipt: OpenSourceBatchCompletionReceipt,
         boundary_waiter: bool,
     },
@@ -15971,7 +16008,7 @@ async fn run_watched_resync_batch_owned(
                 final_handoff_test_capture,
             },
             await_reserved_tickets,
-            post_commit_source_refresh,
+            post_commit_source_refresh.map(|post_commit| *post_commit),
             completion_receipt,
             invocation_commit_complete,
         );
@@ -17373,6 +17410,14 @@ async fn did_open_transactional(
                 workspace_folders,
                 state.cross_file_config.packages_enabled
                     && !state.package_library_ready
+                    // The detached startup build is already producing the
+                    // library; awaiting it here would hold the sole dispatch
+                    // slot for the whole R spawn. Open with the not-ready
+                    // library instead; the build's commit republishes this
+                    // document. See `Backend::startup_package_build_active`.
+                    && !backend
+                        .startup_package_build_active
+                        .load(Ordering::Acquire)
                     && package_init_attempt.as_ref() != Some(&package_init_key)
                     && package_init_rounds < 2,
                 {
@@ -18424,9 +18469,13 @@ impl LanguageServer for Backend {
         // held every queued request behind startup (tower-lsp dispatches in
         // order). See `run_startup_package_library_build`.
         let startup_backend = self.clone();
+        self.startup_package_build_active
+            .store(true, Ordering::Release);
         if !self.routing_tasks.spawn_root(async move {
             startup_backend.run_startup_package_library_build().await;
         }) {
+            self.startup_package_build_active
+                .store(false, Ordering::Release);
             log::debug!("Shutdown drain retired the startup package-library build before spawn");
         }
 
@@ -18554,6 +18603,21 @@ impl LanguageServer for Backend {
                     let state = self.state.read().await;
                     state.documents.keys().cloned().collect()
                 };
+
+                // Serialize with the coordinated startup/didOpen build (#747):
+                // otherwise a refresh issued while that build's R child is
+                // still running spawns a second R for the same library, and
+                // whichever commits second is rejected and rebuilt again by
+                // the reconcile coordinator. Taken *before* the routing
+                // capture so the in-flight build's commit cannot supersede
+                // this basis while we wait.
+                let _coordinator = routing_deadline
+                    .wait(
+                        "refreshPackages package-init coordinator",
+                        self.package_init_coordinator.lock(),
+                    )
+                    .await
+                    .map_err(|_| refresh_not_committed("package-init coordinator deadline"))?;
 
                 // Capture the cache size of the *current* library before any
                 // rebuild/refresh so the user-visible "cleared N entries"
@@ -19881,11 +19945,11 @@ impl LanguageServer for Backend {
                     reserved_tickets: Vec::new(),
                     transfer_handles: Vec::new(),
                     completion: WatchedResyncCompletion::InvocationOwned {
-                        post_commit: Some(OpenSourceBatchPostCommit {
+                        post_commit: Some(Box::new(OpenSourceBatchPostCommit {
                             backend: self.clone(),
                             parents: open_tar_source_parents,
                             refresh_sysdata_fallback: source_sysdata_event,
-                        }),
+                        })),
                         receipt: receipt.clone(),
                         boundary_waiter: true,
                     },
@@ -21352,6 +21416,22 @@ impl Backend {
             'package_settings_routing: {
                 let routing_deadline = LibraryRoutingDeadline::foreground();
                 log::info!("Package settings changed, reinitializing PackageLibrary");
+                // Serialize with the coordinated startup/didOpen build (#747);
+                // see the `raven.refreshPackages` handler for the rationale.
+                let Ok(_coordinator) = routing_deadline
+                    .wait(
+                        "package-settings package-init coordinator",
+                        self.package_init_coordinator.lock(),
+                    )
+                    .await
+                else {
+                    log::warn!(
+                        "Package settings rebuild expired waiting for the package-init \
+                         coordinator; retaining the current package library"
+                    );
+                    deferred_library_routing = Some(None);
+                    break 'package_settings_routing;
+                };
                 let routing_basis = capture_library_routing_basis(
                     &self.state,
                     crate::state::LibraryRoutingMutation::Replacement,
@@ -52283,6 +52363,187 @@ mod project_config_initialize_tests {
         assert!(
             state.workspace_index.get_metadata(&ignored_uri).is_none(),
             "excluded watched-file change must remove stale artifact projection"
+        );
+    }
+
+    /// While the detached startup build is in flight, `did_open` must not
+    /// await it (or run its own build): that would hold the only LSP dispatch
+    /// slot for the whole R spawn. The open proceeds with the not-ready
+    /// library and no package-init attempt is made.
+    #[tokio::test]
+    async fn did_open_does_not_await_active_startup_package_build() {
+        let tmp = TempDir::new().unwrap();
+        let subject = Url::from_file_path(tmp.path().join("subject.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = false;
+            state.force_package_library_not_ready_for_test = true;
+        }
+        // Simulate the startup build holding the coordinator mid-R-spawn.
+        backend
+            .startup_package_build_active
+            .store(true, Ordering::Release);
+        let _held = backend.package_init_coordinator.lock().await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            open_doc(backend, &subject, "r", 1, "subject <- 1\n"),
+        )
+        .await
+        .expect("didOpen must not block behind the startup package build");
+
+        let state = backend.state.read().await;
+        assert!(state.documents.contains_key(&subject));
+        assert!(!state.package_library_ready);
+        drop(state);
+        assert_eq!(
+            backend
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire),
+            0,
+            "didOpen must not run its own package build while startup owns it"
+        );
+
+        // Once the startup task is done, opens initialize on demand again.
+        backend
+            .startup_package_build_active
+            .store(false, Ordering::Release);
+        drop(_held);
+        let second = Url::from_file_path(tmp.path().join("second.R")).unwrap();
+        open_doc(backend, &second, "r", 1, "second <- 1\n").await;
+        assert!(
+            backend
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire)
+                >= 1,
+            "after the startup build exits, didOpen initializes on demand"
+        );
+    }
+
+    /// #747: `raven.refreshPackages` must not spawn its rebuild while the
+    /// coordinated startup/didOpen build holds `package_init_coordinator`.
+    #[tokio::test]
+    async fn refresh_packages_waits_for_package_init_coordinator() {
+        use tower_lsp::lsp_types::ExecuteCommandParams;
+        let tmp = TempDir::new().unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let original = backend.state.read().await.package_library.clone();
+        {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = true;
+            state.package_library_build_outcome_for_test = Some((
+                Arc::new(crate::package_library::PackageLibrary::new_empty()),
+                true,
+            ));
+        }
+        let held = backend.package_init_coordinator.lock().await;
+
+        let refresh_backend = backend.clone();
+        let refresh = tokio::spawn(async move {
+            refresh_backend
+                .execute_command(ExecuteCommandParams {
+                    command: "raven.refreshPackages".into(),
+                    arguments: vec![],
+                    work_done_progress_params: Default::default(),
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                Arc::ptr_eq(&state.package_library, &original),
+                "refresh must not rebuild while the coordinator is held"
+            );
+            assert!(
+                state.package_library_build_outcome_for_test.is_some(),
+                "refresh must not have consumed the synthetic build while blocked"
+            );
+        }
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), refresh)
+            .await
+            .expect("refresh completes once the coordinator is released")
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "refresh commits after the coordinator is released: {result:?}"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            !Arc::ptr_eq(&state.package_library, &original),
+            "refresh installs its rebuilt library after waiting"
+        );
+    }
+
+    /// #748: when a racing `didOpen` already committed the library and its
+    /// routing commit attached a libpath watcher, the startup task's `Ready`
+    /// path must keep that watcher rather than swap in a seeded replacement
+    /// (which forces a second full libpath rescan).
+    #[tokio::test]
+    async fn startup_ready_path_keeps_existing_libpath_watcher() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let owner = {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.packages_enabled = true;
+            state.cross_file_config.packages_watch_library_paths = true;
+            let mut lib = crate::package_library::PackageLibrary::new_empty();
+            lib.set_lib_paths(vec![tmp.path().to_path_buf()]);
+            state.package_library = Arc::new(lib);
+            state.package_library_ready = true;
+            let _journal = state.install_libpath_journal_for_test();
+            state.libpath_watcher_owner()
+        };
+
+        backend.clone().run_startup_package_library_build().await;
+
+        let state = backend.state.read().await;
+        assert!(state.has_active_libpath_watcher());
+        assert!(
+            state.libpath_watcher_owner_is_current(owner),
+            "the Ready path must not retire the watcher the winning commit installed"
+        );
+        assert!(
+            !backend.startup_package_build_active.load(Ordering::Acquire),
+            "the startup flag is cleared when the task exits"
         );
     }
 
