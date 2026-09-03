@@ -131,8 +131,10 @@ One actionable subtype remains enabled even without the flag:
 workspace's renv project, the referenced package is unavailable in its active
 library, and a validated package with that name exists in a vanilla system/user
 library removed by activation. That is evidence of a project setup problem, not
-the ordinary "CI did not install dependencies" case; run `renv::hydrate()` to
-add installed packages to the project library. See
+the ordinary "CI did not install dependencies" case; run
+`renv::hydrate("package")` with the package named by the diagnostic. The named
+form also works for standalone scripts in projects that use explicit renv
+snapshots, where bare `renv::hydrate()` only considers `DESCRIPTION`. See
 [Diagnostics](diagnostics.md#package-names-vs-install-status) for the full
 model.
 

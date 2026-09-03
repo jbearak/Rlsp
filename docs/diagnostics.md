@@ -378,11 +378,14 @@ When enabled, `--report-uninstalled` reports `library()` calls **not present in 
 When Raven successfully activates an explicit workspace's `renv/activate.R`, it
 also compares the vanilla and active library paths. If a referenced package
 exists only in a path removed by activation, Raven reports
-`package-outside-active-library` and suggests running `renv::hydrate()` to add
-installed packages to the project library. Raven reports this project-level
-setup problem at most once per package per document, even when that document
-contains many qualified references. Raven may use explicitly declared exports
-from that outside installation only to suppress undefined-variable cascades
+`package-outside-active-library` and suggests running
+`renv::hydrate("package")` to add that package to the project library. The
+named form also works when renv uses explicit snapshots, where bare
+`renv::hydrate()` only considers dependencies declared in `DESCRIPTION`.
+Raven reports this project-level setup problem at most once per package per
+document, even when that document contains many qualified references. Raven
+may use explicitly declared exports from that outside installation only to
+suppress undefined-variable cascades
 after a true `library()` / `require()` attachment. This diagnostic-only evidence never makes
 the package available for completion, `system.file()`, or package loading.
 Packages installed after startup are recognized when the library is rebuilt
