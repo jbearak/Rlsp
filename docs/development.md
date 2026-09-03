@@ -301,6 +301,13 @@ multi-second scan routinely loses its commit CAS to a `did_change`; the first
 `WORKSPACE_SCAN_EAGER_ATTEMPTS` retry immediately, and later attempts first
 wait for `WorldState::workspace_scan_authority_stamp` to hold still for
 `WORKSPACE_SCAN_QUIET_WINDOW` (bounded by `WORKSPACE_SCAN_QUIET_WAIT_LIMIT`).
+A retry reuses the previous attempt's disk-scan result when the scan inputs
+(folders, depth, exclusions and their generations) are still current, so a
+lost race costs one re-derivation, not a second walk. Scans awaited inline in
+a notification handler (`run_workspace_scan_transaction_inline`, used by the
+configuration and exclusion-reload paths) never sleep: with
+`concurrency_level(1)` no `did_change` can arrive while the handler holds the
+queue, so the quiet window could only freeze the editor.
 Exhaustion is logged at `warn` and leaves the workspace unindexed until the
 next config or watched-file trigger, so the ceiling must stay comfortably above
 the number of edits a user can land during one scan-plus-derivation. The

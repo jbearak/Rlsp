@@ -86,6 +86,8 @@ pub struct PerfMetrics {
     pub package_init_duration: Option<Duration>,
     /// Package awareness was disabled, so no initialization will run
     pub package_init_disabled: bool,
+    /// `log_summary` has run; later package-init records log themselves
+    pub summary_logged: bool,
     /// Number of files scanned during workspace initialization
     pub files_scanned: usize,
     /// Number of R subprocess calls made
@@ -100,11 +102,17 @@ impl PerfMetrics {
         Self::default()
     }
 
-    /// Log a summary of the metrics
-    pub fn log_summary(&self) {
+    /// Log a summary of the metrics.
+    ///
+    /// The package-library build runs detached from `initialized` and usually
+    /// finishes after this summary; `record_package_init` logs its own line in
+    /// that case (and only then, so a build that finished first is not logged
+    /// twice).
+    pub fn log_summary(&mut self) {
         if !is_enabled() {
             return;
         }
+        self.summary_logged = true;
 
         log::info!("[PERF] === Startup Performance Summary ===");
 
@@ -163,10 +171,12 @@ pub fn record_package_init(duration: Duration, r_calls: usize) {
     if !is_enabled() {
         return;
     }
-    log::info!("[PERF] Package init: {duration:?} ({r_calls} R calls)");
     if let Ok(mut metrics) = startup_metrics().lock() {
         metrics.package_init_duration = Some(duration);
         metrics.r_subprocess_calls = r_calls;
+        if metrics.summary_logged {
+            log::info!("[PERF] Package init: {duration:?} ({r_calls} R calls)");
+        }
     }
 }
 
@@ -176,9 +186,11 @@ pub fn record_package_init_disabled() {
     if !is_enabled() {
         return;
     }
-    log::info!("[PERF] Package init: disabled");
     if let Ok(mut metrics) = startup_metrics().lock() {
         metrics.package_init_disabled = true;
+        if metrics.summary_logged {
+            log::info!("[PERF] Package init: disabled");
+        }
     }
 }
 

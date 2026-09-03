@@ -531,19 +531,29 @@ fn translate_watched_directory(
     }
 }
 
+/// Whether a watched directory-shaped path is one whose subtree feeds package
+/// inputs. Directory nodes match by prefix; an R *file* under `R/` or
+/// `tests/` is judged by `is_r_source_path` so this stays consistent with the
+/// seeders (R does not load `R/<sub>/` other than `unix`/`windows`).
 fn is_tracked_package_dir(path: &Path, root: &Path) -> bool {
     let r_dir = root.join("R");
     let testthat_dir = root.join("tests").join("testthat");
     let testit_dir = root.join("tests").join("testit");
     let data_dir = root.join("data");
     let data_raw_dir = root.join("data-raw");
-    path == r_dir
+    let under_source = path == r_dir
         || path.starts_with(&r_dir)
         || path == testthat_dir
         || path.starts_with(&testthat_dir)
         || path == testit_dir
-        || path.starts_with(&testit_dir)
-        || path == data_dir
+        || path.starts_with(&testit_dir);
+    if under_source {
+        if super::has_r_extension(path) {
+            return super::is_r_source_path(path, root).is_some();
+        }
+        return true;
+    }
+    path == data_dir
         || path.starts_with(&data_dir)
         || path == data_raw_dir
         || path.starts_with(&data_raw_dir)

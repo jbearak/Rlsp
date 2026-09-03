@@ -1805,13 +1805,15 @@ enum OpenLifecycleIntentState {
     Committed(u64),
 }
 
-/// Latest-arrival ownership for one top-level full workspace scan.
-///
-/// The process-wide generation is never reused. Both allowed full attempts
-/// retain the same token; a newer driver permanently supersedes the older one.
 /// Snapshot returned by `WorldState::workspace_scan_authority_stamp`; equality
 /// means no scan-invalidating commit occurred between the two captures.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// All-integer and `Copy` on purpose: the scan driver's quiet-window wait
+/// polls it every few hundred milliseconds under the state read lock. Open
+/// records are covered by `open_context_authority_generation`, which every
+/// production path that installs or removes an open-record token advances, so
+/// the per-URI token map the derivation CAS keeps is not repeated here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkspaceScanAuthorityStamp {
     scan_generation: u64,
     graph_revision: u64,
@@ -1820,9 +1822,13 @@ pub(crate) struct WorkspaceScanAuthorityStamp {
     workspace_index_version: u64,
     package_input_generation: u64,
     package_config_generation: u64,
-    open_records: std::collections::BTreeMap<Url, crate::open_document_store::OpenRecordToken>,
 }
 
+/// Latest-arrival ownership for one top-level full workspace scan.
+///
+/// The process-wide generation is never reused. Every permitted attempt of one
+/// driver retains the same token; a newer driver permanently supersedes the
+/// older one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkspaceScanIntentToken {
     generation: u64,
@@ -5115,6 +5121,18 @@ impl WorldState {
         })
     }
 
+    /// Whether some replacement driver currently owns the pending intent slot.
+    ///
+    /// A driver that wants to *re-capture* authority for work it has already
+    /// done (a library built under an intent that has since been superseded)
+    /// must yield when this is true: capturing would mint a newer intent and
+    /// displace the owner that superseded it, letting older work commit over
+    /// newer. A fresh build capturing its *first* intent is different — latest
+    /// arrival is meant to win there.
+    pub(crate) fn has_pending_library_replacement(&self) -> bool {
+        self.library_replacement_lifecycle.lock().pending.is_some()
+    }
+
     fn library_replacement_basis_is_current(&self, basis: &LibraryRoutingBasis) -> bool {
         match basis.mutation {
             LibraryRoutingMutation::Replacement => {
@@ -6226,11 +6244,6 @@ impl WorldState {
             workspace_index_version: self.workspace_index.version(),
             package_input_generation: self.package_input_generation(),
             package_config_generation: self.package_config_generation,
-            open_records: self
-                .documents
-                .keys()
-                .map(|uri| (uri.clone(), self.documents.record_token(uri)))
-                .collect(),
         }
     }
 
@@ -6995,35 +7008,37 @@ impl WorldState {
     ///
     /// Components are judged by their spelled names, as the walk judges
     /// entries, so a file reached through a visible symlink into a hidden
-    /// target is not pruned here either. A URI outside every workspace folder
-    /// is not pruned (the walk has no opinion about it).
+    /// target is not pruned here either. Only the path below the *deepest*
+    /// enclosing workspace folder is judged: the walk starts at each folder
+    /// root without pruning the root itself, so a nested folder that is itself
+    /// under a hidden directory (`/repo` plus `/repo/.claude/worktrees/w1`) is
+    /// scanned, and its files must stay watchable. A URI outside every
+    /// workspace folder is not pruned (the walk has no opinion about it).
     pub(crate) fn is_bulk_discovery_pruned_uri(&self, uri: &tower_lsp::lsp_types::Url) -> bool {
         let Ok(path) = uri.to_file_path() else {
             return false;
         };
-        self.workspace_folders
-            .iter()
-            .filter_map(|folder| folder.to_file_path().ok())
-            .filter_map(|root| path.strip_prefix(&root).ok().map(Path::to_path_buf))
-            .any(|relative| {
-                let mut components = relative.components().peekable();
-                let mut pruned = false;
-                while let Some(component) = components.next() {
-                    // The leaf is a file; only directories are pruned.
-                    if components.peek().is_none() {
-                        break;
-                    }
-                    if component
-                        .as_os_str()
-                        .to_str()
-                        .is_some_and(should_skip_directory)
-                    {
-                        pruned = true;
-                        break;
-                    }
-                }
-                pruned
-            })
+        let Some(root) = workspace_base_for_path_in(&path, &self.workspace_folders) else {
+            return false;
+        };
+        let Ok(relative) = path.strip_prefix(&root) else {
+            return false;
+        };
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            // The leaf is a file; only directories are pruned.
+            if components.peek().is_none() {
+                break;
+            }
+            if component
+                .as_os_str()
+                .to_str()
+                .is_some_and(should_skip_directory)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Return metadata suitable for dependency-graph edge construction under
@@ -14938,6 +14953,12 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         )
         .unwrap();
         assert!(!state.is_bulk_discovery_pruned_uri(&outside));
+        // A nested workspace folder under a hidden directory is scanned from
+        // its own root, so its files are judged relative to that root.
+        state.workspace_folders.push(under(".claude/worktrees/w1"));
+        assert!(!state.is_bulk_discovery_pruned_uri(&under(".claude/worktrees/w1/R/a.R")));
+        assert!(state.is_bulk_discovery_pruned_uri(&under(".claude/worktrees/w2/R/a.R")));
+        assert!(state.is_bulk_discovery_pruned_uri(&under(".claude/worktrees/w1/.git/a.R")));
     }
 
     #[test]

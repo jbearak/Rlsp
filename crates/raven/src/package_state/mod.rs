@@ -879,8 +879,7 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
     let mut comps = rel.components();
     let first = comps.next()?.as_os_str().to_str()?;
 
-    let is_r_extension = matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"),);
-    if !is_r_extension {
+    if !has_r_extension(path) {
         return None;
     }
 
@@ -923,6 +922,14 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
         }
         _ => None,
     }
+}
+
+/// Whether `path` is spelled as an R source file (`.R` or `.r`).
+///
+/// Directory-level package predicates use this to decide whether to judge a
+/// path as a file through [`is_r_source_path`] or as a directory by prefix.
+pub fn has_r_extension(path: &Path) -> bool {
+    matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"))
 }
 
 /// Returns `true` when `path` is under `<root>/tests/testthat/` or

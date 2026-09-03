@@ -2537,6 +2537,13 @@ impl Backend {
                 // separate check and the capture would let the CAS install a
                 // library built from the old key under the new key's
                 // authority.
+                //
+                // The re-capture also yields to any *other* pending replacement
+                // owner. The pre-build basis lost its slot to a newer intent (a
+                // `refreshPackages`, a package-setting change); minting yet
+                // another intent here would displace that owner and let this
+                // older library commit over its newer one. Yielding hands the
+                // outcome to the coordinator instead.
                 None => {
                     capture_library_routing_basis_if(
                         &self.state,
@@ -2544,7 +2551,7 @@ impl Backend {
                         None,
                         crate::state::LibraryReplacementAbortPolicy::Reconcile,
                         deadline,
-                        &still_current,
+                        |state| still_current(state) && !state.has_pending_library_replacement(),
                     )
                     .await?
                 }
@@ -3498,13 +3505,28 @@ mod load_all_revalidation_tests {
     }
 }
 
+/// Whether a watched path under `R/` or `tests/testthat/` can affect package
+/// inputs.
+///
+/// Directory nodes match by prefix (a created or removed `R/unix/` or
+/// `tests/testthat/` subtree must trigger a rescan). An R *file* is judged by
+/// `is_r_source_path`, the same predicate every seeder filters through, so a
+/// save under `R/scripts/` — which R does not load and the seed ignores — no
+/// longer triggers a full package-seed recompute it cannot affect.
 fn is_package_source_dir(path: &std::path::Path, root: &std::path::Path) -> bool {
     let r_dir = root.join("R");
     let testthat_dir = root.join("tests").join("testthat");
-    path == r_dir
+    let under_tracked = path == r_dir
         || path.starts_with(&r_dir)
         || path == testthat_dir
-        || path.starts_with(testthat_dir)
+        || path.starts_with(testthat_dir);
+    if !under_tracked {
+        return false;
+    }
+    if crate::package_state::has_r_extension(path) {
+        return crate::package_state::is_r_source_path(path, root).is_some();
+    }
+    true
 }
 
 /// Whether `path` lives under the package's `data/` or `data-raw/` directories.
@@ -4491,8 +4513,51 @@ const WORKSPACE_SCAN_QUIET_WAIT_LIMIT: std::time::Duration = std::time::Duration
 /// that state persisted until restart. The eager first attempts keep the fast
 /// path fast; later attempts wait for the scan inputs to hold still so they
 /// commit against a basis that is likely to survive.
+#[cfg(test)]
 async fn run_workspace_scan_transaction_using<F, Fut>(
     state_arc: &Arc<RwLock<WorldState>>,
+    scan: F,
+) -> WorkspaceScanRunOutcome
+where
+    F: FnMut(WorkspaceScanInputs) -> Fut,
+    Fut: Future<Output = Option<crate::state::WorkspaceScanResult>>,
+{
+    run_workspace_scan_transaction_with(state_arc, WorkspaceScanDriverMode::Detached, scan).await
+}
+
+/// Where the scan driver runs, which decides whether lost-race retries may
+/// sleep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceScanDriverMode {
+    /// A background task. Later retries wait for the scan authority to hold
+    /// still (`wait_for_workspace_scan_quiet_window`) because concurrent
+    /// `did_change`s are what keep beating the CAS.
+    Detached,
+    /// Awaited inside an LSP notification handler. tower-lsp runs handlers one
+    /// at a time (`concurrency_level(1)`), so nothing the quiet window is
+    /// designed to wait for can arrive while the handler holds the queue; the
+    /// sleeps would only freeze hover, completion, and diagnostics. Retries
+    /// run back to back.
+    Inline,
+}
+
+/// The scan driver proper, with an explicit driver mode (`run_workspace_scan_transaction`
+/// and the test-only `run_workspace_scan_transaction_using` are thin wrappers).
+///
+/// Retries reuse the previous attempt's scan result when the *scan inputs*
+/// (folders, depth, exclusions, and their generations) are still current at
+/// the next capture: the common lost race is a `did_change` invalidating the
+/// derivation basis, which is not an input to the disk walk. Rescanning then
+/// re-reads and re-parses every file for nothing, and on the multi-second
+/// workspaces that lose races at all it turned a retry into a second full
+/// scan. The cache costs one clone of the result per attempt (ropes, trees
+/// and artifacts are reference-counted, so it is cheap relative to the walk).
+/// Disk edits that land between attempts without moving any scan generation
+/// are picked up by the file watcher, exactly as they would be after a
+/// single-attempt scan.
+async fn run_workspace_scan_transaction_with<F, Fut>(
+    state_arc: &Arc<RwLock<WorldState>>,
+    mode: WorkspaceScanDriverMode,
     mut scan: F,
 ) -> WorkspaceScanRunOutcome
 where
@@ -4500,13 +4565,18 @@ where
     Fut: Future<Output = Option<crate::state::WorkspaceScanResult>>,
 {
     let intent = state_arc.write().await.begin_workspace_scan_intent();
+    let mut cached: Option<(WorkspaceScanInputs, crate::state::WorkspaceScanResult)> = None;
     for attempt in 0..WORKSPACE_SCAN_ATTEMPT_LIMIT {
-        if attempt >= WORKSPACE_SCAN_EAGER_ATTEMPTS {
+        if mode == WorkspaceScanDriverMode::Detached && attempt >= WORKSPACE_SCAN_EAGER_ATTEMPTS {
             wait_for_workspace_scan_quiet_window(state_arc).await;
         }
-        let inputs = {
+        let (inputs, reuse_cached) = {
             let state = state_arc.read().await;
-            WorkspaceScanInputs::capture(&state, intent)
+            let inputs = WorkspaceScanInputs::capture(&state, intent);
+            let reuse_cached = cached.as_ref().is_some_and(|(previous, _)| {
+                state.workspace_scan_input_basis_is_current(&previous.basis)
+            });
+            (inputs, reuse_cached)
         };
         let Some(inputs) = inputs else {
             let state = state_arc.read().await;
@@ -4516,8 +4586,24 @@ where
                 WorkspaceScanRunOutcome::Superseded
             };
         };
-        let Some(result) = scan(inputs.clone()).await else {
-            return WorkspaceScanRunOutcome::ScanFailed;
+        let result = match cached.as_ref() {
+            Some((_, previous)) if reuse_cached => {
+                log::debug!(
+                    "Workspace scan attempt {}/{} reuses the previous scan result (scan inputs unchanged)",
+                    attempt + 1,
+                    WORKSPACE_SCAN_ATTEMPT_LIMIT
+                );
+                previous.clone()
+            }
+            _ => {
+                let Some(result) = scan(inputs.clone()).await else {
+                    return WorkspaceScanRunOutcome::ScanFailed;
+                };
+                if attempt + 1 < WORKSPACE_SCAN_ATTEMPT_LIMIT {
+                    cached = Some((inputs.clone(), result.clone()));
+                }
+                result
+            }
         };
         if let Some(transfer) = apply_workspace_scan_if_current(state_arc, &inputs, result).await {
             return WorkspaceScanRunOutcome::Committed(AppliedWorkspaceScan {
@@ -4582,7 +4668,22 @@ async fn wait_for_workspace_scan_quiet_window(state_arc: &Arc<RwLock<WorldState>
 async fn run_workspace_scan_transaction(
     state_arc: &Arc<RwLock<WorldState>>,
 ) -> WorkspaceScanRunOutcome {
-    run_workspace_scan_transaction_using(state_arc, |inputs| async move {
+    run_workspace_scan_transaction_in(state_arc, WorkspaceScanDriverMode::Detached).await
+}
+
+/// [`run_workspace_scan_transaction`] for callers awaiting the scan inside a
+/// notification handler; see [`WorkspaceScanDriverMode::Inline`].
+async fn run_workspace_scan_transaction_inline(
+    state_arc: &Arc<RwLock<WorldState>>,
+) -> WorkspaceScanRunOutcome {
+    run_workspace_scan_transaction_in(state_arc, WorkspaceScanDriverMode::Inline).await
+}
+
+async fn run_workspace_scan_transaction_in(
+    state_arc: &Arc<RwLock<WorldState>>,
+    mode: WorkspaceScanDriverMode,
+) -> WorkspaceScanRunOutcome {
+    run_workspace_scan_transaction_with(state_arc, mode, |inputs| async move {
         match tokio::task::spawn_blocking(move || {
             let scan_start = std::time::Instant::now();
             let result = crate::state::scan_workspace_with_exclusions(
@@ -16313,8 +16414,12 @@ fn collect_watched_resync(
                 // has never seen is not admitted through the watcher either.
                 // Entries that already exist (explicit, on-demand) keep
                 // receiving updates.
+                // A file some indexed or open file already `source()`s is an
+                // on-demand target, not bulk discovery: creating it must index
+                // it and clear the importer's missing-file diagnostic.
                 if !state.workspace_index.contains(uri)
                     && !state.workspace_index.contains_artifacts(uri)
+                    && state.cross_file_graph.get_dependents(uri).is_empty()
                     && state.is_bulk_discovery_pruned_uri(uri)
                 {
                     log::trace!("Ignoring watched change under a pruned directory: {uri}");
@@ -18361,7 +18466,7 @@ impl LanguageServer for Backend {
         let init_duration = init_start.elapsed();
         if crate::perf::is_enabled() {
             log::info!("[PERF] Total initialization: {:?}", init_duration);
-            if let Ok(m) = crate::perf::startup_metrics().lock() {
+            if let Ok(mut m) = crate::perf::startup_metrics().lock() {
                 m.log_summary()
             }
         }
@@ -20966,7 +21071,7 @@ impl Backend {
             );
 
             if should_scan {
-                match run_workspace_scan_transaction(&self.state).await {
+                match run_workspace_scan_transaction_inline(&self.state).await {
                     WorkspaceScanRunOutcome::Committed(applied_scan) => {
                         let root_for_pkg_inputs = applied_scan.workspace_root;
                         let workspace_exclusions = applied_scan.exclusions;
@@ -21105,7 +21210,7 @@ impl Backend {
         if workspace_scan_refresh_needed && !workspace_exclusions_changed {
             // A false -> true transition or a depth change owns its own
             // convergent scan; it cannot depend on the detached startup task.
-            match run_workspace_scan_transaction(&self.state).await {
+            match run_workspace_scan_transaction_inline(&self.state).await {
                 WorkspaceScanRunOutcome::Committed(applied_scan) => {
                     workspace_scan_transfer = Some(applied_scan.transfer);
                     let (package_library, packages_enabled) = {
@@ -31295,6 +31400,19 @@ mod tests {
                 &root
             ));
             assert!(!is_package_source_dir(&root.join("scratch.R"), &root));
+            // Consistent with `is_r_source_path`: R does not load nested
+            // subdirectories other than unix/windows, and neither does the
+            // seed, so a save there must not trigger a seed recompute.
+            assert!(!is_package_source_dir(
+                &root.join("R").join("scripts").join("run.R"),
+                &root
+            ));
+            assert!(is_package_source_dir(
+                &root.join("R").join("unix").join("sys.R"),
+                &root
+            ));
+            // Directory nodes still match by prefix.
+            assert!(is_package_source_dir(&root.join("R").join("unix"), &root));
         }
 
         #[test]
@@ -52165,6 +52283,130 @@ mod project_config_initialize_tests {
         assert!(
             state.workspace_index.get_metadata(&ignored_uri).is_none(),
             "excluded watched-file change must remove stale artifact projection"
+        );
+    }
+
+    /// A build whose pre-build routing intent was superseded must not mint a
+    /// fresh intent over the owner that superseded it: that would let the
+    /// older library commit over the newer owner's replacement.
+    #[tokio::test]
+    async fn stale_build_recapture_yields_to_foreign_pending_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let deadline = LibraryRoutingDeadline::foreground();
+        let original_library = backend.state.read().await.package_library.clone();
+
+        // The build's own pre-build intent (A) ...
+        let pre_build = capture_library_routing_basis(
+            &backend.state,
+            crate::state::LibraryRoutingMutation::Replacement,
+            None,
+            crate::state::LibraryReplacementAbortPolicy::Reconcile,
+            deadline,
+        )
+        .await
+        .expect("pre-build capture");
+        // ... superseded during the R spawn by a foreign owner (B), e.g. a
+        // `refreshPackages` that does not go through the init coordinator.
+        let foreign = capture_library_routing_basis(
+            &backend.state,
+            crate::state::LibraryRoutingMutation::Replacement,
+            None,
+            crate::state::LibraryReplacementAbortPolicy::NoReconcile,
+            deadline,
+        )
+        .await
+        .expect("foreign capture");
+        assert!(backend.state.read().await.has_pending_library_replacement());
+
+        let built = Arc::new(crate::package_library::PackageLibrary::new_empty());
+        let effects = backend
+            .install_built_package_library(
+                Some(pre_build),
+                Arc::clone(&built),
+                false,
+                deadline,
+                |_| true,
+            )
+            .await;
+        assert!(
+            effects.is_none(),
+            "a superseded build must yield rather than re-capture over the foreign owner"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            Arc::ptr_eq(&state.package_library, &original_library),
+            "the superseded build must not have been installed"
+        );
+        assert!(
+            state.has_pending_library_replacement(),
+            "the foreign owner must still hold the pending intent slot"
+        );
+        drop(state);
+        drop(foreign);
+    }
+
+    /// The hidden-directory prune governs bulk discovery only: a file some
+    /// open document already `source()`s is an on-demand target, and creating
+    /// it must index it (and clear the importer's missing-file state) even
+    /// under a hidden directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_create_of_sourced_target_under_hidden_directory_is_indexed() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[crossFile]\nindexWorkspace = false\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join(".scripts")).unwrap();
+        let main_text = "source(\".scripts/helper.R\")\nhelper()\n";
+        fs::write(tmp.path().join("main.R"), main_text).unwrap();
+        let (svc, main_uri) = open_in_quiescent_workspace(&tmp, "main.R", "r", main_text).await;
+        let backend = svc.inner();
+        let helper_path = tmp.path().join(".scripts/helper.R");
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&main_uri)
+                    .iter()
+                    .any(|edge| edge.to == helper_uri),
+                "precondition: the open importer records an edge to the missing target"
+            );
+            assert!(state.is_bulk_discovery_pruned_uri(&helper_uri));
+        }
+
+        fs::write(&helper_path, "helper <- function() 1\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: helper_uri.clone(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state.workspace_index.get_metadata(&helper_uri).is_some()
+            })
+            .await,
+            "a sourced target created under a hidden directory must be indexed on demand"
         );
     }
 
