@@ -1841,6 +1841,18 @@ pub struct Backend {
     /// waiter rechecks readiness/current inputs after the winning transaction
     /// releases the gate, so one key never launches duplicate R/provider work.
     package_init_coordinator: Arc<tokio::sync::Mutex<()>>,
+    /// True while the detached startup package-library build
+    /// (`run_startup_package_library_build`) is in flight.
+    ///
+    /// `did_open` consults this before deciding to initialize the library
+    /// itself. tower-lsp dispatches one notification at a time, so a
+    /// `did_open` that awaited the coordinator (or ran the build) would hold
+    /// the only dispatch slot for the whole R spawn — moving the startup stall
+    /// from `initialized` to the first open. While this is set, opens proceed
+    /// with the not-ready library; the startup build's commit republishes
+    /// every open document (`finalize_library_routing_effects` with the open
+    /// set as fallback), so nothing is lost.
+    startup_package_build_active: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     test_home_dir: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     #[cfg(test)]
@@ -2095,6 +2107,13 @@ impl TraversalTruncationState {
     }
 }
 
+/// Construction identity of a package library: the inputs that determine
+/// what `try_build_package_library` produces. Deliberately excludes
+/// package-input and open-record authority — a `DESCRIPTION` edit or the
+/// startup package seed changes routing derivation, not the library, so a
+/// build that finishes after such a change is still the right library and
+/// `install_built_package_library` re-captures its routing basis instead of
+/// discarding it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PackageInitKey {
     enabled: bool,
@@ -2102,7 +2121,6 @@ struct PackageInitKey {
     additional_paths: Vec<std::path::PathBuf>,
     workspace_root: Option<std::path::PathBuf>,
     workspace_folders: Vec<Url>,
-    package_input_generation: u64,
 }
 
 impl PackageInitKey {
@@ -2119,7 +2137,6 @@ impl PackageInitKey {
                 .first()
                 .and_then(|url| url.to_file_path().ok()),
             workspace_folders: state.workspace_folders.clone(),
-            package_input_generation: state.package_input_generation(),
         }
     }
 }
@@ -2288,7 +2305,9 @@ impl Backend {
                 None,
             )
         } else {
-            log::trace!("Initializing PackageLibrary on demand (not yet ready)");
+            log::trace!("Initializing PackageLibrary (not yet ready)");
+            let pkg_start = std::time::Instant::now();
+            let r_calls_before = crate::perf::get_r_subprocess_calls();
             // R discovery and provider loading stay off-lock in the shared
             // builder. The exact inputs came from `basis.key`.
             let build = crate::package_library::try_build_package_library(
@@ -2330,6 +2349,16 @@ impl Backend {
                     None
                 };
             let ready = outcome.consumer_ready();
+            crate::perf::record_package_init(
+                pkg_start.elapsed(),
+                crate::perf::get_r_subprocess_calls() - r_calls_before,
+            );
+            log::info!(
+                "PackageLibrary initialized: {} lib_paths, {} base_packages, {} base_exports",
+                outcome.library.lib_paths().len(),
+                outcome.library.base_packages().len(),
+                outcome.library.base_exports().len()
+            );
             (outcome.library, ready, outcome.load_notes, init_error)
         };
         if let Some(error) = init_error {
@@ -2350,51 +2379,23 @@ impl Backend {
             }
         }
 
-        // The build owns no state until this exact compare-and-swap. A
-        // concurrent settings/workspace/package-input change or another
-        // readiness transition rejects it without replacing newer state.
-        let exact_init_intent = {
-            let state = self.state.read().await;
-            !state.package_library_ready
-                && state.package_config_generation == basis.package_config_generation
-                && PackageInitKey::capture(&state) == basis.key
-        };
-        let routing_effects = if exact_init_intent {
-            if let Some((routing_basis, replacement_guard, pre_seal)) =
-                routing_basis.take().map(CapturedLibraryRouting::into_parts)
-                && let Some(driver) = prepare_library_routing_driver(
-                    &self.state,
-                    routing_basis,
-                    replacement_guard,
-                    Some(pre_seal),
-                    library,
-                    LibraryRoutingDriverOptions {
-                        ready,
-                        only_packages: None,
-                        warm_open_packages: true,
-                        refresh_cache_epoch: true,
-                        attempt_limit: 2,
-                        deadline,
-                        watcher_runtime: Some(LibpathWatcherRuntime {
-                            client: self.client.clone(),
-                            routing_tasks: self.routing_tasks.clone(),
-                        }),
-                        watcher_recovery: false,
-                    },
-                )
-                .await
-            {
-                match complete_library_routing_driver(&self.state, driver).await {
-                    LibraryRoutingTransactionOutcome::Committed(effects) => Some(effects),
-                    LibraryRoutingTransactionOutcome::Superseded => None,
-                    LibraryRoutingTransactionOutcome::RetryExhausted(_driver) => None,
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // The build owns no state until its compare-and-swap. A concurrent
+        // settings/workspace change or another readiness transition rejects it
+        // without replacing newer state; package-input drift alone does not
+        // (see `install_built_package_library`).
+        let routing_effects = self
+            .install_built_package_library(
+                routing_basis.take(),
+                library,
+                ready,
+                deadline,
+                |state| {
+                    !state.package_library_ready
+                        && state.package_config_generation == basis.package_config_generation
+                        && PackageInitKey::capture(state) == basis.key
+                },
+            )
+            .await;
         let Some(routing_effects) = routing_effects else {
             log::trace!("Discarding stale on-demand PackageLibrary build");
             return PackageInitAttempt::Stale {
@@ -2431,8 +2432,234 @@ impl Backend {
         }
     }
 
+    /// Startup package-library build (historically "Task B" of `initialized`).
+    ///
+    /// Runs detached from the `initialized` handler. Building the library
+    /// spawns R to read `.libPaths()` and expand `exportPattern` exports, and
+    /// on a project whose `renv/activate.R` is slow that spawn alone takes
+    /// 10–15 s. tower-lsp dispatches Raven's messages in order (see
+    /// `concurrency_level(1)`), so while `initialized` awaited this build every
+    /// request the editor sent — hover, references, completion — sat in the
+    /// queue behind it. Handlers already tolerate a not-ready library
+    /// (`package_library_ready` gates every package-aware path), so nothing
+    /// in `initialized` needs to wait for the result.
+    ///
+    /// The build itself is the ordinary coordinated initialization
+    /// (`coordinated_package_library_initialization`), not a parallel copy of
+    /// it. That matters now that startup no longer blocks the queue: the first
+    /// `did_open` arrives while this build is in flight and needs the library,
+    /// and before this shared path it started a second R build of its own —
+    /// two concurrent renv activations contending for CPU, the startup one
+    /// timing out, and the reconcile coordinator spawning a third. Behind the
+    /// coordinator mutex `did_open` simply waits for this build and then sees
+    /// `Ready`.
+    async fn run_startup_package_library_build(self) {
+        // Cleared on every exit path below (including a coordinator deadline
+        // expiry) so `did_open` falls back to on-demand initialization once
+        // this task is no longer working on its behalf.
+        struct ClearOnExit(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ClearOnExit {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _clear = ClearOnExit(Arc::clone(&self.startup_package_build_active));
+        let attempt = self
+            .coordinated_package_library_initialization(LibraryRoutingDeadline::foreground())
+            .await;
+        let committed = match attempt {
+            Some(PackageInitAttempt::Disabled) => {
+                log::info!("Package function awareness disabled");
+                crate::perf::record_package_init_disabled();
+                false
+            }
+            Some(PackageInitAttempt::Committed { .. }) => true,
+            // Another owner (a `did_open` that raced ahead) already committed a
+            // library; nothing to install, but the watcher below still needs to
+            // be attached to that current owner.
+            Some(PackageInitAttempt::Ready) => false,
+            Some(PackageInitAttempt::Stale { attempted_key }) => {
+                log::warn!(
+                    "Startup package-library build did not commit; the reconcile coordinator \
+                     retries it (attempted key {attempted_key:?})"
+                );
+                false
+            }
+            None => {
+                log::warn!("Startup package-library build coordinator deadline expired");
+                false
+            }
+        };
+
+        if !committed {
+            // A didOpen initialization may have won while the startup build was
+            // running. If its routing commit already attached a watcher for the
+            // current library, keep it: swapping would tear it down and attach
+            // a seeded replacement whose journal forces a second full libpath
+            // rescan (#748). Only when no watcher is attached (a stale or
+            // expired build, or a winner that could not attach) start one for
+            // the current owner without reviving the startup routing intent.
+            // The "no watcher attached" predicate is folded into the swap's
+            // basis capture and enforced by its CAS (the basis pins the watcher
+            // lifecycle signature), so a watcher installed by a routing commit
+            // between our check and the swap makes the swap lose, not replace.
+            if !swap_libpath_watcher_if_none_attached(
+                &self.state,
+                &self.client,
+                &self.routing_tasks,
+            )
+            .await
+            {
+                log::trace!(
+                    "Startup package-library build: current library already has a libpath \
+                     watcher (or one was attached concurrently); not re-swapping"
+                );
+            }
+        }
+
+        // R fallback for sysdata: when the AST scan found nothing AND
+        // R/sysdata.rda exists, try loading via an R subprocess.
+        schedule_current_sysdata_fallback(PackageSeedTaskHandles::from_backend(&self)).await;
+    }
+
+    /// Install a freshly built package library under a Replacement routing
+    /// CAS, tolerating routing-authority drift that happened during the build.
+    ///
+    /// The routing basis is captured before the build so a concurrent
+    /// replacement is detected, but the build itself spawns R and can take
+    /// many seconds. Package-input authority routinely moves in that window:
+    /// the startup package seed lands, a `DESCRIPTION` edit commits, a live
+    /// package buffer opens. None of that changes the library's *construction*
+    /// inputs (R path, additional library paths, workspace root, enablement),
+    /// yet it makes `prospective_library_routing` reject the pre-build basis.
+    /// Discarding the build over that drift handed the work to the reconcile
+    /// coordinator, which respawned R from scratch — on the project that
+    /// motivated this, a second 15 s stall on every startup.
+    ///
+    /// When the pre-build basis is stale but `still_current` confirms the
+    /// construction inputs and readiness intent are unchanged, this
+    /// re-captures a fresh Replacement basis and retries the routing
+    /// derivation with the same library. Dropping the stale bundle deposits its
+    /// reconcile currency and pre-seal ledger into the lifecycle; the fresh
+    /// capture adopts both, so no reconcile request is left behind and the
+    /// commit clears it. A `still_current` failure returns `None` and leaves
+    /// the deposited currency for the coordinator, exactly as before.
+    async fn install_built_package_library(
+        &self,
+        mut captured: Option<CapturedLibraryRouting>,
+        library: Arc<crate::package_library::PackageLibrary>,
+        ready: bool,
+        deadline: LibraryRoutingDeadline,
+        still_current: impl Fn(&WorldState) -> bool,
+    ) -> Option<crate::state::LibraryRoutingTransferredEffects> {
+        const ROUTING_ATTEMPTS: usize = 2;
+        for attempt in 0..ROUTING_ATTEMPTS {
+            let bundle = match captured.take() {
+                Some(bundle) => {
+                    // The pre-build basis already pins the configuration the
+                    // library was built from; the routing CAS rejects it if
+                    // that changed. This check only saves a doomed attempt.
+                    // Dropping `bundle` on the early return deposits its
+                    // reconcile currency for the coordinator.
+                    let state = deadline
+                        .wait("built package library currency check", self.state.read())
+                        .await
+                        .ok()?;
+                    if !still_current(&state) {
+                        return None;
+                    }
+                    drop(state);
+                    bundle
+                }
+                // A fresh basis would record the *current* configuration, so
+                // the currency check must run under the same write lock as
+                // the capture: a settings/workspace change landing between a
+                // separate check and the capture would let the CAS install a
+                // library built from the old key under the new key's
+                // authority.
+                //
+                // The re-capture also yields to any *other* pending replacement
+                // owner. The pre-build basis lost its slot to a newer intent (a
+                // `refreshPackages`, a package-setting change); minting yet
+                // another intent here would displace that owner and let this
+                // older library commit over its newer one. Yielding hands the
+                // outcome to the coordinator instead.
+                None => {
+                    capture_library_routing_basis_if(
+                        &self.state,
+                        crate::state::LibraryRoutingMutation::Replacement,
+                        None,
+                        crate::state::LibraryReplacementAbortPolicy::Reconcile,
+                        deadline,
+                        |state| still_current(state) && !state.has_pending_library_replacement(),
+                    )
+                    .await?
+                }
+            };
+            let (basis, replacement_guard, pre_seal) = bundle.into_parts();
+            let Some(driver) = prepare_library_routing_driver(
+                &self.state,
+                basis,
+                replacement_guard,
+                Some(pre_seal),
+                Arc::clone(&library),
+                LibraryRoutingDriverOptions {
+                    ready,
+                    only_packages: None,
+                    warm_open_packages: true,
+                    refresh_cache_epoch: true,
+                    attempt_limit: 2,
+                    deadline,
+                    watcher_runtime: Some(LibpathWatcherRuntime {
+                        client: self.client.clone(),
+                        routing_tasks: self.routing_tasks.clone(),
+                    }),
+                    watcher_recovery: false,
+                },
+            )
+            .await
+            else {
+                log::debug!(
+                    "package-library routing basis went stale during the build \
+                     (attempt {}/{ROUTING_ATTEMPTS}); re-capturing for the same library",
+                    attempt + 1
+                );
+                continue;
+            };
+            match complete_library_routing_driver(&self.state, driver).await {
+                LibraryRoutingTransactionOutcome::Committed(effects) => return Some(effects),
+                LibraryRoutingTransactionOutcome::Superseded => continue,
+                LibraryRoutingTransactionOutcome::RetryExhausted(_driver) => return None,
+            }
+        }
+        None
+    }
+
+    /// Make sure the package library is initialized before a prefetch, and
+    /// report whether it is ready.
+    ///
+    /// Used by the implicit, request-path callers (`did_change` prefetch,
+    /// on-demand prerequisite indexing). While the detached startup build is
+    /// in flight (`startup_package_build_active`) this returns the current
+    /// readiness *without* waiting on the coordinator: those callers run
+    /// inside notification handlers, and tower-lsp's single dispatch slot
+    /// would otherwise stall on the 10–15 s R spawn as soon as the user types
+    /// — the same stall `did_open` avoids. The startup build's commit
+    /// republishes every open document, so the skipped prefetch is redone.
+    /// Explicit rebuilds (`raven.refreshPackages`, package-settings changes)
+    /// take the coordinator directly and do wait, deliberately.
     async fn ensure_package_library_initialized(&self) -> bool {
         let deadline = LibraryRoutingDeadline::foreground();
+        if self.startup_package_build_active.load(Ordering::Acquire) {
+            return deadline
+                .wait(
+                    "package initialization startup-bypass read",
+                    self.state.read(),
+                )
+                .await
+                .map(|state| state.package_library_ready)
+                .unwrap_or(false);
+        }
         let Some(attempt) = self
             .coordinated_package_library_initialization(deadline)
             .await
@@ -2661,6 +2888,7 @@ impl Backend {
                 OpenTarSourceRefreshCompletions::default(),
             ),
             package_init_coordinator: Arc::new(tokio::sync::Mutex::new(())),
+            startup_package_build_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             test_home_dir: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -3341,13 +3569,28 @@ mod load_all_revalidation_tests {
     }
 }
 
+/// Whether a watched path under `R/` or `tests/testthat/` can affect package
+/// inputs.
+///
+/// Directory nodes match by prefix (a created or removed `R/unix/` or
+/// `tests/testthat/` subtree must trigger a rescan). An R *file* is judged by
+/// `is_r_source_path`, the same predicate every seeder filters through, so a
+/// save under `R/scripts/` — which R does not load and the seed ignores — no
+/// longer triggers a full package-seed recompute it cannot affect.
 fn is_package_source_dir(path: &std::path::Path, root: &std::path::Path) -> bool {
     let r_dir = root.join("R");
     let testthat_dir = root.join("tests").join("testthat");
-    path == r_dir
+    let under_tracked = path == r_dir
         || path.starts_with(&r_dir)
         || path == testthat_dir
-        || path.starts_with(testthat_dir)
+        || path.starts_with(testthat_dir);
+    if !under_tracked {
+        return false;
+    }
+    if crate::package_state::has_r_extension(path) {
+        return crate::package_state::is_r_source_path(path, root).is_some();
+    }
+    true
 }
 
 /// Whether `path` lives under the package's `data/` or `data-raw/` directories.
@@ -4292,15 +4535,98 @@ async fn apply_workspace_scan_if_current(
         .workspace_scan
 }
 
-/// Run at most two complete attempts for one latest-arrival scan intent.
+/// Attempts (disk scan + derivation + commit CAS) per scan intent before the
+/// driver gives up. Each attempt is a full re-scan, so the ceiling bounds the
+/// worst case for a workspace whose open buffers never stop changing.
+const WORKSPACE_SCAN_ATTEMPT_LIMIT: usize = 6;
+
+/// Attempts that repeat the disk scan the moment the previous CAS fails. From
+/// this attempt on, the driver first waits for the state to go quiet
+/// ([`WORKSPACE_SCAN_QUIET_WINDOW`]) so a steady stream of `did_change`
+/// commits cannot invalidate every attempt.
+const WORKSPACE_SCAN_EAGER_ATTEMPTS: usize = 2;
+
+/// How long the scan inputs must stay unchanged before a non-eager attempt
+/// begins. Long enough to outlast the ~200 ms edit debounce that drives most
+/// open-document commits; short enough that the index still lands within a
+/// second or two of the user pausing.
+const WORKSPACE_SCAN_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Upper bound on waiting for a quiet window before an attempt proceeds anyway.
+const WORKSPACE_SCAN_QUIET_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run up to [`WORKSPACE_SCAN_ATTEMPT_LIMIT`] complete attempts for one
+/// latest-arrival scan intent.
 ///
-/// A CAS rejection discards the whole attempt. Attempt two recaptures the
+/// A CAS rejection discards the whole attempt. Every retry recaptures the
 /// pre-I/O basis and repeats disk scan plus graph/artifact derivation from
 /// scratch, while retaining the same arrival intent. A newer intent
 /// supersedes immediately and can never be mistaken for intentional no-scan
 /// completion.
+///
+/// Why more than two attempts, and why the quiet window: the derivation basis
+/// is invalidated by *any* open-document commit (every `did_change` advances
+/// the open-record token), and a multi-second scan of a large workspace is
+/// almost guaranteed to overlap one when the user is typing. Two back-to-back
+/// attempts against a workspace that took ~30 s to scan and derive both lost
+/// the race on a real project, the driver logged "exhausted" and gave up, and
+/// the editor ran for the rest of the session with no workspace index — Find
+/// References returned only the current file, `# raven: sourced-by` auto-detect
+/// stayed off, and cross-file definitions in closed files never resolved. With
+/// nothing re-arming the scan (only config edits and watched-file events do),
+/// that state persisted until restart. The eager first attempts keep the fast
+/// path fast; later attempts wait for the scan inputs to hold still so they
+/// commit against a basis that is likely to survive.
+#[cfg(test)]
 async fn run_workspace_scan_transaction_using<F, Fut>(
     state_arc: &Arc<RwLock<WorldState>>,
+    scan: F,
+) -> WorkspaceScanRunOutcome
+where
+    F: FnMut(WorkspaceScanInputs) -> Fut,
+    Fut: Future<Output = Option<crate::state::WorkspaceScanResult>>,
+{
+    run_workspace_scan_transaction_with(state_arc, WorkspaceScanDriverMode::Detached, scan).await
+}
+
+/// Where the scan driver runs, which decides whether lost-race retries may
+/// sleep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceScanDriverMode {
+    /// A background task. Later retries wait for the scan authority to hold
+    /// still (`wait_for_workspace_scan_quiet_window`) because concurrent
+    /// `did_change`s are what keep beating the CAS.
+    Detached,
+    /// Awaited inside an LSP notification handler. tower-lsp runs handlers one
+    /// at a time (`concurrency_level(1)`), so nothing the quiet window is
+    /// designed to wait for can arrive while the handler holds the queue; the
+    /// sleeps would only freeze hover, completion, and diagnostics. Retries
+    /// run back to back.
+    Inline,
+}
+
+/// The scan driver proper, with an explicit driver mode (`run_workspace_scan_transaction`
+/// and the test-only `run_workspace_scan_transaction_using` are thin wrappers).
+///
+/// Retries reuse the previous attempt's scan result when the *scan inputs*
+/// (folders, depth, exclusions, and their generations) are still current at
+/// the next capture *and* the workspace index has not changed since the
+/// result was produced: the common lost race is a `did_change` invalidating
+/// the derivation basis, which touches neither the disk walk's inputs nor
+/// the closed index. Rescanning then re-reads and re-parses every file for
+/// nothing, and on the multi-second workspaces that lose races at all it
+/// turned a retry into a second full scan. The index-version check is what
+/// makes reuse safe: a watched-file resync that updates or deletes a closed
+/// file after the scan read it bumps the index version without touching any
+/// scan-input generation, and `prepare_workspace_scan` lets scanned entries
+/// overwrite retained dynamic ones — so reusing the stale payload would
+/// reinstall old contents or resurrect a deleted file over an event the
+/// watcher already consumed. Such a retry rescans. The cache costs one clone
+/// of the result per attempt (ropes, trees and artifacts are
+/// reference-counted, so it is cheap relative to the walk).
+async fn run_workspace_scan_transaction_with<F, Fut>(
+    state_arc: &Arc<RwLock<WorldState>>,
+    mode: WorkspaceScanDriverMode,
     mut scan: F,
 ) -> WorkspaceScanRunOutcome
 where
@@ -4308,10 +4634,21 @@ where
     Fut: Future<Output = Option<crate::state::WorkspaceScanResult>>,
 {
     let intent = state_arc.write().await.begin_workspace_scan_intent();
-    for attempt in 0..2 {
-        let inputs = {
+    // (inputs the result was scanned under, index version at that capture, result)
+    let mut cached: Option<(WorkspaceScanInputs, u64, crate::state::WorkspaceScanResult)> = None;
+    for attempt in 0..WORKSPACE_SCAN_ATTEMPT_LIMIT {
+        if mode == WorkspaceScanDriverMode::Detached && attempt >= WORKSPACE_SCAN_EAGER_ATTEMPTS {
+            wait_for_workspace_scan_quiet_window(state_arc).await;
+        }
+        let (inputs, index_version, reuse_cached) = {
             let state = state_arc.read().await;
-            WorkspaceScanInputs::capture(&state, intent)
+            let inputs = WorkspaceScanInputs::capture(&state, intent);
+            let index_version = state.workspace_index.version();
+            let reuse_cached = cached.as_ref().is_some_and(|(previous, version, _)| {
+                *version == index_version
+                    && state.workspace_scan_input_basis_is_current(&previous.basis)
+            });
+            (inputs, index_version, reuse_cached)
         };
         let Some(inputs) = inputs else {
             let state = state_arc.read().await;
@@ -4321,8 +4658,25 @@ where
                 WorkspaceScanRunOutcome::Superseded
             };
         };
-        let Some(result) = scan(inputs.clone()).await else {
-            return WorkspaceScanRunOutcome::ScanFailed;
+        let result = match cached.as_ref() {
+            Some((_, _, previous)) if reuse_cached => {
+                log::debug!(
+                    "Workspace scan attempt {}/{} reuses the previous scan result \
+                     (scan inputs and closed index unchanged)",
+                    attempt + 1,
+                    WORKSPACE_SCAN_ATTEMPT_LIMIT
+                );
+                previous.clone()
+            }
+            _ => {
+                let Some(result) = scan(inputs.clone()).await else {
+                    return WorkspaceScanRunOutcome::ScanFailed;
+                };
+                if attempt + 1 < WORKSPACE_SCAN_ATTEMPT_LIMIT {
+                    cached = Some((inputs.clone(), index_version, result.clone()));
+                }
+                result
+            }
         };
         if let Some(transfer) = apply_workspace_scan_if_current(state_arc, &inputs, result).await {
             return WorkspaceScanRunOutcome::Committed(AppliedWorkspaceScan {
@@ -4342,18 +4696,67 @@ where
         {
             return WorkspaceScanRunOutcome::Superseded;
         }
-        if attempt == 1 {
-            return WorkspaceScanRunOutcome::RetryExhausted;
+        if attempt + 1 < WORKSPACE_SCAN_ATTEMPT_LIMIT {
+            log::debug!(
+                "Workspace scan attempt {}/{} lost its authority race; retrying",
+                attempt + 1,
+                WORKSPACE_SCAN_ATTEMPT_LIMIT
+            );
+        } else {
+            log::debug!(
+                "Workspace scan attempt {}/{} lost its authority race; no attempts remain",
+                attempt + 1,
+                WORKSPACE_SCAN_ATTEMPT_LIMIT
+            );
         }
         tokio::task::yield_now().await;
     }
-    unreachable!("the fixed two-attempt loop always returns")
+    WorkspaceScanRunOutcome::RetryExhausted
+}
+
+/// Wait until the scan-input authority has not moved for
+/// [`WORKSPACE_SCAN_QUIET_WINDOW`], or until [`WORKSPACE_SCAN_QUIET_WAIT_LIMIT`]
+/// elapses. Polls a cheap generation snapshot under short read locks; never
+/// holds the lock across a sleep.
+async fn wait_for_workspace_scan_quiet_window(state_arc: &Arc<RwLock<WorldState>>) {
+    let started = tokio::time::Instant::now();
+    let mut last = state_arc.read().await.workspace_scan_authority_stamp();
+    let mut quiet_since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(WORKSPACE_SCAN_QUIET_WINDOW / 3).await;
+        let now = tokio::time::Instant::now();
+        let current = state_arc.read().await.workspace_scan_authority_stamp();
+        if current != last {
+            last = current;
+            quiet_since = now;
+        }
+        if now.duration_since(quiet_since) >= WORKSPACE_SCAN_QUIET_WINDOW
+            || now.duration_since(started) >= WORKSPACE_SCAN_QUIET_WAIT_LIMIT
+        {
+            return;
+        }
+    }
 }
 
 async fn run_workspace_scan_transaction(
     state_arc: &Arc<RwLock<WorldState>>,
 ) -> WorkspaceScanRunOutcome {
-    run_workspace_scan_transaction_using(state_arc, |inputs| async move {
+    run_workspace_scan_transaction_in(state_arc, WorkspaceScanDriverMode::Detached).await
+}
+
+/// [`run_workspace_scan_transaction`] for callers awaiting the scan inside a
+/// notification handler; see [`WorkspaceScanDriverMode::Inline`].
+async fn run_workspace_scan_transaction_inline(
+    state_arc: &Arc<RwLock<WorldState>>,
+) -> WorkspaceScanRunOutcome {
+    run_workspace_scan_transaction_in(state_arc, WorkspaceScanDriverMode::Inline).await
+}
+
+async fn run_workspace_scan_transaction_in(
+    state_arc: &Arc<RwLock<WorldState>>,
+    mode: WorkspaceScanDriverMode,
+) -> WorkspaceScanRunOutcome {
+    run_workspace_scan_transaction_with(state_arc, mode, |inputs| async move {
         match tokio::task::spawn_blocking(move || {
             let scan_start = std::time::Instant::now();
             let result = crate::state::scan_workspace_with_exclusions(
@@ -5041,6 +5444,7 @@ impl LibraryRoutingPreSealObligation {
     /// Fresh vacuous payload is discarded. Adopted currency or concrete
     /// ledger content is returned for the guard to preserve under the same
     /// lifecycle mutex used to retire its exact intent.
+    #[cfg(test)]
     fn take_for_bundle_retirement(mut self) -> Option<crate::state::LibraryRoutingPreSealDeposit> {
         let deposit = self
             .deposit
@@ -5083,8 +5487,11 @@ impl CapturedLibraryRouting {
         )
     }
 
-    /// Retire a startup replacement made redundant by an already-ready
-    /// package library.
+    /// Retire a replacement bundle made redundant by an already-ready package
+    /// library. Production startup no longer captures a bundle before checking
+    /// readiness (`try_initialize_package_library` returns `Ready` first), so
+    /// this exercises the lifecycle primitive for the routing tests only.
+    #[cfg(test)]
     fn retire_bundle_without_reconcile(mut self) {
         let guard = self
             .replacement_guard
@@ -5489,6 +5896,35 @@ async fn capture_library_routing_basis(
     abort_policy: crate::state::LibraryReplacementAbortPolicy,
     deadline: LibraryRoutingDeadline,
 ) -> Option<CapturedLibraryRouting> {
+    capture_library_routing_basis_if(
+        state_arc,
+        mutation,
+        watcher_owner,
+        abort_policy,
+        deadline,
+        |_| true,
+    )
+    .await
+}
+
+/// [`capture_library_routing_basis`] gated by `still_current`, evaluated under
+/// the same write lock that captures the basis.
+///
+/// A caller that checks currency under a read lock, drops it, and then
+/// captures has a window in which the configuration can change; the fresh
+/// basis then records the *new* configuration and the routing CAS cannot tell
+/// that the payload was built from the old one. Evaluating the predicate
+/// under the capture's own write lock closes that window: a `None` from a
+/// failed predicate deposits nothing (no guard or pre-seal obligation was
+/// created yet).
+async fn capture_library_routing_basis_if(
+    state_arc: &Arc<RwLock<WorldState>>,
+    mutation: crate::state::LibraryRoutingMutation,
+    watcher_owner: Option<crate::state::LibpathWatcherOwner>,
+    abort_policy: crate::state::LibraryReplacementAbortPolicy,
+    deadline: LibraryRoutingDeadline,
+    still_current: impl FnOnce(&WorldState) -> bool,
+) -> Option<CapturedLibraryRouting> {
     let library = deadline
         .wait("library-routing capture read", state_arc.read())
         .await
@@ -5504,6 +5940,9 @@ async fn capture_library_routing_basis(
         .wait("library-routing capture write", state_arc.write())
         .await
         .ok()?;
+    if !still_current(&state) {
+        return None;
+    }
     let basis = state.capture_library_routing_basis(&library, epoch, mutation, watcher_owner)?;
     let guard = state.guard_library_replacement(&basis, abort_policy);
     let (pre_seal_owner, pre_seal, adopted_obligation) =
@@ -12659,6 +13098,12 @@ impl WatchedClosedDiskObservation {
 struct WatchedResyncItem {
     uri: Url,
     generation: u64,
+    /// The event only feeds the package seed (a `data-raw/**` script, a
+    /// prelude-sourced helper) and the file lives where bulk discovery would
+    /// prune it. The batch carries it to the package-input reseed without
+    /// reading or indexing it, so a hidden file cannot become a workspace
+    /// entry through a save. See `watched_change_admission`.
+    package_input_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -12671,7 +13116,9 @@ enum WatchedResyncBatchMode {
 enum WatchedResyncCompletion {
     Detached,
     InvocationOwned {
-        post_commit: Option<OpenSourceBatchPostCommit>,
+        /// Boxed: it carries a whole `Backend` by value, and the enum is
+        /// moved through several batch structs alongside a dataless variant.
+        post_commit: Option<Box<OpenSourceBatchPostCommit>>,
         receipt: OpenSourceBatchCompletionReceipt,
         boundary_waiter: bool,
     },
@@ -14750,6 +15197,13 @@ async fn run_watched_resync_batch_owned(
     let mut invocation_retry_needed = false;
     let mut invocation_undecodable_retry_needed = false;
     for (item_index, item) in uris_to_update.iter().enumerate() {
+        if item.package_input_only {
+            // Never read or indexed as a workspace entry; it exists in this
+            // batch so `watched_items_touch_package_inputs` below sees it and
+            // requests the package reseed.
+            eligible_update_indices.insert(item_index);
+            continue;
+        }
         // Capture old metadata before the disk read (for WD change
         // detection). The file was never open — the sync pass skips open
         // documents — so every metadata tier already reflects the last-known
@@ -15433,6 +15887,11 @@ async fn run_watched_resync_batch_owned(
             }
 
             for item in &uris_to_update {
+                if item.package_input_only {
+                    // Same contract as the batch path: carried for the package
+                    // reseed only, never read or indexed as a workspace entry.
+                    continue;
+                }
                 if invocation_owned {
                     if !resync_invocation_fallback_item(
                         &state_arc,
@@ -15605,7 +16064,7 @@ async fn run_watched_resync_batch_owned(
                 final_handoff_test_capture,
             },
             await_reserved_tickets,
-            post_commit_source_refresh,
+            post_commit_source_refresh.map(|post_commit| *post_commit),
             completion_receipt,
             invocation_commit_complete,
         );
@@ -15930,6 +16389,76 @@ fn enrich_box_candidate_importers(
     importers
 }
 
+/// Classify a watched CREATED/CHANGED event for `uri`: index it, carry it to
+/// the package reseed only, or drop it as bulk discovery of a file the
+/// workspace walk would have pruned.
+///
+/// Incremental discovery obeys the bulk-discovery prune rule: a file under a
+/// hidden or vendored directory that nothing already tracks is not admitted
+/// through the watcher either (VS Code's recursive watcher reports every
+/// create under the workspace, and a dynamic entry admitted that way survives
+/// every later scan). Everything that *does* track the file exempts it:
+///
+/// - an existing index entry or artifact projection (explicit, on-demand);
+/// - a graph dependent — some indexed or open file `source()`s it, so
+///   creating it must index it and clear the importer's missing-file state;
+/// - anything that feeds package inputs, judged by the same predicate the
+///   reseed uses (`watched_items_touch_package_inputs`): `R/` and test
+///   sources, `data/` and `data-raw/` (the package scanner reads
+///   `data-raw/**/*.R` recursively, hidden subdirectories included), and the
+///   prelude sets — a workspace `.Rprofile` or a testthat/testit preamble
+///   sources it. Such files often have no index entry and no graph dependent
+///   (the seed harvests them rather than indexing them), and their update is
+///   what lets the reseed run. Dropping it would leave package-derived
+///   symbols stale until some other package event.
+///
+/// How `collect_watched_resync` treats a CREATED/CHANGED event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchedChangeAdmission {
+    /// Read and (re)index the file as a workspace entry.
+    Index,
+    /// Carry the event to the package-input reseed only; do not index.
+    PackageInputOnly,
+    /// Drop the event.
+    Pruned,
+}
+
+fn watched_change_admission(state: &WorldState, uri: &Url) -> WatchedChangeAdmission {
+    if state.workspace_index.contains(uri)
+        || state.workspace_index.contains_artifacts(uri)
+        || !state.cross_file_graph.get_dependents(uri).is_empty()
+        || !state.is_bulk_discovery_pruned_uri(uri)
+    {
+        return WatchedChangeAdmission::Index;
+    }
+    // Under a pruned directory and tracked by nothing that indexes it. If the
+    // package seed harvests it — package mode (`watched_items_touch_package_inputs`
+    // covers `R/`, tests, `data/`, `data-raw/**`, and the prelude sets), or the
+    // prelude sets outside package mode (a plain workspace `.Rprofile`, a
+    // testthat preamble in a non-package project) — the reseed still needs the
+    // event, but indexing the file would make a hidden path a permanent
+    // workspace entry through a single save.
+    let feeds_package_inputs =
+        watched_items_touch_package_inputs(state, std::iter::once(uri.clone()))
+            || uri.to_file_path().is_ok_and(|path| {
+                path_in_rprofile_sourced_set(&path, &state.package_inputs.rprofile_sourced_files)
+                    || path_in_rprofile_sourced_set(
+                        &path,
+                        &state.package_inputs.preamble_sourced_files,
+                    )
+            });
+    if feeds_package_inputs {
+        WatchedChangeAdmission::PackageInputOnly
+    } else {
+        WatchedChangeAdmission::Pruned
+    }
+}
+
+#[cfg(test)]
+fn watched_change_is_bulk_discovery_pruned(state: &WorldState, uri: &Url) -> bool {
+    watched_change_admission(state, uri) == WatchedChangeAdmission::Pruned
+}
+
 /// Reserve one watched generation per closed URI and capture the pre-update
 /// diagnostic fanout. When any event in one normalized notification belongs
 /// to an open source-batch parent, the backend calls this once for the whole
@@ -15987,6 +16516,7 @@ fn collect_watched_resync(
                 updates.push(WatchedResyncItem {
                     uri: importer_uri.clone(),
                     generation,
+                    package_input_only: false,
                 });
             }
         }
@@ -16030,6 +16560,7 @@ fn collect_watched_resync(
                     deletions.push(WatchedResyncItem {
                         uri: uri.clone(),
                         generation,
+                        package_input_only: false,
                     });
                     extend_with_watched_pre_update_dependents(
                         &mut affected,
@@ -16043,12 +16574,29 @@ fn collect_watched_resync(
                 if queued_updates.contains(uri) {
                     continue;
                 }
+                let package_input_only = match watched_change_admission(state, uri) {
+                    WatchedChangeAdmission::Pruned => {
+                        log::trace!("Ignoring watched change under a pruned directory: {uri}");
+                        continue;
+                    }
+                    WatchedChangeAdmission::PackageInputOnly => {
+                        log::trace!(
+                            "Carrying watched change under a pruned directory to the package \
+                             reseed only: {uri}"
+                        );
+                        true
+                    }
+                    WatchedChangeAdmission::Index => false,
+                };
                 let generation = bump_watched_file_resync_generation(state, uri);
-                state.workspace_index.schedule_update(uri.clone());
+                if !package_input_only {
+                    state.workspace_index.schedule_update(uri.clone());
+                }
                 queued_updates.insert(uri.clone());
                 updates.push(WatchedResyncItem {
                     uri: uri.clone(),
                     generation,
+                    package_input_only,
                 });
                 extend_with_watched_pre_update_dependents(
                     &mut affected,
@@ -16062,6 +16610,7 @@ fn collect_watched_resync(
                 deletions.push(WatchedResyncItem {
                     uri: uri.clone(),
                     generation,
+                    package_input_only: false,
                 });
                 extend_with_watched_pre_update_dependents(
                     &mut affected,
@@ -16991,6 +17540,14 @@ async fn did_open_transactional(
                 workspace_folders,
                 state.cross_file_config.packages_enabled
                     && !state.package_library_ready
+                    // The detached startup build is already producing the
+                    // library; awaiting it here would hold the sole dispatch
+                    // slot for the whole R spawn. Open with the not-ready
+                    // library instead; the build's commit republishes this
+                    // document. See `Backend::startup_package_build_active`.
+                    && !backend
+                        .startup_package_build_active
+                        .load(Ordering::Acquire)
                     && package_init_attempt.as_ref() != Some(&package_init_key)
                     && package_init_rounds < 2,
                 {
@@ -17767,23 +18324,10 @@ impl LanguageServer for Backend {
         }
 
         // Get workspace folders and config under brief lock
-        let (
-            folders,
-            packages_enabled,
-            packages_r_path,
-            additional_paths,
-            index_workspace,
-            workspace_exclusions,
-        ) = {
+        let (folders, index_workspace, workspace_exclusions) = {
             let state = self.state.read().await;
             (
                 state.workspace_folders.clone(),
-                state.cross_file_config.packages_enabled,
-                state.cross_file_config.packages_r_path.clone(),
-                state
-                    .cross_file_config
-                    .packages_additional_library_paths
-                    .clone(),
                 state.cross_file_config.index_workspace,
                 state.workspace_exclusions.clone(),
             )
@@ -18032,7 +18576,8 @@ impl LanguageServer for Backend {
                     }
                     WorkspaceScanRunOutcome::RetryExhausted => {
                         log::warn!(
-                            "Background workspace scan exhausted its two authority attempts"
+                            "Background workspace scan exhausted all {} authority attempts",
+                            WORKSPACE_SCAN_ATTEMPT_LIMIT
                         );
                     }
                     WorkspaceScanRunOutcome::ScanFailed => {
@@ -18049,201 +18594,20 @@ impl LanguageServer for Backend {
             .await;
         }
 
-        // Task B: Initialize PackageLibrary (await this - diagnostics need it)
-        // This is fast (~100ms) due to batched R subprocess calls.
-        let startup_routing_deadline = LibraryRoutingDeadline::foreground();
-        let mut startup_routing_basis = capture_library_routing_basis(
-            &self.state,
-            crate::state::LibraryRoutingMutation::Replacement,
-            None,
-            crate::state::LibraryReplacementAbortPolicy::Reconcile,
-            startup_routing_deadline,
-        )
-        .await;
-        let (new_package_library, package_library_ready, load_notes) = 'package_build: {
-            let pkg_start = std::time::Instant::now();
-            let r_calls_before = crate::perf::get_r_subprocess_calls();
-
-            // Get workspace root from folders (if available) for R working
-            // directory (e.g. for renv).
-            let workspace_root = folders.first().and_then(|url| url.to_file_path().ok());
-
-            // The shared helper self-gates on `packages_enabled` (returning
-            // `Disabled` with an empty library and no R discovery), moves R
-            // discovery into kill-on-drop async probes, provider opening onto
-            // dedicated capacity-bounded threads, and computes readiness after
-            // applying additional paths. The helper logs provider-load notes;
-            // perf metrics, the count log, and the "disabled" status log stay
-            // owned by this startup caller.
-            let build = crate::package_library::try_build_package_library(
-                packages_r_path,
-                &additional_paths,
-                workspace_root,
-                packages_enabled,
-                // Startup Task B is passive initialization and may share a
-                // provider generation already started for these exact inputs.
-                crate::package_library::ProviderLoadPolicy::Share,
-            );
-            let outcome = match startup_routing_deadline
-                .wait(
-                    "startup package build",
-                    crate::r_subprocess::with_outer_r_deadline(startup_routing_deadline.at, build),
-                )
-                .await
-            {
-                Ok(Ok(outcome)) => outcome,
-                Ok(Err(error)) => {
-                    log::warn!("Startup package build failed before commit: {error}");
-                    let state = self.state.read().await;
-                    break 'package_build (
-                        state.package_library.clone(),
-                        state.package_library_ready,
-                        Vec::new(),
-                    );
-                }
-                Err(LibraryRoutingDeadlineElapsed(phase)) => {
-                    log::warn!("Startup package build deadline expired during {phase}");
-                    let state = self.state.read().await;
-                    break 'package_build (
-                        state.package_library.clone(),
-                        state.package_library_ready,
-                        Vec::new(),
-                    );
-                }
-            };
-
-            // Captured here before `outcome` is destructured; surfaced after the
-            // commit below, and only if this path wins the race.
-            let package_library_ready = outcome.consumer_ready();
-            let load_notes = outcome.load_notes;
-
-            use crate::package_library::PackageLibraryStatus;
-            let status = outcome.status;
-            let library = outcome.library;
-            if status == PackageLibraryStatus::Disabled {
-                log::info!("Package function awareness disabled");
-                (library, false, load_notes)
-            } else {
-                if let PackageLibraryStatus::InitFailed(e) = &status {
-                    log::warn!("Failed to initialize PackageLibrary: {}", e);
-                }
-                let pkg_duration = pkg_start.elapsed();
-                let r_calls = crate::perf::get_r_subprocess_calls() - r_calls_before;
-                crate::perf::record_package_init(pkg_duration, r_calls);
-
-                log::info!(
-                    "PackageLibrary initialized: {} lib_paths, {} base_packages, {} base_exports",
-                    library.lib_paths().len(),
-                    library.base_packages().len(),
-                    library.base_exports().len()
-                );
-                (library, package_library_ready, load_notes)
-            }
-        };
-
-        // Apply PackageLibrary only if not already initialized.
-        // `ensure_package_library_initialized` (called from `did_open`) may have raced
-        // ahead and already written a library with prefetched package caches.
-        // Overwriting it would discard those caches and cause false-positive
-        // "Package is not installed" diagnostics until the next prefetch.
-        if startup_routing_basis
-            .as_ref()
-            .is_some_and(|captured| captured.basis.ready)
-        {
-            startup_routing_basis
-                .take()
-                .expect("ready startup routing capture remains whole")
-                .retire_bundle_without_reconcile();
+        // Task B: build the PackageLibrary in the background. It spawns R,
+        // which can take 10–15 s on a slow-`renv` project; awaiting it here
+        // held every queued request behind startup (tower-lsp dispatches in
+        // order). See `run_startup_package_library_build`.
+        let startup_backend = self.clone();
+        self.startup_package_build_active
+            .store(true, Ordering::Release);
+        if !self.routing_tasks.spawn_root(async move {
+            startup_backend.run_startup_package_library_build().await;
+        }) {
+            self.startup_package_build_active
+                .store(false, Ordering::Release);
+            log::debug!("Shutdown drain retired the startup package-library build before spawn");
         }
-        let routing_effects = if let Some((basis, replacement_guard, pre_seal)) =
-            startup_routing_basis
-                .take()
-                .map(CapturedLibraryRouting::into_parts)
-            && let Some(driver) = prepare_library_routing_driver(
-                &self.state,
-                basis,
-                replacement_guard,
-                Some(pre_seal),
-                new_package_library,
-                LibraryRoutingDriverOptions {
-                    ready: package_library_ready,
-                    only_packages: None,
-                    warm_open_packages: true,
-                    refresh_cache_epoch: true,
-                    attempt_limit: 2,
-                    deadline: startup_routing_deadline,
-                    watcher_runtime: Some(LibpathWatcherRuntime {
-                        client: self.client.clone(),
-                        routing_tasks: self.routing_tasks.clone(),
-                    }),
-                    watcher_recovery: false,
-                },
-            )
-            .await
-        {
-            match complete_library_routing_driver(&self.state, driver).await {
-                LibraryRoutingTransactionOutcome::Committed(effects) => Some(effects),
-                LibraryRoutingTransactionOutcome::Superseded => None,
-                LibraryRoutingTransactionOutcome::RetryExhausted(_driver) => None,
-            }
-        } else {
-            None
-        };
-        let committed = routing_effects.is_some();
-        // Surface Tier 2/3 load notes only if this path committed the library,
-        // so the did_open race (`ensure_package_library_initialized`) doesn't
-        // double-toast the same notes.
-        if committed {
-            self.surface_load_notes(&load_notes).await;
-        }
-
-        // Re-resolve system.file() sources now that lib_paths are available.
-        // The workspace scan (Task A) may have completed before the library
-        // was ready, leaving branch-2 (installed-package) targets unresolved.
-        // This detached convergence pass picks them up.
-        if let Some(transfer) = routing_effects {
-            let fallback = self.state.read().await.documents.keys().cloned().collect();
-            let tickets = finalize_library_routing_effects(
-                PackageSeedTaskHandles::from_backend(self),
-                transfer,
-                Vec::new(),
-                fallback,
-            )
-            .await;
-            // Package initialization previously let diagnostics fanout run in
-            // the background; preserving that timing avoids serializing the
-            // `initialized` handler on debounce or a slow diagnostic pass.
-            self.routing_tasks
-                .spawn_root(crate::r_subprocess::with_outer_r_deadline(
-                    startup_routing_deadline.at,
-                    Backend::publish_diagnostics_for_tickets_bounded(
-                        self.state.clone(),
-                        self.client.clone(),
-                        tickets,
-                        Some(self.traversal_truncation.clone()),
-                    ),
-                ));
-        }
-
-        // Start the libpath watcher if enabled and we have a real package
-        // library. `lib_paths` is captured here as a one-time snapshot — if the
-        // user later changes `.libPaths()` mid-session (e.g. `renv` switches
-        // projects, `.Rprofile` is edited, or `.libPaths(new=...)` is called),
-        // the watcher keeps watching the originally-captured directories. The
-        // documented workaround is the `raven.refreshPackages` command, which
-        // rebuilds `PackageLibrary` (re-running `.libPaths()`) and restarts the
-        // watcher over the newly-discovered paths. See `docs/packages.md`.
-        if !committed {
-            // A didOpen initialization may have won while Task B was building.
-            // Start a watcher for that current owner without reviving Task B's
-            // superseded routing intent.
-            swap_current_libpath_watcher(&self.state, &self.client, &self.routing_tasks, true)
-                .await;
-        }
-
-        // R fallback for sysdata: when the AST scan found nothing AND
-        // R/sysdata.rda exists, try loading via an R subprocess.
-        schedule_current_sysdata_fallback(PackageSeedTaskHandles::from_backend(self)).await;
 
         // Register dynamic file watches for raven.toml / .lintr along the
         // same workspace-root/ancestor paths that project-config discovery
@@ -18285,7 +18649,9 @@ impl LanguageServer for Backend {
                 m.log_summary()
             }
         }
-        log::info!("Initialization complete (workspace scan running in background)");
+        log::info!(
+            "Initialization complete (workspace scan and package-library build running in background)"
+        );
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -18367,6 +18733,21 @@ impl LanguageServer for Backend {
                     let state = self.state.read().await;
                     state.documents.keys().cloned().collect()
                 };
+
+                // Serialize with the coordinated startup/didOpen build (#747):
+                // otherwise a refresh issued while that build's R child is
+                // still running spawns a second R for the same library, and
+                // whichever commits second is rejected and rebuilt again by
+                // the reconcile coordinator. Taken *before* the routing
+                // capture so the in-flight build's commit cannot supersede
+                // this basis while we wait.
+                let _coordinator = routing_deadline
+                    .wait(
+                        "refreshPackages package-init coordinator",
+                        self.package_init_coordinator.lock(),
+                    )
+                    .await
+                    .map_err(|_| refresh_not_committed("package-init coordinator deadline"))?;
 
                 // Capture the cache size of the *current* library before any
                 // rebuild/refresh so the user-visible "cleared N entries"
@@ -19694,11 +20075,11 @@ impl LanguageServer for Backend {
                     reserved_tickets: Vec::new(),
                     transfer_handles: Vec::new(),
                     completion: WatchedResyncCompletion::InvocationOwned {
-                        post_commit: Some(OpenSourceBatchPostCommit {
+                        post_commit: Some(Box::new(OpenSourceBatchPostCommit {
                             backend: self.clone(),
                             parents: open_tar_source_parents,
                             refresh_sysdata_fallback: source_sysdata_event,
-                        }),
+                        })),
                         receipt: receipt.clone(),
                         boundary_waiter: true,
                     },
@@ -20884,7 +21265,7 @@ impl Backend {
             );
 
             if should_scan {
-                match run_workspace_scan_transaction(&self.state).await {
+                match run_workspace_scan_transaction_inline(&self.state).await {
                     WorkspaceScanRunOutcome::Committed(applied_scan) => {
                         let root_for_pkg_inputs = applied_scan.workspace_root;
                         let workspace_exclusions = applied_scan.exclusions;
@@ -20970,7 +21351,8 @@ impl Backend {
                     }
                     WorkspaceScanRunOutcome::RetryExhausted => {
                         log::warn!(
-                            "Workspace exclusion reload scan exhausted its two authority attempts"
+                            "Workspace exclusion reload scan exhausted all {} authority attempts",
+                            WORKSPACE_SCAN_ATTEMPT_LIMIT
                         );
                         workspace_scan_fallback_affected = affected;
                     }
@@ -21022,7 +21404,7 @@ impl Backend {
         if workspace_scan_refresh_needed && !workspace_exclusions_changed {
             // A false -> true transition or a depth change owns its own
             // convergent scan; it cannot depend on the detached startup task.
-            match run_workspace_scan_transaction(&self.state).await {
+            match run_workspace_scan_transaction_inline(&self.state).await {
                 WorkspaceScanRunOutcome::Committed(applied_scan) => {
                     workspace_scan_transfer = Some(applied_scan.transfer);
                     let (package_library, packages_enabled) = {
@@ -21045,7 +21427,10 @@ impl Backend {
                     log::debug!("Configuration workspace scan was superseded");
                 }
                 WorkspaceScanRunOutcome::RetryExhausted => {
-                    log::warn!("Configuration workspace scan exhausted its two authority attempts");
+                    log::warn!(
+                        "Configuration workspace scan exhausted all {} authority attempts",
+                        WORKSPACE_SCAN_ATTEMPT_LIMIT
+                    );
                 }
                 WorkspaceScanRunOutcome::ScanFailed => {
                     log::error!("Configuration workspace scan failed");
@@ -21161,6 +21546,22 @@ impl Backend {
             'package_settings_routing: {
                 let routing_deadline = LibraryRoutingDeadline::foreground();
                 log::info!("Package settings changed, reinitializing PackageLibrary");
+                // Serialize with the coordinated startup/didOpen build (#747);
+                // see the `raven.refreshPackages` handler for the rationale.
+                let Ok(_coordinator) = routing_deadline
+                    .wait(
+                        "package-settings package-init coordinator",
+                        self.package_init_coordinator.lock(),
+                    )
+                    .await
+                else {
+                    log::warn!(
+                        "Package settings rebuild expired waiting for the package-init \
+                         coordinator; retaining the current package library"
+                    );
+                    deferred_library_routing = Some(None);
+                    break 'package_settings_routing;
+                };
                 let routing_basis = capture_library_routing_basis(
                     &self.state,
                     crate::state::LibraryRoutingMutation::Replacement,
@@ -24253,21 +24654,77 @@ async fn swap_current_libpath_watcher(
     allow_recovery: bool,
 ) -> bool {
     debug_assert!(allow_recovery);
-    swap_current_libpath_watcher_owned(state_arc, client, routing_tasks, None).await
+    swap_current_libpath_watcher_owned(
+        state_arc,
+        client,
+        routing_tasks,
+        LibpathWatcherSwapRequest::Unconditional,
+    )
+    .await
+}
+
+/// [`swap_current_libpath_watcher`] that attaches a watcher only when none is
+/// attached at capture time *and* still none at commit time.
+///
+/// The basis pins the watcher lifecycle signature, so a watcher a routing
+/// commit installs between the capture and the CAS makes this swap lose
+/// rather than tear that watcher down and re-seed a full rescan (#748).
+/// Returns whether a watcher swap committed.
+async fn swap_libpath_watcher_if_none_attached(
+    state_arc: &Arc<RwLock<WorldState>>,
+    client: &Client,
+    routing_tasks: &RoutingTaskOwner,
+) -> bool {
+    swap_current_libpath_watcher_owned(
+        state_arc,
+        client,
+        routing_tasks,
+        LibpathWatcherSwapRequest::OnlyIfNoneAttached,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibpathWatcherSwapRequest {
+    /// Retire whatever is attached and install for the current library.
+    Unconditional,
+    /// Install only if no watcher is attached; otherwise do nothing.
+    OnlyIfNoneAttached,
+    /// Consume the exact `AwaitingRecovery` owner token.
+    Recovery(crate::state::LibpathWatcherOwner),
 }
 
 fn swap_current_libpath_watcher_owned<'a>(
     state_arc: &'a Arc<RwLock<WorldState>>,
     client: &'a Client,
     routing_tasks: &'a RoutingTaskOwner,
-    recovery_owner: Option<crate::state::LibpathWatcherOwner>,
+    request: LibpathWatcherSwapRequest,
 ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
     Box::pin(async move {
+        let recovery_owner = match request {
+            LibpathWatcherSwapRequest::Recovery(owner) => Some(owner),
+            LibpathWatcherSwapRequest::Unconditional
+            | LibpathWatcherSwapRequest::OnlyIfNoneAttached => None,
+        };
         let basis = {
             let state = state_arc.read().await;
-            match recovery_owner {
-                Some(owner) => state.capture_libpath_watcher_recovery_basis(owner),
-                None => state.capture_libpath_watcher_swap_basis(),
+            match request {
+                LibpathWatcherSwapRequest::Recovery(owner) => {
+                    state.capture_libpath_watcher_recovery_basis(owner)
+                }
+                LibpathWatcherSwapRequest::Unconditional => {
+                    state.capture_libpath_watcher_swap_basis()
+                }
+                // The captured lifecycle signature is what the commit CAS
+                // compares; capturing only while no watcher is attached makes
+                // "still none attached" part of the CAS.
+                LibpathWatcherSwapRequest::OnlyIfNoneAttached => {
+                    if state.has_active_libpath_watcher() {
+                        None
+                    } else {
+                        state.capture_libpath_watcher_swap_basis()
+                    }
+                }
             }
         };
         let Some(basis) = basis else {
@@ -24374,7 +24831,7 @@ fn schedule_libpath_watcher_recovery(
             &task_state,
             &task_client,
             &task_routing,
-            Some(owner),
+            LibpathWatcherSwapRequest::Recovery(owner),
         )
         .await;
     }) {
@@ -26800,6 +27257,7 @@ mod tests {
             super::WatchedResyncItem {
                 uri: uri.clone(),
                 generation,
+                package_input_only: false,
             },
         );
         tokio::task::yield_now().await;
@@ -31209,6 +31667,19 @@ mod tests {
                 &root
             ));
             assert!(!is_package_source_dir(&root.join("scratch.R"), &root));
+            // Consistent with `is_r_source_path`: R does not load nested
+            // subdirectories other than unix/windows, and neither does the
+            // seed, so a save there must not trigger a seed recompute.
+            assert!(!is_package_source_dir(
+                &root.join("R").join("scripts").join("run.R"),
+                &root
+            ));
+            assert!(is_package_source_dir(
+                &root.join("R").join("unix").join("sys.R"),
+                &root
+            ));
+            // Directory nodes still match by prefix.
+            assert!(is_package_source_dir(&root.join("R").join("unix"), &root));
         }
 
         #[test]
@@ -36443,13 +36914,30 @@ mod project_config_initialize_tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn workspace_scan_retry_ceiling_is_two() {
+    /// Drive one scan intent through `lost_races` CAS rejections: each attempt
+    /// is paused at its pre-commit barrier, the scan-input generation is
+    /// advanced (as any closed/open commit would), and the attempt released so
+    /// its CAS fails. Returns the driver outcome and the attempt count.
+    async fn run_scan_losing_races(lost_races: usize) -> (WorkspaceScanRunOutcome, usize) {
+        run_scan_losing_races_by(lost_races, |state| {
+            state.advance_workspace_scan_generation()
+        })
+        .await
+    }
+
+    /// [`run_scan_losing_races`] with the per-loss invalidation chosen by the
+    /// caller, so tests can distinguish a loss that changes the *scan inputs*
+    /// (must rescan) from one that changes only the derivation basis (may
+    /// reuse the cached scan result).
+    async fn run_scan_losing_races_by(
+        lost_races: usize,
+        mut invalidate: impl FnMut(&mut WorldState),
+    ) -> (WorkspaceScanRunOutcome, usize) {
         let tmp = TempDir::new().unwrap();
         let state = Arc::new(RwLock::new(WorldState::new()));
         state.write().await.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
         let pause_uri = Url::parse(WORKSPACE_SCAN_PRE_COMMIT_PAUSE_URI).unwrap();
-        let first_pause = state
+        let mut pause = state
             .read()
             .await
             .workspace_scan_pre_commit_test_pause
@@ -36464,36 +36952,119 @@ mod project_config_initialize_tests {
             })
             .await
         });
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            first_pause.wait_arrived(),
-        )
-        .await
-        .expect("first attempt reaches precommit");
-        let second_pause = {
-            let mut current = state.write().await;
-            current.advance_workspace_scan_generation();
-            current.workspace_scan_pre_commit_test_pause.arm(pause_uri)
-        };
-        first_pause.release();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            second_pause.wait_arrived(),
-        )
-        .await
-        .expect("second attempt repeats full derivation");
-        state.write().await.advance_workspace_scan_generation();
-        second_pause.release();
+        for lost in 0..lost_races {
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.wait_arrived())
+                .await
+                .unwrap_or_else(|_| panic!("attempt {} never reached precommit", lost + 1));
+            let next_pause = {
+                let mut current = state.write().await;
+                invalidate(&mut current);
+                current
+                    .workspace_scan_pre_commit_test_pause
+                    .arm(pause_uri.clone())
+            };
+            pause.release();
+            pause = next_pause;
+        }
+        // The attempt after the last forced loss runs to completion
+        // unobstructed. Once every permitted attempt has lost there is no
+        // further attempt to wait for, and waiting would only burn the
+        // timeout.
+        if lost_races < WORKSPACE_SCAN_ATTEMPT_LIMIT {
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.wait_arrived())
+                .await
+                .expect("the attempt after the last forced loss reaches precommit");
+        }
+        pause.release();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), task)
+            .await
+            .expect("scan driver finished")
+            .unwrap();
+        (outcome, attempts.load(Ordering::SeqCst))
+    }
 
-        assert!(matches!(
-            task.await.unwrap(),
-            WorkspaceScanRunOutcome::RetryExhausted
-        ));
-        let state = state.read().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert!(!state.workspace_scan_complete);
-        assert_eq!(state.workspace_index.len(), 0);
-        assert_eq!(state.analysis_revalidation_reservation_count, 0);
+    /// Regression for the real-workspace failure that motivated the raised
+    /// ceiling: two consecutive lost CAS races (a `did_change` landing during
+    /// each multi-second scan) used to exhaust the driver and leave the editor
+    /// with no workspace index for the rest of the session. The third attempt
+    /// must commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_commits_after_two_lost_races() {
+        let (outcome, attempts) = run_scan_losing_races(2).await;
+        assert!(
+            matches!(outcome, WorkspaceScanRunOutcome::Committed(_)),
+            "third attempt must commit"
+        );
+        assert_eq!(attempts, 3);
+    }
+
+    /// A lost race caused only by a derivation-basis change (the common case:
+    /// a `did_change` advancing graph authority) leaves the scan inputs and
+    /// the closed index untouched, so the retry reuses the cached disk-scan
+    /// result instead of walking the workspace again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_retry_reuses_scan_result_when_only_derivation_moved() {
+        let (outcome, scans) = run_scan_losing_races_by(2, |state| {
+            state.advance_workspace_graph_authority_generation()
+        })
+        .await;
+        assert!(matches!(outcome, WorkspaceScanRunOutcome::Committed(_)));
+        assert_eq!(
+            scans, 1,
+            "two derivation-only losses must not rescan the disk"
+        );
+    }
+
+    /// A closed-index change between attempts (a watched-file resync updating
+    /// or deleting a file the scan already read) invalidates the cached scan
+    /// result: reusing it would reinstall stale contents or resurrect a
+    /// deleted file over an event the watcher already consumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_retry_rescans_when_closed_index_changed() {
+        let (outcome, scans) = run_scan_losing_races_by(2, |state| {
+            state.advance_workspace_graph_authority_generation();
+            // Any index mutation bumps its version; a synthetic closed entry
+            // stands in for a watched resync landing mid-scan.
+            let uri = Url::parse(&format!(
+                "file:///resync-{}.R",
+                state.workspace_index.version()
+            ))
+            .unwrap();
+            let text = "x <- 1\n";
+            let tree = crate::parser_pool::with_parser(|p| p.parse(text, None));
+            state.workspace_index.insert(
+                uri,
+                crate::workspace_index::IndexEntry {
+                    contents: ropey::Rope::from_str(text),
+                    tree,
+                    loaded_packages: Vec::new(),
+                    data_packages: vec![],
+                    snapshot: crate::cross_file::file_cache::FileSnapshot {
+                        mtime: std::time::SystemTime::UNIX_EPOCH,
+                        size: text.len() as u64,
+                        content_hash: None,
+                    },
+                    metadata: std::sync::Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                    artifacts: std::sync::Arc::new(
+                        crate::cross_file::scope::ScopeArtifacts::default(),
+                    ),
+                    indexed_at_version: 0,
+                },
+            );
+        })
+        .await;
+        assert!(matches!(outcome, WorkspaceScanRunOutcome::Committed(_)));
+        assert_eq!(
+            scans, 3,
+            "each closed-index change must force a fresh disk scan"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_retry_ceiling_is_attempt_limit() {
+        let (outcome, attempts) = run_scan_losing_races(WORKSPACE_SCAN_ATTEMPT_LIMIT).await;
+        assert!(matches!(outcome, WorkspaceScanRunOutcome::RetryExhausted));
+        assert_eq!(attempts, WORKSPACE_SCAN_ATTEMPT_LIMIT);
     }
 
     #[tokio::test]
@@ -49848,6 +50419,7 @@ mod project_config_initialize_tests {
                 updates: vec![WatchedResyncItem {
                     uri: desc_uri,
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -49906,6 +50478,7 @@ mod project_config_initialize_tests {
                 updates: vec![WatchedResyncItem {
                     uri: desc_uri,
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -49960,6 +50533,7 @@ mod project_config_initialize_tests {
                 updates: vec![WatchedResyncItem {
                     uri: desc_uri,
                     generation: stale_generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -50020,6 +50594,7 @@ mod project_config_initialize_tests {
                 updates: vec![WatchedResyncItem {
                     uri: desc_uri,
                     generation: stale_generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -50097,6 +50672,7 @@ mod project_config_initialize_tests {
                 updates: vec![WatchedResyncItem {
                     uri: helper_uri.clone(),
                     generation: stale_generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -52055,6 +52631,594 @@ mod project_config_initialize_tests {
         assert!(
             state.workspace_index.get_metadata(&ignored_uri).is_none(),
             "excluded watched-file change must remove stale artifact projection"
+        );
+    }
+
+    /// While the detached startup build is in flight, `did_open` must not
+    /// await it (or run its own build): that would hold the only LSP dispatch
+    /// slot for the whole R spawn. The open proceeds with the not-ready
+    /// library and no package-init attempt is made.
+    #[tokio::test]
+    async fn did_open_does_not_await_active_startup_package_build() {
+        let tmp = TempDir::new().unwrap();
+        let subject = Url::from_file_path(tmp.path().join("subject.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = false;
+            state.force_package_library_not_ready_for_test = true;
+        }
+        // Simulate the startup build holding the coordinator mid-R-spawn.
+        backend
+            .startup_package_build_active
+            .store(true, Ordering::Release);
+        let _held = backend.package_init_coordinator.lock().await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            open_doc(backend, &subject, "r", 1, "subject <- 1\n"),
+        )
+        .await
+        .expect("didOpen must not block behind the startup package build");
+
+        let state = backend.state.read().await;
+        assert!(state.documents.contains_key(&subject));
+        assert!(!state.package_library_ready);
+        drop(state);
+        assert_eq!(
+            backend
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire),
+            0,
+            "didOpen must not run its own package build while startup owns it"
+        );
+
+        // Once the startup task is done, opens initialize on demand again.
+        backend
+            .startup_package_build_active
+            .store(false, Ordering::Release);
+        drop(_held);
+        let second = Url::from_file_path(tmp.path().join("second.R")).unwrap();
+        open_doc(backend, &second, "r", 1, "second <- 1\n").await;
+        assert!(
+            backend
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire)
+                >= 1,
+            "after the startup build exits, didOpen initializes on demand"
+        );
+    }
+
+    /// Codex round six (P1): `did_change` and on-demand prerequisite indexing
+    /// go through `ensure_package_library_initialized`; while the startup
+    /// build holds the coordinator they must not wait on it either.
+    #[tokio::test]
+    async fn ensure_package_library_bypasses_active_startup_build() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = false;
+            state.force_package_library_not_ready_for_test = true;
+        }
+        backend
+            .startup_package_build_active
+            .store(true, Ordering::Release);
+        let _held = backend.package_init_coordinator.lock().await;
+
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.ensure_package_library_initialized(),
+        )
+        .await
+        .expect("ensure must not block behind the startup package build");
+        assert!(
+            !ready,
+            "not-ready is reported honestly while startup owns the build"
+        );
+        assert_eq!(
+            backend
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire),
+            0,
+            "no on-demand build may run while startup owns the coordinator"
+        );
+    }
+
+    /// #747: `raven.refreshPackages` must not spawn its rebuild while the
+    /// coordinated startup/didOpen build holds `package_init_coordinator`.
+    #[tokio::test]
+    async fn refresh_packages_waits_for_package_init_coordinator() {
+        use tower_lsp::lsp_types::ExecuteCommandParams;
+        let tmp = TempDir::new().unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let original = backend.state.read().await.package_library.clone();
+        {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = true;
+            state.package_library_build_outcome_for_test = Some((
+                Arc::new(crate::package_library::PackageLibrary::new_empty()),
+                true,
+            ));
+        }
+        let held = backend.package_init_coordinator.lock().await;
+
+        let refresh_backend = backend.clone();
+        let refresh = tokio::spawn(async move {
+            refresh_backend
+                .execute_command(ExecuteCommandParams {
+                    command: "raven.refreshPackages".into(),
+                    arguments: vec![],
+                    work_done_progress_params: Default::default(),
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                Arc::ptr_eq(&state.package_library, &original),
+                "refresh must not rebuild while the coordinator is held"
+            );
+            assert!(
+                state.package_library_build_outcome_for_test.is_some(),
+                "refresh must not have consumed the synthetic build while blocked"
+            );
+        }
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), refresh)
+            .await
+            .expect("refresh completes once the coordinator is released")
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "refresh commits after the coordinator is released: {result:?}"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            !Arc::ptr_eq(&state.package_library, &original),
+            "refresh installs its rebuilt library after waiting"
+        );
+    }
+
+    /// #748: when a racing `didOpen` already committed the library and its
+    /// routing commit attached a libpath watcher, the startup task's `Ready`
+    /// path must keep that watcher rather than swap in a seeded replacement
+    /// (which forces a second full libpath rescan).
+    #[tokio::test]
+    async fn startup_ready_path_keeps_existing_libpath_watcher() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let owner = {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.packages_enabled = true;
+            state.cross_file_config.packages_watch_library_paths = true;
+            let mut lib = crate::package_library::PackageLibrary::new_empty();
+            lib.set_lib_paths(vec![tmp.path().to_path_buf()]);
+            state.package_library = Arc::new(lib);
+            state.package_library_ready = true;
+            let _journal = state.install_libpath_journal_for_test();
+            state.libpath_watcher_owner()
+        };
+
+        backend.clone().run_startup_package_library_build().await;
+
+        let state = backend.state.read().await;
+        assert!(state.has_active_libpath_watcher());
+        assert!(
+            state.libpath_watcher_owner_is_current(owner),
+            "the Ready path must not retire the watcher the winning commit installed"
+        );
+        drop(state);
+
+        // The conditional swap on its own: with a watcher attached it must
+        // decline (and the CAS pins the lifecycle, so a watcher attached
+        // between capture and commit is equally safe).
+        assert!(
+            !swap_libpath_watcher_if_none_attached(
+                &backend.state,
+                &backend.client,
+                &backend.routing_tasks
+            )
+            .await,
+            "the conditional swap must not replace an attached watcher"
+        );
+        let state = backend.state.read().await;
+        assert!(state.libpath_watcher_owner_is_current(owner));
+        assert!(
+            !backend.startup_package_build_active.load(Ordering::Acquire),
+            "the startup flag is cleared when the task exits"
+        );
+    }
+
+    /// A build whose pre-build routing intent was superseded must not mint a
+    /// fresh intent over the owner that superseded it: that would let the
+    /// older library commit over the newer owner's replacement.
+    #[tokio::test]
+    async fn stale_build_recapture_yields_to_foreign_pending_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let deadline = LibraryRoutingDeadline::foreground();
+        let original_library = backend.state.read().await.package_library.clone();
+
+        // The build's own pre-build intent (A) ...
+        let pre_build = capture_library_routing_basis(
+            &backend.state,
+            crate::state::LibraryRoutingMutation::Replacement,
+            None,
+            crate::state::LibraryReplacementAbortPolicy::Reconcile,
+            deadline,
+        )
+        .await
+        .expect("pre-build capture");
+        // ... superseded during the R spawn by a foreign owner (B), e.g. a
+        // `refreshPackages` that does not go through the init coordinator.
+        let foreign = capture_library_routing_basis(
+            &backend.state,
+            crate::state::LibraryRoutingMutation::Replacement,
+            None,
+            crate::state::LibraryReplacementAbortPolicy::NoReconcile,
+            deadline,
+        )
+        .await
+        .expect("foreign capture");
+        assert!(backend.state.read().await.has_pending_library_replacement());
+
+        let built = Arc::new(crate::package_library::PackageLibrary::new_empty());
+        let effects = backend
+            .install_built_package_library(
+                Some(pre_build),
+                Arc::clone(&built),
+                false,
+                deadline,
+                |_| true,
+            )
+            .await;
+        assert!(
+            effects.is_none(),
+            "a superseded build must yield rather than re-capture over the foreign owner"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            Arc::ptr_eq(&state.package_library, &original_library),
+            "the superseded build must not have been installed"
+        );
+        assert!(
+            state.has_pending_library_replacement(),
+            "the foreign owner must still hold the pending intent slot"
+        );
+        drop(state);
+        drop(foreign);
+    }
+
+    /// Codex round seven (P2): a package-only event under a hidden directory
+    /// must reach the package reseed without becoming a workspace-index entry
+    /// (a dynamic entry admitted that way would survive every later scan).
+    #[tokio::test]
+    async fn watched_package_only_event_reseeds_without_indexing() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[crossFile]\nindexWorkspace = false\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("DESCRIPTION"),
+            "Package: demo\nVersion: 0.1.0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("R")).unwrap();
+        fs::create_dir_all(tmp.path().join("data-raw/.helpers")).unwrap();
+        let generate_path = tmp.path().join("data-raw/.helpers/generate.R");
+        let generate_uri = Url::from_file_path(&generate_path).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "pkg".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+            assert!(state.package_inputs.sysdata_names.is_empty());
+        }
+
+        fs::write(
+            &generate_path,
+            "hidden_tbl <- data.frame(x = 1)\nusethis::use_data(hidden_tbl, internal = TRUE)\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: generate_uri.clone(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state.package_inputs.sysdata_names.contains("hidden_tbl")
+            })
+            .await,
+            "the package reseed must pick up the hidden data-raw script"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            state.workspace_index.get(&generate_uri).is_none()
+                && state.workspace_index.get_metadata(&generate_uri).is_none(),
+            "the package-only event must not create a workspace-index entry"
+        );
+    }
+
+    /// A helper tracked only by the package prelude sets (`.Rprofile` or a
+    /// testthat preamble `source()`s it; nothing indexes it and no graph edge
+    /// points at it) must survive the hidden-directory prune, or its edits
+    /// never reach the prelude rescan and harvested symbols go stale.
+    #[tokio::test]
+    async fn watched_change_to_prelude_sourced_hidden_helper_is_not_pruned() {
+        let tmp = TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        fs::create_dir_all(tmp.path().join(".scripts")).unwrap();
+        let helper_path = tmp.path().join(".scripts/setup.R");
+        fs::write(&helper_path, "setup_helper <- function() 1\n").unwrap();
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root];
+        assert!(
+            watched_change_is_bulk_discovery_pruned(&state, &helper_uri),
+            "precondition: an untracked hidden helper is pruned"
+        );
+        state
+            .package_inputs
+            .preamble_sourced_files
+            .insert(helper_path.clone());
+        assert!(
+            !watched_change_is_bulk_discovery_pruned(&state, &helper_uri),
+            "a preamble-sourced helper must not be pruned"
+        );
+        state.package_inputs.preamble_sourced_files.clear();
+        state.package_inputs.rprofile_sourced_files.insert(
+            crate::package_state::preamble::canonicalize_for_routing(&helper_path),
+        );
+        assert!(
+            !watched_change_is_bulk_discovery_pruned(&state, &helper_uri),
+            "an .Rprofile-sourced helper must not be pruned (canonical spelling)"
+        );
+        state.package_inputs.rprofile_sourced_files.clear();
+
+        // Package-mode seeds: the sysdata scanner reads `data-raw/**/*.R`
+        // recursively, hidden subdirectories included, so an edit there must
+        // reach the reseed even though nothing indexes the file.
+        let generate_path = tmp.path().join("data-raw/.helpers/generate.R");
+        fs::create_dir_all(generate_path.parent().unwrap()).unwrap();
+        fs::write(&generate_path, "x <- 1\n").unwrap();
+        let generate_uri = Url::from_file_path(&generate_path).unwrap();
+        assert!(
+            watched_change_is_bulk_discovery_pruned(&state, &generate_uri),
+            "precondition: outside package mode the hidden data-raw helper is pruned"
+        );
+        state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+        assert_eq!(
+            watched_change_admission(&state, &generate_uri),
+            WatchedChangeAdmission::PackageInputOnly,
+            "a seeded data-raw input reaches the reseed but is not indexed"
+        );
+        assert_eq!(
+            watched_change_admission(&state, &helper_uri),
+            WatchedChangeAdmission::Pruned,
+            "an untracked hidden helper is still pruned in package mode"
+        );
+        state
+            .package_inputs
+            .preamble_sourced_files
+            .insert(helper_path.clone());
+        assert_eq!(
+            watched_change_admission(&state, &helper_uri),
+            WatchedChangeAdmission::PackageInputOnly
+        );
+        // Visible package sources are indexed as before.
+        let visible = Url::from_file_path(tmp.path().join("R/a.R")).unwrap();
+        assert_eq!(
+            watched_change_admission(&state, &visible),
+            WatchedChangeAdmission::Index
+        );
+        // But a hidden directory the seed also ignores stays pruned.
+        let scratch_uri =
+            Url::from_file_path(tmp.path().join(".claude/worktrees/w1/R/a.R")).unwrap();
+        assert!(watched_change_is_bulk_discovery_pruned(
+            &state,
+            &scratch_uri
+        ));
+    }
+
+    /// The hidden-directory prune governs bulk discovery only: a file some
+    /// open document already `source()`s is an on-demand target, and creating
+    /// it must index it (and clear the importer's missing-file state) even
+    /// under a hidden directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_create_of_sourced_target_under_hidden_directory_is_indexed() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[crossFile]\nindexWorkspace = false\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join(".scripts")).unwrap();
+        let main_text = "source(\".scripts/helper.R\")\nhelper()\n";
+        fs::write(tmp.path().join("main.R"), main_text).unwrap();
+        let (svc, main_uri) = open_in_quiescent_workspace(&tmp, "main.R", "r", main_text).await;
+        let backend = svc.inner();
+        let helper_path = tmp.path().join(".scripts/helper.R");
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&main_uri)
+                    .iter()
+                    .any(|edge| edge.to == helper_uri),
+                "precondition: the open importer records an edge to the missing target"
+            );
+            assert!(state.is_bulk_discovery_pruned_uri(&helper_uri));
+        }
+
+        fs::write(&helper_path, "helper <- function() 1\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: helper_uri.clone(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state.workspace_index.get_metadata(&helper_uri).is_some()
+            })
+            .await,
+            "a sourced target created under a hidden directory must be indexed on demand"
+        );
+    }
+
+    /// The scan prunes hidden directories; the watcher must not re-admit
+    /// their files one create/change at a time (dynamic entries survive later
+    /// scans, so one leak would be permanent).
+    #[tokio::test]
+    async fn watched_file_create_under_hidden_directory_is_not_indexed() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[crossFile]\nindexWorkspace = false\n",
+        )
+        .unwrap();
+        let worktree_r = tmp.path().join(".claude/worktrees/w1/R");
+        fs::create_dir_all(&worktree_r).unwrap();
+        let hidden_path = worktree_r.join("helper.R");
+        fs::write(&hidden_path, "helper <- function() 1\n").unwrap();
+        let visible_path = tmp.path().join("visible.R");
+        fs::write(&visible_path, "visible <- function() 2\n").unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let hidden_uri = Url::from_file_path(&hidden_path).unwrap();
+        let visible_uri = Url::from_file_path(&visible_path).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![
+                    FileEvent {
+                        uri: hidden_uri.clone(),
+                        typ: FileChangeType::CREATED,
+                    },
+                    FileEvent {
+                        uri: visible_uri.clone(),
+                        typ: FileChangeType::CREATED,
+                    },
+                ],
+            })
+            .await;
+
+        // The visible file's update lands through the detached watched batch;
+        // once it has, the same batch has also had every chance to admit the
+        // hidden one.
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state.workspace_index.get_metadata(&visible_uri).is_some()
+            })
+            .await,
+            "the same notification's visible file must still be indexed"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            state.workspace_index.get(&hidden_uri).is_none()
+                && state.workspace_index.get_metadata(&hidden_uri).is_none(),
+            "a watched create under a hidden directory must not enter the index"
         );
     }
 
@@ -57577,6 +58741,103 @@ infixContinuationStyle = "aligned"
         );
     }
 
+    /// Package-input drift during the R build (a package seed, an open/close,
+    /// a manifest edit) must not discard the built library: the build's
+    /// construction inputs are unchanged, so `install_built_package_library`
+    /// re-captures its routing basis and commits the same library. Before
+    /// this, the startup build on a renv project was routinely thrown away
+    /// and rebuilt, spawning R twice.
+    #[tokio::test]
+    async fn package_input_drift_during_build_does_not_discard_library() {
+        let tmp = TempDir::new().unwrap();
+        let subject = Url::from_file_path(tmp.path().join("subject.R")).unwrap();
+        let pause_uri = Url::parse("raven-test://package-library-init").unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let install_key_baseline = backend
+            .package_library_install_keys_for_test
+            .lock()
+            .unwrap()
+            .len();
+        let (pause, original_library, original_key) = {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = false;
+            state.force_package_library_not_ready_for_test = true;
+            (
+                state
+                    .package_init_pre_commit_test_pause
+                    .arm(pause_uri.clone()),
+                state.package_library.clone(),
+                PackageInitKey::capture(&state),
+            )
+        };
+
+        let handler = open_doc(backend, &subject, "r", 1, "subject <- 1\n");
+        tokio::pin!(handler);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut handler => panic!("package initialization skipped the CAS barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("package initialization did not reach the CAS barrier")
+            }
+        }
+        // Drift that changes the routing basis but not the construction key.
+        let generation_before = {
+            let mut state = backend.state.write().await;
+            let before = state.package_input_generation();
+            state.record_package_input_mutation();
+            assert_eq!(
+                PackageInitKey::capture(&state),
+                original_key,
+                "package-input drift must not change the construction key"
+            );
+            before
+        };
+        pause.release();
+        handler.await;
+
+        let state = backend.state.read().await;
+        assert!(
+            !Arc::ptr_eq(&state.package_library, &original_library),
+            "the single build must commit despite package-input drift"
+        );
+        assert!(
+            state.package_input_generation() > generation_before,
+            "the drift must have been observed by the build"
+        );
+        assert!(state.documents.contains_key(&subject));
+        drop(state);
+
+        assert_eq!(
+            backend
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire),
+            1,
+            "drift alone must not trigger a rebuild"
+        );
+        let install_keys = backend
+            .package_library_install_keys_for_test
+            .lock()
+            .unwrap();
+        assert_eq!(
+            &install_keys[install_key_baseline..],
+            std::slice::from_ref(&original_key),
+            "exactly the one drifted build must win the library CAS"
+        );
+    }
+
     #[tokio::test]
     async fn did_open_awaits_inherited_package_prefetch_before_ticket_spawn() {
         let tmp = TempDir::new().unwrap();
@@ -59864,6 +61125,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: child_uri.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -59946,6 +61208,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: description_uri,
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -60000,6 +61263,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: description_uri.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -60067,6 +61331,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: target.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -60125,11 +61390,13 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: target.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: vec![WatchedResyncItem {
                     uri: target.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
@@ -60234,20 +61501,24 @@ infixContinuationStyle = "aligned"
                     WatchedResyncItem {
                         uri: description,
                         generation: description_generation,
+                        package_input_only: false,
                     },
                     WatchedResyncItem {
                         uri: consumer.clone(),
                         generation: consumer_generation,
+                        package_input_only: false,
                     },
                     WatchedResyncItem {
                         uri: transient.clone(),
                         generation: transient_generation,
+                        package_input_only: false,
                     },
                 ],
                 affected: Vec::new(),
                 deletions: vec![WatchedResyncItem {
                     uri: transient.clone(),
                     generation: transient_generation,
+                    package_input_only: false,
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
@@ -60727,6 +61998,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: uri.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -60792,6 +62064,7 @@ infixContinuationStyle = "aligned"
                 deletions: vec![WatchedResyncItem {
                     uri: uri.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
@@ -60856,10 +62129,12 @@ infixContinuationStyle = "aligned"
                     WatchedResyncItem {
                         uri: description_uri,
                         generation: description_generation,
+                        package_input_only: false,
                     },
                     WatchedResyncItem {
                         uri: helper_uri.clone(),
                         generation: helper_generation,
+                        package_input_only: false,
                     },
                 ],
                 affected: Vec::new(),
@@ -60909,7 +62184,11 @@ infixContinuationStyle = "aligned"
                 backend.client.clone(),
                 backend.traversal_truncation.clone(),
                 WatchedResyncBatch {
-                    updates: vec![WatchedResyncItem { uri, generation }],
+                    updates: vec![WatchedResyncItem {
+                        uri,
+                        generation,
+                        package_input_only: false,
+                    }],
                     affected: Vec::new(),
                     deletions: Vec::new(),
                     reserved_tickets: Vec::new(),
@@ -60965,6 +62244,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: uri.clone(),
                     generation: stale_generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -60999,6 +62279,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: uri.clone(),
                     generation: successor_generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -61085,6 +62366,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: child_uri,
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),

@@ -294,6 +294,36 @@ Keep new scan inputs in the shared two-phase basis so startup, exclusion
 reloads, and package-mode rebuilds cannot drift or introduce blocking
 filesystem work under the state lock.
 
+The scan driver (`run_workspace_scan_transaction_using` in `backend.rs`) makes
+up to `WORKSPACE_SCAN_ATTEMPT_LIMIT` full attempts per intent. The derivation
+basis is invalidated by any open-document commit, so on a large workspace a
+multi-second scan routinely loses its commit CAS to a `did_change`; the first
+`WORKSPACE_SCAN_EAGER_ATTEMPTS` retry immediately, and later attempts first
+wait for `WorldState::workspace_scan_authority_stamp` to hold still for
+`WORKSPACE_SCAN_QUIET_WINDOW` (bounded by `WORKSPACE_SCAN_QUIET_WAIT_LIMIT`).
+A retry reuses the previous attempt's disk-scan result when the scan inputs
+(folders, depth, exclusions and their generations) are still current, so a
+lost race costs one re-derivation, not a second walk. Scans awaited inline in
+a notification handler (`run_workspace_scan_transaction_inline`, used by the
+configuration and exclusion-reload paths) never sleep: with
+`concurrency_level(1)` no `did_change` can arrive while the handler holds the
+queue, so the quiet window could only freeze the editor.
+Exhaustion is logged at `warn` and leaves the workspace unindexed until the
+next config or watched-file trigger, so the ceiling must stay comfortably above
+the number of edits a user can land during one scan-plus-derivation. The
+workspace walk itself prunes every hidden directory plus the fixed vendored
+list (`should_skip_directory` in `state.rs`); embedded worktrees under
+`.claude/worktrees/` were multiplying scan time and Find References results
+before that rule existed. The watched-file resync applies the same rule to
+URIs the index has never seen (`WorldState::is_bulk_discovery_pruned_uri`),
+because VS Code's recursive watcher reports every create under the workspace
+and a dynamic entry admitted that way survives every later scan. The prune
+(`watched_change_admission` in `backend.rs`) indexes anything already
+tracked — an index entry or a graph dependent — and carries a path that only
+feeds package inputs (by the reseed's own predicate; the seed harvests
+`data-raw/**` and prelude-sourced helpers without indexing them) to the
+package reseed as a `package_input_only` item that is never read or indexed.
+
 Document analysis has one authority per lifecycle state. Open buffers live in
 `OpenDocumentStore`; all closed records live in `WorkspaceIndex`. The closed
 authority has two residency tiers under one lock: metadata/scope artifacts
@@ -430,13 +460,36 @@ fresh final capture reserves the complete union once. `.Rprofile` and testthat
 scans overlay all authoritative buffers plus only package routes the candidate
 will authoritatively own, and reduce with its package `DidOpen` event into one
 package state. Package-library initialization precedes every derivation that
-can resolve `system.file()`. Each on-demand library build owns an exact key
-(R path, additional paths, workspace root, and package-input generation) plus
-the package-config generation and not-ready state it observed. Its final swap
-is a CAS on that basis; stale builds are discarded and `didOpen` performs one
-bounded fresh-key retry. A stable degraded/unavailable build is remembered by
-its winning key so opening continues fail-closed with unresolved package
-sources instead of looping. After commit, direct and converged-scope inherited
+can resolve `system.file()`. Each library build owns an exact construction
+key (R path, additional paths, and workspace root — deliberately *not* the
+package-input or open-record generations, which change while R is running
+without changing what the build would produce) plus the package-config
+generation and not-ready state it observed. Its final swap is a CAS on that
+basis; a build whose *construction* inputs changed is discarded and `didOpen`
+performs one bounded fresh-key retry, while a build whose *routing* basis
+merely drifted (a package seed or open/close landed during the ~10–15 s R
+spawn) re-captures the routing basis and installs the same library
+(`install_built_package_library`) instead of throwing it away. A stable
+degraded/unavailable build is remembered by its winning key so opening
+continues fail-closed with unresolved package sources instead of looping.
+
+Startup does not build the library inline. `initialized` returns immediately
+after scheduling the workspace scan and `run_startup_package_library_build`,
+which goes through the same `package_init_coordinator` mutex as `didOpen`'s
+on-demand path, `raven.refreshPackages`, and the package-settings rebuild, so
+at most one R child runs for any library build. While the startup task is in
+flight (`Backend::startup_package_build_active`) neither `didOpen` nor the
+request-path prefetch callers (`did_change`, on-demand prerequisite indexing,
+via `ensure_package_library_initialized`) wait on it: they proceed with the
+not-ready library and the build's commit republishes every open document. Because tower-lsp runs with `concurrency_level(1)`,
+anything awaited inside a notification handler stalls every queued request;
+awaiting the build in `initialized` (or in the first `didOpen`) cost ~20 s
+before the first references/definition response on a renv project and used to
+spawn R twice. The startup task's non-committing path keeps a libpath watcher
+that a racing `didOpen` commit already attached instead of re-swapping it,
+which would force a second full libpath rescan.
+
+After commit, direct and converged-scope inherited
 packages are warmed synchronously before any diagnostic ticket starts. A
 bounded convergence overflow clears foreign Rprofile/preamble provenance and
 commits only candidate-local facts; there is no delayed stabilization publish.

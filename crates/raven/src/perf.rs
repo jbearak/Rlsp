@@ -98,11 +98,27 @@ impl PerfMetrics {
         Self::default()
     }
 
-    /// Log a summary of the metrics
+    /// Log a summary of the metrics.
+    ///
+    /// The package-library build runs detached from `initialized` and usually
+    /// finishes after this summary; `record_package_init` logs its own line in
+    /// that case (and only then, so a build that finished first is not logged
+    /// twice). That handoff is tracked in the private `PackageInitReporting`
+    /// state rather than on this public struct, whose fields are part of the
+    /// crate's API.
     pub fn log_summary(&self) {
         if !is_enabled() {
             return;
         }
+        // Held for the whole summary so a concurrent `record_package_init`
+        // either lands before this (and is printed here) or after (and prints
+        // itself), never both. Lock order everywhere is metrics → reporting:
+        // callers hold `STARTUP_METRICS` while calling this, and the
+        // `record_*` functions take metrics first too.
+        let mut reporting = package_init_reporting()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reporting.summary_logged = true;
 
         log::info!("[PERF] === Startup Performance Summary ===");
 
@@ -114,12 +130,16 @@ impl PerfMetrics {
             );
         }
 
-        if let Some(d) = self.package_init_duration {
-            log::info!(
+        match self.package_init_duration {
+            Some(d) => log::info!(
                 "[PERF] Package init: {:?} ({} R calls)",
                 d,
                 self.r_subprocess_calls
-            );
+            ),
+            None if reporting.disabled => {
+                log::info!("[PERF] Package init: disabled")
+            }
+            None => log::info!("[PERF] Package init: still running (logged on completion)"),
         }
 
         if let Some(d) = self.r_subprocess_total_duration {
@@ -130,6 +150,23 @@ impl PerfMetrics {
 
 /// Global metrics collector for startup timing
 static STARTUP_METRICS: OnceLock<std::sync::Mutex<PerfMetrics>> = OnceLock::new();
+
+/// Private bookkeeping for how package-init timing gets reported. Kept off
+/// [`PerfMetrics`] so that adding it did not change that public struct's field
+/// set (downstream exhaustive literals must keep compiling).
+#[derive(Debug, Default, Clone, Copy)]
+struct PackageInitReporting {
+    /// Package awareness is disabled, so no initialization will run.
+    disabled: bool,
+    /// `log_summary` has run; a later package-init record logs itself.
+    summary_logged: bool,
+}
+
+static PACKAGE_INIT_REPORTING: OnceLock<std::sync::Mutex<PackageInitReporting>> = OnceLock::new();
+
+fn package_init_reporting() -> &'static std::sync::Mutex<PackageInitReporting> {
+    PACKAGE_INIT_REPORTING.get_or_init(|| std::sync::Mutex::new(PackageInitReporting::default()))
+}
 
 /// Get or initialize the global startup metrics
 pub fn startup_metrics() -> &'static std::sync::Mutex<PerfMetrics> {
@@ -147,14 +184,50 @@ pub fn record_workspace_scan(duration: Duration, files_scanned: usize) {
     }
 }
 
-/// Record package initialization completion
+/// Record package initialization completion.
+///
+/// Also logs the timing directly. The package library builds on a task
+/// detached from `initialized`, so it usually finishes *after*
+/// [`PerfMetrics::log_summary`] has already printed the startup summary; the
+/// stored metric alone would then never be seen.
 pub fn record_package_init(duration: Duration, r_calls: usize) {
     if !is_enabled() {
         return;
     }
-    if let Ok(mut metrics) = startup_metrics().lock() {
-        metrics.package_init_duration = Some(duration);
-        metrics.r_subprocess_calls = r_calls;
+    // Metric update and log-once decision under one critical section
+    // (metrics → reporting, the same order `log_summary`'s callers use), so a
+    // summary racing this call cannot print the completion *and* leave
+    // `summary_logged` set for this call to print it again.
+    let Ok(mut metrics) = startup_metrics().lock() else {
+        return;
+    };
+    let Ok(reporting) = package_init_reporting().lock() else {
+        return;
+    };
+    metrics.package_init_duration = Some(duration);
+    metrics.r_subprocess_calls = r_calls;
+    if reporting.summary_logged {
+        log::info!("[PERF] Package init: {duration:?} ({r_calls} R calls)");
+    }
+}
+
+/// Record that package awareness is disabled, so the summary does not report
+/// an initialization that will never run as "still running".
+pub fn record_package_init_disabled() {
+    if !is_enabled() {
+        return;
+    }
+    // Same order as `record_package_init`: metrics (held only for ordering),
+    // then reporting; decide and log under both.
+    let Ok(_metrics) = startup_metrics().lock() else {
+        return;
+    };
+    let Ok(mut reporting) = package_init_reporting().lock() else {
+        return;
+    };
+    reporting.disabled = true;
+    if reporting.summary_logged {
+        log::info!("[PERF] Package init: disabled");
     }
 }
 

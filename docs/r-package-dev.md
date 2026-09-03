@@ -20,6 +20,8 @@ Raven activates **package mode** when the workspace root contains a `DESCRIPTION
 
 All top-level symbols (functions, variables, constants) defined in files under `R/` are visible to every other file under `R/`. This eliminates false-positive "undefined variable" diagnostics for cross-file function calls within your package.
 
+"Under `R/`" means what R loads: the files directly in `R/` plus the two OS-specific subdirectories `R/unix/` and `R/windows/`, and only files whose name starts with an ASCII letter or digit (R's `tools::list_files_with_type(.., "code")` filter, so `R/_helper.R` and `R/.hidden.R` are not package code). R never recurses into `R/` (`R CMD INSTALL`, `devtools::load_all()`, and `pkgload` all use the non-recursive `tools::list_files_with_type()` listing), so a script kept in another subdirectory such as `R/scripts/run.R` is not package source. Raven treats it as an ordinary script: it neither contributes symbols to the namespace nor sees package internals unqualified, and it gets the usual cross-file behavior (`source()` detection, directives) instead.
+
 ```r
 # R/helpers.R
 validate_input <- function(x) { ... }

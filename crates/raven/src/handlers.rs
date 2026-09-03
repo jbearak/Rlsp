@@ -50483,6 +50483,10 @@ mod proptests {
             arg_name in "[a-z]{2,6}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
             value in 1i32..100
         ) {
+            // `f(f = 1)` is legal R, but then the function's own usage and
+            // the argument share a name and the assertion below cannot tell
+            // them apart. Distinct names are what this property is about.
+            prop_assume!(func_name != arg_name);
             let code = format!("{}({} = {})", func_name, arg_name, value);
 
             let tree = parse_r_code(&code);

@@ -1805,10 +1805,37 @@ enum OpenLifecycleIntentState {
     Committed(u64),
 }
 
+/// Snapshot returned by `WorldState::workspace_scan_authority_stamp`; equality
+/// means no scan-invalidating commit occurred between the two captures.
+///
+/// All-integer and `Copy` on purpose: the scan driver's quiet-window wait
+/// polls it every few hundred milliseconds under the state read lock. Open
+/// records are covered by `open_context_authority_generation`, which every
+/// production path that installs or removes an open-record token advances, so
+/// the per-URI token map the derivation CAS keeps is not repeated here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkspaceScanAuthorityStamp {
+    scan_generation: u64,
+    tar_source_event_generation: u64,
+    analysis_config_generation: AnalysisConfigGeneration,
+    chunk_override_generation: ChunkOverrideGeneration,
+    graph_revision: u64,
+    graph_authority_generation: u64,
+    open_context_authority_generation: OpenContextAuthorityGeneration,
+    workspace_index_version: u64,
+    package_input_generation: u64,
+    package_config_generation: u64,
+    package_state_record_generation: u64,
+    system_file_routing_owner: SystemFileRoutingOwnerIdentity,
+    package_library_install_id: u64,
+    package_library_content_generation: u64,
+}
+
 /// Latest-arrival ownership for one top-level full workspace scan.
 ///
-/// The process-wide generation is never reused. Both allowed full attempts
-/// retain the same token; a newer driver permanently supersedes the older one.
+/// The process-wide generation is never reused. Every permitted attempt of one
+/// driver retains the same token; a newer driver permanently supersedes the
+/// older one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkspaceScanIntentToken {
     generation: u64,
@@ -2680,6 +2707,7 @@ impl PendingLibraryReplacementGuard {
     /// intent and both Drop owners are therefore resolved under one lifecycle
     /// mutex, with no partial-take window that can manufacture phantom
     /// reconciliation. A newer intent is never cleared.
+    #[cfg(test)]
     pub(crate) fn retire_bundle_without_reconcile(
         mut self,
         mut preserved: Option<LibraryRoutingPreSealDeposit>,
@@ -4744,12 +4772,20 @@ impl WorldState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_active_libpath_watcher_for_test(&self) -> bool {
+    /// Whether a libpath watcher is currently attached (active, possibly with
+    /// an unapplied spec change pending). Used by the startup build's
+    /// non-committing path to avoid re-swapping a watcher a racing commit
+    /// already installed (#748).
+    pub(crate) fn has_active_libpath_watcher(&self) -> bool {
         matches!(
             self.libpath_watcher,
             LibpathWatcherState::Active { .. } | LibpathWatcherState::ActiveUnapplied { .. }
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_libpath_watcher_for_test(&self) -> bool {
+        self.has_active_libpath_watcher()
     }
 
     #[cfg(test)]
@@ -5098,6 +5134,18 @@ impl WorldState {
             adopted_reconcile_obligation,
             mutation,
         })
+    }
+
+    /// Whether some replacement driver currently owns the pending intent slot.
+    ///
+    /// A driver that wants to *re-capture* authority for work it has already
+    /// done (a library built under an intent that has since been superseded)
+    /// must yield when this is true: capturing would mint a newer intent and
+    /// displace the owner that superseded it, letting older work commit over
+    /// newer. A fresh build capturing its *first* intent is different — latest
+    /// arrival is meant to win there.
+    pub(crate) fn has_pending_library_replacement(&self) -> bool {
+        self.library_replacement_lifecycle.lock().pending.is_some()
     }
 
     fn library_replacement_basis_is_current(&self, basis: &LibraryRoutingBasis) -> bool {
@@ -6193,7 +6241,48 @@ impl WorldState {
         })
     }
 
-    fn workspace_scan_input_basis_is_current(&self, basis: &WorkspaceScanInputBasis) -> bool {
+    /// Cheap fingerprint of every *generation* that invalidates an in-flight
+    /// workspace scan: those compared by `workspace_scan_input_basis_is_current`
+    /// (scan, tar-source, analysis-config, chunk-override) and by
+    /// `workspace_scan_derivation_basis_is_current` (graph revision and
+    /// authority, index version, package input/config/state-record, routing
+    /// owner, library install and content), plus the open-context generation
+    /// that every open-record install/remove advances. Two equal stamps mean
+    /// no scan-invalidating commit happened between them.
+    ///
+    /// Deliberately omitted are the non-generation inputs those two predicates
+    /// also compare (workspace folders, exclusion patterns, depth/visit limits,
+    /// index config, workspace name/root/library paths): each is only ever
+    /// changed by a commit that also advances one of the stamped generations
+    /// (config recompute bumps `analysis_config_generation`; a library or
+    /// routing commit bumps its install/content/owner identity), so stamping
+    /// the integer is enough and keeps the poll allocation-free. Used by the
+    /// scan driver's quiet-window wait; not a substitute for the full CAS.
+    pub(crate) fn workspace_scan_authority_stamp(&self) -> WorkspaceScanAuthorityStamp {
+        WorkspaceScanAuthorityStamp {
+            scan_generation: self.workspace_scan_generation,
+            tar_source_event_generation: self.tar_source_event_generation,
+            analysis_config_generation: self.analysis_config_generation,
+            chunk_override_generation: self.chunk_override_generation,
+            graph_revision: self.cross_file_graph.edge_revision(),
+            graph_authority_generation: self.workspace_graph_authority_generation,
+            open_context_authority_generation: self.open_context_authority_generation,
+            // `version()` reads one integer; `authority_snapshot()` would
+            // clone every entry on each 250 ms poll under the read guard.
+            workspace_index_version: self.workspace_index.version(),
+            package_input_generation: self.package_input_generation(),
+            package_config_generation: self.package_config_generation,
+            package_state_record_generation: self.package_state_record_generation,
+            system_file_routing_owner: self.system_file_routing_owner_identity(),
+            package_library_install_id: self.package_library_install_id,
+            package_library_content_generation: self.package_library_content_generation,
+        }
+    }
+
+    pub(crate) fn workspace_scan_input_basis_is_current(
+        &self,
+        basis: &WorkspaceScanInputBasis,
+    ) -> bool {
         self.workspace_scan_intent_is_current(basis.intent)
             && self.workspace_scan_generation == basis.scan_generation
             && self.tar_source_event_generation == basis.tar_source_event_generation
@@ -6933,6 +7022,55 @@ impl WorldState {
     /// matcher. Empty exclusions are a fast false path.
     pub(crate) fn is_project_excluded_uri(&self, uri: &tower_lsp::lsp_types::Url) -> bool {
         self.workspace_exclusions.is_excluded_uri(uri)
+    }
+
+    /// Whether the workspace walk would never have reached `uri`: some
+    /// directory component of its path *below a workspace folder* is one
+    /// [`should_skip_directory`] prunes (hidden, or the fixed vendored list).
+    ///
+    /// The bulk-discovery rule has to hold for incremental discovery too.
+    /// VS Code's recursive file watcher reports every create/change under the
+    /// workspace, including `.claude/worktrees/<n>/R/foo.R`; if the watched
+    /// resync installed such a file as a dynamic index entry, later scans
+    /// (which retain dynamic entries) would never remove it, and the hidden
+    /// worktrees the scan now skips would trickle back in one edit at a time.
+    /// Callers apply this only to URIs the index has *not* seen: an explicit
+    /// CLI file, an open buffer, or an on-demand `source()` target under a
+    /// hidden directory keeps receiving updates.
+    ///
+    /// Components are judged by their spelled names, as the walk judges
+    /// entries, so a file reached through a visible symlink into a hidden
+    /// target is not pruned here either. Only the path below the *deepest*
+    /// enclosing workspace folder is judged: the walk starts at each folder
+    /// root without pruning the root itself, so a nested folder that is itself
+    /// under a hidden directory (`/repo` plus `/repo/.claude/worktrees/w1`) is
+    /// scanned, and its files must stay watchable. A URI outside every
+    /// workspace folder is not pruned (the walk has no opinion about it).
+    pub(crate) fn is_bulk_discovery_pruned_uri(&self, uri: &tower_lsp::lsp_types::Url) -> bool {
+        let Ok(path) = uri.to_file_path() else {
+            return false;
+        };
+        let Some(root) = workspace_base_for_path_in(&path, &self.workspace_folders) else {
+            return false;
+        };
+        let Ok(relative) = path.strip_prefix(&root) else {
+            return false;
+        };
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            // The leaf is a file; only directories are pruned.
+            if components.peek().is_none() {
+                break;
+            }
+            if component
+                .as_os_str()
+                .to_str()
+                .is_some_and(should_skip_directory)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Return metadata suitable for dependency-graph edge construction under
@@ -12289,10 +12427,10 @@ struct ProcessedFile {
 
 /// Recursively collect file paths under `dir` whose leaf matches `accept`
 /// (serial walk, fast). Symlinked directories ARE followed, with canonical-path
-/// cycle detection to terminate on loops and avoid double-counting; the
-/// non-source directories in [`should_skip_directory`] (`.git`, `node_modules`,
-/// `renv`, `target`, …) are pruned. Results are unsorted; callers that need
-/// deterministic order sort afterwards.
+/// cycle detection to terminate on loops and avoid double-counting; hidden
+/// directories and the non-source directories in [`should_skip_directory`]
+/// (`.git`, `.claude`, `node_modules`, `renv`, `target`, …) are pruned.
+/// Results are unsorted; callers that need deterministic order sort afterwards.
 ///
 /// This is the single directory walk shared by the workspace indexer (which
 /// passes [`is_stat_model_extension`] to collect
@@ -12381,13 +12519,16 @@ fn collect_files_matching_inner(
                     continue;
                 }
             };
-            // A symlink whose own name isn't skip-listed but whose TARGET is
-            // (e.g. `deps -> node_modules`) must be pruned too, or it pulls the
-            // whole vendored tree back into the scan.
+            // A symlink whose own name isn't skip-listed but whose TARGET is a
+            // vendored directory (e.g. `deps -> node_modules`) must be pruned
+            // too, or it pulls the whole vendored tree back into the scan. Only
+            // the vendored list applies here: a visible symlink into a hidden
+            // target is an intentional mount point, and `tempfile` roots are
+            // themselves hidden (`.tmpXXXX`).
             if canonical
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(should_skip_directory)
+                .is_some_and(is_vendored_directory)
             {
                 log::trace!(
                     "Skipping symlinked directory {} -> {}",
@@ -12761,31 +12902,54 @@ pub fn scan_workspace_with_exclusions(
     entries
 }
 
-/// Directories to skip during workspace scanning.
+/// Non-hidden directories to skip during workspace scanning.
 ///
 /// This is a conservative list of directories that are extremely unlikely to
 /// contain user R source files. The workspace scan runs in the background,
 /// so the primary goal is to avoid wasting time on directories that would
-/// never contain R files.
+/// never contain R files. Hidden directories (leading `.`) are pruned by
+/// [`should_skip_directory`] without being listed here.
 ///
 /// Comparison is case-insensitive. This list is also used by the
 /// `analysis-stats` CLI (via [`should_skip_directory`]).
 const SKIP_DIRECTORIES: &[&str] = &[
-    ".git",         // Git internal files
-    ".github",      // GitHub Actions workflows (not package code)
-    ".svn",         // Subversion internal files
-    ".hg",          // Mercurial internal files
     "node_modules", // JavaScript dependencies (can have 100k+ files)
-    ".Rproj.user",  // RStudio user-local project state
     "renv",         // renv package library cache
     "packrat",      // packrat package library cache
-    ".vscode",      // VS Code settings
-    ".idea",        // JetBrains IDE settings
     "target",       // Rust build artifacts
 ];
 
-/// Check if a directory should be skipped during scanning.
+/// Check if a directory entry should be skipped during scanning, by the name
+/// it is spelled with in the tree.
+///
+/// Every hidden directory (name starting with `.`) is skipped, plus the
+/// vendored/build directories in `SKIP_DIRECTORIES`. Hidden directories hold
+/// VCS internals (`.git`, `.svn`, `.hg`), IDE state (`.vscode`, `.idea`,
+/// `.Rproj.user`), CI config (`.github`), and — the case that motivated the
+/// blanket rule — AI coding agents' embedded git worktrees (`.claude/worktrees/`,
+/// `.codex/…`): dozens of full copies of the repository, each with its own
+/// `R/` and `tests/`, that would otherwise be indexed as workspace sources,
+/// multiply Find References results, and slow the background scan by an order
+/// of magnitude. R itself never reads hidden entries when it loads a package
+/// (`tools::list_files_with_type(all.files = FALSE)`), and the `tar_source()`
+/// expansion walk already skips them, so the workspace walk now matches. The
+/// rule is unconditional — `[workspace].exclude` negations cannot re-include a
+/// hidden tree — but it only governs bulk discovery: an explicit CLI file
+/// argument, an open buffer, and on-demand indexing of a `source()` target
+/// under a hidden directory all still work.
+///
+/// The hidden rule is about the *spelled* entry only. A symlink whose own name
+/// is visible but whose target is a hidden directory (`shared -> ../.cache/lib`,
+/// or a `tempfile` `.tmpXXXX` directory) is a deliberate, visible mount point
+/// and is walked; see [`is_vendored_directory`] for the target-name check.
 pub(crate) fn should_skip_directory(dir_name: &str) -> bool {
+    dir_name.starts_with('.') || is_vendored_directory(dir_name)
+}
+
+/// The vendored/build-directory half of [`should_skip_directory`], applied to
+/// both an entry's own name and a symlink's canonical target name so that
+/// `deps -> node_modules` cannot pull a vendored tree back into the scan.
+pub(crate) fn is_vendored_directory(dir_name: &str) -> bool {
     SKIP_DIRECTORIES
         .iter()
         .any(|skip| dir_name.eq_ignore_ascii_case(skip))
@@ -14802,6 +14966,34 @@ tarchetypes::tar_render(nested, "nested.Rmd")
     include!("state_tests.rs");
 
     #[test]
+    fn bulk_discovery_pruned_uri_judges_directory_components_under_the_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![root];
+        let under = |rel: &str| Url::from_file_path(tmp.path().join(rel)).unwrap();
+        assert!(state.is_bulk_discovery_pruned_uri(&under(".claude/worktrees/w1/R/a.R")));
+        assert!(state.is_bulk_discovery_pruned_uri(&under("node_modules/x/a.R")));
+        assert!(state.is_bulk_discovery_pruned_uri(&under("pkg/.Rproj.user/a.R")));
+        assert!(!state.is_bulk_discovery_pruned_uri(&under("R/a.R")));
+        // Hidden *files* are not directories; the walk's accept filter, not
+        // the prune rule, decides them.
+        assert!(!state.is_bulk_discovery_pruned_uri(&under("R/.hidden.R")));
+        // Outside every workspace folder: no opinion.
+        let outside = Url::from_file_path(
+            std::env::temp_dir().join(".elsewhere/other-root-for-prune-test/a.R"),
+        )
+        .unwrap();
+        assert!(!state.is_bulk_discovery_pruned_uri(&outside));
+        // A nested workspace folder under a hidden directory is scanned from
+        // its own root, so its files are judged relative to that root.
+        state.workspace_folders.push(under(".claude/worktrees/w1"));
+        assert!(!state.is_bulk_discovery_pruned_uri(&under(".claude/worktrees/w1/R/a.R")));
+        assert!(state.is_bulk_discovery_pruned_uri(&under(".claude/worktrees/w2/R/a.R")));
+        assert!(state.is_bulk_discovery_pruned_uri(&under(".claude/worktrees/w1/.git/a.R")));
+    }
+
+    #[test]
     fn test_should_skip_directory() {
         assert!(should_skip_directory(".git"));
         assert!(should_skip_directory("node_modules"));
@@ -14810,6 +15002,87 @@ tarchetypes::tar_render(nested, "nested.Rmd")
         assert!(!should_skip_directory("R"));
         assert!(!should_skip_directory("src"));
         assert!(!should_skip_directory("data"));
+    }
+
+    /// Every hidden directory is pruned, not just the handful of well-known
+    /// VCS/IDE names: an AI agent's embedded worktrees under `.claude/` (or any
+    /// other dot-directory) must never reach the workspace index.
+    #[test]
+    fn should_skip_directory_prunes_every_hidden_directory() {
+        for hidden in [
+            ".claude",
+            ".codex",
+            ".Rproj.user",
+            ".vscode",
+            ".idea",
+            ".cache",
+            ".x",
+        ] {
+            assert!(should_skip_directory(hidden), "{hidden} must be pruned");
+        }
+        // A leading dot is the rule; a dot elsewhere is an ordinary name.
+        assert!(!should_skip_directory("my.scripts"));
+        assert!(!should_skip_directory("v1.2"));
+        // The symlink-target check uses only the vendored list.
+        assert!(is_vendored_directory("node_modules"));
+        assert!(is_vendored_directory("RENV"));
+        assert!(!is_vendored_directory(".claude"));
+    }
+
+    /// A visible symlink whose target is a hidden directory is an intentional
+    /// mount point and must be walked (the `tempfile` crate's `.tmpXXXX` roots
+    /// are exactly this shape, so `raven check`'s symlink coverage depends on
+    /// it).
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_matching_follows_visible_symlink_to_hidden_target() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let hidden = tmp.path().join(".cache").join("lib");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::write(hidden.join("mounted.R"), "1\n").unwrap();
+        std::os::unix::fs::symlink(&hidden, tmp.path().join("shared")).unwrap();
+
+        let mut out = Vec::new();
+        collect_files_matching(tmp.path(), &mut out, is_stat_model_extension);
+
+        // Reached once, through the visible `shared` spelling; the direct
+        // `.cache` path is pruned.
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert!(out[0].ends_with("shared/mounted.R"), "got {out:?}");
+    }
+
+    /// End-to-end through the walk: a hidden directory containing an embedded
+    /// worktree copy of the package is skipped, while a dotted-but-not-hidden
+    /// sibling and the real sources are collected.
+    #[test]
+    fn collect_files_matching_skips_hidden_directories() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(tmp.path().join("R").join("real.R"), "1\n").unwrap();
+        let worktree = tmp
+            .path()
+            .join(".claude")
+            .join("worktrees")
+            .join("wt-1")
+            .join("R");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join("real.R"), "1\n").unwrap();
+        fs::create_dir(tmp.path().join("my.scripts")).unwrap();
+        fs::write(tmp.path().join("my.scripts").join("dotted.R"), "1\n").unwrap();
+
+        let mut out = Vec::new();
+        collect_files_matching(tmp.path(), &mut out, is_stat_model_extension);
+        out.sort();
+
+        assert_eq!(out.len(), 2, "got {out:?}");
+        assert!(out[0].ends_with("R/real.R"), "got {out:?}");
+        assert!(out[1].ends_with("my.scripts/dotted.R"), "got {out:?}");
+        assert!(
+            !out.iter().any(|p| p.to_string_lossy().contains(".claude")),
+            "hidden worktree copy leaked into the scan: {out:?}"
+        );
     }
 
     #[test]

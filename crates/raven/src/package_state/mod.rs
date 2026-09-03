@@ -851,7 +851,21 @@ use std::path::Path;
 /// based on the workspace root. Returns `None` otherwise.
 ///
 /// Rules:
-/// - `<root>/R/**/*.R` (or `*.r`) → `Source`
+/// - `<root>/R/*.R` (or `*.r`) → `Source`
+/// - `<root>/R/unix/*.R` and `<root>/R/windows/*.R` (or `*.r`) → `Source`
+///   (the two OS-specific subdirectories that
+///   `tools::list_files_with_type(path_r, "code", OS_subdirs = c("unix", "windows"))`
+///   loads; matched case-sensitively like R does)
+/// - a `Source` basename must start with an ASCII letter or digit, exactly
+///   as `list_files_with_type(.., "code")` filters: `R/_helper.R`,
+///   `R/.hidden.R`, and `R/unix/_x.R` are not package code and are `None`.
+/// - any other `<root>/R/<sub>/…` → `None`. R does not recurse into `R/`:
+///   `R CMD INSTALL`, `devtools::load_all()`, and `pkgload` all take the
+///   non-recursive `list_files_with_type(path_r, "code")` listing, so a script
+///   under `R/scripts/` is neither part of the namespace nor able to see it
+///   unqualified. Treating it as `Source` would hide genuine undefined-variable
+///   diagnostics in both directions and pull non-package scripts into
+///   mutual visibility.
 /// - `<root>/tests/testthat/**/*.R` (or `*.r`) → `Test`
 /// - `<root>/tests/testit/**/*.R` (or `*.r`) → `Test`
 /// - `<root>/tests/*.R` (direct children only, or `*.r`) → `Test`
@@ -869,13 +883,32 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
     let mut comps = rel.components();
     let first = comps.next()?.as_os_str().to_str()?;
 
-    let is_r_extension = matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"),);
-    if !is_r_extension {
+    if !has_r_extension(path) {
         return None;
     }
 
     match first {
-        "R" => Some(RFileKind::Source),
+        "R" => {
+            // R's code-file listing accepts only basenames that start with an
+            // ASCII letter or digit (`tools::list_files_with_type`, type
+            // "code"). Anything else under `R/` is never part of the namespace.
+            if !has_r_code_basename(path) {
+                return None;
+            }
+            let second = comps.next()?.as_os_str().to_str()?;
+            if comps.next().is_none() {
+                // Direct child of R/ — the file itself.
+                return Some(RFileKind::Source);
+            }
+            // `R/unix/x.R`, `R/windows/x.R`: the only subdirectories R loads.
+            // `comps` has consumed the third component; anything deeper
+            // (`R/unix/sub/x.R`) is not loaded either.
+            if (second == "unix" || second == "windows") && comps.next().is_none() {
+                Some(RFileKind::Source)
+            } else {
+                None
+            }
+        }
         "inst" => {
             // Installed test suites run with the package loaded.
             let second = comps.next()?.as_os_str().to_str()?;
@@ -899,6 +932,24 @@ pub fn is_r_source_path(path: &Path, workspace_root: &Path) -> Option<RFileKind>
         }
         _ => None,
     }
+}
+
+/// Whether `path`'s basename would pass R's code-file name filter: the first
+/// byte is an ASCII letter or digit (`tools::list_files_with_type(.., "code")`
+/// keeps `^[A-Za-z0-9]` only, deliberately avoiding locale-dependent ranges).
+fn has_r_code_basename(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.bytes().next())
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Whether `path` is spelled as an R source file (`.R` or `.r`).
+///
+/// Directory-level package predicates use this to decide whether to judge a
+/// path as a file through [`is_r_source_path`] or as a directory by prefix.
+pub fn has_r_extension(path: &Path) -> bool {
+    matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"))
 }
 
 /// Returns `true` when `path` is under `<root>/tests/testthat/` or
@@ -1227,14 +1278,64 @@ mod path_tests {
 
     #[test]
     #[allow(non_snake_case)]
-    fn r_source_path_recognizes_subdirs_in_R() {
+    fn r_source_path_recognizes_os_subdirs_in_R() {
+        let root = Path::new("/work/pkg");
         assert_eq!(
-            is_r_source_path(
-                Path::new("/work/pkg/R/unix/utils.R"),
-                Path::new("/work/pkg")
-            ),
+            is_r_source_path(Path::new("/work/pkg/R/unix/utils.R"), root),
             Some(RFileKind::Source),
         );
+        assert_eq!(
+            is_r_source_path(Path::new("/work/pkg/R/windows/utils.R"), root),
+            Some(RFileKind::Source),
+        );
+    }
+
+    /// R never recurses into `R/`: only `R/*.R` plus the OS-specific
+    /// `R/unix` / `R/windows` are loaded. A script under any other `R/`
+    /// subdirectory (`R/mics/loop.R`, `R/scripts/run.R`) is not package source
+    /// and must not join mutual visibility.
+    #[test]
+    #[allow(non_snake_case)]
+    fn r_source_path_rejects_other_subdirs_in_R() {
+        let root = Path::new("/work/pkg");
+        for path in [
+            "/work/pkg/R/mics/loop.R",
+            "/work/pkg/R/scripts/run.R",
+            "/work/pkg/R/unix/deeper/x.R",
+            "/work/pkg/R/Unix/x.R", // case-sensitive, like R
+        ] {
+            assert_eq!(is_r_source_path(Path::new(path), root), None, "{path}");
+        }
+    }
+
+    /// `tools::list_files_with_type(.., "code")` keeps only basenames whose
+    /// first character is an ASCII letter or digit, so `R/_helper.R` and
+    /// `R/.hidden.R` (and the same names under `R/unix`, `R/windows`) are not
+    /// package code even though they carry the `.R` extension.
+    #[test]
+    #[allow(non_snake_case)]
+    fn r_source_path_applies_R_code_basename_filter() {
+        let root = Path::new("/work/pkg");
+        for path in [
+            "/work/pkg/R/_helper.R",
+            "/work/pkg/R/.hidden.R",
+            "/work/pkg/R/-dash.R",
+            "/work/pkg/R/unix/_helper.R",
+            "/work/pkg/R/windows/.hidden.r",
+        ] {
+            assert_eq!(is_r_source_path(Path::new(path), root), None, "{path}");
+        }
+        for path in [
+            "/work/pkg/R/a.R",
+            "/work/pkg/R/0-setup.R",
+            "/work/pkg/R/unix/Zz.r",
+        ] {
+            assert_eq!(
+                is_r_source_path(Path::new(path), root),
+                Some(RFileKind::Source),
+                "{path}"
+            );
+        }
     }
 
     #[test]
