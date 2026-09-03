@@ -130,6 +130,19 @@ jobs:
   fmt:
     name: Formatting
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  # ── Tree-sitter grammar validation ────────────────────────────────────
+  # Regenerate both vendored grammars and exercise their corpus and oracle
+  # checks. Keep these npm-dependent checks separate from the fast,
+  # dependency-free Rust formatting gate.
+  grammar-validation:
+    name: Grammar Validation
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -141,8 +154,6 @@ jobs:
           cache-dependency-path: |
             crates/tree-sitter-jags/package-lock.json
             crates/tree-sitter-stan/package-lock.json
-      - name: Check formatting
-        run: cargo fmt --all --check
       - name: Check generated Stan parsers
         working-directory: crates/tree-sitter-stan
         run: |
