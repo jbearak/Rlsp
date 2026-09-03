@@ -503,6 +503,9 @@ jobs:
         working-directory: editors/vscode
         run: npm ci
 
+      - name: Run Bun tests
+        run: bun test
+
       - name: Check Stan builtin catalog is up to date
         run: bun editors/vscode/scripts/generate-stan-builtins.mjs --check
 
