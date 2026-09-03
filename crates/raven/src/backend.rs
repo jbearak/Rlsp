@@ -2513,26 +2513,37 @@ impl Backend {
     ) -> Option<crate::state::LibraryRoutingTransferredEffects> {
         const ROUTING_ATTEMPTS: usize = 2;
         for attempt in 0..ROUTING_ATTEMPTS {
-            {
-                let state = deadline
-                    .wait("built package library currency check", self.state.read())
-                    .await
-                    .ok()?;
-                if !still_current(&state) {
-                    // Dropping `captured` (if any) deposits its reconcile
-                    // currency for the coordinator.
-                    return None;
-                }
-            }
             let bundle = match captured.take() {
-                Some(bundle) => bundle,
+                Some(bundle) => {
+                    // The pre-build basis already pins the configuration the
+                    // library was built from; the routing CAS rejects it if
+                    // that changed. This check only saves a doomed attempt.
+                    // Dropping `bundle` on the early return deposits its
+                    // reconcile currency for the coordinator.
+                    let state = deadline
+                        .wait("built package library currency check", self.state.read())
+                        .await
+                        .ok()?;
+                    if !still_current(&state) {
+                        return None;
+                    }
+                    drop(state);
+                    bundle
+                }
+                // A fresh basis would record the *current* configuration, so
+                // the currency check must run under the same write lock as
+                // the capture: a settings/workspace change landing between a
+                // separate check and the capture would let the CAS install a
+                // library built from the old key under the new key's
+                // authority.
                 None => {
-                    capture_library_routing_basis(
+                    capture_library_routing_basis_if(
                         &self.state,
                         crate::state::LibraryRoutingMutation::Replacement,
                         None,
                         crate::state::LibraryReplacementAbortPolicy::Reconcile,
                         deadline,
+                        &still_current,
                     )
                     .await?
                 }
@@ -5702,6 +5713,35 @@ async fn capture_library_routing_basis(
     abort_policy: crate::state::LibraryReplacementAbortPolicy,
     deadline: LibraryRoutingDeadline,
 ) -> Option<CapturedLibraryRouting> {
+    capture_library_routing_basis_if(
+        state_arc,
+        mutation,
+        watcher_owner,
+        abort_policy,
+        deadline,
+        |_| true,
+    )
+    .await
+}
+
+/// [`capture_library_routing_basis`] gated by `still_current`, evaluated under
+/// the same write lock that captures the basis.
+///
+/// A caller that checks currency under a read lock, drops it, and then
+/// captures has a window in which the configuration can change; the fresh
+/// basis then records the *new* configuration and the routing CAS cannot tell
+/// that the payload was built from the old one. Evaluating the predicate
+/// under the capture's own write lock closes that window: a `None` from a
+/// failed predicate deposits nothing (no guard or pre-seal obligation was
+/// created yet).
+async fn capture_library_routing_basis_if(
+    state_arc: &Arc<RwLock<WorldState>>,
+    mutation: crate::state::LibraryRoutingMutation,
+    watcher_owner: Option<crate::state::LibpathWatcherOwner>,
+    abort_policy: crate::state::LibraryReplacementAbortPolicy,
+    deadline: LibraryRoutingDeadline,
+    still_current: impl FnOnce(&WorldState) -> bool,
+) -> Option<CapturedLibraryRouting> {
     let library = deadline
         .wait("library-routing capture read", state_arc.read())
         .await
@@ -5717,6 +5757,9 @@ async fn capture_library_routing_basis(
         .wait("library-routing capture write", state_arc.write())
         .await
         .ok()?;
+    if !still_current(&state) {
+        return None;
+    }
     let basis = state.capture_library_routing_basis(&library, epoch, mutation, watcher_owner)?;
     let guard = state.guard_library_replacement(&basis, abort_policy);
     let (pre_seal_owner, pre_seal, adopted_obligation) =
@@ -36498,11 +36541,15 @@ mod project_config_initialize_tests {
             pause.release();
             pause = next_pause;
         }
-        // The attempt after the last forced loss (if any) runs to completion
-        // unobstructed.
-        tokio::time::timeout(std::time::Duration::from_secs(30), pause.wait_arrived())
-            .await
-            .ok();
+        // The attempt after the last forced loss runs to completion
+        // unobstructed. Once every permitted attempt has lost there is no
+        // further attempt to wait for, and waiting would only burn the
+        // timeout.
+        if lost_races < WORKSPACE_SCAN_ATTEMPT_LIMIT {
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.wait_arrived())
+                .await
+                .expect("the attempt after the last forced loss reaches precommit");
+        }
         pause.release();
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), task)
             .await
