@@ -13083,6 +13083,12 @@ impl WatchedClosedDiskObservation {
 struct WatchedResyncItem {
     uri: Url,
     generation: u64,
+    /// The event only feeds the package seed (a `data-raw/**` script, a
+    /// prelude-sourced helper) and the file lives where bulk discovery would
+    /// prune it. The batch carries it to the package-input reseed without
+    /// reading or indexing it, so a hidden file cannot become a workspace
+    /// entry through a save. See `watched_change_admission`.
+    package_input_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -15176,6 +15182,13 @@ async fn run_watched_resync_batch_owned(
     let mut invocation_retry_needed = false;
     let mut invocation_undecodable_retry_needed = false;
     for (item_index, item) in uris_to_update.iter().enumerate() {
+        if item.package_input_only {
+            // Never read or indexed as a workspace entry; it exists in this
+            // batch so `watched_items_touch_package_inputs` below sees it and
+            // requests the package reseed.
+            eligible_update_indices.insert(item_index);
+            continue;
+        }
         // Capture old metadata before the disk read (for WD change
         // detection). The file was never open — the sync pass skips open
         // documents — so every metadata tier already reflects the last-known
@@ -16356,8 +16369,9 @@ fn enrich_box_candidate_importers(
     importers
 }
 
-/// Whether a watched CREATED/CHANGED event for `uri` is bulk discovery of a
-/// file the workspace walk would have pruned, and so must not be admitted.
+/// Classify a watched CREATED/CHANGED event for `uri`: index it, carry it to
+/// the package reseed only, or drop it as bulk discovery of a file the
+/// workspace walk would have pruned.
 ///
 /// Incremental discovery obeys the bulk-discovery prune rule: a file under a
 /// hidden or vendored directory that nothing already tracks is not admitted
@@ -16377,25 +16391,51 @@ fn enrich_box_candidate_importers(
 ///   (the seed harvests them rather than indexing them), and their update is
 ///   what lets the reseed run. Dropping it would leave package-derived
 ///   symbols stale until some other package event.
-fn watched_change_is_bulk_discovery_pruned(state: &WorldState, uri: &Url) -> bool {
+/// How `collect_watched_resync` treats a CREATED/CHANGED event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchedChangeAdmission {
+    /// Read and (re)index the file as a workspace entry.
+    Index,
+    /// Carry the event to the package-input reseed only; do not index.
+    PackageInputOnly,
+    /// Drop the event.
+    Pruned,
+}
+
+fn watched_change_admission(state: &WorldState, uri: &Url) -> WatchedChangeAdmission {
     if state.workspace_index.contains(uri)
         || state.workspace_index.contains_artifacts(uri)
         || !state.cross_file_graph.get_dependents(uri).is_empty()
-        // Package mode (a `package_inputs.workspace_root` is set).
-        || watched_items_touch_package_inputs(state, std::iter::once(uri.clone()))
+        || !state.is_bulk_discovery_pruned_uri(uri)
     {
-        return false;
+        return WatchedChangeAdmission::Index;
     }
-    // The prelude sets are populated outside package mode too (a plain
-    // workspace `.Rprofile`, a testthat preamble in a non-package project), so
-    // check them directly rather than only through the package-mode gate.
-    if let Ok(path) = uri.to_file_path()
-        && (path_in_rprofile_sourced_set(&path, &state.package_inputs.rprofile_sourced_files)
-            || path_in_rprofile_sourced_set(&path, &state.package_inputs.preamble_sourced_files))
-    {
-        return false;
+    // Under a pruned directory and tracked by nothing that indexes it. If the
+    // package seed harvests it — package mode (`watched_items_touch_package_inputs`
+    // covers `R/`, tests, `data/`, `data-raw/**`, and the prelude sets), or the
+    // prelude sets outside package mode (a plain workspace `.Rprofile`, a
+    // testthat preamble in a non-package project) — the reseed still needs the
+    // event, but indexing the file would make a hidden path a permanent
+    // workspace entry through a single save.
+    let feeds_package_inputs =
+        watched_items_touch_package_inputs(state, std::iter::once(uri.clone()))
+            || uri.to_file_path().is_ok_and(|path| {
+                path_in_rprofile_sourced_set(&path, &state.package_inputs.rprofile_sourced_files)
+                    || path_in_rprofile_sourced_set(
+                        &path,
+                        &state.package_inputs.preamble_sourced_files,
+                    )
+            });
+    if feeds_package_inputs {
+        WatchedChangeAdmission::PackageInputOnly
+    } else {
+        WatchedChangeAdmission::Pruned
     }
-    state.is_bulk_discovery_pruned_uri(uri)
+}
+
+#[cfg(test)]
+fn watched_change_is_bulk_discovery_pruned(state: &WorldState, uri: &Url) -> bool {
+    watched_change_admission(state, uri) == WatchedChangeAdmission::Pruned
 }
 
 /// Reserve one watched generation per closed URI and capture the pre-update
@@ -16455,6 +16495,7 @@ fn collect_watched_resync(
                 updates.push(WatchedResyncItem {
                     uri: importer_uri.clone(),
                     generation,
+                    package_input_only: false,
                 });
             }
         }
@@ -16498,6 +16539,7 @@ fn collect_watched_resync(
                     deletions.push(WatchedResyncItem {
                         uri: uri.clone(),
                         generation,
+                        package_input_only: false,
                     });
                     extend_with_watched_pre_update_dependents(
                         &mut affected,
@@ -16511,16 +16553,29 @@ fn collect_watched_resync(
                 if queued_updates.contains(uri) {
                     continue;
                 }
-                if watched_change_is_bulk_discovery_pruned(state, uri) {
-                    log::trace!("Ignoring watched change under a pruned directory: {uri}");
-                    continue;
-                }
+                let package_input_only = match watched_change_admission(state, uri) {
+                    WatchedChangeAdmission::Pruned => {
+                        log::trace!("Ignoring watched change under a pruned directory: {uri}");
+                        continue;
+                    }
+                    WatchedChangeAdmission::PackageInputOnly => {
+                        log::trace!(
+                            "Carrying watched change under a pruned directory to the package \
+                             reseed only: {uri}"
+                        );
+                        true
+                    }
+                    WatchedChangeAdmission::Index => false,
+                };
                 let generation = bump_watched_file_resync_generation(state, uri);
-                state.workspace_index.schedule_update(uri.clone());
+                if !package_input_only {
+                    state.workspace_index.schedule_update(uri.clone());
+                }
                 queued_updates.insert(uri.clone());
                 updates.push(WatchedResyncItem {
                     uri: uri.clone(),
                     generation,
+                    package_input_only,
                 });
                 extend_with_watched_pre_update_dependents(
                     &mut affected,
@@ -16534,6 +16589,7 @@ fn collect_watched_resync(
                 deletions.push(WatchedResyncItem {
                     uri: uri.clone(),
                     generation,
+                    package_input_only: false,
                 });
                 extend_with_watched_pre_update_dependents(
                     &mut affected,
@@ -27124,6 +27180,7 @@ mod tests {
             super::WatchedResyncItem {
                 uri: uri.clone(),
                 generation,
+                package_input_only: false,
             },
         );
         tokio::task::yield_now().await;
@@ -50209,6 +50266,7 @@ mod project_config_initialize_tests {
                 updates: vec![WatchedResyncItem {
                     uri: desc_uri,
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -50267,6 +50325,7 @@ mod project_config_initialize_tests {
                 updates: vec![WatchedResyncItem {
                     uri: desc_uri,
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -50321,6 +50380,7 @@ mod project_config_initialize_tests {
                 updates: vec![WatchedResyncItem {
                     uri: desc_uri,
                     generation: stale_generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -50381,6 +50441,7 @@ mod project_config_initialize_tests {
                 updates: vec![WatchedResyncItem {
                     uri: desc_uri,
                     generation: stale_generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -50458,6 +50519,7 @@ mod project_config_initialize_tests {
                 updates: vec![WatchedResyncItem {
                     uri: helper_uri.clone(),
                     generation: stale_generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -52719,6 +52781,75 @@ mod project_config_initialize_tests {
         drop(foreign);
     }
 
+    /// Codex round seven (P2): a package-only event under a hidden directory
+    /// must reach the package reseed without becoming a workspace-index entry
+    /// (a dynamic entry admitted that way would survive every later scan).
+    #[tokio::test]
+    async fn watched_package_only_event_reseeds_without_indexing() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[crossFile]\nindexWorkspace = false\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("DESCRIPTION"),
+            "Package: demo\nVersion: 0.1.0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("R")).unwrap();
+        fs::create_dir_all(tmp.path().join("data-raw/.helpers")).unwrap();
+        let generate_path = tmp.path().join("data-raw/.helpers/generate.R");
+        let generate_uri = Url::from_file_path(&generate_path).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "pkg".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+            assert!(state.package_inputs.sysdata_names.is_empty());
+        }
+
+        fs::write(
+            &generate_path,
+            "hidden_tbl <- data.frame(x = 1)\nusethis::use_data(hidden_tbl, internal = TRUE)\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: generate_uri.clone(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state.package_inputs.sysdata_names.contains("hidden_tbl")
+            })
+            .await,
+            "the package reseed must pick up the hidden data-raw script"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            state.workspace_index.get(&generate_uri).is_none()
+                && state.workspace_index.get_metadata(&generate_uri).is_none(),
+            "the package-only event must not create a workspace-index entry"
+        );
+    }
+
     /// A helper tracked only by the package prelude sets (`.Rprofile` or a
     /// testthat preamble `source()`s it; nothing indexes it and no graph edge
     /// points at it) must survive the hidden-directory prune, or its edits
@@ -52767,9 +52898,29 @@ mod project_config_initialize_tests {
             "precondition: outside package mode the hidden data-raw helper is pruned"
         );
         state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
-        assert!(
-            !watched_change_is_bulk_discovery_pruned(&state, &generate_uri),
-            "a seeded data-raw input must not be pruned in package mode"
+        assert_eq!(
+            watched_change_admission(&state, &generate_uri),
+            WatchedChangeAdmission::PackageInputOnly,
+            "a seeded data-raw input reaches the reseed but is not indexed"
+        );
+        assert_eq!(
+            watched_change_admission(&state, &helper_uri),
+            WatchedChangeAdmission::Pruned,
+            "an untracked hidden helper is still pruned in package mode"
+        );
+        state
+            .package_inputs
+            .preamble_sourced_files
+            .insert(helper_path.clone());
+        assert_eq!(
+            watched_change_admission(&state, &helper_uri),
+            WatchedChangeAdmission::PackageInputOnly
+        );
+        // Visible package sources are indexed as before.
+        let visible = Url::from_file_path(tmp.path().join("R/a.R")).unwrap();
+        assert_eq!(
+            watched_change_admission(&state, &visible),
+            WatchedChangeAdmission::Index
         );
         // But a hidden directory the seed also ignores stays pruned.
         let scratch_uri =
@@ -60805,6 +60956,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: child_uri.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -60887,6 +61039,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: description_uri,
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -60941,6 +61094,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: description_uri.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -61008,6 +61162,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: target.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -61066,11 +61221,13 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: target.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: vec![WatchedResyncItem {
                     uri: target.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
@@ -61175,20 +61332,24 @@ infixContinuationStyle = "aligned"
                     WatchedResyncItem {
                         uri: description,
                         generation: description_generation,
+                        package_input_only: false,
                     },
                     WatchedResyncItem {
                         uri: consumer.clone(),
                         generation: consumer_generation,
+                        package_input_only: false,
                     },
                     WatchedResyncItem {
                         uri: transient.clone(),
                         generation: transient_generation,
+                        package_input_only: false,
                     },
                 ],
                 affected: Vec::new(),
                 deletions: vec![WatchedResyncItem {
                     uri: transient.clone(),
                     generation: transient_generation,
+                    package_input_only: false,
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
@@ -61668,6 +61829,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: uri.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -61733,6 +61895,7 @@ infixContinuationStyle = "aligned"
                 deletions: vec![WatchedResyncItem {
                     uri: uri.clone(),
                     generation,
+                    package_input_only: false,
                 }],
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
@@ -61797,10 +61960,12 @@ infixContinuationStyle = "aligned"
                     WatchedResyncItem {
                         uri: description_uri,
                         generation: description_generation,
+                        package_input_only: false,
                     },
                     WatchedResyncItem {
                         uri: helper_uri.clone(),
                         generation: helper_generation,
+                        package_input_only: false,
                     },
                 ],
                 affected: Vec::new(),
@@ -61850,7 +62015,11 @@ infixContinuationStyle = "aligned"
                 backend.client.clone(),
                 backend.traversal_truncation.clone(),
                 WatchedResyncBatch {
-                    updates: vec![WatchedResyncItem { uri, generation }],
+                    updates: vec![WatchedResyncItem {
+                        uri,
+                        generation,
+                        package_input_only: false,
+                    }],
                     affected: Vec::new(),
                     deletions: Vec::new(),
                     reserved_tickets: Vec::new(),
@@ -61906,6 +62075,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: uri.clone(),
                     generation: stale_generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -61940,6 +62110,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: uri.clone(),
                     generation: successor_generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),
@@ -62026,6 +62197,7 @@ infixContinuationStyle = "aligned"
                 updates: vec![WatchedResyncItem {
                     uri: child_uri,
                     generation,
+                    package_input_only: false,
                 }],
                 affected: Vec::new(),
                 deletions: Vec::new(),

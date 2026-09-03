@@ -318,10 +318,11 @@ before that rule existed. The watched-file resync applies the same rule to
 URIs the index has never seen (`WorldState::is_bulk_discovery_pruned_uri`),
 because VS Code's recursive watcher reports every create under the workspace
 and a dynamic entry admitted that way survives every later scan. The prune
-(`watched_change_is_bulk_discovery_pruned` in `backend.rs`) exempts anything
-already tracked: an index entry, a graph dependent, or any path that feeds
-package inputs by the same predicate the reseed uses, since the package seed
-harvests `data-raw/**` and prelude-sourced helpers without indexing them.
+(`watched_change_admission` in `backend.rs`) indexes anything already
+tracked — an index entry or a graph dependent — and carries a path that only
+feeds package inputs (by the reseed's own predicate; the seed harvests
+`data-raw/**` and prelude-sourced helpers without indexing them) to the
+package reseed as a `package_input_only` item that is never read or indexed.
 
 Document analysis has one authority per lifecycle state. Open buffers live in
 `OpenDocumentStore`; all closed records live in `WorkspaceIndex`. The closed
