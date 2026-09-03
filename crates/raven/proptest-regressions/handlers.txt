@@ -14,3 +14,4 @@ cc 983b057cd15b41227acf67a33b60f8aad42d25970dfa29401494b609f8d246fe # shrinks to
 cc d3a667aae8fefd13d4da291efa222936bb1f1f6806e9bf2c52529364e215c4de # shrinks to symbol_name = "bmp", is_function = false, lines_between = 0
 cc 45e6028c72f7d8b279bbde2cb156a3ac934a6cff2e4f83142171fa19e7706317 # shrinks to func = "i__", lhs = "aa0", rhs = "i__"
 cc 5ffd8e9d8fe0cb62ca747b14ce4eea20ff072c71b60bc3fcdeb7dd6869a03705 # shrinks to content = "NA<-", ext = "jags"
+cc f035bdc73f96552f49411ca5d91f4eb41c8f51b9c07acb510bd025542181bfeb # shrinks to func_name = "rgf", arg_name = "rgf", value = 1

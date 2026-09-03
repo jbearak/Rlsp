@@ -2629,8 +2629,31 @@ impl Backend {
         None
     }
 
+    /// Make sure the package library is initialized before a prefetch, and
+    /// report whether it is ready.
+    ///
+    /// Used by the implicit, request-path callers (`did_change` prefetch,
+    /// on-demand prerequisite indexing). While the detached startup build is
+    /// in flight (`startup_package_build_active`) this returns the current
+    /// readiness *without* waiting on the coordinator: those callers run
+    /// inside notification handlers, and tower-lsp's single dispatch slot
+    /// would otherwise stall on the 10–15 s R spawn as soon as the user types
+    /// — the same stall `did_open` avoids. The startup build's commit
+    /// republishes every open document, so the skipped prefetch is redone.
+    /// Explicit rebuilds (`raven.refreshPackages`, package-settings changes)
+    /// take the coordinator directly and do wait, deliberately.
     async fn ensure_package_library_initialized(&self) -> bool {
         let deadline = LibraryRoutingDeadline::foreground();
+        if self.startup_package_build_active.load(Ordering::Acquire) {
+            return deadline
+                .wait(
+                    "package initialization startup-bypass read",
+                    self.state.read(),
+                )
+                .await
+                .map(|state| state.package_library_ready)
+                .unwrap_or(false);
+        }
         let Some(attempt) = self
             .coordinated_package_library_initialization(deadline)
             .await
@@ -16345,18 +16368,27 @@ fn enrich_box_candidate_importers(
 /// - an existing index entry or artifact projection (explicit, on-demand);
 /// - a graph dependent — some indexed or open file `source()`s it, so
 ///   creating it must index it and clear the importer's missing-file state;
-/// - the package prelude sets — a workspace `.Rprofile` or a testthat/testit
-///   preamble sources it. Such a helper often has no index entry and no graph
-///   dependent (the prelude is harvested, not indexed), and its update is
-///   what lets `watched_items_touch_package_inputs` rescan the prelude.
-///   Dropping it would leave harvested symbols and packages stale.
+/// - anything that feeds package inputs, judged by the same predicate the
+///   reseed uses (`watched_items_touch_package_inputs`): `R/` and test
+///   sources, `data/` and `data-raw/` (the package scanner reads
+///   `data-raw/**/*.R` recursively, hidden subdirectories included), and the
+///   prelude sets — a workspace `.Rprofile` or a testthat/testit preamble
+///   sources it. Such files often have no index entry and no graph dependent
+///   (the seed harvests them rather than indexing them), and their update is
+///   what lets the reseed run. Dropping it would leave package-derived
+///   symbols stale until some other package event.
 fn watched_change_is_bulk_discovery_pruned(state: &WorldState, uri: &Url) -> bool {
     if state.workspace_index.contains(uri)
         || state.workspace_index.contains_artifacts(uri)
         || !state.cross_file_graph.get_dependents(uri).is_empty()
+        // Package mode (a `package_inputs.workspace_root` is set).
+        || watched_items_touch_package_inputs(state, std::iter::once(uri.clone()))
     {
         return false;
     }
+    // The prelude sets are populated outside package mode too (a plain
+    // workspace `.Rprofile`, a testthat preamble in a non-package project), so
+    // check them directly rather than only through the package-mode gate.
     if let Ok(path) = uri.to_file_path()
         && (path_in_rprofile_sourced_set(&path, &state.package_inputs.rprofile_sourced_files)
             || path_in_rprofile_sourced_set(&path, &state.package_inputs.preamble_sourced_files))
@@ -52455,6 +52487,54 @@ mod project_config_initialize_tests {
         );
     }
 
+    /// Codex round six (P1): `did_change` and on-demand prerequisite indexing
+    /// go through `ensure_package_library_initialized`; while the startup
+    /// build holds the coordinator they must not wait on it either.
+    #[tokio::test]
+    async fn ensure_package_library_bypasses_active_startup_build() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "workspace".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library_ready = false;
+            state.force_package_library_not_ready_for_test = true;
+        }
+        backend
+            .startup_package_build_active
+            .store(true, Ordering::Release);
+        let _held = backend.package_init_coordinator.lock().await;
+
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend.ensure_package_library_initialized(),
+        )
+        .await
+        .expect("ensure must not block behind the startup package build");
+        assert!(
+            !ready,
+            "not-ready is reported honestly while startup owns the build"
+        );
+        assert_eq!(
+            backend
+                .package_init_attempts_for_test
+                .load(Ordering::Acquire),
+            0,
+            "no on-demand build may run while startup owns the coordinator"
+        );
+    }
+
     /// #747: `raven.refreshPackages` must not spawn its rebuild while the
     /// coordinated startup/didOpen build holds `package_init_coordinator`.
     #[tokio::test]
@@ -52673,6 +52753,31 @@ mod project_config_initialize_tests {
             !watched_change_is_bulk_discovery_pruned(&state, &helper_uri),
             "an .Rprofile-sourced helper must not be pruned (canonical spelling)"
         );
+        state.package_inputs.rprofile_sourced_files.clear();
+
+        // Package-mode seeds: the sysdata scanner reads `data-raw/**/*.R`
+        // recursively, hidden subdirectories included, so an edit there must
+        // reach the reseed even though nothing indexes the file.
+        let generate_path = tmp.path().join("data-raw/.helpers/generate.R");
+        fs::create_dir_all(generate_path.parent().unwrap()).unwrap();
+        fs::write(&generate_path, "x <- 1\n").unwrap();
+        let generate_uri = Url::from_file_path(&generate_path).unwrap();
+        assert!(
+            watched_change_is_bulk_discovery_pruned(&state, &generate_uri),
+            "precondition: outside package mode the hidden data-raw helper is pruned"
+        );
+        state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+        assert!(
+            !watched_change_is_bulk_discovery_pruned(&state, &generate_uri),
+            "a seeded data-raw input must not be pruned in package mode"
+        );
+        // But a hidden directory the seed also ignores stays pruned.
+        let scratch_uri =
+            Url::from_file_path(tmp.path().join(".claude/worktrees/w1/R/a.R")).unwrap();
+        assert!(watched_change_is_bulk_discovery_pruned(
+            &state,
+            &scratch_uri
+        ));
     }
 
     /// The hidden-directory prune governs bulk discovery only: a file some

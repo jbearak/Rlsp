@@ -317,7 +317,11 @@ list (`should_skip_directory` in `state.rs`); embedded worktrees under
 before that rule existed. The watched-file resync applies the same rule to
 URIs the index has never seen (`WorldState::is_bulk_discovery_pruned_uri`),
 because VS Code's recursive watcher reports every create under the workspace
-and a dynamic entry admitted that way survives every later scan.
+and a dynamic entry admitted that way survives every later scan. The prune
+(`watched_change_is_bulk_discovery_pruned` in `backend.rs`) exempts anything
+already tracked: an index entry, a graph dependent, or any path that feeds
+package inputs by the same predicate the reseed uses, since the package seed
+harvests `data-raw/**` and prelude-sourced helpers without indexing them.
 
 Document analysis has one authority per lifecycle state. Open buffers live in
 `OpenDocumentStore`; all closed records live in `WorkspaceIndex`. The closed
@@ -473,9 +477,10 @@ after scheduling the workspace scan and `run_startup_package_library_build`,
 which goes through the same `package_init_coordinator` mutex as `didOpen`'s
 on-demand path, `raven.refreshPackages`, and the package-settings rebuild, so
 at most one R child runs for any library build. While the startup task is in
-flight (`Backend::startup_package_build_active`) `didOpen` does *not* wait on
-it: it opens with the not-ready library and the build's commit republishes
-every open document. Because tower-lsp runs with `concurrency_level(1)`,
+flight (`Backend::startup_package_build_active`) neither `didOpen` nor the
+request-path prefetch callers (`did_change`, on-demand prerequisite indexing,
+via `ensure_package_library_initialized`) wait on it: they proceed with the
+not-ready library and the build's commit republishes every open document. Because tower-lsp runs with `concurrency_level(1)`,
 anything awaited inside a notification handler stalls every queued request;
 awaiting the build in `initialized` (or in the first `didOpen`) cost ~20 s
 before the first references/definition response on a renv project and used to
