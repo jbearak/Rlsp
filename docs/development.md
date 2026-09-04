@@ -59,6 +59,7 @@ cargo build --release -p raven
 - Unit tests: `cargo test -p raven`
 - Integration tests: `cargo test -p raven --features test-support -- --test`
 - Bun tests (TypeScript): `bun test` (from repo root; `bunfig.toml` sets root to `./tests/bun`)
+- Full local workspace suite (Rust, Bun, and VS Code): `RAVEN_RUN_WORKSPACE_SUITE=1 bun test tests/bun/workspace-suite.test.ts`
 - VS Code extension tests: `cd editors/vscode && bun run test`
 - Setup (build + install + package): `./scripts/setup.sh`
 

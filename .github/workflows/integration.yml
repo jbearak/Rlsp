@@ -133,6 +133,23 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  # ── Tree-sitter grammar validation ────────────────────────────────────
+  # Regenerate both vendored grammars and exercise their corpus and oracle
+  # checks. Keep these npm-dependent checks separate from the fast,
+  # dependency-free Rust formatting gate.
+  grammar-validation:
+    name: Grammar Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
       - name: Setup Node.js for grammar generation
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
@@ -141,8 +158,6 @@ jobs:
           cache-dependency-path: |
             crates/tree-sitter-jags/package-lock.json
             crates/tree-sitter-stan/package-lock.json
-      - name: Check formatting
-        run: cargo fmt --all --check
       - name: Check generated Stan parsers
         working-directory: crates/tree-sitter-stan
         run: |
@@ -502,6 +517,9 @@ jobs:
       - name: Install VS Code extension dependencies
         working-directory: editors/vscode
         run: npm ci
+
+      - name: Run Bun tests
+        run: bun test
 
       - name: Check Stan builtin catalog is up to date
         run: bun editors/vscode/scripts/generate-stan-builtins.mjs --check
