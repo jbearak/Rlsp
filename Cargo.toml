@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/raven", "crates/tree-sitter-jags", "crates/tree-sitter-stan"]
 
 [workspace.package]
-version = "0.20.0"
+version = "0.20.1"
 authors = ["Jonathan Marc Bearak <jonathan@bearak.net>"]
 edition = "2024"
 license = "GPL-3.0"
