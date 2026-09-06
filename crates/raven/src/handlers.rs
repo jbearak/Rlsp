@@ -33389,13 +33389,16 @@ mod tests {
 
     /// The functional spelling `` `:=`(...) `` — backticked identifier, string
     /// head, or namespace-qualified — is data.table notation too, so the whole
-    /// bracket is suppressed, including the `` `:=` `` head itself.
+    /// bracket is suppressed, including the `` `:=` `` head itself. Each case
+    /// carries sibling `i` / `by` arguments so the suppression is attributable
+    /// to this rule: an unresolved callee (the string head) or a `data.table::`
+    /// qualifier would already suppress the `:=` call's own arguments.
     #[test]
     fn nse_walrus_functional_form_triggers() {
         for code in [
             "x[, `:=`(a = 1, b = val)]",
-            "x[, \":=\"(a = 1, b = val)]",
-            "x[, data.table::`:=`(a = 1, b = val)]",
+            "x[cond, \":=\"(a = 1, b = val), by = g]",
+            "x[cond, mypkg::`:=`(a = 1, b = val), by = g]",
             "x[cond, j = `:=`(a = 1, b = val), by = g]",
         ] {
             let tree = parse_r_code(code);
@@ -33479,15 +33482,17 @@ mod tests {
     // ---- F1: data.table by-reference class transitions (setDT/setDF/setattr) ----
 
     /// A statement-level `setDT(x)` flips `x` to data.table from that call
-    /// onward, so a subsequent `x[, newcol := val]` suppresses `newcol`/`val`.
+    /// onward, so a subsequent `x[, mean(value), by = grp]` suppresses
+    /// `value`/`grp`. The `j` deliberately carries no `:=` — a walrus would
+    /// suppress the bracket on its own and shadow the classification under test.
     #[test]
     fn nse_setdt_flips_class_to_data_table() {
-        let code = "x <- read.csv(\"f.csv\")\nsetDT(x)\nx[, newcol := val]";
+        let code = "x <- read.csv(\"f.csv\")\nsetDT(x)\nx[, mean(value), by = grp]";
         let tree = parse_r_code(code);
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
-        assert!(!was_collected(&used, "newcol"));
-        assert!(!was_collected(&used, "val"));
+        assert!(!was_collected(&used, "value"));
+        assert!(!was_collected(&used, "grp"));
     }
 
     /// `setDT(x)` works even when `x` has no constructor-derived classification
@@ -33519,24 +33524,25 @@ mod tests {
     /// checked; only indices after the call are suppressed.
     #[test]
     fn nse_setdt_transition_is_positional() {
-        let code = "x <- data.frame(a = 1)\nx[before_idx, ]\nsetDT(x)\nx[, after := 1]";
+        let code = "x <- data.frame(a = 1)\nx[before_idx, ]\nsetDT(x)\nx[after_idx, ]";
         let tree = parse_r_code(code);
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
         assert!(was_collected(&used, "before_idx"));
-        assert!(!was_collected(&used, "after"));
+        assert!(!was_collected(&used, "after_idx"));
     }
 
     /// `setattr(x, "class", "data.table")` is a by-reference class set: `x`
-    /// becomes a data.table from that call onward.
+    /// becomes a data.table from that call onward. No `:=` in `j`, so the
+    /// suppression is attributable to the classification, not the walrus rule.
     #[test]
     fn nse_setattr_class_data_table_flips_class() {
-        let code = "x <- read.csv(\"f.csv\")\nsetattr(x, \"class\", c(\"data.table\", \"data.frame\"))\nx[, j := val]";
+        let code = "x <- read.csv(\"f.csv\")\nsetattr(x, \"class\", c(\"data.table\", \"data.frame\"))\nx[, mean(value), by = grp]";
         let tree = parse_r_code(code);
         let mut used = Vec::new();
         collect_usages_with_context(tree.root_node(), code, &UsageContext::default(), &mut used);
-        assert!(!was_collected(&used, "j"));
-        assert!(!was_collected(&used, "val"));
+        assert!(!was_collected(&used, "value"));
+        assert!(!was_collected(&used, "grp"));
     }
 
     // ========================================================================
