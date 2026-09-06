@@ -205,7 +205,12 @@ suppressions.
 For `[` calls, Raven checks indices for ordinary objects but treats data.table
 contexts specially. In data.table-heavy projects, an unresolved object can be
 treated as data.table-like when data.table is detectably in play; this avoids
-many false positives but can miss a real undefined index in ambiguous code.
+many false positives but can miss a real undefined index in ambiguous code. A
+`[` call with a `:=` argument (`d[, col := value, by = grp]`) is treated as NSE
+unconditionally, whatever package is in play and whatever the indexed object
+is, because no base `[` method evaluates `:=`; packages that adopt data.table's
+bracket notation for their own containers get the same treatment without a
+declaration.
 
 ## Toward NSE Metadata
 

@@ -22094,8 +22094,26 @@ fn fun_resolves_to_data_masking_verb(value: Node, text: &str, analysis: &NseAnal
 }
 
 /// Resolve a `subset` (`[`) / `subset2` (`[[`) node's index policy (issue #398
-/// Phases 0 & 3). `[[` is always standard-eval; `[` is suppressed only for
+/// Phases 0 & 3). `[[` is always standard-eval; `[` is suppressed for
 /// data.table-style indexing.
+///
+/// Two independent signals make a `[` call data.table-style:
+///
+/// 1. **A `:=` argument** ([`subset_has_walrus_arg`]). Base R defines no `:=`
+///    function and no base `[` method evaluates one, so a `[` call carrying a
+///    `:=` argument can only be dispatching to a method that quotes its
+///    arguments — data.table's `[.data.table`, or another package's container
+///    that adopts the same bracket notation (e.g. `d[, avg := mean(x), by = g]`
+///    on a non-data.table class). This check runs first and wins
+///    unconditionally: it does not require data.table to be in play, and it
+///    overrides a [`DataTableClass::NonDataTable`] classification of the indexed
+///    object. That override is deliberate — `df[, y := 1]` on a plain
+///    data.frame is a runtime error either way, and an undefined-variable
+///    report on `y` would describe the failure misleadingly.
+/// 2. **The indexed object's classification** ([`subset_object_data_table_class`]),
+///    resolved only when no `:=` argument is present: a known data.table object
+///    suppresses, a known non-data.table checks, and an unresolved object is
+///    suppressed only when data.table is detectably in play.
 fn resolve_subset_arg_policy(
     node: Node,
     text: &str,
@@ -22103,8 +22121,13 @@ fn resolve_subset_arg_policy(
 ) -> crate::nse::ArgPolicy {
     use crate::nse::ArgPolicy;
     if node.kind() == "subset2" {
-        // `[[` is standard-eval: `DT[[x]]` references `x`.
+        // `[[` is standard-eval: `DT[[x]]` references `x`. A `:=` inside `[[`
+        // is not data.table notation (`[[.data.table` does not evaluate it), so
+        // the walrus rule below is deliberately not consulted here.
         return ArgPolicy::Standard;
+    }
+    if subset_has_walrus_arg(node) {
+        return ArgPolicy::WholeCall;
     }
     match subset_object_data_table_class(node, text, analysis) {
         DataTableClass::DataTable => ArgPolicy::WholeCall,
@@ -22113,6 +22136,41 @@ fn resolve_subset_arg_policy(
         DataTableClass::Unknown if analysis.data_table_in_play => ArgPolicy::WholeCall,
         DataTableClass::Unknown => ArgPolicy::Standard,
     }
+}
+
+/// True when any argument of a `subset` (`[`) node has a `:=` binary operator
+/// as its **top-level value** — positional (`x[, y := v]`, `x[i, y := v, by =
+/// g]`) or named (`x[, j = y := v]`).
+///
+/// Only the argument value node itself is inspected; a `:=` nested deeper
+/// inside an argument (`x[, f(a := b)]`, `x[, (y := 1)]`) does not trigger.
+/// Every real data.table / data.table-style usage places `:=` directly as the
+/// `j` argument, and a nested `:=` would be evaluated by whatever call encloses
+/// it, not by the `[` method — so the conservative top-level rule covers the
+/// real notation without letting an arbitrary inner expression silence the
+/// whole bracket. The functional form `` x[, `:=`(a = 1, b = 2)] `` is a `call`
+/// whose head is `` `:=` ``, not a `binary_operator`, and is likewise not
+/// matched here.
+///
+/// Purely syntactic: it reads no NSE facts and so is independent of which
+/// packages are in play.
+fn subset_has_walrus_arg(node: Node) -> bool {
+    if node.kind() != "subset" {
+        return false;
+    }
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    args.children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+        .filter_map(|arg| arg.child_by_field_name("value"))
+        .any(|value| {
+            value.kind() == "binary_operator"
+                && value
+                    .child_by_field_name("operator")
+                    .is_some_and(|op| op.kind() == ":=")
+        })
 }
 
 /// Classify the object being indexed by a `[` node using the file's data.table
@@ -33161,6 +33219,107 @@ mod tests {
         let mut used = Vec::new();
         collect_with_flags(tree.root_node(), code, true, false, &mut used);
         assert!(!was_collected(&used, "undefined_var"));
+    }
+
+    // ---- `:=` inside `[` is NSE regardless of package ----
+
+    /// `x[, y := val]` with no packages in play: the `:=` argument alone marks
+    /// the bracket as data.table-style, so neither the assigned name nor the
+    /// value expression is collected. The indexed object is still a reference.
+    #[test]
+    fn nse_walrus_bracket_suppresses_without_data_table() {
+        let code = "x[, y := val]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(was_collected(&used, "x"));
+        assert!(!was_collected(&used, "y"));
+        assert!(!was_collected(&used, "val"));
+    }
+
+    /// With a `:=` present, every other argument of the same `[` call (`i`,
+    /// the `by =` grouping) is suppressed too — the whole call is NSE.
+    #[test]
+    fn nse_walrus_bracket_suppresses_whole_call() {
+        let code = "x[cond, y := f(z), by = g]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(was_collected(&used, "x"));
+        for name in ["cond", "y", "f", "z", "g"] {
+            assert!(!was_collected(&used, name), "{name} should be suppressed");
+        }
+    }
+
+    /// A named `j = y := val` argument is matched the same as a positional one.
+    #[test]
+    fn nse_walrus_bracket_named_j_argument() {
+        let code = "x[, j = y := val]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(!was_collected(&used, "y"));
+        assert!(!was_collected(&used, "val"));
+    }
+
+    /// `[[` is unchanged: a (degenerate) `:=` inside `[[` still checks `y`.
+    #[test]
+    fn nse_walrus_double_bracket_still_checked() {
+        let code = "x[[y := 1]]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(was_collected(&used, "y"));
+    }
+
+    /// No `:=` and no data.table signal: the standard-eval default is intact.
+    #[test]
+    fn nse_walrus_absent_keeps_standard_eval_default() {
+        let code = "x[y, ]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(was_collected(&used, "y"));
+    }
+
+    /// `:=` wins over a `NonDataTable` classification of the indexed object:
+    /// `df[, y := val]` on a known data.frame is a runtime error regardless, so
+    /// flagging `y` as undefined would be misleading.
+    #[test]
+    fn nse_walrus_bracket_overrides_non_data_table_class() {
+        let code = "x <- data.frame(a = 1)\nx[, y := val]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(!was_collected(&used, "y"));
+        assert!(!was_collected(&used, "val"));
+    }
+
+    /// A `:=` nested inside an argument expression (not the argument's
+    /// top-level value) does not trigger the rule; the bracket falls through to
+    /// the object classification, which here is standard-eval. The enclosing
+    /// call is a base standard-eval function so its own policy checks `a`/`b`
+    /// (an unresolved callee would suppress them for an unrelated reason).
+    #[test]
+    fn nse_walrus_nested_in_argument_does_not_trigger() {
+        let code = "x[, paste(a := b)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(was_collected(&used, "a"));
+        assert!(was_collected(&used, "b"));
+    }
+
+    /// A `:=` in one `[` call does not leak into a sibling `[` call on the
+    /// same object without one.
+    #[test]
+    fn nse_walrus_bracket_does_not_leak_to_sibling_subset() {
+        let code = "x[, y := 1]\nx[typo, ]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(!was_collected(&used, "y"));
+        assert!(was_collected(&used, "typo"));
     }
 
     /// Every data.table-yielding constructor recognized by
