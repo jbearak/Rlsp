@@ -147,6 +147,53 @@ Each `[[function]]` entry takes:
 `formals` and `captured` apply to `policy = "per-formal"` only; the other two
 kinds need just a `name`.
 
+### Declaring data.table-style `[` semantics
+
+Raven models `[` on a data.table specially: `d[, mean(x), by = grp]` quotes
+`x` and `grp`, so they are not undefined variables (see
+[diagnostics](diagnostics.md#undefined-variables)). A package whose own
+container adopts that bracket notation can declare it with an optional
+`[subset]` table in the same file:
+
+```toml
+schema = 1
+
+# `[` on this package's objects is data-masking, like data.table's.
+[subset]
+constructors = ["dibble", "as_dibble", "read_dta", "read_arrow"]
+converters = ["set_dibble"]
+```
+
+The table's presence is the declaration: while the package is in play — the
+same rule Raven applies to data.table (a `library()` / `require()` /
+`loadNamespace()` call, a DESCRIPTION `Imports:` / `importFrom`, a `pkg::`
+reference anywhere in the file, and the other sources listed under
+[diagnostics](diagnostics.md#call-arguments-and-bracket-indices)) — `[`
+indices on an object Raven cannot classify are suppressed exactly as they are
+when data.table is in play. The two optional lists refine that for objects
+Raven can trace to a definition:
+
+| Key | Meaning |
+| --- | --- |
+| `constructors` | Exported functions whose return value is such a container. `x <- pkg::dibble(...)` classifies `x`, as does a bare `x <- dibble(...)` while the package is in play, so `x[, mean(v), by = g]` is suppressed — the analogue of `data.table()` / `as.data.table()` / `fread()`. |
+| `converters` | Exported by-reference converters whose first argument becomes such a container from that call onward — the analogue of `setDT(x)`. |
+
+Both lists may be empty or omitted. A bare (unqualified) declared name counts
+only while the declaring package is in play (by the rule above), so a sidecar
+installed in your library cannot re-classify a same-named function in a file
+that never loads or references that package. A known data.frame-family object (`data.frame()`, `tibble()`,
+`read.csv()`, …) keeps its indices checked regardless — a declaration cannot
+claim one of those names — `setDF()` / `setattr()` keep their built-in
+meaning, `[[` is always standard-eval, and a `:=` argument already marks a `[`
+call as NSE without any declaration. The lists are intersected with the
+package's export set, like `[[function]]` entries, and share their size limits:
+the file must be at most 256 KiB and each list honors its first 2,000 entries
+(any beyond that are ignored). `data.table` itself is built in — a sidecar
+under that name cannot alter Raven's own entry.
+
+Older Ravens that predate `[subset]` ignore the table (unknown keys are never
+an error), so it ships under `schema = 1`.
+
 Three rules keep a declaration file from making diagnostics worse:
 
 - **Built-ins win.** A declaration is consulted only after Raven's own table
@@ -203,8 +250,10 @@ loads, and computed data or column names may still need declarations or local
 suppressions.
 
 For `[` calls, Raven checks indices for ordinary objects but treats data.table
-contexts specially. In data.table-heavy projects, an unresolved object can be
-treated as data.table-like when data.table is detectably in play; this avoids
+contexts — and those of any package that
+[declares data.table-style `[` semantics](#declaring-datatable-style--semantics)
+— specially. In such projects, an unresolved object can be treated as
+data.table-like when one of those packages is detectably in play; this avoids
 many false positives but can miss a real undefined index in ambiguous code. A
 `[` call with a `:=` argument (`d[, col := value, by = grp]`, in either the
 infix or the functional `` `:=`(...) `` spelling, and only when the `:=` is the

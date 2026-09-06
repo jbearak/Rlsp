@@ -306,19 +306,20 @@ pub struct PackageInfo {
     /// `Unknown` (never absence-authoritative) via every constructor; production
     /// load paths stamp the real value. See `namespace_member_status_sync`.
     pub exports_completeness: MemberCompleteness,
-    /// NSE policies the package declares for its own exports in
-    /// `raven/nse.toml` (installed from `inst/raven/nse.toml`). Empty for the
-    /// overwhelming majority of packages, which ship no sidecar.
+    /// What the package declares about its own exports in `raven/nse.toml`
+    /// (installed from `inst/raven/nse.toml`): per-function NSE policies and
+    /// the optional `[subset]` bracket declaration. Empty for the overwhelming
+    /// majority of packages, which ship no sidecar.
     ///
     /// Populated by `package_info_from_dir`, the same on-disk chokepoint that
     /// fills `lazy_data`; base packages never carry declarations. Consulted by
-    /// the NSE resolver only *after* the built-in table misses, so a package
+    /// the NSE resolver only *after* the built-in tables miss, so a package
     /// can add coverage but never weaken Raven's own modeling — see
     /// [`crate::nse_declarations`].
     ///
     /// `Arc` so the per-read `PackageInfo` clones stay cheap for the packages
-    /// that do declare policies.
-    pub(crate) nse_policies: Arc<crate::nse_declarations::DeclaredPolicies>,
+    /// that do declare something.
+    pub(crate) nse_declarations: Arc<crate::nse_declarations::Declarations>,
 }
 
 impl PackageInfo {
@@ -335,7 +336,7 @@ impl PackageInfo {
             lazy_data: Vec::new(),
             data_aliases: HashMap::new(),
             exports_completeness: MemberCompleteness::Unknown,
-            nse_policies: Arc::default(),
+            nse_declarations: Arc::default(),
         }
     }
 
@@ -357,7 +358,7 @@ impl PackageInfo {
             lazy_data,
             data_aliases: HashMap::new(),
             exports_completeness: MemberCompleteness::Unknown,
-            nse_policies: Arc::default(),
+            nse_declarations: Arc::default(),
         }
     }
 }
@@ -391,7 +392,7 @@ async fn package_info_from_dir(
     };
     let mut info = PackageInfo::with_details(name, exports, depends, lazy_data);
     if !declared.is_empty() {
-        info.nse_policies = Arc::new(declared);
+        info.nse_declarations = Arc::new(declared);
     }
     info
 }
@@ -2021,7 +2022,31 @@ impl PackageLibrary {
         self.packages
             .load()
             .get(package)
-            .and_then(|info| info.nse_policies.get(name).cloned())
+            .and_then(|info| info.nse_declarations.policies.get(name).cloned())
+    }
+
+    /// Every cached package whose `raven/nse.toml` carries a `[subset]` table,
+    /// with what it declared (synchronous, cached-only).
+    ///
+    /// Same cached-only contract as [`Self::declared_nse_policy`]: this runs
+    /// inside the undefined-variable collector, which cannot block on a package
+    /// load, so a package that is not yet cached simply does not appear — its
+    /// `[` calls are checked as they were before the sidecar existed, and the
+    /// declaration applies once the normal load path warms the entry. One
+    /// ArcSwap `load()` and a linear scan of the cache; no lock is held.
+    ///
+    /// The result is a snapshot: the collector merges it with Raven's built-in
+    /// data.table entry (built-in wins on a name collision) at the start of a
+    /// diagnostic pass — see `BracketNsePackages` in `handlers.rs`.
+    pub(crate) fn declared_bracket_nse_packages(
+        &self,
+    ) -> Vec<(String, Arc<crate::nse_declarations::Declarations>)> {
+        self.packages
+            .load()
+            .values()
+            .filter(|info| info.nse_declarations.subset.is_some())
+            .map(|info| (info.name.clone(), Arc::clone(&info.nse_declarations)))
+            .collect()
     }
 
     /// Find which package exports a symbol (synchronous, cached-only)

@@ -483,6 +483,21 @@ See [Non-Standard Evaluation](non-standard-evaluation.md) and
 [Diagnostics](diagnostics.md#call-arguments-and-bracket-indices) for the full
 rules and the `undefinedVariableInBracketIndices` opt-out.
 
+### Shipping NSE metadata with your package
+
+If your package exports data-masking or tidy-selecting functions, or a
+container whose `[` method quotes its arguments the way data.table's does, you
+can describe that once in `inst/raven/nse.toml` so every user of the package
+gets the right diagnostics without writing `# raven: nse` directives.
+`[[function]]` entries declare per-function argument policies; an optional
+`[subset]` table declares data.table-style `[` semantics, naming the
+constructors and by-reference converters that produce such objects. Inside
+your package's own source files the `[subset]` declaration applies without a
+`library()` call, like your own NSE verbs — but Raven reads the sidecar from
+the *installed* copy of the package, so install it (or `devtools::install()`)
+for the declaration to take effect while you develop. See
+[Declaring NSE From a Package](non-standard-evaluation.md#declaring-nse-from-a-package).
+
 ### Live Updates
 
 Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running `devtools::document()` or editing these files directly, diagnostics update automatically without restarting the editor.

@@ -19698,15 +19698,189 @@ struct UsageContext {
     suppressed: bool,
 }
 
-/// How an indexed object's class is known for data.table `[` suppression.
+/// How an indexed object's class is known for data.table-style `[`
+/// suppression.
+///
+/// "Data table" here is shorthand for *any* container whose `[` method quotes
+/// its arguments the way `[.data.table` does — data.table itself (Raven's
+/// built-in entry) and every package that declares the same semantics through
+/// a `[subset]` table in its `raven/nse.toml` sidecar (see
+/// [`BracketNsePackages`]). The enum is not renamed because the whole
+/// `[`-suppression model is documented and tested in data.table's terms; a
+/// dibble classified `DataTable` behaves exactly like a data.table would.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DataTableClass {
-    /// Defining expression is a data.table constructor/converter.
+    /// Defining expression is a bracket-NSE constructor/converter (data.table's
+    /// own, or one a bracket-NSE package declares).
     DataTable,
     /// Defining expression is a known data.frame-family constructor.
     NonDataTable,
     /// Not resolvable from the file's top-level definitions.
     Unknown,
+}
+
+/// The packages whose `[` method is data-masking, keyed by package name, with
+/// the exported functions that produce or convert to such a container.
+///
+/// Membership is what makes the data.table `[` model fire for an *unresolved*
+/// object: `resolve_subset_arg_policy` suppresses `y[, mean(v), by = g]` for an
+/// unknown `y` iff some member is in play (a `library()`/import in
+/// `in_play_packages`, or a `pkg::` qualifier for a member anywhere in the
+/// file). The per-member lists let `collect_nse_facts` classify specific
+/// objects (`x <- ctor(...)`, `conv(x)`) the way it does for `data.table()` /
+/// `setDT()`.
+///
+/// Assembled once per [`NseAnalysis::build`] by [`BracketNsePackages::assemble`]
+/// from Raven's built-in data.table entry plus every cached package that ships a
+/// `[subset]` declaration ([`crate::package_library::PackageLibrary::declared_bracket_nse_packages`]).
+/// The declared lists are shared by `Arc`, not cloned, so assembly costs one
+/// ArcSwap load plus a scan of the package cache; the path is cached-only and
+/// lock-free, so building this never blocks the collector.
+///
+/// **Built-in wins on a name collision**, mirroring [`package_arg_policy`], in
+/// two senses: a sidecar claiming to be `data.table` can neither remove nor
+/// reshape the built-in entry, and a declared constructor/converter can never
+/// re-classify a name Raven's built-in data.frame-family list already knows
+/// (`constructor_data_table_class` and `by_reference_class_transition` consult
+/// the built-in `NonDataTable` names before any declared list).
+///
+/// **Bare declared names are gated on in-play.** Bare `fread()` has always
+/// classified its assignee without resolving the package, because `fread` is a
+/// name Raven curated. A declared name is chosen by an arbitrary installed
+/// package and the package cache is workspace-wide, so a bare `read_dta()` in
+/// a file that never loads the declaring package must not be re-classified by
+/// a sidecar that happens to be cached: a bare name matches a *declared* entry
+/// only when that package is in play — in `in_play_packages`, named by a
+/// `pkgx::` qualifier somewhere in the file (`collect_namespace_qualifiers`),
+/// or the package whose own sources are being analyzed (`self_nse_package`);
+/// the same signals put a package in play for the unresolved-object rule. A
+/// qualified `pkgx::mk()` matches regardless: the qualifier names the package
+/// explicitly.
+struct BracketNsePackages {
+    packages: HashMap<String, BracketNseEntry>,
+}
+
+/// One bracket-NSE package's object-producing exports.
+struct BracketNseEntry {
+    /// `constructors`: functions whose return value is a data-masking container
+    /// (`data.table`, `as.data.table`, `fread`; a declared list).
+    /// `converters`: statement-level by-reference converters whose first
+    /// argument becomes such a container from the call onward (`setDT`; a
+    /// declared list). `setDF` / `setattr` are handled separately by
+    /// [`by_reference_class_transition`] because they can also flip an object
+    /// *away* from the class, which a declaration cannot express.
+    lists: Arc<crate::nse_declarations::DeclaredSubset>,
+    /// Whether a bare (unqualified) callee may match this entry's lists: always
+    /// for the built-in entry, and for a declared entry only when the package
+    /// is in play. See the type doc.
+    bare_callable: bool,
+}
+
+/// Raven's own data.table entry, shared across every analysis.
+static BUILT_IN_DATA_TABLE_SUBSET: std::sync::LazyLock<
+    Arc<crate::nse_declarations::DeclaredSubset>,
+> = std::sync::LazyLock::new(|| {
+    Arc::new(crate::nse_declarations::DeclaredSubset {
+        constructors: ["data.table", "as.data.table", "fread"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        converters: ["setDT"].into_iter().map(str::to_string).collect(),
+    })
+});
+
+impl BracketNsePackages {
+    /// The built-in entry alone — what every file gets with no package library
+    /// (unit tests) or no declaring package cached.
+    fn built_in() -> Self {
+        let mut packages = HashMap::new();
+        packages.insert(
+            "data.table".to_string(),
+            BracketNseEntry {
+                lists: Arc::clone(&BUILT_IN_DATA_TABLE_SUBSET),
+                bare_callable: true,
+            },
+        );
+        Self { packages }
+    }
+
+    /// Built-in entry plus every `[subset]`-declaring package the library has
+    /// cached. Built-in wins on collision, and declared entries may match bare
+    /// callees only when in play — `in_play_packages` or `qualified_packages`
+    /// (see the type doc).
+    fn assemble(
+        package_library: Option<&crate::package_library::PackageLibrary>,
+        in_play_packages: &[String],
+        qualified_packages: &HashSet<String>,
+    ) -> Self {
+        let mut set = Self::built_in();
+        let Some(lib) = package_library else {
+            return set;
+        };
+        for (name, declarations) in lib.declared_bracket_nse_packages() {
+            let Some(subset) = declarations.subset.as_ref() else {
+                continue;
+            };
+            let bare_callable =
+                in_play_packages.contains(&name) || qualified_packages.contains(&name);
+            set.packages.entry(name).or_insert_with(|| BracketNseEntry {
+                lists: Arc::clone(subset),
+                bare_callable,
+            });
+        }
+        set
+    }
+
+    fn contains(&self, package: &str) -> bool {
+        self.packages.contains_key(package)
+    }
+
+    /// Whether some member is detectably in play for this file: in
+    /// `in_play_packages`, or referenced through a `pkg::` qualifier.
+    fn any_in_play(
+        &self,
+        in_play_packages: &[String],
+        qualified_packages: &HashSet<String>,
+    ) -> bool {
+        in_play_packages.iter().any(|p| self.contains(p))
+            || qualified_packages.iter().any(|p| self.contains(p))
+    }
+
+    /// True when a callee `func` node names a constructor of some member: a bare
+    /// `ctor(...)` matches the built-in list or an in-play declared list, while
+    /// a qualified `pkg::ctor(...)` must name a member *and* one of that
+    /// member's own constructors — so `other::mk()` does not inherit `pkgx`'s
+    /// declaration.
+    fn is_constructor(&self, func: Node, text: &str) -> bool {
+        self.names_export(func, text, |lists| &lists.constructors)
+    }
+
+    /// [`Self::is_constructor`] for the `converters` list.
+    fn is_converter(&self, func: Node, text: &str) -> bool {
+        self.names_export(func, text, |lists| &lists.converters)
+    }
+
+    fn names_export(
+        &self,
+        func: Node,
+        text: &str,
+        list: impl Fn(&crate::nse_declarations::DeclaredSubset) -> &HashSet<String>,
+    ) -> bool {
+        match func.kind() {
+            "identifier" => {
+                let name = crate::r_names::canonical_use_name(node_text(func, text));
+                self.packages
+                    .values()
+                    .any(|entry| entry.bare_callable && list(&entry.lists).contains(name))
+            }
+            "namespace_operator" => namespace_parts(func, text).is_some_and(|(pkg, name)| {
+                self.packages.get(pkg).is_some_and(|entry| {
+                    list(&entry.lists).contains(crate::r_names::canonical_use_name(name))
+                })
+            }),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -19871,12 +20045,19 @@ pub(crate) struct NseAnalysis<'a> {
     /// conservatively arg-suppressed rather than flipping to checked — which
     /// would surface the very data-masking false positives this issue removes.
     self_nse_package: Option<String>,
-    /// Whether data.table is detectably in play (Phase 3).
-    data_table_in_play: bool,
-    /// Variable names whose defining RHS is a data.table constructor/converter.
+    /// Whether some bracket-NSE package — data.table or a `[subset]`-declaring
+    /// package — is detectably in play (Phase 3): a [`BracketNsePackages`]
+    /// member is in `in_play_packages`, or the file uses a `member::` qualified
+    /// reference. The member set itself is consumed entirely inside
+    /// [`NseAnalysis::build`] (object classification happens in the fact walk),
+    /// so only this derived bit is retained.
+    bracket_nse_in_play: bool,
+    /// Variable names whose defining RHS is a bracket-NSE constructor/converter
+    /// (`data.table()`, `fread()`, a declared constructor, …).
     data_table_objects: HashSet<String>,
     /// Variable names whose defining RHS is a known data.frame-family
-    /// constructor (so `[` indices are checked even when data.table is loaded).
+    /// constructor (so `[` indices are checked even when a bracket-NSE package
+    /// is loaded).
     non_data_table_objects: HashSet<String>,
     /// By-reference class-transition events (`setDT`/`setDF`/`setattr`) per
     /// variable, sorted ascending by source byte offset. A transition at or
@@ -19927,8 +20108,10 @@ pub(crate) struct NseAnalysis<'a> {
 
 impl<'a> NseAnalysis<'a> {
     /// Walk `root` once to gather the file-local facts (top-level function
-    /// definitions, data.table-like objects, `data.table::` qualified usage),
-    /// bundle them with the supplied config flags and package context, then
+    /// definitions, data.table-like objects), bundle them with the supplied
+    /// config flags and package context (including the file's `pkg::`
+    /// qualifiers, pre-scanned so the bracket-NSE set can be assembled before
+    /// the fact walk), then
     /// infer the local function policies in two passes: the context-free
     /// Phase 2.5 baseline per definition, followed by the issue #433
     /// dots-forwarding upgrade, which resolves each body's inner callees
@@ -19962,7 +20145,21 @@ impl<'a> NseAnalysis<'a> {
         let mut reference_class_generators = HashMap::new();
         let mut reference_class_by_class = HashMap::new();
         let mut reference_class_method_functions = HashMap::new();
-        let mut data_table_qualifier_seen = false;
+        // The `pkg::` qualifiers must be known before the fact walk so a bare
+        // declared constructor can be unlocked by a qualifier that appears
+        // later in the file; a second, namespace-operator-only traversal is
+        // cheaper than making the walk order-dependent.
+        let mut qualified_packages = collect_namespace_qualifiers(root, text);
+        // Issue #431 analogue: inside a package's own sources its `[subset]`
+        // declaration applies without a `library()` call, just as its own NSE
+        // verbs keep their policy there. Only the *installed* copy's sidecar is
+        // read (the cache is the library path), so an uninstalled package under
+        // development gets nothing here — see `docs/r-package-dev.md`.
+        if let Some(self_pkg) = &self_nse_package {
+            qualified_packages.insert(self_pkg.clone());
+        }
+        let bracket_nse =
+            BracketNsePackages::assemble(package_library, &in_play_packages, &qualified_packages);
         // Names redefined within the file under two or more DIFFERENT formal
         // orders (see [`FormalOrderTracker`]). `local_function_defs` is
         // last-binding-wins, so a later redefinition with permuted parameters
@@ -20001,7 +20198,7 @@ impl<'a> NseAnalysis<'a> {
             &mut reference_class_generators,
             &mut reference_class_by_class,
             &mut reference_class_method_functions,
-            &mut data_table_qualifier_seen,
+            &bracket_nse,
             false,
         );
         // Keep each variable's transition list ordered by position so the
@@ -20009,10 +20206,11 @@ impl<'a> NseAnalysis<'a> {
         for events in class_transitions.values_mut() {
             events.sort_by_key(|(start, _)| *start);
         }
-        // data.table is "in play" if it is an in-play package (library()/import)
-        // or the file uses a `data.table::` qualified reference (Phase 3).
-        let data_table_in_play =
-            in_play_packages.iter().any(|p| p == "data.table") || data_table_qualifier_seen;
+        // A bracket-NSE package is "in play" if it is an in-play package
+        // (library()/import) or the file uses a `pkg::` qualified reference to
+        // it (Phase 3). data.table is always a member; declared packages join
+        // through the package library.
+        let bracket_nse_in_play = bracket_nse.any_in_play(&in_play_packages, &qualified_packages);
         // Phase 2.5 baseline: the context-free per-function capture inference.
         // Derived from the deduplicated definition map, so a name redefined
         // several times walks only the surviving (last) definition's body.
@@ -20028,7 +20226,7 @@ impl<'a> NseAnalysis<'a> {
             local_callee_aliases,
             in_play_packages,
             self_nse_package,
-            data_table_in_play,
+            bracket_nse_in_play,
             data_table_objects,
             non_data_table_objects,
             class_transitions,
@@ -20415,18 +20613,42 @@ impl FormalOrderTracker {
     }
 }
 
+/// Every package named on the left of a `pkg::` / `pkg:::` operator anywhere in
+/// `root`. A file-wide fact (in-play is a file fact): it puts a bracket-NSE
+/// package in play for the unresolved-object rule and unlocks its bare
+/// constructor/converter names, so it must be known before the fact walk that
+/// classifies objects — see `NseAnalysis::build`. Namespace operators are
+/// leaves for this purpose, so the traversal does not descend into them.
+fn collect_namespace_qualifiers(root: Node, text: &str) -> HashSet<String> {
+    let mut packages = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "namespace_operator" {
+            if let Some(lhs) = node.child_by_field_name("lhs") {
+                // `` `data.table`::fread `` names the same package as
+                // `data.table::fread`.
+                packages
+                    .insert(crate::r_names::canonical_use_name(node_text(lhs, text)).to_string());
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    packages
+}
+
 /// Walk the tree gathering the facts [`NseAnalysis`] needs: top-level function
 /// definitions (their capture policies are inferred afterwards in
 /// [`NseAnalysis::build`]), top-level non-literal callee aliases/rebindings
-/// (`filter <- stats::filter`; issue #450), top-level data.table-like object
-/// bindings, and whether `data.table::` is used anywhere in the file.
+/// (`filter <- stats::filter`; issue #450), and top-level data.table-like
+/// object bindings.
 ///
 /// Only **top-level** bindings are recorded (`in_function` is false): with
 /// global hoisting, top-level functions are visible everywhere, whereas a
 /// nested helper is scope-local and would otherwise contaminate the file-level
 /// maps and mis-shadow a sibling callee of the same name. A nested NSE helper
-/// simply falls to the conservative unresolved-callee path. The `data.table::`
-/// qualifier scan stays file-wide because data.table-in-play is a file fact.
+/// simply falls to the conservative unresolved-callee path.
 /// `HashMap::insert` makes the last definition of a name win, matching R's
 /// runtime where the latest top-level assignment is the one in effect; the
 /// definition map and the alias map clear each other on rebinding so they stay
@@ -20445,21 +20667,16 @@ fn collect_nse_facts<'t>(
     reference_class_generators: &mut HashMap<String, ReferenceClassInfo>,
     reference_class_by_class: &mut HashMap<String, String>,
     reference_class_method_functions: &mut HashMap<String, HashSet<String>>,
-    data_table_qualifier_seen: &mut bool,
+    bracket_nse: &BracketNsePackages,
     in_function: bool,
 ) {
-    if node.kind() == "namespace_operator"
-        && node
-            .child_by_field_name("lhs")
-            .is_some_and(|lhs| node_text(lhs, text) == "data.table")
+    // F1: a statement-level by-reference converter (`setDT`/`setDF`/`setattr`,
+    // or a declared converter) flips its first argument's class from this call
+    // onward. Recorded only at top level (like the constructor bindings below)
+    // to avoid cross-scope contamination between sibling functions.
+    if !in_function
+        && let Some((name, class)) = by_reference_class_transition(node, text, bracket_nse)
     {
-        *data_table_qualifier_seen = true;
-    }
-    // F1: a statement-level by-reference converter (`setDT`/`setDF`/`setattr`)
-    // flips its first argument's class from this call onward. Recorded only at
-    // top level (like the constructor bindings below) to avoid cross-scope
-    // contamination between sibling functions.
-    if !in_function && let Some((name, class)) = by_reference_class_transition(node, text) {
         class_transitions
             .entry(name)
             .or_default()
@@ -20532,7 +20749,7 @@ fn collect_nse_facts<'t>(
             }
             reference_class_generators.insert(generator, info);
         } else if value.kind() != "function_definition" {
-            match constructor_data_table_class(value, text) {
+            match constructor_data_table_class(value, text, bracket_nse) {
                 DataTableClass::DataTable => {
                     non_data_table_objects.remove(name);
                     data_table_objects.insert(name.to_string());
@@ -20562,7 +20779,7 @@ fn collect_nse_facts<'t>(
             reference_class_generators,
             reference_class_by_class,
             reference_class_method_functions,
-            data_table_qualifier_seen,
+            bracket_nse,
             child_in_function,
         );
     }
@@ -20804,54 +21021,97 @@ fn unwrap_parenthesized(node: Node) -> Node {
     current
 }
 
-/// Classify an assignment's defining call as a data.table constructor, a known
-/// data.frame-family constructor, or unknown (Phase 3 object-class facts). The
-/// leaf callee name is distinctive enough to classify without resolving the
-/// package — `data.table::fread` and bare `fread` both count.
-fn constructor_data_table_class(node: Node, text: &str) -> DataTableClass {
+/// Classify an assignment's defining call as a known data.frame-family
+/// constructor, a bracket-NSE constructor (a constructor of any
+/// [`BracketNsePackages`] member — data.table's own, or one a package declares),
+/// or unknown (Phase 3 object-class facts). The built-in data.frame-family list
+/// is matched on the leaf name first, so a declaration can never re-classify
+/// `data.frame()` / `read_csv()` / … (built-in wins). Bare and `pkg::`-qualified
+/// callees both count for the bracket-NSE lists, but a qualified callee must
+/// name the owning package: `data.table::fread()` classifies, `foo::fread()` is
+/// `Unknown` (a foreign package's `fread` is not data.table's). See
+/// [`BracketNsePackages::is_constructor`] for the qualifier and in-play rules.
+fn constructor_data_table_class(
+    node: Node,
+    text: &str,
+    bracket_nse: &BracketNsePackages,
+) -> DataTableClass {
     if node.kind() != "call" {
         return DataTableClass::Unknown;
     }
-    let Some(leaf) = node
-        .child_by_field_name("function")
-        .and_then(|func| callee_leaf_name(func, text))
-    else {
+    let Some(func) = node.child_by_field_name("function") else {
         return DataTableClass::Unknown;
     };
-    match leaf {
-        "data.table" | "as.data.table" | "fread" => DataTableClass::DataTable,
-        "data.frame" | "as.data.frame" | "tibble" | "as_tibble" | "tribble" | "read.csv"
-        | "read.csv2" | "read.table" | "read_csv" | "read_csv2" | "read_tsv" | "read_delim"
-        | "read_excel" => DataTableClass::NonDataTable,
-        _ => DataTableClass::Unknown,
+    // Canonicalize so `` `data.frame`() `` cannot slip past the built-in check
+    // and reach a declared list that matched the canonical name.
+    if callee_leaf_name(func, text)
+        .map(crate::r_names::canonical_use_name)
+        .is_some_and(is_non_data_table_constructor)
+    {
+        return DataTableClass::NonDataTable;
     }
+    if bracket_nse.is_constructor(func, text) {
+        return DataTableClass::DataTable;
+    }
+    DataTableClass::Unknown
 }
 
-/// F1: classify a statement-level by-reference class converter. `setDT(x)` and
-/// `setDF(x)` flip `x` to data.table / data.frame respectively; `setattr(x,
-/// "class", value)` sets the class explicitly. Returns the affected variable
-/// name (the first positional argument, which must be a bare identifier) and
-/// the class it transitions to, or `None` when the call is not a recognized
-/// by-reference converter or its target is not a plain name.
-fn by_reference_class_transition(node: Node, text: &str) -> Option<(String, DataTableClass)> {
+/// Raven's built-in data.frame-family constructors: an object defined by one of
+/// these has standard-eval `[` indices even when a bracket-NSE package is in
+/// play. Consulted before any declared list so a sidecar cannot override it.
+fn is_non_data_table_constructor(leaf: &str) -> bool {
+    matches!(
+        leaf,
+        "data.frame"
+            | "as.data.frame"
+            | "tibble"
+            | "as_tibble"
+            | "tribble"
+            | "read.csv"
+            | "read.csv2"
+            | "read.table"
+            | "read_csv"
+            | "read_csv2"
+            | "read_tsv"
+            | "read_delim"
+            | "read_excel"
+    )
+}
+
+/// F1: classify a statement-level by-reference class converter. `setDT(x)` —
+/// or a converter a bracket-NSE package declares — flips `x` to the
+/// data-masking class; `setDF(x)` flips it to data.frame; `setattr(x, "class",
+/// value)` sets the class explicitly. Returns the affected variable name (the
+/// first positional argument, which must be a bare identifier) and the class
+/// it transitions to, or `None` when the call is not a recognized by-reference
+/// converter or its target is not a plain name.
+fn by_reference_class_transition(
+    node: Node,
+    text: &str,
+    bracket_nse: &BracketNsePackages,
+) -> Option<(String, DataTableClass)> {
     if node.kind() != "call" {
         return None;
     }
-    let leaf = node
-        .child_by_field_name("function")
-        .and_then(|func| callee_leaf_name(func, text))?;
+    let func = node.child_by_field_name("function")?;
     let args = node.child_by_field_name("arguments")?;
     let first = unwrap_parenthesized(first_positional_arg_value(args)?);
     if first.kind() != "identifier" {
         return None;
     }
     let name = node_text(first, text).to_string();
-    match leaf {
-        "setDT" => Some((name, DataTableClass::DataTable)),
-        "setDF" => Some((name, DataTableClass::NonDataTable)),
-        "setattr" => setattr_class_transition(node, text).map(|class| (name, class)),
-        _ => None,
+    // Built-in converters first, so a declared `converters = ["setDF"]` cannot
+    // turn data.table's own away-from-class converter into a to-class one.
+    match callee_leaf_name(func, text).map(crate::r_names::canonical_use_name) {
+        Some("setDF") => return Some((name, DataTableClass::NonDataTable)),
+        Some("setattr") => {
+            return setattr_class_transition(node, text).map(|class| (name, class));
+        }
+        _ => {}
     }
+    bracket_nse
+        .is_converter(func, text)
+        .then_some((name, DataTableClass::DataTable))
 }
 
 /// Classify the class assigned by `setattr(x, "class", value)`. Only a literal
@@ -21259,8 +21519,8 @@ fn native_routine_formal_value<'t>(
 /// The leaf callee name of a call's `function` field — the identifier itself,
 /// or the member (`rhs`) of a `pkg::name` namespace operator. `None` for a
 /// computed callee (`fns[[1]]`, `(function(x) x)`). Shared so capture inference
-/// and data.table-constructor classification treat `enquo`/`rlang::enquo` and
-/// `data.table`/`data.table::data.table` consistently.
+/// and the built-in data.frame-family / `setDF` / `setattr` checks treat
+/// `enquo`/`rlang::enquo` and `setDF`/`data.table::setDF` consistently.
 fn callee_leaf_name<'t>(func: Node<'t>, text: &'t str) -> Option<&'t str> {
     match func.kind() {
         "identifier" => Some(node_text(func, text)),
@@ -22095,7 +22355,9 @@ fn fun_resolves_to_data_masking_verb(value: Node, text: &str, analysis: &NseAnal
 
 /// Resolve a `subset` (`[`) / `subset2` (`[[`) node's index policy (issue #398
 /// Phases 0 & 3). `[[` is always standard-eval; `[` is suppressed for
-/// data.table-style indexing.
+/// data.table-style indexing — data.table's own, or that of any package that
+/// declares the same semantics through `[subset]` in its `raven/nse.toml`
+/// ([`BracketNsePackages`]).
 ///
 /// Two independent signals make a `[` call data.table-style:
 ///
@@ -22111,9 +22373,10 @@ fn fun_resolves_to_data_masking_verb(value: Node, text: &str, analysis: &NseAnal
 ///    data.frame is a runtime error either way, and an undefined-variable
 ///    report on `y` would describe the failure misleadingly.
 /// 2. **The indexed object's classification** ([`subset_object_data_table_class`]),
-///    resolved only when no `:=` argument is present: a known data.table object
-///    suppresses, a known non-data.table checks, and an unresolved object is
-///    suppressed only when data.table is detectably in play.
+///    resolved only when no `:=` argument is present: a known data.table-style
+///    object suppresses, a known non-data.table checks, and an unresolved
+///    object is suppressed only when some bracket-NSE package is detectably in
+///    play (`NseAnalysis::bracket_nse_in_play`).
 fn resolve_subset_arg_policy(
     node: Node,
     text: &str,
@@ -22132,8 +22395,9 @@ fn resolve_subset_arg_policy(
     match subset_object_data_table_class(node, text, analysis) {
         DataTableClass::DataTable => ArgPolicy::WholeCall,
         DataTableClass::NonDataTable => ArgPolicy::Standard,
-        // Unresolved object: prefer silence only when data.table is in play.
-        DataTableClass::Unknown if analysis.data_table_in_play => ArgPolicy::WholeCall,
+        // Unresolved object: prefer silence only when a bracket-NSE package is
+        // in play.
+        DataTableClass::Unknown if analysis.bracket_nse_in_play => ArgPolicy::WholeCall,
         DataTableClass::Unknown => ArgPolicy::Standard,
     }
 }
@@ -31386,7 +31650,8 @@ mod tests {
 
         let mut lib = crate::package_library::PackageLibrary::with_subprocess(None);
         lib.set_lib_paths(vec![lib_root.path().to_path_buf()]);
-        // Warm the cache: `declared_nse_policy` is cached-only by design.
+        // Warm the cache: `declared_nse_policy` and
+        // `declared_bracket_nse_packages` are cached-only by design.
         lib.get_package(pkg).await;
         (lib_root, lib)
     }
@@ -31515,6 +31780,412 @@ mod tests {
             "built-in dplyr policy still checks `.data`"
         );
         assert!(!was_collected(&used, "col"));
+    }
+
+    // ---- Package-declared bracket NSE (`[subset]` in `inst/raven/nse.toml`) ----
+
+    /// Collect against a warmed library with the given in-play packages.
+    fn collect_with_library<'a>(
+        root: Node<'a>,
+        text: &str,
+        packages: &[&str],
+        lib: &crate::package_library::PackageLibrary,
+        used: &mut Vec<(String, Node<'a>)>,
+    ) {
+        let analysis = NseAnalysis::build(
+            root,
+            text,
+            true,
+            true,
+            packages.iter().map(|s| s.to_string()).collect(),
+            None,
+            Some(lib),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        collect_usages_with_analysis(root, text, &analysis, &UsageContext::default(), used);
+    }
+
+    const PKGX_SUBSET_SIDECAR: &str = r#"
+        schema = 1
+        [subset]
+        constructors = ["mk", "not_exported_ctor"]
+        converters = ["setx"]
+    "#;
+
+    /// A declared constructor classifies its assignee: `x <- mk(); x[, mean(v),
+    /// by = g]` suppresses `v`/`g` exactly like `x <- data.table()` would. No
+    /// `:=` in `j`. `x` is first bound to a `data.frame()` so that, with pkgx in
+    /// play, the suppression can only come from the constructor re-classifying
+    /// it — an Unknown rebinding would leave the NonDataTable fact in place
+    /// (`y`, the control).
+    #[tokio::test]
+    async fn declared_subset_constructor_suppresses_bracket() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "x <- data.frame(a = 1)\nx <- mk()\nx[, mean(v), by = g]\ny <- data.frame(a = 1)\ny <- other()\ny[, mean(w)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["pkgx"], &lib, &mut used);
+        assert!(was_collected(&used, "x"));
+        assert!(!was_collected(&used, "v"));
+        assert!(!was_collected(&used, "g"));
+        assert!(
+            was_collected(&used, "w"),
+            "unknown rebinding keeps `y` a data.frame"
+        );
+    }
+
+    /// With the declaring package in play, an unresolved object's `[` indices
+    /// are suppressed (the data.table in-play rule, generalized) while a known
+    /// data.frame's are still checked.
+    #[tokio::test]
+    async fn declared_subset_package_in_play_suppresses_unresolved_object() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "y[, mean(v), by = g]\nz <- data.frame()\nz[, mean(w)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["pkgx"], &lib, &mut used);
+        assert!(!was_collected(&used, "v"), "unresolved `y` is suppressed");
+        assert!(!was_collected(&used, "g"));
+        assert!(
+            was_collected(&used, "w"),
+            "known data.frame `z` stays checked"
+        );
+    }
+
+    /// The same sidecar with the package NOT in play (no `library()`, no
+    /// qualifier) changes nothing: `y[, mean(v)]` still flags `v`. This is what
+    /// makes the in-play test above evidence for the declaration path.
+    #[tokio::test]
+    async fn declared_subset_package_not_in_play_keeps_checking() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "y[, mean(v)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &[], &lib, &mut used);
+        assert!(was_collected(&used, "v"));
+    }
+
+    /// A `pkgx::` qualifier anywhere in the file puts the package in play, just
+    /// as `data.table::` does — here through the constructor, which also
+    /// re-classifies its data.frame-bound assignee; the unresolved `y` proves
+    /// the in-play half.
+    #[tokio::test]
+    async fn declared_subset_qualifier_puts_package_in_play() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "x <- data.frame(a = 1)\nx <- pkgx::mk()\nx[, mean(a)]\ny[, mean(v)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &[], &lib, &mut used);
+        assert!(
+            !was_collected(&used, "a"),
+            "qualified constructor classifies `x`"
+        );
+        assert!(
+            !was_collected(&used, "v"),
+            "qualifier alone puts pkgx in play"
+        );
+    }
+
+    /// A `pkgx::` qualifier also unlocks the package's *bare* declared names, so
+    /// "in play" means the same thing for bare-name classification as for the
+    /// unresolved-object rule — even when the qualifier appears after the bare
+    /// call. `x`/`y` are data.frame-bound so only a real re-classification
+    /// suppresses.
+    #[tokio::test]
+    async fn declared_subset_qualifier_unlocks_bare_names_anywhere_in_file() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "x <- data.frame(a = 1)\nsetx(x)\nx[, mean(a)]\ny <- data.frame()\ny <- mk()\ny[, mean(b)]\nz <- pkgx::other()";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &[], &lib, &mut used);
+        assert!(
+            !was_collected(&used, "a"),
+            "bare converter unlocked by later qualifier"
+        );
+        assert!(
+            !was_collected(&used, "b"),
+            "bare constructor unlocked by later qualifier"
+        );
+    }
+
+    /// A qualified constructor call must name the declaring package: `other::mk()`
+    /// neither classifies `x` nor puts anything in play.
+    #[tokio::test]
+    async fn declared_subset_constructor_under_another_qualifier_is_ignored() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "x <- other::mk()\nx[, mean(a)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &[], &lib, &mut used);
+        assert!(was_collected(&used, "a"));
+    }
+
+    /// A declared constructor the package does not export is dropped at load
+    /// time: the loaded declaration lacks it, and at the collector a data.frame
+    /// rebound through it keeps its NonDataTable fact (the exported `mk` is the
+    /// positive control).
+    #[tokio::test]
+    async fn declared_subset_constructor_not_exported_is_dropped() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "x <- data.frame()\nx <- pkgx::not_exported_ctor()\nx[, mean(a)]\ny <- data.frame()\ny <- pkgx::mk()\ny[, mean(b)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["pkgx"], &lib, &mut used);
+        assert!(
+            was_collected(&used, "a"),
+            "dropped constructor does not classify"
+        );
+        assert!(!was_collected(&used, "b"), "exported constructor does");
+        let declared = lib.declared_bracket_nse_packages();
+        let (name, declarations) = declared
+            .iter()
+            .find(|(name, _)| name == "pkgx")
+            .expect("pkgx declares [subset]");
+        assert_eq!(name, "pkgx");
+        let subset = declarations.subset.as_ref().unwrap();
+        assert!(subset.constructors.contains("mk"));
+        assert!(!subset.constructors.contains("not_exported_ctor"));
+        assert!(subset.converters.contains("setx"));
+    }
+
+    /// A bare declared constructor/converter classifies only while the
+    /// declaring package is in play. The cache is workspace-wide, so a file that
+    /// never loads pkgx must not have its `x <- mk()` re-classified by pkgx's
+    /// sidecar — unlike Raven's own curated `fread`, which classifies
+    /// unconditionally.
+    #[tokio::test]
+    async fn declared_subset_bare_constructor_requires_package_in_play() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "x <- mk()\nx[, mean(a)]\ny <- data.frame()\nsetx(y)\ny[, mean(b)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &[], &lib, &mut used);
+        assert!(was_collected(&used, "a"), "bare constructor: not in play");
+        assert!(was_collected(&used, "b"), "bare converter: not in play");
+        // Built-in `fread` is unaffected by the gate.
+        let code = "x <- fread(\"f\")\nx[, mean(a)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &[], &lib, &mut used);
+        assert!(!was_collected(&used, "a"));
+    }
+
+    /// A sidecar that declares Raven's own data.frame-family names cannot
+    /// re-classify them: `data.frame()` stays non-data.table and `setDF()` still
+    /// converts *away* from the class, even with the package in play and even
+    /// when the callee is backtick-quoted.
+    #[tokio::test]
+    async fn declared_subset_cannot_override_built_in_data_frame_names() {
+        let sidecar = r#"
+            [subset]
+            constructors = ["data.frame", "read_csv"]
+            converters = ["setDF"]
+        "#;
+        let (_root, lib) = library_with_declaring_package(
+            "pkgx",
+            &["data.frame", "read_csv", "setDF"],
+            Some(sidecar),
+        )
+        .await;
+        let code = "x <- data.frame()\nx[, mean(a)]\ny <- pkgx::read_csv(\"f\")\ny[, mean(b)]\nz <- fread(\"f\")\nsetDF(z)\nz[, mean(c)]\nu <- `data.frame`()\nu[, mean(d)]\nv <- fread(\"f\")\n`setDF`(v)\nv[, mean(e)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["pkgx"], &lib, &mut used);
+        assert!(was_collected(&used, "a"), "bare data.frame stays checked");
+        assert!(
+            was_collected(&used, "b"),
+            "qualified read_csv stays checked"
+        );
+        assert!(was_collected(&used, "c"), "setDF still converts away");
+        assert!(
+            was_collected(&used, "d"),
+            "backticked data.frame stays checked"
+        );
+        assert!(
+            was_collected(&used, "e"),
+            "backticked setDF still converts away"
+        );
+    }
+
+    /// A declared converter behaves like `setDT`: positional, first argument,
+    /// from the call onward.
+    #[tokio::test]
+    async fn declared_subset_converter_flips_class_like_setdt() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "x <- data.frame(a = 1)\nx[before_idx, ]\nsetx(x)\nx[, mean(after)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["pkgx"], &lib, &mut used);
+        assert!(was_collected(&used, "before_idx"));
+        assert!(!was_collected(&used, "after"));
+    }
+
+    /// `[subset]` with no lists still puts the package in play (unresolved
+    /// objects suppressed) but classifies nothing, so a `data.frame` stays
+    /// checked and the package's own functions do not classify their result.
+    #[tokio::test]
+    async fn declared_subset_without_constructors_only_affects_in_play() {
+        let sidecar = "schema = 1\n[subset]\n";
+        let (_root, lib) = library_with_declaring_package("pkgx", &["mk"], Some(sidecar)).await;
+        let code = "y[, mean(v)]\nx <- mk()\nx[, mean(a)]\nz <- data.frame()\nz[, mean(w)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["pkgx"], &lib, &mut used);
+        assert!(
+            !was_collected(&used, "v"),
+            "in play: unresolved `y` suppressed"
+        );
+        assert!(
+            !was_collected(&used, "a"),
+            "in play: unresolved `x` suppressed"
+        );
+        assert!(was_collected(&used, "w"), "known data.frame still checked");
+        // And without the library call, nothing is in play and `mk()` — not a
+        // declared constructor — classifies nothing.
+        let code = "x <- mk()\nx[, mean(a)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &[], &lib, &mut used);
+        assert!(was_collected(&used, "a"));
+    }
+
+    /// Inside the declaring package's own sources (`self_nse_package`), its
+    /// `[subset]` applies with no `library()` call or qualifier: bare declared
+    /// names classify (`x`, data.frame-bound so only a real match suppresses)
+    /// and unresolved objects are suppressed (`y`).
+    #[tokio::test]
+    async fn declared_subset_applies_inside_own_package_sources() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "x <- data.frame(a = 1)\nx <- mk()\nx[, mean(a)]\ny[, mean(v)]";
+        let tree = parse_r_code(code);
+        let analysis = NseAnalysis::build(
+            tree.root_node(),
+            code,
+            true,
+            true,
+            Vec::new(),
+            Some("pkgx".to_string()),
+            Some(&lib),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let mut used = Vec::new();
+        collect_usages_with_analysis(
+            tree.root_node(),
+            code,
+            &analysis,
+            &UsageContext::default(),
+            &mut used,
+        );
+        assert!(
+            !was_collected(&used, "a"),
+            "own package's bare constructor classifies"
+        );
+        assert!(!was_collected(&used, "v"), "own package is in play");
+    }
+
+    /// `[[` stays standard-eval for a declared container.
+    #[tokio::test]
+    async fn declared_subset_double_bracket_still_checked() {
+        let (_root, lib) =
+            library_with_declaring_package("pkgx", &["mk", "setx"], Some(PKGX_SUBSET_SIDECAR))
+                .await;
+        let code = "x <- mk()\nx[[idx]]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["pkgx"], &lib, &mut used);
+        assert!(was_collected(&used, "idx"));
+    }
+
+    /// A sidecar without `[subset]` (the pre-existing schema) declares no
+    /// bracket semantics: with the package in play, `y[, mean(v)]` flags `v`.
+    #[tokio::test]
+    async fn sidecar_without_subset_does_not_make_package_bracket_nse() {
+        let (_root, lib) =
+            library_with_declaring_package("dtatools", &["gen"], Some(DTATOOLS_SIDECAR)).await;
+        let code = "y[, mean(v)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["dtatools"], &lib, &mut used);
+        assert!(was_collected(&used, "v"));
+    }
+
+    /// A sidecar installed under the name `data.table` cannot reshape the
+    /// built-in entry: `fread()` still classifies, `setDT` still converts, and
+    /// the bogus declared constructor does not.
+    #[tokio::test]
+    async fn a_fake_data_table_sidecar_cannot_alter_the_built_in_entry() {
+        let sidecar = r#"
+            [subset]
+            constructors = ["bogus"]
+            converters = ["bogus_set"]
+        "#;
+        let (_root, lib) = library_with_declaring_package(
+            "data.table",
+            &["fread", "setDT", "bogus", "bogus_set"],
+            Some(sidecar),
+        )
+        .await;
+        assert!(lib.is_cached_sync("data.table"), "fake package was loaded");
+        let code = "a <- fread(\"f\")\na[, mean(v1)]\nsetDT(b)\nb[, mean(v2)]\nc <- bogus()\nc[, mean(v3)]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &[], &lib, &mut used);
+        assert!(!was_collected(&used, "v1"), "built-in constructor intact");
+        assert!(!was_collected(&used, "v2"), "built-in converter intact");
+        assert!(
+            was_collected(&used, "v3"),
+            "sidecar's own entry is not merged"
+        );
+    }
+
+    /// The built-in data.table model is unchanged with a library present that
+    /// declares nothing about `[`.
+    #[tokio::test]
+    async fn built_in_data_table_model_unchanged_with_library() {
+        let (_root, lib) = library_with_declaring_package("pkgx", &["mk"], None).await;
+        let code = "f <- function(dt) dt[, mean(value), by = grp]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["data.table"], &lib, &mut used);
+        assert!(!was_collected(&used, "value"));
+        let mut used = Vec::new();
+        collect_with_library(tree.root_node(), code, &["pkgx"], &lib, &mut used);
+        assert!(
+            was_collected(&used, "value"),
+            "pkgx without [subset] is not bracket-NSE"
+        );
     }
 
     // ---- Issue #459: redundant backtick-quoting of syntactic callees ----
