@@ -22126,7 +22126,7 @@ fn resolve_subset_arg_policy(
         // the walrus rule below is deliberately not consulted here.
         return ArgPolicy::Standard;
     }
-    if subset_has_walrus_arg(node) {
+    if subset_has_walrus_arg(node, text) {
         return ArgPolicy::WholeCall;
     }
     match subset_object_data_table_class(node, text, analysis) {
@@ -22138,9 +22138,14 @@ fn resolve_subset_arg_policy(
     }
 }
 
-/// True when any argument of a `subset` (`[`) node has a `:=` binary operator
-/// as its **top-level value** — positional (`x[, y := v]`, `x[i, y := v, by =
-/// g]`) or named (`x[, j = y := v]`).
+/// True when any argument of a `subset` (`[`) node has a `:=` assignment as
+/// its **top-level value** — positional (`x[, y := v]`, `x[i, y := v, by = g]`)
+/// or named (`x[, j = y := v]`). Both spellings of data.table's `:=` count:
+/// the infix `binary_operator` form and the functional-call form
+/// (`` x[, `:=`(a = 1, b = 2)] ``, `x[, ":="(a = 1)]`, `` x[, data.table::`:=`(a = 1)] ``),
+/// whose head is the `` `:=` `` identifier, the `":="` string, or a
+/// `namespace_operator` whose rhs is `:=`. The lhs shape of the infix form is
+/// irrelevant — `(cols) := v` and `c("a", "b") := v` trigger as well.
 ///
 /// Only the argument value node itself is inspected; a `:=` nested deeper
 /// inside an argument (`x[, f(a := b)]`, `x[, (y := 1)]`) does not trigger.
@@ -22148,13 +22153,11 @@ fn resolve_subset_arg_policy(
 /// `j` argument, and a nested `:=` would be evaluated by whatever call encloses
 /// it, not by the `[` method — so the conservative top-level rule covers the
 /// real notation without letting an arbitrary inner expression silence the
-/// whole bracket. The functional form `` x[, `:=`(a = 1, b = 2)] `` is a `call`
-/// whose head is `` `:=` ``, not a `binary_operator`, and is likewise not
-/// matched here.
+/// whole bracket.
 ///
 /// Purely syntactic: it reads no NSE facts and so is independent of which
 /// packages are in play.
-fn subset_has_walrus_arg(node: Node) -> bool {
+fn subset_has_walrus_arg(node: Node, text: &str) -> bool {
     if node.kind() != "subset" {
         return false;
     }
@@ -22165,12 +22168,42 @@ fn subset_has_walrus_arg(node: Node) -> bool {
     args.children(&mut cursor)
         .filter(|child| child.kind() == "argument")
         .filter_map(|arg| arg.child_by_field_name("value"))
-        .any(|value| {
-            value.kind() == "binary_operator"
-                && value
-                    .child_by_field_name("operator")
-                    .is_some_and(|op| op.kind() == ":=")
-        })
+        .any(|value| is_walrus_assignment(value, text))
+}
+
+/// True when `node` is a `:=` assignment expression in either spelling: the
+/// infix `binary_operator` (`a := b`) or the functional call whose head names
+/// `:=` (`` `:=`(a = b) ``, `":="(a = b)`, `` pkg::`:=`(a = b) ``). See
+/// [`subset_has_walrus_arg`] for the one consumer and the rationale.
+fn is_walrus_assignment(node: Node, text: &str) -> bool {
+    match node.kind() {
+        "binary_operator" => node
+            .child_by_field_name("operator")
+            .is_some_and(|op| op.kind() == ":="),
+        "call" => {
+            let Some(head) = node.child_by_field_name("function") else {
+                return false;
+            };
+            let head = if head.kind() == "namespace_operator" {
+                match head.child_by_field_name("rhs") {
+                    Some(rhs) => rhs,
+                    None => return false,
+                }
+            } else {
+                head
+            };
+            match head.kind() {
+                // `:=` is not a syntactic name, so the identifier token keeps
+                // its backticks in the source text.
+                "identifier" => node_text(head, text).trim_matches('`') == ":=",
+                "string" => head
+                    .child_by_field_name("content")
+                    .is_some_and(|content| node_text(content, text) == ":="),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Classify the object being indexed by a `[` node using the file's data.table
@@ -33320,6 +33353,77 @@ mod tests {
         collect_with_packages(tree.root_node(), code, &[], &mut used);
         assert!(!was_collected(&used, "y"));
         assert!(was_collected(&used, "typo"));
+    }
+
+    /// The rule is per-`[`-call: in a chain `x[cond][, y := 1]` only the outer
+    /// call carries the `:=`, so the inner call's `cond` is still checked.
+    #[test]
+    fn nse_walrus_chained_inner_subset_still_checked() {
+        let code = "x[cond][, y := 1]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(was_collected(&used, "cond"));
+        assert!(!was_collected(&used, "y"));
+    }
+
+    /// The lhs shape of the `:=` does not matter: `(cols) := ...` and
+    /// `c("a", "b") := ...` both trigger.
+    #[test]
+    fn nse_walrus_non_identifier_lhs_triggers() {
+        for code in [
+            "x[, (cols) := lapply(.SD, f)]",
+            "x[, c(\"a\", \"b\") := list(v1, v2)]",
+        ] {
+            let tree = parse_r_code(code);
+            let mut used = Vec::new();
+            collect_with_packages(tree.root_node(), code, &[], &mut used);
+            for name in ["cols", "f", "v1", "v2"] {
+                assert!(
+                    !was_collected(&used, name),
+                    "{code}: {name} should be suppressed"
+                );
+            }
+        }
+    }
+
+    /// The functional spelling `` `:=`(...) `` — backticked identifier, string
+    /// head, or namespace-qualified — is data.table notation too, so the whole
+    /// bracket is suppressed, including the `` `:=` `` head itself.
+    #[test]
+    fn nse_walrus_functional_form_triggers() {
+        for code in [
+            "x[, `:=`(a = 1, b = val)]",
+            "x[, \":=\"(a = 1, b = val)]",
+            "x[, data.table::`:=`(a = 1, b = val)]",
+            "x[cond, j = `:=`(a = 1, b = val), by = g]",
+        ] {
+            let tree = parse_r_code(code);
+            let mut used = Vec::new();
+            collect_with_packages(tree.root_node(), code, &[], &mut used);
+            assert!(was_collected(&used, "x"), "{code}");
+            for name in ["`:=`", "val", "cond", "g"] {
+                assert!(
+                    !was_collected(&used, name),
+                    "{code}: {name} should be suppressed"
+                );
+            }
+        }
+    }
+
+    /// A `:=` bracket inside a function body on a formal, with no data.table
+    /// signal anywhere, is suppressed — the dtatools-style helper shape.
+    #[test]
+    fn nse_walrus_in_function_body_without_data_table() {
+        let code =
+            "f <- function(d) d[eligible, total := dta_total(income[eligible]), by = household]";
+        let tree = parse_r_code(code);
+        let mut used = Vec::new();
+        collect_with_packages(tree.root_node(), code, &[], &mut used);
+        assert!(was_collected(&used, "d"));
+        for name in ["eligible", "total", "dta_total", "income", "household"] {
+            assert!(!was_collected(&used, name), "{name} should be suppressed");
+        }
     }
 
     /// Every data.table-yielding constructor recognized by
