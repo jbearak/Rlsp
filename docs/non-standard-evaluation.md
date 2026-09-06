@@ -186,8 +186,10 @@ that never loads or references that package. A known data.frame-family object (`
 claim one of those names — `setDF()` / `setattr()` keep their built-in
 meaning, `[[` is always standard-eval, and a `:=` argument already marks a `[`
 call as NSE without any declaration. The lists are intersected with the
-package's export set, like `[[function]]` entries, and `data.table` itself is
-built in — a sidecar under that name cannot alter Raven's own entry.
+package's export set, like `[[function]]` entries, and share their size limits:
+the file must be at most 256 KiB and each list honors its first 2,000 entries
+(any beyond that are ignored). `data.table` itself is built in — a sidecar
+under that name cannot alter Raven's own entry.
 
 Older Ravens that predate `[subset]` ignore the table (unknown keys are never
 an error), so it ships under `schema = 1`.
