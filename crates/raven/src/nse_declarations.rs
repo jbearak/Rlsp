@@ -19,7 +19,22 @@
 //! name = "gen"
 //! formals = ["data", "variable", "values", "where"]
 //! captured = ["variable", "values", "where"]
+//!
+//! # `[` on this package's containers is data-masking, like data.table's.
+//! [subset]
+//! constructors = ["dibble", "as_dibble"]
+//! converters = ["set_dibble"]
 //! ```
+//!
+//! Besides per-function policies, the optional `[subset]` table declares that
+//! the package's `[` method quotes its arguments the way `[.data.table` does
+//! (see [`DeclaredSubset`]). Its presence alone puts the package in the
+//! bracket-NSE set the undefined-variable collector consults; `constructors`
+//! and `converters` additionally let the collector classify specific objects.
+//!
+//! The file is parsed without `deny_unknown_fields`, so a Raven that predates a
+//! key ignores it rather than rejecting the file — which is what lets `[subset]`
+//! ship under `schema = 1`.
 //!
 //! Declared policies are strictly *additive*: they are consulted only after the
 //! built-in table misses, so a package cannot weaken Raven's own modeling of
@@ -29,6 +44,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -54,12 +70,65 @@ const MAX_ENTRIES: usize = 2_000;
 /// Parsed policies for one package: exported name → policy.
 pub(crate) type DeclaredPolicies = HashMap<String, ArgPolicy>;
 
+/// A package's `[subset]` declaration: its `[` method is data-masking
+/// (whole-call NSE), like data.table's `[.data.table`.
+///
+/// The declaration's *presence* is the primary fact — with the package in
+/// play, an unresolved object's `[` indices are suppressed exactly as they are
+/// when data.table is in play. The two lists refine that for objects the
+/// collector can trace to a definition:
+///
+/// - `constructors`: exported functions whose return value is such a container
+///   (`x <- pkg::ctor(...)` or bare `ctor(...)` classifies `x`), the analogue
+///   of `data.table()` / `as.data.table()` / `fread()`.
+/// - `converters`: exported by-reference converters whose first positional
+///   argument becomes such a container from that call onward, the analogue of
+///   `setDT(x)`.
+///
+/// Both are intersected with the export set at load time, like `[[function]]`
+/// entries. Either may be empty; the declaration is still meaningful.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeclaredSubset {
+    pub(crate) constructors: HashSet<String>,
+    pub(crate) converters: HashSet<String>,
+}
+
+/// Everything one sidecar declares.
+#[derive(Debug, Default)]
+pub(crate) struct Declarations {
+    pub(crate) policies: DeclaredPolicies,
+    /// `Some` iff the file carries a `[subset]` table (possibly empty). `Arc`
+    /// so the per-diagnostic-pass snapshot in `handlers.rs` shares it rather
+    /// than cloning the lists.
+    pub(crate) subset: Option<Arc<DeclaredSubset>>,
+}
+
+impl Declarations {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.policies.is_empty() && self.subset.is_none()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DeclarationFile {
     #[serde(default)]
     schema: Option<u32>,
     #[serde(default, rename = "function")]
     functions: Vec<FunctionDeclaration>,
+    #[serde(default)]
+    subset: Option<SubsetDeclaration>,
+}
+
+/// Raw `[subset]` table. A type error here (e.g. `constructors = 5`) fails
+/// deserialization of the whole file, the same as a type error in any
+/// `[[function]]` entry: the file is treated as absent rather than partially
+/// applied.
+#[derive(Debug, Default, Deserialize)]
+struct SubsetDeclaration {
+    #[serde(default)]
+    constructors: Vec<String>,
+    #[serde(default)]
+    converters: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,13 +149,10 @@ struct FunctionDeclaration {
 /// names in `exports`.
 ///
 /// Best-effort by design: a missing file is the overwhelmingly common case, and
-/// a malformed one yields an empty map rather than an error. A package's
+/// a malformed one yields empty [`Declarations`] rather than an error. A package's
 /// tooling metadata must never be able to fail a package load — the worst
 /// outcome of a bad sidecar is the false positives the user had before it.
-pub(crate) fn load_declared_policies(
-    pkg_dir: &Path,
-    exports: &HashSet<String>,
-) -> DeclaredPolicies {
+pub(crate) fn load_declared_policies(pkg_dir: &Path, exports: &HashSet<String>) -> Declarations {
     let mut path = pkg_dir.to_path_buf();
     for segment in NSE_DECLARATION_PATH {
         path.push(segment);
@@ -94,24 +160,24 @@ pub(crate) fn load_declared_policies(
 
     match std::fs::metadata(&path) {
         Ok(meta) if meta.is_file() && meta.len() <= MAX_FILE_BYTES => {}
-        _ => return DeclaredPolicies::new(),
+        _ => return Declarations::default(),
     }
     let Ok(contents) = std::fs::read_to_string(&path) else {
-        return DeclaredPolicies::new();
+        return Declarations::default();
     };
     parse_declarations(&contents, exports)
 }
 
 /// The pure half of [`load_declared_policies`], split out so the schema rules
 /// are testable without a filesystem.
-pub(crate) fn parse_declarations(contents: &str, exports: &HashSet<String>) -> DeclaredPolicies {
+pub(crate) fn parse_declarations(contents: &str, exports: &HashSet<String>) -> Declarations {
     let Ok(file) = toml::from_str::<DeclarationFile>(contents) else {
-        return DeclaredPolicies::new();
+        return Declarations::default();
     };
     // An absent `schema` is treated as v1 so an early adopter's file keeps
     // working; a newer one is ignored wholesale (see `SUPPORTED_SCHEMA`).
     if file.schema.unwrap_or(SUPPORTED_SCHEMA) > SUPPORTED_SCHEMA {
-        return DeclaredPolicies::new();
+        return Declarations::default();
     }
 
     let mut policies = DeclaredPolicies::new();
@@ -125,7 +191,22 @@ pub(crate) fn parse_declarations(contents: &str, exports: &HashSet<String>) -> D
             policies.insert(declaration.name, policy);
         }
     }
-    policies
+    let subset = file.subset.map(|subset| {
+        // Same export intersection and entry cap as `[[function]]`: a name the
+        // package does not export is dropped, never applied to a stranger.
+        let exported = |names: Vec<String>| -> HashSet<String> {
+            names
+                .into_iter()
+                .take(MAX_ENTRIES)
+                .filter(|name| exports.contains(name))
+                .collect()
+        };
+        Arc::new(DeclaredSubset {
+            constructors: exported(subset.constructors),
+            converters: exported(subset.converters),
+        })
+    });
+    Declarations { policies, subset }
 }
 
 /// Convert one validated declaration into an [`ArgPolicy`], or `None` when it
@@ -195,7 +276,7 @@ mod tests {
 
     #[test]
     fn parses_per_formal_declaration() {
-        let policies = parse_declarations(GEN, &exports(&["gen"]));
+        let policies = parse_declarations(GEN, &exports(&["gen"])).policies;
         assert_eq!(
             policies.get("gen"),
             Some(&ArgPolicy::per_formal(
@@ -250,7 +331,9 @@ mod tests {
             captured_dots = true
         "#;
         assert_eq!(
-            parse_declarations(dots, &exports(&["select_like"])).get("select_like"),
+            parse_declarations(dots, &exports(&["select_like"]))
+                .policies
+                .get("select_like"),
             Some(&ArgPolicy::per_formal(&["data", "..."], &[], true))
         );
     }
@@ -265,7 +348,7 @@ mod tests {
             name = "plan"
             policy = "named-arguments"
         "#;
-        let policies = parse_declarations(kinds, &exports(&["mapping", "plan"]));
+        let policies = parse_declarations(kinds, &exports(&["mapping", "plan"])).policies;
         assert_eq!(policies.get("mapping"), Some(&ArgPolicy::WholeCall));
         assert_eq!(policies.get("plan"), Some(&ArgPolicy::NamedArguments));
     }
@@ -315,8 +398,124 @@ mod tests {
             captured = ["..."]
         "#;
         assert_eq!(
-            parse_declarations(named_dots, &exports(&["gen"])).get("gen"),
+            parse_declarations(named_dots, &exports(&["gen"]))
+                .policies
+                .get("gen"),
             Some(&ArgPolicy::per_formal(&["data", "..."], &["..."], false))
         );
+    }
+
+    // ---- `[subset]`: data.table-style `[` declarations ----
+
+    const SUBSET: &str = r#"
+        schema = 1
+        [[function]]
+        name = "gen"
+        formals = ["data", "variable", "values", "where"]
+        captured = ["variable", "values", "where"]
+
+        [subset]
+        constructors = ["dibble", "as_dibble", "internal_ctor"]
+        converters = ["set_dibble", "internal_conv"]
+    "#;
+
+    fn subset_exports() -> HashSet<String> {
+        exports(&["gen", "dibble", "as_dibble", "set_dibble"])
+    }
+
+    #[test]
+    fn parses_subset_alongside_function_policies() {
+        let declarations = parse_declarations(SUBSET, &subset_exports());
+        assert_eq!(declarations.policies.len(), 1);
+        let subset = declarations.subset.expect("[subset] present");
+        assert_eq!(subset.constructors, exports(&["dibble", "as_dibble"]));
+        assert_eq!(subset.converters, exports(&["set_dibble"]));
+    }
+
+    #[test]
+    fn subset_drops_constructors_and_converters_the_package_does_not_export() {
+        let subset = parse_declarations(SUBSET, &subset_exports())
+            .subset
+            .unwrap();
+        assert!(!subset.constructors.contains("internal_ctor"));
+        assert!(!subset.converters.contains("internal_conv"));
+    }
+
+    #[test]
+    fn a_file_without_subset_declares_none() {
+        // The pre-`[subset]` file shape is unchanged: no bracket declaration.
+        let declarations = parse_declarations(GEN, &exports(&["gen"]));
+        assert!(declarations.subset.is_none());
+        assert!(!declarations.is_empty());
+    }
+
+    #[test]
+    fn an_empty_subset_table_still_counts_as_a_declaration() {
+        // `[subset]` with no lists says "my `[` is data-masking" and nothing
+        // more — enough to put the package in the bracket-NSE set.
+        let declarations = parse_declarations("[subset]\n", &exports(&[]));
+        assert_eq!(
+            declarations.subset.as_deref(),
+            Some(&DeclaredSubset::default())
+        );
+        assert!(!declarations.is_empty());
+    }
+
+    #[test]
+    fn a_subset_only_file_is_not_empty() {
+        let declarations =
+            parse_declarations("[subset]\nconstructors = [\"mk\"]\n", &exports(&["mk"]));
+        assert!(!declarations.is_empty());
+        assert!(declarations.policies.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_subset_table_discards_the_whole_file() {
+        // A type error anywhere fails TOML deserialization, so the `[[function]]`
+        // entries go with it — the file is treated as absent, never half-read.
+        let bad = SUBSET.replace(
+            r#"constructors = ["dibble", "as_dibble", "internal_ctor"]"#,
+            "constructors = 5",
+        );
+        let declarations = parse_declarations(&bad, &subset_exports());
+        assert!(declarations.is_empty());
+    }
+
+    #[test]
+    fn a_newer_schema_discards_subset_too() {
+        let newer = SUBSET.replace("schema = 1", "schema = 2");
+        assert!(parse_declarations(&newer, &subset_exports()).is_empty());
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored_not_rejected() {
+        // Forward compatibility: a key this build does not know must not fail
+        // the file, or a future addition could not ship under `schema = 1`.
+        let future = r#"
+            schema = 1
+            future_top_level = true
+            [subset]
+            constructors = ["mk"]
+            future_key = ["x"]
+            [[function]]
+            name = "gen"
+            policy = "whole-call"
+            future_field = 1
+        "#;
+        let declarations = parse_declarations(future, &exports(&["gen", "mk"]));
+        assert_eq!(
+            declarations.policies.get("gen"),
+            Some(&ArgPolicy::WholeCall)
+        );
+        assert!(declarations.subset.unwrap().constructors.contains("mk"));
+    }
+
+    #[test]
+    fn subset_lists_are_capped_like_function_entries() {
+        let many: Vec<String> = (0..MAX_ENTRIES + 5).map(|i| format!("\"c{i}\"")).collect();
+        let toml = format!("[subset]\nconstructors = [{}]\n", many.join(", "));
+        let all: HashSet<String> = (0..MAX_ENTRIES + 5).map(|i| format!("c{i}")).collect();
+        let subset = parse_declarations(&toml, &all).subset.unwrap();
+        assert_eq!(subset.constructors.len(), MAX_ENTRIES);
     }
 }
