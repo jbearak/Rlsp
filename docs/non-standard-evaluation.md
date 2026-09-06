@@ -212,7 +212,8 @@ argument itself rather than nested inside another expression) is treated as
 NSE unconditionally, whatever package is in play and whatever the indexed
 object is, because no base `[` method evaluates `:=`; packages that adopt
 data.table's bracket notation for their own containers get the same treatment
-without a declaration.
+without a declaration. The cost is that a typo elsewhere in that same call
+(`d[typo, y := 1]`) goes unreported.
 
 ## Toward NSE Metadata
 
